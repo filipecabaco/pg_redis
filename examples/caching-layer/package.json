@@ -1,0 +1,9 @@
+{
+  "name": "pg-redis-caching-layer-example",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "bun run index.ts",
+    "dev": "bun --hot run index.ts",
+    "test": "bun test"
+  }
+}

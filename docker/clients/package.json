@@ -1,0 +1,9 @@
+{
+  "name": "pg-redis-client-compat",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "ioredis": "^5.0.0",
+    "redis": "^4.0.0"
+  }
+}

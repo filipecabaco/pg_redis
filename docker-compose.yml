@@ -1,0 +1,61 @@
+services:
+  postgres:
+    build: .
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+      - "6379:6379"
+    volumes:
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    command: >
+      postgres
+        -c shared_preload_libraries=pg_redis
+        -c redis.port=6379
+        -c redis.use_logged=true
+        -c redis.workers=${PG_REDIS_WORKERS:-4}
+        -c redis.password=testpass
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  e2e:
+    build: ./docker/e2e
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      REDIS_HOST: postgres
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: testpass
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/postgres
+    network_mode: "service:postgres"
+    profiles: ["e2e"]
+
+  clients:
+    build: ./docker/clients
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      REDIS_HOST: postgres
+      REDIS_PORT: "6379"
+    network_mode: "service:postgres"
+    profiles: ["clients"]
+
+  bench:
+    image: redis:7-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./docker/bench/run_bench.sh:/run_bench.sh
+    entrypoint: ["sh", "/run_bench.sh", "postgres", "6379", "testpass"]
+    network_mode: "service:postgres"
+    profiles: ["bench"]
+    environment:
+      - QUICK

@@ -1,0 +1,51 @@
+[vars]
+pg_version = "pg17"
+
+[tasks.fmt]
+description = "Format Rust code"
+run = "cargo fmt --all"
+
+[tasks.lint]
+description = "Lint with clippy (warnings as errors)"
+run = "cargo clippy --features {{vars.pg_version}} -- -D warnings"
+
+[tasks.build]
+description = "Build the extension"
+run = "cargo build --features {{vars.pg_version}}"
+
+[tasks.run]
+description = "Start a local postgres with the extension hot-reloaded"
+run = "cargo pgrx run {{vars.pg_version}}"
+
+[tasks.test-unit]
+description = "Run unit tests (no postgres required)"
+run = "cargo test --features {{vars.pg_version}} --lib -- --skip pg_test"
+
+[tasks.test-pg]
+description = "Run integration tests with pgrx managed postgres"
+run = "cargo pgrx test {{vars.pg_version}}"
+
+[tasks.test]
+description = "Run all tests (unit + pgrx integration)"
+depends = ["test-unit", "test-pg"]
+
+[tasks.e2e]
+description = "Run end-to-end tests in Docker (redis-cli based)"
+run = [
+  "docker compose --profile e2e up --build --abort-on-container-exit --exit-code-from e2e",
+  "docker compose --profile e2e down -v",
+]
+
+[tasks.clients]
+description = "Run client-compatibility e2e tests in Docker (node-redis, ioredis)"
+run = [
+  "docker compose --profile clients up --build --abort-on-container-exit --exit-code-from clients",
+  "docker compose --profile clients down -v",
+]
+
+[tasks.bench]
+description = "Run benchmarks in Docker (redis-benchmark)"
+run = [
+  "docker compose --profile bench up --build --abort-on-container-exit --exit-code-from bench",
+  "docker compose --profile bench down -v",
+]

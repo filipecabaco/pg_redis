@@ -1,0 +1,7 @@
+{
+  "name": "pg-redis-e2e",
+  "version": "1.0.0",
+  "devDependencies": {
+    "bun-types": "latest"
+  }
+}

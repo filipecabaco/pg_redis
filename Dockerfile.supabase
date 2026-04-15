@@ -1,0 +1,24 @@
+# Build stage: use Nix (same toolchain Supabase uses for all their pgrx extensions)
+FROM nixos/nix AS builder
+
+RUN echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf && \
+    echo "sandbox = false" >> /etc/nix/nix.conf
+
+WORKDIR /build
+COPY . .
+
+RUN nix build .#pg_redis-pg17 --impure --out-link /result
+
+# ── Runtime image ──────────────────────────────────────────────────────────────
+FROM public.ecr.aws/supabase/postgres:17.6.1.106
+
+COPY --from=builder /result /nix-result
+
+# /usr/bin/pg_config --pkglibdir → Nix store lib dir (where .so must go)
+# /usr/bin/pg_config --sharedir  → /usr/share/postgresql (where control/sql go)
+RUN PKGLIBDIR=$(/usr/bin/pg_config --pkglibdir) && \
+    cp /nix-result/lib/pg_redis.so "$PKGLIBDIR/" && \
+    cp /nix-result/share/postgresql/extension/pg_redis*.control /usr/share/postgresql/extension/ && \
+    cp /nix-result/share/postgresql/extension/pg_redis*.sql     /usr/share/postgresql/extension/ && \
+    rm -rf /nix-result && \
+    sed -i "s/\(shared_preload_libraries = '[^']*\)'/\1, pg_redis'/" /etc/postgresql/postgresql.conf

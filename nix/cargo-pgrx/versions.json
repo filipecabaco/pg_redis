@@ -1,0 +1,10 @@
+{
+  "0.16.1": {
+    "hash": "sha256-AjoBr+/sEPdzbD0wLUNVm2syCySkGaFOFQ70TST1U9w=",
+    "rust": {
+      "1.88.0": {
+        "cargoHash": "sha256-95DHq5GLnAqb3bbKwwaeBeKEmkfRh81ZTRaJ7L59DAg="
+      }
+    }
+  }
+}

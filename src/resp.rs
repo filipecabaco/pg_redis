@@ -7,24 +7,56 @@ const MAX_INLINE_LEN: usize = 8_192;
 
 pub struct RespParser {
     reader: BufReader<TcpStream>,
+    line_buf: Vec<u8>,
 }
 
 impl RespParser {
     pub fn new(stream: TcpStream) -> Self {
         Self {
             reader: BufReader::new(stream),
+            line_buf: Vec::with_capacity(256),
         }
     }
 
-    pub fn read_command(&mut self) -> io::Result<Vec<Vec<u8>>> {
-        let mut line = String::new();
-        let n = self.reader.read_line(&mut line)?;
-        if n == 0 {
+    fn read_line_bytes(&mut self) -> io::Result<&[u8]> {
+        self.line_buf.clear();
+        loop {
+            let n = self.reader.read_until(b'\n', &mut self.line_buf)?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed",
+                ));
+            }
+            if self.line_buf.last() == Some(&b'\n') {
+                break;
+            }
+            if self.line_buf.len() > MAX_INLINE_LEN {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "inline command too long",
+                ));
+            }
+        }
+        if self.line_buf.len() > MAX_INLINE_LEN {
             return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "connection closed",
+                io::ErrorKind::InvalidData,
+                "inline command too long",
             ));
         }
+        let end = self.line_buf.len();
+        let end = if end >= 2 && self.line_buf[end - 2] == b'\r' {
+            end - 2
+        } else if end >= 1 {
+            end - 1
+        } else {
+            end
+        };
+        Ok(&self.line_buf[..end])
+    }
+
+    pub fn read_command(&mut self) -> io::Result<Vec<Vec<u8>>> {
+        let line = self.read_line_bytes()?;
 
         if line.len() > MAX_INLINE_LEN {
             return Err(io::Error::new(
@@ -33,10 +65,10 @@ impl RespParser {
             ));
         }
 
-        let line = line.trim_end_matches("\r\n").trim_end_matches('\n');
-
-        if let Some(rest) = line.strip_prefix('*') {
-            let count: usize = rest
+        if line.first() == Some(&b'*') {
+            let count_str = std::str::from_utf8(&line[1..])
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad array count"))?;
+            let count: usize = count_str
                 .parse()
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad array count"))?;
             if count > MAX_ARRAY_LEN {
@@ -51,7 +83,9 @@ impl RespParser {
             }
             Ok(parts)
         } else {
-            Ok(line
+            let line_owned = line.to_vec();
+            Ok(std::str::from_utf8(&line_owned)
+                .unwrap_or("")
                 .split_whitespace()
                 .map(|s| s.as_bytes().to_vec())
                 .collect())
@@ -59,13 +93,16 @@ impl RespParser {
     }
 
     fn read_bulk_string(&mut self) -> io::Result<Vec<u8>> {
-        let mut line = String::new();
-        self.reader.read_line(&mut line)?;
-        let line = line.trim_end_matches("\r\n").trim_end_matches('\n');
-        let rest = line
-            .strip_prefix('$')
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "expected bulk string"))?;
-        let len: i64 = rest
+        let line = self.read_line_bytes()?;
+        if line.first() != Some(&b'$') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected bulk string",
+            ));
+        }
+        let len_str = std::str::from_utf8(&line[1..])
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad bulk len"))?;
+        let len: i64 = len_str
             .parse()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad bulk len"))?;
         if len < 0 {
@@ -188,7 +225,7 @@ mod tests {
 
     #[test]
     fn test_write_null_bulk() {
-        check_write(|w| write_null_bulk(w), b"$-1\r\n");
+        check_write(write_null_bulk, b"$-1\r\n");
     }
 
     #[test]

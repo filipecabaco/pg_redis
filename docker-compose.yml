@@ -16,6 +16,7 @@ services:
         -c redis.port=6379
         -c redis.use_logged=true
         -c redis.workers=${PG_REDIS_WORKERS:-4}
+        -c redis.batch_size=${PG_REDIS_BATCH_SIZE:-64}
         -c redis.password=testpass
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
@@ -47,15 +48,14 @@ services:
     network_mode: "service:postgres"
     profiles: ["clients"]
 
-  bench:
+  redis:
     image: redis:7-alpine
-    depends_on:
-      postgres:
-        condition: service_healthy
-    volumes:
-      - ./docker/bench/run_bench.sh:/run_bench.sh
-    entrypoint: ["sh", "/run_bench.sh", "postgres", "6379", "testpass"]
-    network_mode: "service:postgres"
+    command: ["redis-server", "--requirepass", "testpass"]
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a testpass ping | grep -q PONG"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
     profiles: ["bench"]
-    environment:
-      - QUICK

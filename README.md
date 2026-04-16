@@ -115,6 +115,7 @@ SELECT key, value, expires_at FROM redis.kv_1;
 | `redis.use_logged` | `true` | Default database for new connections (`true` = db 1, `false` = db 0) |
 | `redis.workers` | `4` | Number of background worker processes (requires server restart) |
 | `redis.max_connections` | `128` | Max simultaneous Redis clients per worker |
+| `redis.batch_size` | `64` | Max commands coalesced into one transaction (group commit); `1` disables batching |
 | `redis.password` | _(none)_ | When set, clients must `AUTH <password>` before any command |
 
 Set in `postgresql.conf` or at runtime:
@@ -225,37 +226,37 @@ Use **logged** for anything you care about keeping. Use **unlogged** for ephemer
 
 ## Benchmarks
 
-Benchmarks use [`redis-benchmark`](https://redis.io/docs/management/optimization/benchmarks/) — the same tool used to benchmark Redis itself. It measures throughput (ops/sec) across a pool of parallel connections with configurable pipelining.
+Benchmarks use [`redis-benchmark`](https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/benchmarks/) — the same tool used to benchmark Redis itself. It measures throughput (ops/sec) across a pool of parallel connections with configurable pipelining.
 
-### Run with Docker (recommended)
-
-Builds the extension, starts a fresh postgres container, and runs `redis-benchmark` against it:
+### Run the suite
 
 ```bash
 mise run bench
 ```
 
-This runs five passes:
+This starts the `bench` Docker profile (pg_redis on `:6379`, Redis 7 on `:6380`, both with password `testpass`), runs the full built-in `redis-benchmark` suite against each one in turn, and tears the stack down.
 
-| Pass | Config | Commands |
-|------|--------|----------|
-| Baseline | 50 clients, 100k requests, no pipeline | PING, SET, GET |
-| Pipelined | 50 clients, 100k requests, P=16 | PING, SET, GET |
-| Logged tables | 50 clients, 100k requests | SET, GET |
-| Unlogged tables | 50 clients, 100k requests | SET, GET |
-| Hash ops | 50 clients, 100k requests | HSET, HGET |
+Both runs use identical flags — `-n 20000 -c 50 -q` — so the output is directly comparable. The built-in suite covers PING, SET, GET, INCR, LPUSH, RPUSH, LPOP, RPOP, SADD, HSET, SPOP, ZADD, ZPOPMIN, LRANGE, MSET.
 
-Logged vs Unlogged is the primary comparison: unlogged tables skip WAL writes entirely, trading crash durability for throughput.
+### Run custom commands
 
-### Run against a local instance
-
-If you have a running `cargo pgrx run` session:
+For anything outside the built-in suite (ZRANGE, ZRANGEBYSCORE, HGETALL, SMEMBERS, EXPIRE, …), start the stack once and drive `redis-benchmark` yourself:
 
 ```bash
-redis-benchmark -h localhost -p 6379 -n 100000 -c 50 -q -t ping,set,get
+docker compose --profile bench up -d --wait
+
+# Anything from the redis-benchmark docs, just swap the port.
+redis-benchmark -h localhost -p 6379 -a testpass -n 100000 -c 50 -q -P 16 -t set,get
+redis-benchmark -h localhost -p 6380 -a testpass -n 100000 -c 50 -q -P 16 -t set,get
+
+# Arbitrary command with __rand_int__ substitution:
+redis-benchmark -h localhost -p 6379 -a testpass -n 50000 -c 50 -q \
+  -r 100000 ZADD leaderboard __rand_int__ user:__rand_int__
+
+docker compose --profile bench down
 ```
 
-Customise freely — `redis-benchmark --help` lists all flags. Useful ones:
+Flags worth knowing (`redis-benchmark --help` lists everything):
 
 ```
 -n  total requests       (default 100000)
@@ -263,38 +264,72 @@ Customise freely — `redis-benchmark --help` lists all flags. Useful ones:
 -P  pipeline depth       (default 1 — disables pipelining)
 -d  value size in bytes  (default 3)
 -t  commands to test     (comma-separated)
+-r  keyspace length      (enables __rand_int__ substitution)
 -q  quiet output         (one line per command)
 --csv                    machine-readable output
 ```
 
-### Results (4 workers, Docker on Apple M-series)
+### Results (Docker, Apple M-series)
 
-Measured with `redis-benchmark` against a Docker container running `postgres:17-alpine` with 4 background workers (`redis.workers=4`).
+Three-way comparison: Redis 7 Alpine · pg_redis defaults · pg_redis tuned for high write throughput.
 
-| Pass | Command | Throughput |
-|------|---------|-----------|
-| Baseline (c=50, no pipeline) | PING | ~156,000 rps |
-| Baseline (c=50, no pipeline) | SET  | ~1,230 rps  |
-| Baseline (c=50, no pipeline) | GET  | ~58,000 rps  |
-| Pipelined (c=50, P=16) | PING | ~19,500 rps |
-| Pipelined (c=50, P=16) | SET  | ~1,240 rps  |
-| Pipelined (c=50, P=16) | GET  | ~19,000 rps  |
-| Logged tables (db 1) | SET | ~1,210 rps |
-| Logged tables (db 1) | GET | ~55,500 rps |
-| Unlogged tables (db 0) | SET | ~970–1,280 rps |
-| Unlogged tables (db 0) | GET | ~55,500 rps |
-| Hash operations | HSET | ~1,230 rps |
+| | **Redis 7** | **pg_redis default** | **pg_redis high-write** |
+|-|-------------|---------------------|------------------------|
+| Workers | — | 4 | 8 |
+| Batch size | — | 64 | 256 |
+| Clients | 50 | 50 | 200 |
+| Requests | 20,000 | 20,000 | 50,000 |
+| Run with | — | `mise run bench` | `mise run bench-high-write` |
 
-**Key observations:**
+| Command | Redis 7 | pg_redis default | pg_redis high-write |
+|---------|---------|-----------------|---------------------|
+| PING    | 253,164 rps · 0.10 ms | 158,730 rps · 0.17 ms | — |
+| GET     | 238,095 rps · 0.10 ms | 101,522 rps · 0.43 ms | 103,519 rps · 1.56 ms |
+| SET     | 235,294 rps · 0.10 ms | 5,611 rps · 7.97 ms | **10,298 rps** · 16.5 ms |
+| INCR    | 190,476 rps · 0.16 ms | 6,182 rps · 7.18 ms | **11,057 rps** · 14.6 ms |
+| HSET    | 192,307 rps · 0.16 ms | 14,705 rps · 2.90 ms | 10,663 rps · 15.6 ms |
+| ZADD    | 194,174 rps · 0.16 ms | 6,112 rps · 7.63 ms | 6,400 rps · 23.0 ms |
+| LPOP    | 155,038 rps · 0.24 ms | 6,891 rps · 7.33 ms | **62,972 rps** · 2.94 ms |
+| RPOP    | 192,307 rps · 0.16 ms | 11,514 rps · 4.23 ms | **60,313 rps** · 2.78 ms |
+| SADD    | 196,078 rps · 0.16 ms | 25,412 rps · 1.86 ms | **80,906 rps** · 2.15 ms |
+| SPOP    | 204,081 rps · 0.16 ms | 24,009 rps · 2.00 ms | **65,530 rps** · 2.25 ms |
+| ZPOPMIN | 202,020 rps · 0.16 ms | 18,867 rps · 2.56 ms | **57,273 rps** · 3.06 ms |
+| LRANGE 100 | 51,546 rps · 0.50 ms | 632 rps · 78.5 ms | — |
+| LRANGE 300 | 28,089 rps · 0.86 ms | 609 rps · 81.4 ms | — |
+| LRANGE 500 | 18,604 rps · 1.33 ms | 587 rps · 84.5 ms | — |
+| LRANGE 600 | 17,123 rps · 1.47 ms | 577 rps · 85.8 ms | — |
 
-- **PING / GET** are fast (~55–156k rps) because they require no WAL write or heavy locking.
-- **SET / HSET** are bounded by per-transaction PostgreSQL commit overhead (~35–50 ms p50), giving ~1,200 rps regardless of pipelining.
-- **Pipelining** improves PING throughput from background workers sharing the port, but cannot help SET because each write must commit before the response is sent.
-- **Unlogged tables** (db 0) show similar SET throughput to logged tables in this environment; the WAL skip benefit is most visible on storage-bound hardware.
+**Reading the table:**
+
+- **GET (~100k rps)** is limited by worker count, not WAL. Pure `SELECT` with no write overhead — already at ~43% of Redis throughput at default settings, and stays flat as concurrency rises because the workers are saturated.
+- **SET/INCR/ZADD** are WAL-bound. Each commit costs ~37 ms. Group commit amortises that across ~5 commands at default (5,611 rps) and ~25 commands at high-write (10,298 rps). More clients → fuller batches → lower effective commit cost per command.
+- **LPOP/RPOP/SADD/SPOP/ZPOPMIN** are fast single-row operations. At default settings they batch loosely (~5k–25k rps); at 200 clients with 8 workers they fill every batch and the commit overhead nearly vanishes — **SADD reaches 80k rps, 41% of Redis**.
+- **HSET** bucks the trend: it uses `unnest` to insert field arrays, and the per-command SQL cost dominates at high concurrency, limiting batching gains.
+- **LRANGE** is commit-floor dominated (~600 rps). The CTE scans the list in one pass but the ~80 ms commit cost is not shared with other writes because LRANGE is rarely issued concurrently with matching writes. Range size has no effect — the commit dominates.
+- **PING** never touches SPI and is handled entirely in the connection thread, hence ~160k rps regardless of database load.
+
+### Tuning batch size
+
+`redis.batch_size` controls how many queued commands are coalesced per transaction. The default of 64 caps the batch; the actual fill level under load is limited by how many clients are writing concurrently.
+
+| `redis.batch_size` | Effect |
+|--------------------|--------|
+| `1` | Disables batching. One transaction per command. Lowest write latency, lowest write throughput. |
+| `8–16` | Light coalescing. Good balance for mixed workloads with few concurrent writers. |
+| `64` (default) | Aggressive coalescing under high concurrency (50+ clients). Maximises write throughput. |
+| `256` | Useful when hundreds of clients write simultaneously. Diminishing returns beyond natural channel fill rate. |
+
+Change at runtime without restart:
+```sql
+ALTER SYSTEM SET redis.batch_size = 16;
+SELECT pg_reload_conf();
+```
+
+Workers read the GUC at startup, so newly added workers pick up changes immediately while running workers require a `redis.remove_workers` / `redis.add_workers` cycle or server reload.
 
 ### Expected behaviour
 
-Each background worker serialises SPI calls through a single dispatcher thread. Throughput is bounded by single-core PostgreSQL transaction commit rate for writes (~1,200 SET/s per worker). GET throughput scales with read concurrency across workers. Adding more workers via `redis.workers` or `redis.add_workers()` increases read parallelism and connection capacity without affecting per-write latency.
+Each background worker serialises SPI calls through a single dispatcher thread. After receiving a command, it drains up to `redis.batch_size` additional queued commands and executes them all in one PostgreSQL transaction. Write throughput scales with batch fill rate — more concurrent writers → larger batches → lower per-write commit overhead. GET throughput scales with read concurrency across workers. Adding more workers via `redis.workers` or `redis.add_workers()` increases both read parallelism and the number of independent batch queues.
 
 ---
 

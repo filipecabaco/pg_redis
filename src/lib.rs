@@ -21,6 +21,7 @@ pub(crate) static LISTEN_ADDRESS: GucSetting<Option<std::ffi::CString>> =
 pub(crate) static MAX_CONNECTIONS: GucSetting<i32> = GucSetting::<i32>::new(128);
 pub(crate) static PASSWORD: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
+pub(crate) static BATCH_SIZE: GucSetting<i32> = GucSetting::<i32>::new(64);
 
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
@@ -80,6 +81,19 @@ pub extern "C-unwind" fn _PG_init() {
         c"Password for Redis client authentication",
         c"When set, clients must AUTH before any command.",
         &PASSWORD,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"redis.batch_size",
+        c"Maximum commands per group-commit transaction",
+        c"How many queued commands are coalesced into one PostgreSQL transaction. \
+          Higher values amortise WAL flush cost across more writes; lower values \
+          reduce worst-case latency. Set to 1 to disable batching (default: 64).",
+        &BATCH_SIZE,
+        1,
+        256,
         GucContext::Suset,
         GucFlags::default(),
     );
@@ -172,8 +186,7 @@ mod tests {
     #[pg_test]
     fn test_kv_db1_logged_schema() {
         Spi::run("INSERT INTO redis.kv_1 (key, value) VALUES ('k', 'v')").unwrap();
-        let v =
-            Spi::get_one::<String>("SELECT value FROM redis.kv_1 WHERE key = 'k'").unwrap();
+        let v = Spi::get_one::<String>("SELECT value FROM redis.kv_1 WHERE key = 'k'").unwrap();
         assert_eq!(v, Some("v".to_string()));
         clean_kv(1);
     }
@@ -181,16 +194,14 @@ mod tests {
     #[pg_test]
     fn test_kv_db0_unlogged_schema() {
         Spi::run("INSERT INTO redis.kv_0 (key, value) VALUES ('k', 'v')").unwrap();
-        let v = Spi::get_one::<String>("SELECT value FROM redis.kv_0 WHERE key = 'k'")
-            .unwrap();
+        let v = Spi::get_one::<String>("SELECT value FROM redis.kv_0 WHERE key = 'k'").unwrap();
         assert_eq!(v, Some("v".to_string()));
         clean_kv(0);
     }
 
     #[pg_test]
     fn test_hash_db1_logged_schema() {
-        Spi::run("INSERT INTO redis.hash_1 (key, field, value) VALUES ('h', 'f', 'v')")
-            .unwrap();
+        Spi::run("INSERT INTO redis.hash_1 (key, field, value) VALUES ('h', 'f', 'v')").unwrap();
         let v = Spi::get_one::<String>(
             "SELECT value FROM redis.hash_1 WHERE key = 'h' AND field = 'f'",
         )
@@ -201,8 +212,7 @@ mod tests {
 
     #[pg_test]
     fn test_hash_db0_unlogged_schema() {
-        Spi::run("INSERT INTO redis.hash_0 (key, field, value) VALUES ('h', 'f', 'v')")
-            .unwrap();
+        Spi::run("INSERT INTO redis.hash_0 (key, field, value) VALUES ('h', 'f', 'v')").unwrap();
         let v = Spi::get_one::<String>(
             "SELECT value FROM redis.hash_0 WHERE key = 'h' AND field = 'f'",
         )
@@ -217,8 +227,7 @@ mod tests {
     fn test_kv_upsert() {
         Spi::run("INSERT INTO redis.kv_1 (key, value) VALUES ('x', 'first') ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value").unwrap();
         Spi::run("INSERT INTO redis.kv_1 (key, value) VALUES ('x', 'second') ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value").unwrap();
-        let v =
-            Spi::get_one::<String>("SELECT value FROM redis.kv_1 WHERE key = 'x'").unwrap();
+        let v = Spi::get_one::<String>("SELECT value FROM redis.kv_1 WHERE key = 'x'").unwrap();
         assert_eq!(v, Some("second".to_string()));
         clean_kv(1);
     }
@@ -248,8 +257,7 @@ mod tests {
 
     #[pg_test]
     fn test_kv_delete_returns_count() {
-        Spi::run("INSERT INTO redis.kv_1 (key, value) VALUES ('d1', 'v'), ('d2', 'v')")
-            .unwrap();
+        Spi::run("INSERT INTO redis.kv_1 (key, value) VALUES ('d1', 'v'), ('d2', 'v')").unwrap();
         let n = Spi::get_one::<i64>(
             "WITH del AS (DELETE FROM redis.kv_1 WHERE key = ANY(ARRAY['d1','d2','missing']) RETURNING 1) SELECT count(*) FROM del",
         )
@@ -260,8 +268,7 @@ mod tests {
 
     #[pg_test]
     fn test_kv_exists_count() {
-        Spi::run("INSERT INTO redis.kv_1 (key, value) VALUES ('e1', 'v'), ('e2', 'v')")
-            .unwrap();
+        Spi::run("INSERT INTO redis.kv_1 (key, value) VALUES ('e1', 'v'), ('e2', 'v')").unwrap();
         let n = Spi::get_one::<i64>(
             "SELECT count(*)::bigint FROM redis.kv_1 WHERE key = ANY(ARRAY['e1','e2','nope']) AND (expires_at IS NULL OR expires_at > now())",
         )
@@ -332,10 +339,9 @@ mod tests {
             "UPDATE redis.kv_1 SET expires_at = NULL WHERE key = 'pk' AND expires_at IS NOT NULL",
         )
         .unwrap();
-        let exp = Spi::get_one::<bool>(
-            "SELECT expires_at IS NULL FROM redis.kv_1 WHERE key = 'pk'",
-        )
-        .unwrap();
+        let exp =
+            Spi::get_one::<bool>("SELECT expires_at IS NULL FROM redis.kv_1 WHERE key = 'pk'")
+                .unwrap();
         assert_eq!(exp, Some(true));
         clean_kv(1);
     }
@@ -346,27 +352,42 @@ mod tests {
     fn test_lazy_delete_removes_expired_row() {
         Spi::run("INSERT INTO redis.kv_1 (key, value, expires_at) VALUES ('ex_del', 'v', now() - interval '1 second')").unwrap();
         Spi::run("DELETE FROM redis.kv_1 WHERE key = 'ex_del' AND expires_at <= now()").unwrap();
-        let count = Spi::get_one::<i64>("SELECT count(*)::bigint FROM redis.kv_1 WHERE key = 'ex_del'")
-            .unwrap();
-        assert_eq!(count, Some(0), "expired key must be deleted from the table, not just filtered");
+        let count =
+            Spi::get_one::<i64>("SELECT count(*)::bigint FROM redis.kv_1 WHERE key = 'ex_del'")
+                .unwrap();
+        assert_eq!(
+            count,
+            Some(0),
+            "expired key must be deleted from the table, not just filtered"
+        );
     }
 
     #[pg_test]
     fn test_active_expiry_deletes_rows() {
         Spi::run("INSERT INTO redis.kv_1 (key, value, expires_at) VALUES ('active_exp', 'v', now() - interval '1 second')").unwrap();
         Spi::run("DELETE FROM redis.kv_1 WHERE expires_at <= now()").unwrap();
-        let count = Spi::get_one::<i64>("SELECT count(*)::bigint FROM redis.kv_1 WHERE key = 'active_exp'")
-            .unwrap();
-        assert_eq!(count, Some(0), "active expiry scan must delete expired rows");
+        let count =
+            Spi::get_one::<i64>("SELECT count(*)::bigint FROM redis.kv_1 WHERE key = 'active_exp'")
+                .unwrap();
+        assert_eq!(
+            count,
+            Some(0),
+            "active expiry scan must delete expired rows"
+        );
     }
 
     #[pg_test]
     fn test_non_expired_key_survives_active_scan() {
         Spi::run("INSERT INTO redis.kv_1 (key, value, expires_at) VALUES ('live_key', 'v', now() + interval '1 hour')").unwrap();
         Spi::run("DELETE FROM redis.kv_1 WHERE expires_at <= now()").unwrap();
-        let count = Spi::get_one::<i64>("SELECT count(*)::bigint FROM redis.kv_1 WHERE key = 'live_key'")
-            .unwrap();
-        assert_eq!(count, Some(1), "non-expired key must not be deleted by expiry scan");
+        let count =
+            Spi::get_one::<i64>("SELECT count(*)::bigint FROM redis.kv_1 WHERE key = 'live_key'")
+                .unwrap();
+        assert_eq!(
+            count,
+            Some(1),
+            "non-expired key must not be deleted by expiry scan"
+        );
         clean_kv(1);
     }
 
@@ -380,9 +401,14 @@ mod tests {
         .ok()
         .flatten();
         assert_eq!(v, None, "GET must return null for expired key");
-        let exists = Spi::get_one::<bool>("SELECT EXISTS (SELECT 1 FROM redis.kv_1 WHERE key = 'lazy')")
-            .unwrap();
-        assert_eq!(exists, Some(false), "expired key must be removed from table after GET");
+        let exists =
+            Spi::get_one::<bool>("SELECT EXISTS (SELECT 1 FROM redis.kv_1 WHERE key = 'lazy')")
+                .unwrap();
+        assert_eq!(
+            exists,
+            Some(false),
+            "expired key must be removed from table after GET"
+        );
     }
 
     // ──────────────────────────────── Hash ops ────────────────────────────────
@@ -432,10 +458,8 @@ mod tests {
     #[pg_test]
     fn test_mset_batch_upsert() {
         Spi::run("INSERT INTO redis.kv_1 (key, value, expires_at) SELECT unnest(ARRAY['k1','k2']::text[]), unnest(ARRAY['v1','v2']::text[]), NULL ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, expires_at = EXCLUDED.expires_at").unwrap();
-        let v1 = Spi::get_one::<String>("SELECT value FROM redis.kv_1 WHERE key = 'k1'")
-            .unwrap();
-        let v2 = Spi::get_one::<String>("SELECT value FROM redis.kv_1 WHERE key = 'k2'")
-            .unwrap();
+        let v1 = Spi::get_one::<String>("SELECT value FROM redis.kv_1 WHERE key = 'k1'").unwrap();
+        let v2 = Spi::get_one::<String>("SELECT value FROM redis.kv_1 WHERE key = 'k2'").unwrap();
         assert_eq!(v1, Some("v1".to_string()));
         assert_eq!(v2, Some("v2".to_string()));
         clean_kv(1);
@@ -462,10 +486,19 @@ mod tests {
     #[pg_test]
     fn test_mget_lazy_deletes_expired_keys() {
         Spi::run("INSERT INTO redis.kv_1 (key, value, expires_at) VALUES ('ex1', 'v', now() - interval '1 second'), ('ex2', 'v', now() - interval '1 second')").unwrap();
-        Spi::run("DELETE FROM redis.kv_1 WHERE key = ANY(ARRAY['ex1','ex2']) AND expires_at <= now()").unwrap();
-        let count = Spi::get_one::<i64>("SELECT count(*)::bigint FROM redis.kv_1 WHERE key = ANY(ARRAY['ex1','ex2'])")
-            .unwrap();
-        assert_eq!(count, Some(0), "mget lazy delete must remove expired keys from storage");
+        Spi::run(
+            "DELETE FROM redis.kv_1 WHERE key = ANY(ARRAY['ex1','ex2']) AND expires_at <= now()",
+        )
+        .unwrap();
+        let count = Spi::get_one::<i64>(
+            "SELECT count(*)::bigint FROM redis.kv_1 WHERE key = ANY(ARRAY['ex1','ex2'])",
+        )
+        .unwrap();
+        assert_eq!(
+            count,
+            Some(0),
+            "mget lazy delete must remove expired keys from storage"
+        );
         clean_kv(1);
     }
 
@@ -477,7 +510,11 @@ mod tests {
         let count = Spi::get_one::<i64>("SELECT redis.worker_count()")
             .unwrap()
             .unwrap_or(0);
-        assert!(count > 0, "expected at least one worker running, got {}", count);
+        assert!(
+            count > 0,
+            "expected at least one worker running, got {}",
+            count
+        );
     }
 
     #[pg_test]

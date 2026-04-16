@@ -44,8 +44,51 @@ run = [
 ]
 
 [tasks.bench]
-description = "Run benchmarks in Docker (redis-benchmark)"
-run = [
-  "docker compose --profile bench up --build --abort-on-container-exit --exit-code-from bench",
-  "docker compose --profile bench down -v",
-]
+description = "Run the full redis-benchmark suite against pg_redis (:6379) and Redis (:6380)"
+run = """
+set -e
+docker compose --profile bench up -d --build --wait
+trap 'docker compose --profile bench down' EXIT INT TERM
+sleep 2
+
+run_suite() {
+  label=$1; host=$2
+  echo ''
+  echo "══ $label ═══════════════════════════════════════════"
+  for t in ping set get incr lpush rpush lpop rpop sadd hset spop zadd zpopmin lrange mset; do
+    docker compose exec -T redis redis-benchmark \\
+        -h $host -p 6379 -a testpass -n 20000 -c 50 -q -t $t 2>/dev/null \\
+      | tr '\\r' '\\n' \\
+      | grep 'requests per second' \\
+      || echo " $t: <connection closed>"
+  done
+}
+
+run_suite 'Redis 7 (reference)' redis
+run_suite 'pg_redis' postgres
+"""
+
+[tasks.bench-high-write]
+description = "High-concurrency write benchmark: 8 workers, batch_size=256, 200 clients"
+run = """
+set -e
+PG_REDIS_WORKERS=8 PG_REDIS_BATCH_SIZE=256 docker compose --profile bench up -d --build --wait
+trap 'docker compose --profile bench down' EXIT INT TERM
+sleep 2
+
+run_suite() {
+  label=$1; host=$2
+  echo ''
+  echo "══ $label ═══════════════════════════════════════════"
+  for t in set get incr hset zadd lpop sadd zpopmin rpop spop; do
+    docker compose exec -T redis redis-benchmark \\
+        -h $host -p 6379 -a testpass -n 50000 -c 200 -q -t $t 2>/dev/null \\
+      | tr '\\r' '\\n' \\
+      | grep 'requests per second' \\
+      || echo " $t: <connection closed>"
+  done
+}
+
+run_suite 'Redis 7 (reference, 200 clients)' redis
+run_suite 'pg_redis (8 workers, batch_size=256, 200 clients)' postgres
+"""

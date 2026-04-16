@@ -28,11 +28,14 @@ pub fn worker_main() {
         .to_string();
     let max_conn = crate::MAX_CONNECTIONS.get().max(1) as usize;
     let password = configured_password();
+    let batch_size = crate::BATCH_SIZE.get().max(1) as usize;
 
     // Bounded: limits queued commands under backpressure rather than buffering indefinitely.
     let (cmd_tx, cmd_rx) = mpsc::sync_channel::<CmdMsg>(256);
 
-    std::thread::spawn(move || accept_loop(port, cmd_tx, default_db, listen_addr, max_conn, password));
+    std::thread::spawn(move || {
+        accept_loop(port, cmd_tx, default_db, listen_addr, max_conn, password)
+    });
 
     let mut last_expiry_scan = Instant::now();
 
@@ -40,15 +43,52 @@ pub fn worker_main() {
         if BackgroundWorker::sigterm_received() {
             break;
         }
-        match cmd_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok((cmd, db, resp_tx)) => {
-                // BackgroundWorker::transaction calls StartTransactionCommand /
-                // CommitTransactionCommand around SPI. Omitting it causes a segfault
-                // on the first SPI call.
-                let response = BackgroundWorker::transaction(|| {
-                    Spi::connect_mut(|client| cmd.execute(client, db))
-                });
-                resp_tx.send(response).ok();
+        match cmd_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(first) => {
+                // Drain up to batch_size queued commands without blocking.
+                // All commands share one PostgreSQL transaction, amortising the
+                // WAL flush cost across the entire batch.
+                let mut batch: Vec<CmdMsg> = Vec::with_capacity(batch_size);
+                batch.push(first);
+                while batch.len() < batch_size {
+                    match cmd_rx.try_recv() {
+                        Ok(item) => batch.push(item),
+                        Err(_) => break,
+                    }
+                }
+
+                if batch.len() == 1 {
+                    // Single command: no savepoint overhead.
+                    let (cmd, db, resp_tx) = batch.pop().unwrap();
+                    let response = BackgroundWorker::transaction(|| {
+                        Spi::connect_mut(|client| cmd.execute(client, db))
+                    });
+                    resp_tx.send(response).ok();
+                } else {
+                    // Multiple commands: savepoint per command so one failure
+                    // rolls back only that command, not the entire batch.
+                    let responses: Vec<Response> = BackgroundWorker::transaction(|| {
+                        Spi::connect_mut(|client| {
+                            batch
+                                .iter()
+                                .map(|(cmd, db, _)| {
+                                    client.update("SAVEPOINT pgr", None, &[]).ok();
+                                    let resp = cmd.execute(client, *db);
+                                    if matches!(resp, Response::Error(_)) {
+                                        client
+                                            .update("ROLLBACK TO SAVEPOINT pgr", None, &[])
+                                            .ok();
+                                    }
+                                    client.update("RELEASE SAVEPOINT pgr", None, &[]).ok();
+                                    resp
+                                })
+                                .collect()
+                        })
+                    });
+                    for ((_, _, resp_tx), response) in batch.into_iter().zip(responses) {
+                        resp_tx.send(response).ok();
+                    }
+                }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -56,36 +96,21 @@ pub fn worker_main() {
 
         if last_expiry_scan.elapsed() >= Duration::from_secs(1) {
             last_expiry_scan = Instant::now();
-            let schema_exists = BackgroundWorker::transaction(|| {
-                Spi::connect(|client| {
-                    client
-                        .select(
-                            "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = 'redis')",
-                            None,
-                            &[],
-                        )
-                        .ok()
-                        .and_then(|t| t.first().get::<bool>(1).ok().flatten())
-                        .unwrap_or(false)
-                })
-            });
-            if schema_exists {
-                // Each table in its own transaction to minimise lock hold time.
-                for db in 0u8..16 {
-                    BackgroundWorker::transaction(|| {
-                        Spi::connect_mut(|client| {
-                            client
-                                .update(
-                                    &format!(
-                                        "DELETE FROM redis.kv_{db} WHERE expires_at <= now()"
-                                    ),
-                                    None,
-                                    &[],
-                                )
-                                .ok();
-                        })
-                    });
-                }
+            for db in 0u8..16 {
+                BackgroundWorker::transaction(|| {
+                    Spi::connect_mut(|client| {
+                        client
+                            .update(
+                                &format!(
+                                    "DELETE FROM redis.kv_{db} \
+                                     WHERE expires_at IS NOT NULL AND expires_at <= now()"
+                                ),
+                                None,
+                                &[],
+                            )
+                            .ok();
+                    })
+                });
             }
         }
     }
@@ -102,7 +127,10 @@ fn accept_loop(
     let addr: SocketAddr = match format!("{}:{}", listen_addr, port).parse() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("pg_redis: invalid listen address '{}:{}': {}", listen_addr, port, e);
+            eprintln!(
+                "pg_redis: invalid listen address '{}:{}': {}",
+                listen_addr, port, e
+            );
             return;
         }
     };
@@ -163,7 +191,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 /// Returns the configured password bytes, or `None` if authentication is disabled.
@@ -178,7 +209,12 @@ fn configured_password() -> Option<Vec<u8>> {
     })
 }
 
-fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<CmdMsg>, default_db: u8, required_password: Option<Vec<u8>>) {
+fn conn_loop(
+    stream: TcpStream,
+    cmd_tx: mpsc::SyncSender<CmdMsg>,
+    default_db: u8,
+    required_password: Option<Vec<u8>>,
+) {
     let write_stream = match stream.try_clone() {
         Ok(s) => s,
         Err(_) => return,
@@ -208,7 +244,11 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<CmdMsg>, default_db: u8
         // PING, AUTH, HELLO, RESET, QUIT, and CLIENT commands are always available,
         // even before authentication.
         match &cmd {
-            Command::Hello { proto: requested_proto, auth: inline_auth, setname: _ } => {
+            Command::Hello {
+                proto: requested_proto,
+                auth: inline_auth,
+                ..
+            } => {
                 if let Some(password) = inline_auth {
                     let ok = match &required_password {
                         None => true,
@@ -218,7 +258,10 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<CmdMsg>, default_db: u8
                         authenticated = true;
                     } else {
                         reply(&mut writer, |w| {
-                            write_error(w, "WRONGPASS invalid username-password pair or user is disabled.")
+                            write_error(
+                                w,
+                                "WRONGPASS invalid username-password pair or user is disabled.",
+                            )
                         });
                         continue;
                     }
@@ -308,7 +351,7 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<CmdMsg>, default_db: u8
                 continue;
             }
             Command::ClientGetname => {
-                reply(&mut writer, |w| write_null_bulk(w));
+                reply(&mut writer, write_null_bulk);
                 continue;
             }
             Command::ClientSetname { .. } => {
@@ -361,12 +404,12 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<CmdMsg>, default_db: u8
                 let info = format!(
                     "# Server\r\nredis_version:7.0.0\r\nmode:standalone\r\nos:PostgreSQL\r\ndb:{}\r\ntable_mode:{}\r\n",
                     db,
-                    if db % 2 == 0 { "unlogged" } else { "logged" }
+                    if db.is_multiple_of(2) { "unlogged" } else { "logged" }
                 );
                 reply(&mut writer, |w| write_bulk_string(w, info.as_bytes()));
             }
-            Command::CommandCount => reply(&mut writer, |w| write_integer(w, 100)),
-            Command::CommandInfo | Command::CommandDocs | Command::CommandList | Command::CommandOther => {
+            Command::CmdCount => reply(&mut writer, |w| write_integer(w, 100)),
+            Command::CmdInfo | Command::CmdDocs | Command::CmdList | Command::CmdOther => {
                 reply(&mut writer, |w| write_array_header(w, 0))
             }
             Command::ConfigGet { .. } => reply(&mut writer, |w| write_array_header(w, 0)),
@@ -407,6 +450,13 @@ fn write_response(w: &mut impl std::io::Write, response: Response) -> std::io::R
                     Some(data) => write_bulk_string(w, &data)?,
                     None => write_null_bulk(w)?,
                 }
+            }
+            Ok(())
+        }
+        Response::IntegerArray(items) => {
+            write_array_header(w, items.len())?;
+            for n in items {
+                write_integer(w, n)?;
             }
             Ok(())
         }
@@ -548,8 +598,14 @@ mod tests {
         let a_db = db_rx_a.recv_timeout(Duration::from_secs(2)).unwrap();
         let b_db = db_rx_b.recv_timeout(Duration::from_secs(2)).unwrap();
 
-        assert_eq!(a_db, 2, "connection A: after SELECT 2 should use db 2 (unlogged)");
-        assert_eq!(b_db, 3, "connection B: after SELECT 3 should use db 3 (logged)");
+        assert_eq!(
+            a_db, 2,
+            "connection A: after SELECT 2 should use db 2 (unlogged)"
+        );
+        assert_eq!(
+            b_db, 3,
+            "connection B: after SELECT 3 should use db 3 (logged)"
+        );
     }
 
     #[test]
@@ -655,7 +711,10 @@ mod tests {
         let (mut client, _) = connect_conn_loop(1);
         send_cmd(&mut client, &["AUTH", "anything"]);
         let resp = read_line(&mut client);
-        assert_eq!(resp, "+OK", "AUTH must return OK when no password is configured");
+        assert_eq!(
+            resp, "+OK",
+            "AUTH must return OK when no password is configured"
+        );
     }
 
     // ──────────────────────────── Connection limit ────────────────────────────

@@ -110,6 +110,17 @@ jobs:
       - name: Initialize pgrx for pg${{ matrix.pg }}
         run: cargo pgrx init --pg${{ matrix.pg }} download
 
+      - name: Diagnose environment before tests
+        run: |
+          echo "=== Listeners on :6379 ==="
+          ss -tlnp 2>&1 | grep -E ":6379|State" || echo "no listener on 6379"
+          echo "=== /etc/hosts ==="
+          cat /etc/hosts
+          echo "=== redis-cli availability ==="
+          which redis-cli || echo "no redis-cli"
+          echo "=== postgres binaries ==="
+          ls -la ~/.pgrx/*/pgrx-install/bin/ 2>/dev/null | head -20 || true
+
       - name: Run unit tests
         run: cargo pgrx test pg${{ matrix.pg }}
 

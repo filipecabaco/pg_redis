@@ -75,9 +75,7 @@ pub fn worker_main() {
                                     client.update("SAVEPOINT pgr", None, &[]).ok();
                                     let resp = cmd.execute(client, *db);
                                     if matches!(resp, Response::Error(_)) {
-                                        client
-                                            .update("ROLLBACK TO SAVEPOINT pgr", None, &[])
-                                            .ok();
+                                        client.update("ROLLBACK TO SAVEPOINT pgr", None, &[]).ok();
                                     }
                                     client.update("RELEASE SAVEPOINT pgr", None, &[]).ok();
                                     resp

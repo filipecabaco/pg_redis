@@ -3779,7 +3779,7 @@ fn list_pop(
             if left {
                 rows.sort_by_key(|(p, _)| *p);
             } else {
-                rows.sort_by(|a, b| b.0.cmp(&a.0));
+                rows.sort_by_key(|b| std::cmp::Reverse(b.0));
             }
             if count.is_none() {
                 match rows.into_iter().next() {

@@ -146,7 +146,7 @@ fn remove_workers(n: i32) -> i32 {
     match Spi::get_one::<i32>(&format!(
         "SELECT count(pg_terminate_backend(pid))::int \
          FROM (SELECT pid FROM pg_stat_activity \
-               WHERE application_name LIKE 'pg_redis worker%' \
+               WHERE backend_type LIKE 'pg_redis worker%' \
                ORDER BY backend_start DESC \
                LIMIT {}) s",
         n.max(0)
@@ -161,7 +161,7 @@ fn remove_workers(n: i32) -> i32 {
 fn worker_count() -> i64 {
     Spi::get_one::<i64>(
         "SELECT count(*)::bigint FROM pg_stat_activity \
-         WHERE application_name LIKE 'pg_redis worker%'",
+         WHERE backend_type LIKE 'pg_redis worker%'",
     )
     .ok()
     .flatten()

@@ -13,6 +13,13 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # sccache speeds up incremental Rust compilation by caching individual
+  # compilation artifacts keyed by input hash. This pairs with the cargo cache
+  # by accelerating the compilation of items that weren't in the target cache.
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PGRX_VERSION: "0.16.1"
 
 jobs:
   lint:
@@ -43,26 +50,47 @@ jobs:
             zlib1g-dev \
             clang
 
-      - name: Cache cargo
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+
+      # Swatinem/rust-cache caches ~/.cargo/{registry,git} and target/ with
+      # smart invalidation: only dependency artifacts (not workspace crates)
+      # are cached, and it auto-prunes stale artifacts to keep the cache small.
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          shared-key: "lint"
+          cache-on-failure: "true"
+
+      # ~/.pgrx is a large directory containing downloaded Postgres sources and
+      # built binaries. Cache it separately keyed on the pgrx version only —
+      # it doesn't change between runs unless the pgrx version bumps.
+      - name: Cache pgrx data dir
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
-          path: |
-            ~/.cargo/bin
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.pgrx
-            target
-          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-lint-
+          path: ~/.pgrx
+          key: ${{ runner.os }}-pgrx-${{ env.CARGO_PGRX_VERSION }}-pg17
+          restore-keys: ${{ runner.os }}-pgrx-${{ env.CARGO_PGRX_VERSION }}-
+
+      # Cache the cargo-pgrx binary separately — it's ~50MB and its build
+      # has no local inputs, so it's safe to key only on version.
+      - name: Cache cargo-pgrx binary
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~/.cargo/bin/cargo-pgrx
+          key: ${{ runner.os }}-cargo-pgrx-bin-${{ env.CARGO_PGRX_VERSION }}
 
       - name: Install cargo-pgrx
-        run: cargo pgrx --version 2>/dev/null | grep -q "0.16.1" || cargo install cargo-pgrx --version "=0.16.1" --locked
+        run: cargo pgrx --version 2>/dev/null | grep -q "${{ env.CARGO_PGRX_VERSION }}" || cargo install cargo-pgrx --version "=${{ env.CARGO_PGRX_VERSION }}" --locked
 
       - name: Initialize pgrx
         run: cargo pgrx init --pg17 download
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+      - name: Print sccache stats
+        run: sccache --show-stats
 
   test:
     name: Test (pg${{ matrix.pg }})
@@ -92,20 +120,30 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Cache cargo
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          shared-key: "pg${{ matrix.pg }}"
+          cache-on-failure: "true"
+
+      - name: Cache pgrx data dir
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
-          path: |
-            ~/.cargo/bin
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.pgrx
-            target
-          key: ${{ runner.os }}-cargo-pg${{ matrix.pg }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-pg${{ matrix.pg }}-
+          path: ~/.pgrx
+          key: ${{ runner.os }}-pgrx-${{ env.CARGO_PGRX_VERSION }}-pg${{ matrix.pg }}
+          restore-keys: ${{ runner.os }}-pgrx-${{ env.CARGO_PGRX_VERSION }}-
+
+      - name: Cache cargo-pgrx binary
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~/.cargo/bin/cargo-pgrx
+          key: ${{ runner.os }}-cargo-pgrx-bin-${{ env.CARGO_PGRX_VERSION }}
 
       - name: Install cargo-pgrx
-        run: cargo pgrx --version 2>/dev/null | grep -q "0.16.1" || cargo install cargo-pgrx --version "=0.16.1" --locked
+        run: cargo pgrx --version 2>/dev/null | grep -q "${{ env.CARGO_PGRX_VERSION }}" || cargo install cargo-pgrx --version "=${{ env.CARGO_PGRX_VERSION }}" --locked
 
       - name: Initialize pgrx for pg${{ matrix.pg }}
         run: cargo pgrx init --pg${{ matrix.pg }} download
@@ -126,3 +164,6 @@ jobs:
 
       - name: Run pg_regress e2e tests
         run: cargo pgrx regress pg${{ matrix.pg }}
+
+      - name: Print sccache stats
+        run: sccache --show-stats

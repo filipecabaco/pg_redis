@@ -89,7 +89,13 @@ pub fn worker_main() {
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // accept_loop exited (e.g., port bind failure because the
+                // port is already in use). Keep the worker alive so it
+                // remains visible in pg_stat_activity and continues running
+                // the expiry scan below. Sleep briefly to avoid busy-looping.
+                std::thread::sleep(Duration::from_millis(250));
+            }
         }
 
         if last_expiry_scan.elapsed() >= Duration::from_secs(1) {

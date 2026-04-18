@@ -13,17 +13,14 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # sccache speeds up incremental Rust compilation by caching individual
-  # compilation artifacts keyed by input hash. This pairs with the cargo cache
-  # by accelerating the compilation of items that weren't in the target cache.
   SCCACHE_GHA_ENABLED: "true"
   RUSTC_WRAPPER: "sccache"
   CARGO_INCREMENTAL: "0"
   CARGO_PGRX_VERSION: "0.16.1"
 
 jobs:
-  lint:
-    name: Lint
+  check:
+    name: Check
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -53,18 +50,12 @@ jobs:
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
-      # Swatinem/rust-cache caches ~/.cargo/{registry,git} and target/ with
-      # smart invalidation: only dependency artifacts (not workspace crates)
-      # are cached, and it auto-prunes stale artifacts to keep the cache small.
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
         with:
-          shared-key: "lint"
+          shared-key: "check"
           cache-on-failure: "true"
 
-      # ~/.pgrx is a large directory containing downloaded Postgres sources and
-      # built binaries. Cache it separately keyed on the pgrx version only —
-      # it doesn't change between runs unless the pgrx version bumps.
       - name: Cache pgrx data dir
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
@@ -72,8 +63,6 @@ jobs:
           key: ${{ runner.os }}-pgrx-${{ env.CARGO_PGRX_VERSION }}-pg17
           restore-keys: ${{ runner.os }}-pgrx-${{ env.CARGO_PGRX_VERSION }}-
 
-      # Cache the cargo-pgrx binary separately — it's ~50MB and its build
-      # has no local inputs, so it's safe to key only on version.
       - name: Cache cargo-pgrx binary
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
@@ -94,6 +83,7 @@ jobs:
 
   test:
     name: Test (pg${{ matrix.pg }})
+    needs: [check]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -147,17 +137,6 @@ jobs:
 
       - name: Initialize pgrx for pg${{ matrix.pg }}
         run: cargo pgrx init --pg${{ matrix.pg }} download
-
-      - name: Diagnose environment before tests
-        run: |
-          echo "=== Listeners on :6379 ==="
-          ss -tlnp 2>&1 | grep -E ":6379|State" || echo "no listener on 6379"
-          echo "=== /etc/hosts ==="
-          cat /etc/hosts
-          echo "=== redis-cli availability ==="
-          which redis-cli || echo "no redis-cli"
-          echo "=== postgres binaries ==="
-          ls -la ~/.pgrx/*/pgrx-install/bin/ 2>/dev/null | head -20 || true
 
       - name: Run unit tests
         run: cargo pgrx test pg${{ matrix.pg }}

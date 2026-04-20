@@ -12,9 +12,22 @@ use std::time::{Duration, Instant};
 
 type CmdMsg = (Command, u8, mpsc::SyncSender<Response>);
 
-pub fn worker_main() {
+pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
-    BackgroundWorker::connect_worker_to_spi(Some("postgres"), None);
+    // OID is InvalidOid when loaded via shared_preload_libraries (postmaster
+    // startup has no database context); use redis.database GUC in that case.
+    let db_oid = pgrx::pg_sys::Oid::from_u32(db_oid_datum.value() as u32);
+    if db_oid == pgrx::pg_sys::InvalidOid {
+        let db_name = crate::DATABASE
+            .get()
+            .as_deref()
+            .and_then(|s| s.to_str().ok())
+            .unwrap_or("postgres")
+            .to_string();
+        BackgroundWorker::connect_worker_to_spi(Some(&db_name), None);
+    } else {
+        BackgroundWorker::connect_worker_to_spi_by_oid(Some(db_oid), None);
+    }
 
     let port = crate::PORT.get() as u16;
     let default_db: u8 = if crate::USE_LOGGED.get() { 1 } else { 0 };
@@ -75,9 +88,7 @@ pub fn worker_main() {
                                     client.update("SAVEPOINT pgr", None, &[]).ok();
                                     let resp = cmd.execute(client, *db);
                                     if matches!(resp, Response::Error(_)) {
-                                        client
-                                            .update("ROLLBACK TO SAVEPOINT pgr", None, &[])
-                                            .ok();
+                                        client.update("ROLLBACK TO SAVEPOINT pgr", None, &[]).ok();
                                     }
                                     client.update("RELEASE SAVEPOINT pgr", None, &[]).ok();
                                     resp
@@ -91,7 +102,13 @@ pub fn worker_main() {
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // accept_loop exited (e.g., port bind failure because the
+                // port is already in use). Keep the worker alive so it
+                // remains visible in pg_stat_activity and continues running
+                // the expiry scan below. Sleep briefly to avoid busy-looping.
+                std::thread::sleep(Duration::from_millis(250));
+            }
         }
 
         if last_expiry_scan.elapsed() >= Duration::from_secs(1) {

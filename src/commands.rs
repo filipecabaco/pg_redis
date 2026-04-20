@@ -8,156 +8,211 @@ pub mod sql {
         std::array::from_fn(f)
     }
 
-    pub static GET: LazyLock<[String; 16]> = LazyLock::new(|| arr(|db| format!(
-        "SELECT value FROM redis.kv_{db} WHERE key=$1 \
+    pub static GET: LazyLock<[String; 16]> = LazyLock::new(|| {
+        arr(|db| {
+            format!(
+                "SELECT value FROM redis.kv_{db} WHERE key=$1 \
          AND (expires_at IS NULL OR expires_at > now())"
-    )));
+            )
+        })
+    });
 
-    pub static MGET: LazyLock<[String; 16]> = LazyLock::new(|| arr(|db| format!(
-        "SELECT key, value FROM redis.kv_{db} \
+    pub static MGET: LazyLock<[String; 16]> = LazyLock::new(|| {
+        arr(|db| {
+            format!(
+                "SELECT key, value FROM redis.kv_{db} \
          WHERE key=ANY($1::text[]) AND (expires_at IS NULL OR expires_at > now())"
-    )));
+            )
+        })
+    });
 
-    pub static STRLEN: LazyLock<[String; 16]> = LazyLock::new(|| arr(|db| format!(
-        "SELECT coalesce(length(value), 0)::bigint FROM redis.kv_{db} \
+    pub static STRLEN: LazyLock<[String; 16]> = LazyLock::new(|| {
+        arr(|db| {
+            format!(
+                "SELECT coalesce(length(value), 0)::bigint FROM redis.kv_{db} \
          WHERE key=$1 AND (expires_at IS NULL OR expires_at > now())"
-    )));
+            )
+        })
+    });
 
-    pub static TTL: LazyLock<[String; 16]> = LazyLock::new(|| arr(|db| format!(
-        "SELECT CASE \
+    pub static TTL: LazyLock<[String; 16]> = LazyLock::new(|| {
+        arr(|db| {
+            format!(
+                "SELECT CASE \
            WHEN r.key IS NULL THEN -2::bigint \
            WHEN r.expires_at IS NULL THEN -1::bigint \
            ELSE GREATEST(-1, EXTRACT(EPOCH FROM (r.expires_at - now()))::bigint) \
          END \
          FROM (VALUES ($1::text)) AS dummy(k) \
          LEFT JOIN redis.kv_{db} r ON r.key = dummy.k"
-    )));
+            )
+        })
+    });
 
-    pub static PTTL: LazyLock<[String; 16]> = LazyLock::new(|| arr(|db| format!(
-        "SELECT CASE \
+    pub static PTTL: LazyLock<[String; 16]> = LazyLock::new(|| {
+        arr(|db| {
+            format!(
+                "SELECT CASE \
            WHEN r.key IS NULL THEN -2::bigint \
            WHEN r.expires_at IS NULL THEN -1::bigint \
            ELSE GREATEST(-1, (EXTRACT(EPOCH FROM (r.expires_at - now())) * 1000)::bigint) \
          END \
          FROM (VALUES ($1::text)) AS dummy(k) \
          LEFT JOIN redis.kv_{db} r ON r.key = dummy.k"
-    )));
+            )
+        })
+    });
 
-    pub static EXPIRETIME: LazyLock<[String; 16]> = LazyLock::new(|| arr(|db| format!(
-        "SELECT CASE \
+    pub static EXPIRETIME: LazyLock<[String; 16]> = LazyLock::new(|| {
+        arr(|db| {
+            format!(
+                "SELECT CASE \
            WHEN r.key IS NULL THEN -2::bigint \
            WHEN r.expires_at IS NULL THEN -1::bigint \
            ELSE EXTRACT(EPOCH FROM r.expires_at)::bigint \
          END \
          FROM (VALUES ($1::text)) AS dummy(k) \
          LEFT JOIN redis.kv_{db} r ON r.key = dummy.k"
-    )));
+            )
+        })
+    });
 
-    pub static PEXPIRETIME: LazyLock<[String; 16]> = LazyLock::new(|| arr(|db| format!(
-        "SELECT CASE \
+    pub static PEXPIRETIME: LazyLock<[String; 16]> = LazyLock::new(|| {
+        arr(|db| {
+            format!(
+                "SELECT CASE \
            WHEN r.key IS NULL THEN -2::bigint \
            WHEN r.expires_at IS NULL THEN -1::bigint \
            ELSE (EXTRACT(EPOCH FROM r.expires_at) * 1000)::bigint \
          END \
          FROM (VALUES ($1::text)) AS dummy(k) \
          LEFT JOIN redis.kv_{db} r ON r.key = dummy.k"
-    )));
+            )
+        })
+    });
 
-    pub static INCR: LazyLock<[String; 16]> = LazyLock::new(|| arr(|db| format!(
-        "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, '1') \
+    pub static INCR: LazyLock<[String; 16]> = LazyLock::new(|| {
+        arr(|db| {
+            format!(
+                "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, '1') \
          ON CONFLICT (key) DO UPDATE \
          SET value = (CAST(redis.kv_{db}.value AS bigint) + 1)::text \
          RETURNING value::bigint"
-    )));
+            )
+        })
+    });
 
-    pub static DECR: LazyLock<[String; 16]> = LazyLock::new(|| arr(|db| format!(
-        "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, '-1') \
+    pub static DECR: LazyLock<[String; 16]> = LazyLock::new(|| {
+        arr(|db| {
+            format!(
+                "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, '-1') \
          ON CONFLICT (key) DO UPDATE \
          SET value = (CAST(redis.kv_{db}.value AS bigint) - 1)::text \
          RETURNING value::bigint"
-    )));
+            )
+        })
+    });
 
-    pub static INCRBY: LazyLock<[String; 16]> = LazyLock::new(|| arr(|db| format!(
-        "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, $2::text) \
+    pub static INCRBY: LazyLock<[String; 16]> = LazyLock::new(|| {
+        arr(|db| {
+            format!(
+                "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, $2::text) \
          ON CONFLICT (key) DO UPDATE \
          SET value = (CAST(redis.kv_{db}.value AS bigint) + $3)::text \
          RETURNING value::bigint"
-    )));
+            )
+        })
+    });
 
-    pub static DECRBY: LazyLock<[String; 16]> = LazyLock::new(|| arr(|db| format!(
-        "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, $2::text) \
+    pub static DECRBY: LazyLock<[String; 16]> = LazyLock::new(|| {
+        arr(|db| {
+            format!(
+                "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, $2::text) \
          ON CONFLICT (key) DO UPDATE \
          SET value = (CAST(redis.kv_{db}.value AS bigint) + $3)::text \
          RETURNING value::bigint"
-    )));
+            )
+        })
+    });
 
-    pub static INCRBYFLOAT: LazyLock<[String; 16]> = LazyLock::new(|| arr(|db| format!(
-        "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, $2::text) \
+    pub static INCRBYFLOAT: LazyLock<[String; 16]> = LazyLock::new(|| {
+        arr(|db| {
+            format!(
+                "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, $2::text) \
          ON CONFLICT (key) DO UPDATE \
          SET value = (CAST(redis.kv_{db}.value AS float8) + $3)::text \
          RETURNING value"
-    )));
+            )
+        })
+    });
 
-    pub static PERSIST: LazyLock<[String; 16]> = LazyLock::new(|| arr(|db| format!(
-        "UPDATE redis.kv_{db} SET expires_at = NULL \
+    pub static PERSIST: LazyLock<[String; 16]> = LazyLock::new(|| {
+        arr(|db| {
+            format!(
+                "UPDATE redis.kv_{db} SET expires_at = NULL \
          WHERE key=$1 AND expires_at IS NOT NULL"
-    )));
+            )
+        })
+    });
 
-    pub static GETDEL: LazyLock<[String; 16]> = LazyLock::new(|| arr(|db| format!(
-        "DELETE FROM redis.kv_{db} WHERE key=$1 \
+    pub static GETDEL: LazyLock<[String; 16]> = LazyLock::new(|| {
+        arr(|db| {
+            format!(
+                "DELETE FROM redis.kv_{db} WHERE key=$1 \
          AND (expires_at IS NULL OR expires_at > now()) \
          RETURNING value"
-    )));
+            )
+        })
+    });
 
-    pub static HGET: LazyLock<[String; 16]> = LazyLock::new(|| arr(|db| format!(
-        "SELECT value FROM redis.hash_{db} WHERE key=$1 AND field=$2"
-    )));
+    pub static HGET: LazyLock<[String; 16]> = LazyLock::new(|| {
+        arr(|db| format!("SELECT value FROM redis.hash_{db} WHERE key=$1 AND field=$2"))
+    });
 
-    pub static HGETALL: LazyLock<[String; 16]> = LazyLock::new(|| arr(|db| format!(
-        "SELECT field, value FROM redis.hash_{db} WHERE key=$1 ORDER BY field"
-    )));
+    pub static HGETALL: LazyLock<[String; 16]> = LazyLock::new(|| {
+        arr(|db| format!("SELECT field, value FROM redis.hash_{db} WHERE key=$1 ORDER BY field"))
+    });
 
-    pub static HKEYS: LazyLock<[String; 16]> = LazyLock::new(|| arr(|db| format!(
-        "SELECT field FROM redis.hash_{db} WHERE key=$1 ORDER BY field"
-    )));
+    pub static HKEYS: LazyLock<[String; 16]> = LazyLock::new(|| {
+        arr(|db| format!("SELECT field FROM redis.hash_{db} WHERE key=$1 ORDER BY field"))
+    });
 
-    pub static HVALS: LazyLock<[String; 16]> = LazyLock::new(|| arr(|db| format!(
-        "SELECT value FROM redis.hash_{db} WHERE key=$1 ORDER BY field"
-    )));
+    pub static HVALS: LazyLock<[String; 16]> = LazyLock::new(|| {
+        arr(|db| format!("SELECT value FROM redis.hash_{db} WHERE key=$1 ORDER BY field"))
+    });
 
-    pub static HLEN: LazyLock<[String; 16]> = LazyLock::new(|| arr(|db| format!(
-        "SELECT count(*)::bigint FROM redis.hash_{db} WHERE key=$1"
-    )));
+    pub static HLEN: LazyLock<[String; 16]> = LazyLock::new(|| {
+        arr(|db| format!("SELECT count(*)::bigint FROM redis.hash_{db} WHERE key=$1"))
+    });
 
-    pub static HEXISTS: LazyLock<[String; 16]> = LazyLock::new(|| arr(|db| format!(
-        "SELECT 1 FROM redis.hash_{db} WHERE key=$1 AND field=$2"
-    )));
+    pub static HEXISTS: LazyLock<[String; 16]> = LazyLock::new(|| {
+        arr(|db| format!("SELECT 1 FROM redis.hash_{db} WHERE key=$1 AND field=$2"))
+    });
 
-    pub static SCARD: LazyLock<[String; 16]> = LazyLock::new(|| arr(|db| format!(
-        "SELECT count(*)::bigint FROM redis.set_{db} WHERE key=$1"
-    )));
+    pub static SCARD: LazyLock<[String; 16]> = LazyLock::new(|| {
+        arr(|db| format!("SELECT count(*)::bigint FROM redis.set_{db} WHERE key=$1"))
+    });
 
-    pub static SMEMBERS: LazyLock<[String; 16]> = LazyLock::new(|| arr(|db| format!(
-        "SELECT member FROM redis.set_{db} WHERE key=$1 ORDER BY member"
-    )));
+    pub static SMEMBERS: LazyLock<[String; 16]> = LazyLock::new(|| {
+        arr(|db| format!("SELECT member FROM redis.set_{db} WHERE key=$1 ORDER BY member"))
+    });
 
-    pub static SISMEMBER: LazyLock<[String; 16]> = LazyLock::new(|| arr(|db| format!(
-        "SELECT 1 FROM redis.set_{db} WHERE key=$1 AND member=$2"
-    )));
+    pub static SISMEMBER: LazyLock<[String; 16]> = LazyLock::new(|| {
+        arr(|db| format!("SELECT 1 FROM redis.set_{db} WHERE key=$1 AND member=$2"))
+    });
 
-    pub static ZCARD: LazyLock<[String; 16]> = LazyLock::new(|| arr(|db| format!(
-        "SELECT count(*)::bigint FROM redis.zset_{db} WHERE key=$1"
-    )));
+    pub static ZCARD: LazyLock<[String; 16]> = LazyLock::new(|| {
+        arr(|db| format!("SELECT count(*)::bigint FROM redis.zset_{db} WHERE key=$1"))
+    });
 
-    pub static ZSCORE: LazyLock<[String; 16]> = LazyLock::new(|| arr(|db| format!(
-        "SELECT score FROM redis.zset_{db} WHERE key=$1 AND member=$2"
-    )));
+    pub static ZSCORE: LazyLock<[String; 16]> = LazyLock::new(|| {
+        arr(|db| format!("SELECT score FROM redis.zset_{db} WHERE key=$1 AND member=$2"))
+    });
 
-    pub static LLEN: LazyLock<[String; 16]> = LazyLock::new(|| arr(|db| format!(
-        "SELECT count(*)::bigint FROM redis.list_{db} WHERE key=$1"
-    )));
+    pub static LLEN: LazyLock<[String; 16]> = LazyLock::new(|| {
+        arr(|db| format!("SELECT count(*)::bigint FROM redis.list_{db} WHERE key=$1"))
+    });
 }
-
 
 /// Score bound for ZRANGEBYSCORE / ZCOUNT. `exclusive` encodes the Redis
 /// `(` prefix; `value` may be +/- infinity.
@@ -2682,7 +2737,7 @@ impl Command {
                        AND (SELECT s FROM nrm) <= (SELECT e FROM nrm) \
                      ORDER BY l.pos ASC \
                      OFFSET (SELECT s FROM nrm) \
-                     LIMIT (SELECT e - s + 1 FROM nrm)"
+                     LIMIT (SELECT GREATEST(0, e - s + 1) FROM nrm)"
                 );
                 match client.select(
                     &sql,
@@ -3541,7 +3596,7 @@ impl Command {
                            AND (SELECT s FROM nrm) <= (SELECT e FROM nrm) \
                          ORDER BY score ASC, member ASC \
                          OFFSET (SELECT s FROM nrm) \
-                         LIMIT (SELECT e - s + 1 FROM nrm) \
+                         LIMIT (SELECT GREATEST(0, e - s + 1) FROM nrm) \
                      ), \
                      d AS ( \
                          DELETE FROM redis.zset_{db} z USING victims v \
@@ -3724,7 +3779,7 @@ fn list_pop(
             if left {
                 rows.sort_by_key(|(p, _)| *p);
             } else {
-                rows.sort_by(|a, b| b.0.cmp(&a.0));
+                rows.sort_by_key(|b| std::cmp::Reverse(b.0));
             }
             if count.is_none() {
                 match rows.into_iter().next() {
@@ -4463,7 +4518,17 @@ fn zadd_execute(
     }
     let members: Vec<Option<String>> = pairs.iter().map(|(_, m)| Some(m.clone())).collect();
     let scores: Vec<Option<f64>> = pairs.iter().map(|(s, _)| Some(*s)).collect();
-    let sql = zadd_sql(db, &ZAddFlags { nx, xx, gt, lt, ch, incr });
+    let sql = zadd_sql(
+        db,
+        &ZAddFlags {
+            nx,
+            xx,
+            gt,
+            lt,
+            ch,
+            incr,
+        },
+    );
     match client.update(&sql, None, &[key.into(), members.into(), scores.into()]) {
         Ok(tbl) => {
             let row = tbl.first();
@@ -4483,7 +4548,9 @@ fn zadd_execute(
 }
 
 fn zadd_sql(db: u8, flags: &ZAddFlags) -> String {
-    let ZAddFlags { nx, xx, gt, lt, ch, .. } = *flags;
+    let ZAddFlags {
+        nx, xx, gt, lt, ch, ..
+    } = *flags;
     let cmp = if gt {
         Some(">")
     } else if lt {
@@ -4751,7 +4818,7 @@ fn zrange_by_index(
            AND (SELECT s FROM nrm) <= (SELECT e FROM nrm) \
          ORDER BY score {order}, member {order} \
          OFFSET (SELECT s FROM nrm) \
-         LIMIT (SELECT e - s + 1 FROM nrm)"
+         LIMIT (SELECT GREATEST(0, e - s + 1) FROM nrm)"
     );
     zrange_collect(
         client,
@@ -6583,19 +6650,51 @@ mod tests {
 
     #[test]
     fn lrange_parses_with_negative_indices() {
-        let cmd = Command::parse(vec![b"LRANGE".to_vec(), b"k".to_vec(), b"-1".to_vec(), b"-1".to_vec()]).unwrap();
-        assert!(matches!(cmd, Command::LRange { start: -1, stop: -1, .. }));
+        let cmd = Command::parse(vec![
+            b"LRANGE".to_vec(),
+            b"k".to_vec(),
+            b"-1".to_vec(),
+            b"-1".to_vec(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            cmd,
+            Command::LRange {
+                start: -1,
+                stop: -1,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn lset_parses_with_negative_index() {
-        let cmd = Command::parse(vec![b"LSET".to_vec(), b"k".to_vec(), b"-1".to_vec(), b"v".to_vec()]).unwrap();
+        let cmd = Command::parse(vec![
+            b"LSET".to_vec(),
+            b"k".to_vec(),
+            b"-1".to_vec(),
+            b"v".to_vec(),
+        ])
+        .unwrap();
         assert!(matches!(cmd, Command::LSet { index: -1, .. }));
     }
 
     #[test]
     fn ltrim_parses_with_out_of_bounds_stop() {
-        let cmd = Command::parse(vec![b"LTRIM".to_vec(), b"k".to_vec(), b"0".to_vec(), b"-100".to_vec()]).unwrap();
-        assert!(matches!(cmd, Command::LTrim { start: 0, stop: -100, .. }));
+        let cmd = Command::parse(vec![
+            b"LTRIM".to_vec(),
+            b"k".to_vec(),
+            b"0".to_vec(),
+            b"-100".to_vec(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            cmd,
+            Command::LTrim {
+                start: 0,
+                stop: -100,
+                ..
+            }
+        ));
     }
 }

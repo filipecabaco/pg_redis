@@ -17,6 +17,22 @@ run = "cargo build --features {{vars.pg_version}}"
 description = "Start a local postgres with the extension hot-reloaded"
 run = "cargo pgrx run {{vars.pg_version}}"
 
+[tasks.fmt-check]
+description = "Check formatting (mirrors CI)"
+run = "cargo fmt --all -- --check"
+
+[tasks.check]
+description = "Run fmt-check + clippy (mirrors CI check step)"
+depends = ["fmt-check", "lint"]
+
+[tasks.fix]
+description = "Auto-fix formatting and lints, then run tests"
+run = [
+  "cargo fmt --all",
+  "cargo clippy --fix --allow-dirty --features {{vars.pg_version}} -- -D warnings",
+  "cargo pgrx test {{vars.pg_version}}",
+]
+
 [tasks.test-unit]
 description = "Run unit tests (no postgres required)"
 run = "cargo test --features {{vars.pg_version}} --lib -- --skip pg_test"
@@ -24,6 +40,31 @@ run = "cargo test --features {{vars.pg_version}} --lib -- --skip pg_test"
 [tasks.test-pg]
 description = "Run integration tests with pgrx managed postgres"
 run = "cargo pgrx test {{vars.pg_version}}"
+
+[tasks.test-pg15]
+description = "Run integration tests against PostgreSQL 15"
+run = "cargo pgrx test pg15"
+
+[tasks.test-pg16]
+description = "Run integration tests against PostgreSQL 16"
+run = "cargo pgrx test pg16"
+
+[tasks.test-pg17]
+description = "Run integration tests against PostgreSQL 17"
+run = "cargo pgrx test pg17"
+
+[tasks.test-pg18]
+description = "Run integration tests against PostgreSQL 18"
+run = "cargo pgrx test pg18"
+
+[tasks.test-all-pg]
+description = "Run integration tests for all supported pg versions sequentially"
+run = [
+  "cargo pgrx test pg15",
+  "cargo pgrx test pg16",
+  "cargo pgrx test pg17",
+  "cargo pgrx test pg18",
+]
 
 [tasks.test]
 description = "Run all tests (unit + pgrx integration)"

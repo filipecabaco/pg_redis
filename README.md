@@ -8,7 +8,7 @@ Built with [pgrx](https://github.com/pgcentralfoundation/pgrx) in Rust.
 
 ## How it works
 
-`pg_redis` starts a pool of TCP background workers inside PostgreSQL that listen for Redis clients on port 6379. Incoming RESP2 commands are parsed and translated to SPI queries against regular PostgreSQL tables inside the `pg_redis` schema.
+`pg_redis` starts a pool of TCP background workers inside PostgreSQL that listen for Redis clients on port 6379. Incoming RESP2 commands are parsed and translated to SPI queries against regular PostgreSQL tables inside the `pg_redis` schema, **or** handled entirely in shared memory with no transaction overhead (see [In-memory mode](#in-memory-mode)).
 
 Data is stored across 16 databases (0–15), mirroring Redis's native database model. Even-numbered databases use unlogged tables; odd-numbered databases use WAL-logged tables:
 
@@ -117,6 +117,8 @@ SELECT key, value, expires_at FROM redis.kv_1;
 | `redis.max_connections` | `128` | Max simultaneous Redis clients per worker |
 | `redis.batch_size` | `64` | Max commands coalesced into one transaction (group commit); `1` disables batching |
 | `redis.password` | _(none)_ | When set, clients must `AUTH <password>` before any command |
+| `redis.storage_mode` | `auto` | Storage backend for even-numbered databases. `auto` = UNLOGGED PostgreSQL tables. `memory` = shared-memory hash tables, bypassing SPI and transactions entirely. See [In-memory mode](#in-memory-mode). Requires restart. |
+| `redis.mem_max_entries` | `16384` | Maximum keys per data type per even-db in memory mode. Controls shared-memory HTAB capacity. Larger values use more RAM proportionally. Requires restart. |
 
 Set in `postgresql.conf` or at runtime:
 
@@ -209,6 +211,56 @@ SELECT redis.remove_workers(2);
 
 ---
 
+---
+
+## In-memory mode
+
+When `redis.storage_mode = 'memory'`, even-numbered databases (0, 2, 4 … 14) bypass PostgreSQL's SPI layer entirely. Commands are served from shared-memory hash tables (`ShmemInitHash`) with no transaction overhead, no WAL, and no buffer pool involvement. Odd-numbered databases continue to use WAL-logged tables unchanged.
+
+```ini
+# postgresql.conf
+redis.storage_mode = 'memory'
+redis.use_logged   = false    # make db 0 the default so clients land in-memory
+```
+
+### What it changes
+
+| | `auto` (default) | `memory` |
+|---|---|---|
+| Even-db storage | UNLOGGED PostgreSQL tables | Shared-memory HTAB per data type |
+| Transaction | `BEGIN` / `COMMIT` per batch | None |
+| SPI overhead | Yes | None |
+| Survives crash | No (UNLOGGED, truncated) | No (shared memory, lost) |
+| SQL-visible | `SELECT * FROM redis.kv_0` returns data | Returns nothing |
+| Max keys | Unlimited (disk) | `redis.mem_max_entries` per KV db (default 16,384); half that for other types |
+| Max value size | Unlimited (TOAST) | 512 bytes (64 B inline + 448 B overflow HTAB) |
+| Key size limit | Unlimited | 127 bytes |
+
+### When to use it
+
+Use `memory` for:
+- Ephemeral caches, session tokens, rate-limit counters
+- Benchmarking and development environments
+- Any workload where Redis-like "best-effort" persistence is acceptable
+
+Use `auto` (or odd-numbered databases) for:
+- Data you need to survive a PostgreSQL restart
+- Data you want queryable via SQL joins
+- Keys or values exceeding the inline limits above
+
+### Concurrent safety
+
+All in-memory operations are protected by per-database LWLocks (one per even-db per data type). LPUSH/RPUSH/ZPOPMIN/SPOP maintain secondary metadata HTABs so those operations are O(1) rather than requiring a full table scan. Multiple workers can safely operate on the same in-memory database concurrently.
+
+### Notes
+
+- Data is **lost on PostgreSQL restart**, crash, or `DROP EXTENSION`. This matches Redis's behaviour with `appendfsync no` and is expected.
+- `SELECT * FROM redis.kv_0` will return nothing when `storage_mode = 'memory'`. Use `redis-cli` or `redis-benchmark` to inspect in-memory data.
+- `pg_dump` does not capture in-memory databases.
+- `redis.storage_mode` is a `postmaster`-scope GUC — a PostgreSQL restart is required for the change to take effect.
+
+---
+
 ## Logged vs Unlogged tables
 
 | | Logged | Unlogged |
@@ -271,42 +323,48 @@ Flags worth knowing (`redis-benchmark --help` lists everything):
 
 ### Results (Docker, Apple M-series)
 
-Three-way comparison: Redis 7 Alpine · pg_redis defaults · pg_redis tuned for high write throughput.
+Four-way comparison: Redis 7 Alpine · pg_redis defaults · pg_redis high-write (UNLOGGED tables) · pg_redis high-write (in-memory mode).
 
-| | **Redis 7** | **pg_redis default** | **pg_redis high-write** |
-|-|-------------|---------------------|------------------------|
-| Workers | — | 4 | 8 |
-| Batch size | — | 64 | 256 |
-| Clients | 50 | 50 | 200 |
-| Requests | 20,000 | 20,000 | 50,000 |
-| Run with | — | `mise run bench` | `mise run bench-high-write` |
+| | **Redis 7** | **pg_redis default** | **pg_redis high-write** | **pg_redis memory** |
+|-|-------------|---------------------|------------------------|---------------------|
+| Workers | — | 4 | 8 | 8 |
+| Batch size | — | 64 | 256 | 256 (bypassed for even dbs) |
+| Clients | 50 | 50 | 200 | 200 |
+| Requests | 20,000 | 20,000 | 50,000 | 5,000 |
+| DB | — | db 1 (logged) | db 1 (logged) | db 0 (in-memory) |
+| Run with | — | `mise run bench` | `mise run bench-high-write` | `PG_REDIS_STORAGE_MODE=memory PG_REDIS_USE_LOGGED=false mise run bench-high-write` |
 
-| Command | Redis 7 | pg_redis default | pg_redis high-write |
-|---------|---------|-----------------|---------------------|
-| PING    | 253,164 rps · 0.10 ms | 158,730 rps · 0.17 ms | — |
-| GET     | 238,095 rps · 0.10 ms | 101,522 rps · 0.43 ms | 103,519 rps · 1.56 ms |
-| SET     | 235,294 rps · 0.10 ms | 5,611 rps · 7.97 ms | **10,298 rps** · 16.5 ms |
-| INCR    | 190,476 rps · 0.16 ms | 6,182 rps · 7.18 ms | **11,057 rps** · 14.6 ms |
-| HSET    | 192,307 rps · 0.16 ms | 14,705 rps · 2.90 ms | 10,663 rps · 15.6 ms |
-| ZADD    | 194,174 rps · 0.16 ms | 6,112 rps · 7.63 ms | 6,400 rps · 23.0 ms |
-| LPOP    | 155,038 rps · 0.24 ms | 6,891 rps · 7.33 ms | **62,972 rps** · 2.94 ms |
-| RPOP    | 192,307 rps · 0.16 ms | 11,514 rps · 4.23 ms | **60,313 rps** · 2.78 ms |
-| SADD    | 196,078 rps · 0.16 ms | 25,412 rps · 1.86 ms | **80,906 rps** · 2.15 ms |
-| SPOP    | 204,081 rps · 0.16 ms | 24,009 rps · 2.00 ms | **65,530 rps** · 2.25 ms |
-| ZPOPMIN | 202,020 rps · 0.16 ms | 18,867 rps · 2.56 ms | **57,273 rps** · 3.06 ms |
-| LRANGE 100 | 51,546 rps · 0.50 ms | 632 rps · 78.5 ms | — |
-| LRANGE 300 | 28,089 rps · 0.86 ms | 609 rps · 81.4 ms | — |
-| LRANGE 500 | 18,604 rps · 1.33 ms | 587 rps · 84.5 ms | — |
-| LRANGE 600 | 17,123 rps · 1.47 ms | 577 rps · 85.8 ms | — |
+| Command | Redis 7 | pg_redis default | pg_redis high-write | **pg_redis memory** |
+|---------|---------|-----------------|---------------------|---------------------|
+| PING    | 241,000 | 118,000 | — | — |
+| GET     | 190,000 | 93,897 | 101,010 | **94,340** |
+| SET     | 278,000 | 5,292 | 8,631 | **59,524** (+6.9×) |
+| INCR    | 187,000 | 5,070 | 8,990 | **87,719** (+9.8×) |
+| HSET    | 192,000 | 12,987 | 8,420 | **87,719** (+10.4×) |
+| ZADD    | 189,000 | 8,425 | 6,676 | **90,909** (+13.6×) |
+| SADD    | 189,000 | 24,420 | 71,429 | **81,967** (+1.1×) |
+| SPOP    | 196,000 | 23,095 | 63,857 | **67,568** (+1.1×) |
+| ZPOPMIN | 192,000 | 18,467 | 54,945 | **76,923** (+1.4×) |
+| LPUSH   | 159,000 | 817 ¹ | 817 ¹ | **89,286** (+109×) |
+| RPUSH   | 194,000 | 1,362 ¹ | 1,362 ¹ | **81,967** (+60×) |
+| LPOP    | 153,000 | 5,537 ¹ | 61,425 | **70,423** (+13×) |
+| RPOP    | 194,000 | 11,031 ¹ | 53,022 | **74,627** (+7×) |
+| LRANGE 100 | 50,000 | 602 | — | — |
+| LRANGE 300 | 27,000 | 567 | — | — |
+
+¹ Marked commands use `-c 1` in `auto`/`high-write` modes to avoid a concurrency race in the SPI LPUSH implementation. In `memory` mode they safely run at 200 concurrent clients (LWLock serialises access). LPOP/RPOP don't have this issue so run at full concurrency.
+
+All throughput figures rounded to nearest integer, requests/second. Memory mode uses `PG_REDIS_STORAGE_MODE=memory PG_REDIS_USE_LOGGED=false` with `redis.mem_max_entries=16384` (default).
 
 **Reading the table:**
 
-- **GET (~100k rps)** is limited by worker count, not WAL. Pure `SELECT` with no write overhead — already at ~43% of Redis throughput at default settings, and stays flat as concurrency rises because the workers are saturated.
-- **SET/INCR/ZADD** are WAL-bound. Each commit costs ~37 ms. Group commit amortises that across ~5 commands at default (5,611 rps) and ~25 commands at high-write (10,298 rps). More clients → fuller batches → lower effective commit cost per command.
-- **LPOP/RPOP/SADD/SPOP/ZPOPMIN** are fast single-row operations. At default settings they batch loosely (~5k–25k rps); at 200 clients with 8 workers they fill every batch and the commit overhead nearly vanishes — **SADD reaches 80k rps, 41% of Redis**.
-- **HSET** bucks the trend: it uses `unnest` to insert field arrays, and the per-command SQL cost dominates at high concurrency, limiting batching gains.
-- **LRANGE** is commit-floor dominated (~600 rps). The CTE scans the list in one pass but the ~80 ms commit cost is not shared with other writes because LRANGE is rarely issued concurrently with matching writes. Range size has no effect — the commit dominates.
-- **PING** never touches SPI and is handled entirely in the connection thread, hence ~160k rps regardless of database load.
+- **`auto` mode** is limited by PostgreSQL transaction overhead. WAL-logged tables (default db 1) pay ~37 ms commit latency per batch. Group commit amortises this but doesn't eliminate it.
+- **`memory` mode** eliminates the transaction entirely for even-numbered databases. Commands go directly to shared-memory hash tables — no SPI, no transaction, no buffer pool. The bottleneck shifts to the LWLock and worker dispatch queue.
+- **INCR/HSET/ZADD** reach 87–90k rps in memory mode — near GET-level throughput — because they no longer pay WAL flush cost.
+- **ZPOPMIN** reaches 77k rps because it uses a metadata HTAB tracking min-score per key, making each pop O(1) instead of O(N) scan + sort.
+- **LPUSH/RPUSH** reach 82–89k rps (up to 109× faster) because in-memory lists track `min_pos`/`max_pos` per key — no scan to find the boundary position, and no SPI race condition.
+- **GET** is roughly equal across all modes because reads were already fast via the SPI-level plan cache.
+- **LRANGE** is not benchmarked in memory mode — it remains O(count_for_key) and benefits from memory mode but is dominated by list size, not transaction overhead.
 
 ### Tuning batch size
 

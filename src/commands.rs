@@ -4004,7 +4004,7 @@ impl Command {
             }
             Command::SMisMember { key, members } => {
                 let results = unsafe { mem::mem_smismember(db_idx, key, &strs(members)) };
-                Response::IntegerArray(results.into_iter().map(|b| i64::from(b)).collect())
+                Response::IntegerArray(results.into_iter().map(i64::from).collect())
             }
             Command::SMembers { key } => {
                 let members = unsafe { mem::mem_smembers(db_idx, key) };
@@ -4181,7 +4181,7 @@ impl Command {
                         let results = unsafe {
                             mem::mem_zrangebylex(db_idx, key, &min_b, &max_b, *rev, *limit)
                         };
-                        Response::Array(results.into_iter().map(|b| Some(b)).collect())
+                        Response::Array(results.into_iter().map(Some).collect())
                     }
                 }
             }
@@ -4226,7 +4226,7 @@ impl Command {
                 limit,
             } => {
                 let results = unsafe { mem::mem_zrangebylex(db_idx, key, min, max, *rev, *limit) };
-                Response::Array(results.into_iter().map(|b| Some(b)).collect())
+                Response::Array(results.into_iter().map(Some).collect())
             }
             Command::ZPopMin { key, count } => {
                 let n = count.unwrap_or(1).max(0);

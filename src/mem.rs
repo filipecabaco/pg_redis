@@ -166,7 +166,7 @@ unsafe impl Sync for MemControlBlock {}
 // Thread-local per-bgworker references (set once in mem_init_worker).
 thread_local! {
     static CTL_PTR: std::cell::Cell<*mut MemControlBlock> =
-        std::cell::Cell::new(std::ptr::null_mut());
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
 }
 
 fn ctl() -> *mut MemControlBlock {
@@ -1234,55 +1234,6 @@ pub unsafe fn mem_dbsize(db_idx: usize) -> i64 {
     count
 }
 
-/// FLUSHDB: delete all keys in the database. O(N).
-///
-/// # Safety
-/// Must be called from bgworker thread with mem_init_worker already called.
-pub unsafe fn mem_flushdb(db_idx: usize) {
-    let htab = htab_for(db_idx);
-    if htab.is_null() {
-        return;
-    }
-    let overflow_htab = kv_overflow_htab_for(db_idx);
-    let lk = lwlock(db_idx);
-
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
-
-    let mut status = pg_sys::HASH_SEQ_STATUS::default();
-    pg_sys::hash_seq_init(&mut status, htab);
-    let mut to_delete: Vec<[u8; MAX_KEY_LEN]> = Vec::new();
-
-    loop {
-        let entry = pg_sys::hash_seq_search(&mut status) as *mut KvEntry;
-        if entry.is_null() {
-            break;
-        }
-        let key_ptr = addr_of!((*entry).key) as *const [u8; MAX_KEY_LEN];
-        to_delete.push(key_ptr.read());
-    }
-
-    for key_buf in &to_delete {
-        let mut found = false;
-        pg_sys::hash_search(
-            htab,
-            key_buf.as_ptr().cast::<c_void>(),
-            pg_sys::HASHACTION::HASH_REMOVE,
-            &mut found,
-        );
-        if !overflow_htab.is_null() {
-            let mut f2 = false;
-            pg_sys::hash_search(
-                overflow_htab,
-                key_buf.as_ptr().cast::<c_void>(),
-                pg_sys::HASHACTION::HASH_REMOVE,
-                &mut f2,
-            );
-        }
-    }
-
-    pg_sys::LWLockRelease(lk);
-}
-
 /// Background expiry sweep: delete expired keys.
 ///
 /// # Safety
@@ -1308,7 +1259,7 @@ pub unsafe fn mem_sweep_expired(db_idx: usize) {
         }
         let exp = (*entry).expires_at;
         if exp != 0 && exp <= now {
-            let key_ptr = addr_of!((*entry).key) as *const [u8; MAX_KEY_LEN];
+            let key_ptr = addr_of!((*entry).key);
             to_delete.push(key_ptr.read());
         }
     }
@@ -1611,16 +1562,12 @@ pub unsafe fn mem_init_tables(ctl: *mut MemControlBlock) {
 
     for i in 0..NUM_MEM_DBS {
         let name = format!("pg_redis_kv_{}\0", i * 2);
-        let mut info = pg_sys::HASHCTL::default();
-        info.keysize = MAX_KEY_LEN as pg_sys::Size;
-        info.entrysize = std::mem::size_of::<KvEntry>() as pg_sys::Size;
+        let mut info = pg_sys::HASHCTL { keysize: MAX_KEY_LEN as pg_sys::Size, entrysize: std::mem::size_of::<KvEntry>() as pg_sys::Size, ..Default::default() };
         let htab = pg_sys::ShmemInitHash(name.as_ptr().cast(), sz, sz, &mut info, str_flags);
         std::ptr::addr_of_mut!((*ctl).htab[i]).write(htab);
 
         let name = format!("pg_redis_hash_{}\0", i * 2);
-        let mut info = pg_sys::HASHCTL::default();
-        info.keysize = (MAX_KEY_LEN * 2) as pg_sys::Size;
-        info.entrysize = std::mem::size_of::<HashEntry>() as pg_sys::Size;
+        let mut info = pg_sys::HASHCTL { keysize: (MAX_KEY_LEN * 2) as pg_sys::Size, entrysize: std::mem::size_of::<HashEntry>() as pg_sys::Size, ..Default::default() };
         let htab = pg_sys::ShmemInitHash(
             name.as_ptr().cast(),
             sz_small,
@@ -1631,9 +1578,7 @@ pub unsafe fn mem_init_tables(ctl: *mut MemControlBlock) {
         std::ptr::addr_of_mut!((*ctl).hash_htab[i]).write(htab);
 
         let name = format!("pg_redis_set_{}\0", i * 2);
-        let mut info = pg_sys::HASHCTL::default();
-        info.keysize = (MAX_KEY_LEN * 2) as pg_sys::Size;
-        info.entrysize = std::mem::size_of::<SetEntry>() as pg_sys::Size;
+        let mut info = pg_sys::HASHCTL { keysize: (MAX_KEY_LEN * 2) as pg_sys::Size, entrysize: std::mem::size_of::<SetEntry>() as pg_sys::Size, ..Default::default() };
         let htab = pg_sys::ShmemInitHash(
             name.as_ptr().cast(),
             sz_small,
@@ -1644,9 +1589,7 @@ pub unsafe fn mem_init_tables(ctl: *mut MemControlBlock) {
         std::ptr::addr_of_mut!((*ctl).set_htab[i]).write(htab);
 
         let name = format!("pg_redis_zset_{}\0", i * 2);
-        let mut info = pg_sys::HASHCTL::default();
-        info.keysize = (MAX_KEY_LEN * 2) as pg_sys::Size;
-        info.entrysize = std::mem::size_of::<ZsetEntry>() as pg_sys::Size;
+        let mut info = pg_sys::HASHCTL { keysize: (MAX_KEY_LEN * 2) as pg_sys::Size, entrysize: std::mem::size_of::<ZsetEntry>() as pg_sys::Size, ..Default::default() };
         let htab = pg_sys::ShmemInitHash(
             name.as_ptr().cast(),
             sz_small,
@@ -1851,11 +1794,6 @@ fn key_matches_entry(entry_key_ptr: *const u8, key: &str) -> bool {
     let ek_slice = unsafe { std::slice::from_raw_parts(entry_key_ptr, MAX_KEY_LEN) };
     let ek_end = ek_slice.iter().position(|&b| b == 0).unwrap_or(MAX_KEY_LEN);
     ek_end == key_bytes.len() && &ek_slice[..ek_end] == key_bytes
-}
-
-fn bytes_to_string(ptr: *const u8, len: u32) -> String {
-    let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-    String::from_utf8_lossy(slice).into_owned()
 }
 
 // ─────────────────────────── Hash operations ────────────────────────────────
@@ -2123,56 +2061,6 @@ pub unsafe fn mem_hincrby(
         let ns = new_val.to_string();
         hash_write_full_value(entry, overflow_htab, key, field, ns.as_bytes());
         Ok(new_val)
-    };
-    pg_sys::LWLockRelease(lk);
-    result
-}
-
-/// # Safety
-/// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
-/// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
-pub unsafe fn mem_hincrbyfloat(
-    db_idx: usize,
-    key: &str,
-    field: &str,
-    delta: f64,
-) -> Result<String, String> {
-    let htab = hash_htab_for(db_idx);
-    if htab.is_null() {
-        return Err("ERR memory not initialized".to_string());
-    }
-    let overflow_htab = hash_overflow_htab_for(db_idx);
-    let lk = hash_lwlock(db_idx);
-    let k = make_composite_key(key, field);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
-    let mut found = false;
-    let entry = pg_sys::hash_search(
-        htab,
-        k.as_ptr().cast::<c_void>(),
-        pg_sys::HASHACTION::HASH_ENTER,
-        &mut found,
-    ) as *mut HashEntry;
-    let result = if entry.is_null() {
-        pg_sys::LWLockRelease(lk);
-        return Err("ERR out of memory".to_string());
-    } else if !found {
-        let s = format_float(delta);
-        hash_write_full_value(entry, overflow_htab, key, field, s.as_bytes());
-        Ok(s)
-    } else {
-        let cur_bytes = hash_read_full_value(entry, overflow_htab, key, field);
-        let cur: f64 = std::str::from_utf8(&cur_bytes)
-            .map_err(|_| "ERR value is not a valid float".to_string())?
-            .parse()
-            .map_err(|_| "ERR value is not a valid float".to_string())?;
-        let new_val = cur + delta;
-        if new_val.is_nan() || new_val.is_infinite() {
-            pg_sys::LWLockRelease(lk);
-            return Err("ERR increment would produce NaN or Infinity".to_string());
-        }
-        let ns = format_float(new_val);
-        hash_write_full_value(entry, overflow_htab, key, field, ns.as_bytes());
-        Ok(ns)
     };
     pg_sys::LWLockRelease(lk);
     result

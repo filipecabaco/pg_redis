@@ -1562,12 +1562,20 @@ pub unsafe fn mem_init_tables(ctl: *mut MemControlBlock) {
 
     for i in 0..NUM_MEM_DBS {
         let name = format!("pg_redis_kv_{}\0", i * 2);
-        let mut info = pg_sys::HASHCTL { keysize: MAX_KEY_LEN as pg_sys::Size, entrysize: std::mem::size_of::<KvEntry>() as pg_sys::Size, ..Default::default() };
+        let mut info = pg_sys::HASHCTL {
+            keysize: MAX_KEY_LEN as pg_sys::Size,
+            entrysize: std::mem::size_of::<KvEntry>() as pg_sys::Size,
+            ..Default::default()
+        };
         let htab = pg_sys::ShmemInitHash(name.as_ptr().cast(), sz, sz, &mut info, str_flags);
         std::ptr::addr_of_mut!((*ctl).htab[i]).write(htab);
 
         let name = format!("pg_redis_hash_{}\0", i * 2);
-        let mut info = pg_sys::HASHCTL { keysize: (MAX_KEY_LEN * 2) as pg_sys::Size, entrysize: std::mem::size_of::<HashEntry>() as pg_sys::Size, ..Default::default() };
+        let mut info = pg_sys::HASHCTL {
+            keysize: (MAX_KEY_LEN * 2) as pg_sys::Size,
+            entrysize: std::mem::size_of::<HashEntry>() as pg_sys::Size,
+            ..Default::default()
+        };
         let htab = pg_sys::ShmemInitHash(
             name.as_ptr().cast(),
             sz_small,
@@ -1578,7 +1586,11 @@ pub unsafe fn mem_init_tables(ctl: *mut MemControlBlock) {
         std::ptr::addr_of_mut!((*ctl).hash_htab[i]).write(htab);
 
         let name = format!("pg_redis_set_{}\0", i * 2);
-        let mut info = pg_sys::HASHCTL { keysize: (MAX_KEY_LEN * 2) as pg_sys::Size, entrysize: std::mem::size_of::<SetEntry>() as pg_sys::Size, ..Default::default() };
+        let mut info = pg_sys::HASHCTL {
+            keysize: (MAX_KEY_LEN * 2) as pg_sys::Size,
+            entrysize: std::mem::size_of::<SetEntry>() as pg_sys::Size,
+            ..Default::default()
+        };
         let htab = pg_sys::ShmemInitHash(
             name.as_ptr().cast(),
             sz_small,
@@ -1589,7 +1601,11 @@ pub unsafe fn mem_init_tables(ctl: *mut MemControlBlock) {
         std::ptr::addr_of_mut!((*ctl).set_htab[i]).write(htab);
 
         let name = format!("pg_redis_zset_{}\0", i * 2);
-        let mut info = pg_sys::HASHCTL { keysize: (MAX_KEY_LEN * 2) as pg_sys::Size, entrysize: std::mem::size_of::<ZsetEntry>() as pg_sys::Size, ..Default::default() };
+        let mut info = pg_sys::HASHCTL {
+            keysize: (MAX_KEY_LEN * 2) as pg_sys::Size,
+            entrysize: std::mem::size_of::<ZsetEntry>() as pg_sys::Size,
+            ..Default::default()
+        };
         let htab = pg_sys::ShmemInitHash(
             name.as_ptr().cast(),
             sz_small,
@@ -1600,9 +1616,11 @@ pub unsafe fn mem_init_tables(ctl: *mut MemControlBlock) {
         std::ptr::addr_of_mut!((*ctl).zset_htab[i]).write(htab);
 
         let name = format!("pg_redis_list_{}\0", i * 2);
-        let mut info = pg_sys::HASHCTL::default();
-        info.keysize = (MAX_KEY_LEN + 8) as pg_sys::Size;
-        info.entrysize = std::mem::size_of::<ListEntry>() as pg_sys::Size;
+        let mut info = pg_sys::HASHCTL {
+            keysize: (MAX_KEY_LEN + 8) as pg_sys::Size,
+            entrysize: std::mem::size_of::<ListEntry>() as pg_sys::Size,
+            ..Default::default()
+        };
         let htab = pg_sys::ShmemInitHash(
             name.as_ptr().cast(),
             sz_small,
@@ -1613,9 +1631,11 @@ pub unsafe fn mem_init_tables(ctl: *mut MemControlBlock) {
         std::ptr::addr_of_mut!((*ctl).list_htab[i]).write(htab);
 
         let name = format!("pg_redis_list_meta_{}\0", i * 2);
-        let mut info = pg_sys::HASHCTL::default();
-        info.keysize = MAX_KEY_LEN as pg_sys::Size;
-        info.entrysize = std::mem::size_of::<ListMeta>() as pg_sys::Size;
+        let mut info = pg_sys::HASHCTL {
+            keysize: MAX_KEY_LEN as pg_sys::Size,
+            entrysize: std::mem::size_of::<ListMeta>() as pg_sys::Size,
+            ..Default::default()
+        };
         let htab = pg_sys::ShmemInitHash(
             name.as_ptr().cast(),
             sz_small,
@@ -1626,9 +1646,11 @@ pub unsafe fn mem_init_tables(ctl: *mut MemControlBlock) {
         std::ptr::addr_of_mut!((*ctl).list_meta_htab[i]).write(htab);
 
         let name = format!("pg_redis_zset_meta_{}\0", i * 2);
-        let mut info = pg_sys::HASHCTL::default();
-        info.keysize = MAX_KEY_LEN as pg_sys::Size;
-        info.entrysize = std::mem::size_of::<ZsetMeta>() as pg_sys::Size;
+        let mut info = pg_sys::HASHCTL {
+            keysize: MAX_KEY_LEN as pg_sys::Size,
+            entrysize: std::mem::size_of::<ZsetMeta>() as pg_sys::Size,
+            ..Default::default()
+        };
         let htab = pg_sys::ShmemInitHash(
             name.as_ptr().cast(),
             sz_small,
@@ -1639,9 +1661,11 @@ pub unsafe fn mem_init_tables(ctl: *mut MemControlBlock) {
         std::ptr::addr_of_mut!((*ctl).zset_meta_htab[i]).write(htab);
 
         let name = format!("pg_redis_set_meta_{}\0", i * 2);
-        let mut info = pg_sys::HASHCTL::default();
-        info.keysize = MAX_KEY_LEN as pg_sys::Size;
-        info.entrysize = std::mem::size_of::<SetMeta>() as pg_sys::Size;
+        let mut info = pg_sys::HASHCTL {
+            keysize: MAX_KEY_LEN as pg_sys::Size,
+            entrysize: std::mem::size_of::<SetMeta>() as pg_sys::Size,
+            ..Default::default()
+        };
         let htab = pg_sys::ShmemInitHash(
             name.as_ptr().cast(),
             sz_small,
@@ -1653,17 +1677,21 @@ pub unsafe fn mem_init_tables(ctl: *mut MemControlBlock) {
 
         // KV overflow: HASH_STRINGS, key = MAX_KEY_LEN (same as KvEntry)
         let name = format!("pg_redis_kv_of_{}\0", i * 2);
-        let mut info = pg_sys::HASHCTL::default();
-        info.keysize = MAX_KEY_LEN as pg_sys::Size;
-        info.entrysize = std::mem::size_of::<KvOverflow>() as pg_sys::Size;
+        let mut info = pg_sys::HASHCTL {
+            keysize: MAX_KEY_LEN as pg_sys::Size,
+            entrysize: std::mem::size_of::<KvOverflow>() as pg_sys::Size,
+            ..Default::default()
+        };
         let htab = pg_sys::ShmemInitHash(name.as_ptr().cast(), sz, sz, &mut info, str_flags);
         std::ptr::addr_of_mut!((*ctl).kv_overflow_htab[i]).write(htab);
 
         // Hash overflow: HASH_BLOBS, composite key key[128] + field[128] = 256 bytes
         let name = format!("pg_redis_hash_of_{}\0", i * 2);
-        let mut info = pg_sys::HASHCTL::default();
-        info.keysize = (MAX_KEY_LEN * 2) as pg_sys::Size;
-        info.entrysize = std::mem::size_of::<HashOverflow>() as pg_sys::Size;
+        let mut info = pg_sys::HASHCTL {
+            keysize: (MAX_KEY_LEN * 2) as pg_sys::Size,
+            entrysize: std::mem::size_of::<HashOverflow>() as pg_sys::Size,
+            ..Default::default()
+        };
         let htab = pg_sys::ShmemInitHash(
             name.as_ptr().cast(),
             sz_small,
@@ -1675,9 +1703,11 @@ pub unsafe fn mem_init_tables(ctl: *mut MemControlBlock) {
 
         // List overflow: HASH_BLOBS, key[128] + pos_bytes[8] = 136 bytes
         let name = format!("pg_redis_list_of_{}\0", i * 2);
-        let mut info = pg_sys::HASHCTL::default();
-        info.keysize = (MAX_KEY_LEN + 8) as pg_sys::Size;
-        info.entrysize = std::mem::size_of::<ListOverflow>() as pg_sys::Size;
+        let mut info = pg_sys::HASHCTL {
+            keysize: (MAX_KEY_LEN + 8) as pg_sys::Size,
+            entrysize: std::mem::size_of::<ListOverflow>() as pg_sys::Size,
+            ..Default::default()
+        };
         let htab = pg_sys::ShmemInitHash(
             name.as_ptr().cast(),
             sz_small,
@@ -2661,6 +2691,7 @@ unsafe fn zset_collect(htab: *mut pg_sys::HTAB, key: &str) -> Vec<(String, f64)>
 /// # Safety
 /// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn mem_zadd(
     db_idx: usize,
     key: &str,
@@ -2784,6 +2815,7 @@ pub unsafe fn mem_zadd(
 /// # Safety
 /// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn mem_zadd_incr(
     db_idx: usize,
     key: &str,
@@ -2823,25 +2855,23 @@ pub unsafe fn mem_zadd_incr(
             addr_of_mut!((*entry).score).write(delta);
             Some(delta)
         }
+    } else if nx {
+        None
     } else {
-        if nx {
-            None
+        let old = (*entry).score;
+        let new_score = old + delta;
+        let should_update = if gt {
+            new_score > old
+        } else if lt {
+            new_score < old
         } else {
-            let old = (*entry).score;
-            let new_score = old + delta;
-            let should_update = if gt {
-                new_score > old
-            } else if lt {
-                new_score < old
-            } else {
-                true
-            };
-            if should_update {
-                addr_of_mut!((*entry).score).write(new_score);
-                Some(new_score)
-            } else {
-                Some(old)
-            }
+            true
+        };
+        if should_update {
+            addr_of_mut!((*entry).score).write(new_score);
+            Some(new_score)
+        } else {
+            Some(old)
         }
     };
     pg_sys::LWLockRelease(lk);
@@ -3060,6 +3090,7 @@ pub unsafe fn mem_zrange_by_index(
 /// # Safety
 /// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn mem_zrange_by_score(
     db_idx: usize,
     key: &str,
@@ -4772,12 +4803,10 @@ pub unsafe fn mem_lmove(
         } else {
             dst_min - LIST_POS_STEP
         }
+    } else if dst_count == 0 {
+        0
     } else {
-        if dst_count == 0 {
-            0
-        } else {
-            dst_max + LIST_POS_STEP
-        }
+        dst_max + LIST_POS_STEP
     };
 
     let dk = make_list_key(dst, dst_pos);

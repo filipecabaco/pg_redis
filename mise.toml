@@ -25,6 +25,14 @@ run = "cargo fmt --all -- --check"
 description = "Run fmt-check + clippy (mirrors CI check step)"
 depends = ["fmt-check", "lint"]
 
+[tasks.fix]
+description = "Auto-fix formatting and lints, then run tests"
+run = [
+  "cargo fmt --all",
+  "cargo clippy --fix --allow-dirty --features {{vars.pg_version}} -- -D warnings",
+  "cargo pgrx test {{vars.pg_version}}",
+]
+
 [tasks.test-unit]
 description = "Run unit tests (no postgres required)"
 run = "cargo test --features {{vars.pg_version}} --lib -- --skip pg_test"

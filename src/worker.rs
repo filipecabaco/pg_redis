@@ -1,6 +1,7 @@
 use crate::commands::{Command, Response};
 use crate::resp::*;
 use pgrx::bgworkers::*;
+use pgrx::pg_sys;
 use pgrx::prelude::*;
 use socket2::{Domain, Socket, Type};
 use std::io::BufWriter;
@@ -27,6 +28,17 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
         BackgroundWorker::connect_worker_to_spi(Some(&db_name), None);
     } else {
         BackgroundWorker::connect_worker_to_spi_by_oid(Some(db_oid), None);
+    }
+
+    let mem_mode = crate::storage_mode() == crate::StorageMode::Memory;
+    if mem_mode {
+        let ctl = crate::shmem_ctl();
+        if !ctl.is_null() {
+            unsafe {
+                pg_sys::CurrentMemoryContext = pg_sys::TopMemoryContext;
+                crate::mem::mem_init_worker(ctl);
+            }
+        }
     }
 
     let port = crate::PORT.get() as u16;
@@ -71,31 +83,45 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                 }
 
                 if batch.len() == 1 {
-                    // Single command: no savepoint overhead.
                     let (cmd, db, resp_tx) = batch.pop().unwrap();
-                    let response = BackgroundWorker::transaction(|| {
-                        Spi::connect_mut(|client| cmd.execute(client, db))
-                    });
+                    let response = if mem_mode && db % 2 == 0 {
+                        unsafe {
+                            pg_sys::CurrentMemoryContext = pg_sys::TopMemoryContext;
+                        }
+                        cmd.execute_mem(db)
+                    } else {
+                        BackgroundWorker::transaction(|| {
+                            Spi::connect_mut(|client| cmd.execute(client, db))
+                        })
+                    };
                     resp_tx.send(response).ok();
                 } else {
-                    // Multiple commands: savepoint per command so one failure
-                    // rolls back only that command, not the entire batch.
-                    let responses: Vec<Response> = BackgroundWorker::transaction(|| {
-                        Spi::connect_mut(|client| {
-                            batch
-                                .iter()
-                                .map(|(cmd, db, _)| {
-                                    client.update("SAVEPOINT pgr", None, &[]).ok();
-                                    let resp = cmd.execute(client, *db);
-                                    if matches!(resp, Response::Error(_)) {
-                                        client.update("ROLLBACK TO SAVEPOINT pgr", None, &[]).ok();
-                                    }
-                                    client.update("RELEASE SAVEPOINT pgr", None, &[]).ok();
-                                    resp
-                                })
-                                .collect()
+                    let all_mem = mem_mode && batch.iter().all(|(_, db, _)| db % 2 == 0);
+                    let responses: Vec<Response> = if all_mem {
+                        unsafe {
+                            pg_sys::CurrentMemoryContext = pg_sys::TopMemoryContext;
+                        }
+                        batch.iter().map(|(cmd, db, _)| cmd.execute_mem(*db)).collect()
+                    } else {
+                        BackgroundWorker::transaction(|| {
+                            Spi::connect_mut(|client| {
+                                batch
+                                    .iter()
+                                    .map(|(cmd, db, _)| {
+                                        client.update("SAVEPOINT pgr", None, &[]).ok();
+                                        let resp = cmd.execute(client, *db);
+                                        if matches!(resp, Response::Error(_)) {
+                                            client
+                                                .update("ROLLBACK TO SAVEPOINT pgr", None, &[])
+                                                .ok();
+                                        }
+                                        client.update("RELEASE SAVEPOINT pgr", None, &[]).ok();
+                                        resp
+                                    })
+                                    .collect()
+                            })
                         })
-                    });
+                    };
                     for ((_, _, resp_tx), response) in batch.into_iter().zip(responses) {
                         resp_tx.send(response).ok();
                     }
@@ -114,20 +140,27 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
         if last_expiry_scan.elapsed() >= Duration::from_secs(1) {
             last_expiry_scan = Instant::now();
             for db in 0u8..16 {
-                BackgroundWorker::transaction(|| {
-                    Spi::connect_mut(|client| {
-                        client
-                            .update(
-                                &format!(
-                                    "DELETE FROM redis.kv_{db} \
-                                     WHERE expires_at IS NOT NULL AND expires_at <= now()"
-                                ),
-                                None,
-                                &[],
-                            )
-                            .ok();
-                    })
-                });
+                if mem_mode && db % 2 == 0 {
+                    unsafe {
+                        pg_sys::CurrentMemoryContext = pg_sys::TopMemoryContext;
+                        crate::mem::mem_sweep_expired((db / 2) as usize);
+                    }
+                } else {
+                    BackgroundWorker::transaction(|| {
+                        Spi::connect_mut(|client| {
+                            client
+                                .update(
+                                    &format!(
+                                        "DELETE FROM redis.kv_{db} \
+                                         WHERE expires_at IS NOT NULL AND expires_at <= now()"
+                                    ),
+                                    None,
+                                    &[],
+                                )
+                                .ok();
+                        })
+                    });
+                }
             }
         }
     }

@@ -3662,6 +3662,722 @@ impl Command {
             }
         }
     }
+
+    /// Execute command via shared-memory path (no SPI, no transaction).
+    /// Only valid for even-numbered databases when storage_mode = 'memory'.
+    /// Hash/list/set/zset commands fall back to the SPI path.
+    pub fn execute_mem(&self, db: u8) -> Response {
+        use crate::mem;
+
+        fn strs(v: &[String]) -> Vec<&str> {
+            v.iter().map(String::as_str).collect()
+        }
+
+        fn mem_ttl_response(db_idx: usize, key: &str, divisor: i64, relative: bool) -> Response {
+            let (exists, exp_us) = unsafe { crate::mem::mem_ttl_raw(db_idx, key) };
+            if !exists { return Response::Integer(-2); }
+            if exp_us == 0 { return Response::Integer(-1); }
+            let value = if relative {
+                ((exp_us - now_micros()).max(-divisor) / divisor).max(-1)
+            } else {
+                exp_us / divisor
+            };
+            Response::Integer(value)
+        }
+
+        let db_idx = (db / 2) as usize;
+
+        match self {
+            Command::Get { key } => {
+                let v = unsafe { mem::mem_get(db_idx, key) };
+                match v {
+                    Some(s) => Response::BulkString(s),
+                    None => Response::Null,
+                }
+            }
+
+            Command::Set {
+                key,
+                value,
+                ex_ms,
+                nx,
+                xx,
+                get,
+                keepttl,
+            } => {
+                let expires_at_us = ex_ms
+                    .map(|ms| now_micros() + ms * 1000)
+                    .unwrap_or(0);
+
+                unsafe {
+                    if *nx {
+                        let exists = mem::mem_exists(db_idx, &[key.as_str()]) > 0;
+                        if exists {
+                            return Response::Null;
+                        }
+                    }
+                    if *xx {
+                        let exists = mem::mem_exists(db_idx, &[key.as_str()]) > 0;
+                        if !exists {
+                            return Response::Null;
+                        }
+                    }
+
+                    if *keepttl {
+                        let (exists, exp) = mem::mem_ttl_raw(db_idx, key);
+                        let ttl = if exists { exp } else { 0 };
+                        mem::mem_set(db_idx, key, value, ttl);
+                        return Response::Ok;
+                    }
+
+                    let old = if *get {
+                        mem::mem_get(db_idx, key)
+                    } else {
+                        None
+                    };
+
+                    mem::mem_set(db_idx, key, value, expires_at_us);
+
+                    if *get {
+                        match old {
+                            Some(s) => Response::BulkString(s),
+                            None => Response::Null,
+                        }
+                    } else {
+                        Response::Ok
+                    }
+                }
+            }
+
+            Command::SetEx { key, value, ex_secs } => {
+                let expires_at_us = now_micros() + ex_secs * 1_000_000;
+                unsafe { mem::mem_set(db_idx, key, value, expires_at_us) };
+                Response::Ok
+            }
+
+            Command::PSetEx { key, value, ex_ms } => {
+                let expires_at_us = now_micros() + ex_ms * 1000;
+                unsafe { mem::mem_set(db_idx, key, value, expires_at_us) };
+                Response::Ok
+            }
+
+            Command::SetNx { key, value } => {
+                let exists = unsafe { mem::mem_exists(db_idx, &[key.as_str()]) > 0 };
+                if !exists {
+                    unsafe { mem::mem_set(db_idx, key, value, 0) };
+                    Response::Integer(1)
+                } else {
+                    Response::Integer(0)
+                }
+            }
+
+            Command::MSetNx { pairs } => {
+                let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+                let any_exists = unsafe { mem::mem_exists(db_idx, &keys) > 0 };
+                if any_exists {
+                    Response::Integer(0)
+                } else {
+                    let p: Vec<(&str, &str)> =
+                        pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                    unsafe { mem::mem_mset(db_idx, &p) };
+                    Response::Integer(1)
+                }
+            }
+
+            Command::Del { keys } | Command::Unlink { keys } => {
+                let mut count = 0i64;
+                for k in keys {
+                    let kv = unsafe { mem::mem_del(db_idx, &[k.as_str()]) };
+                    let sub = unsafe { mem::mem_del_all_types(db_idx, k) };
+                    if kv > 0 || sub > 0 { count += 1; }
+                }
+                Response::Integer(count)
+            }
+
+            Command::Exists { keys } => {
+                Response::Integer(unsafe { mem::mem_exists(db_idx, &strs(keys)) })
+            }
+
+            Command::Incr { key } => match unsafe { mem::mem_incr(db_idx, key, 1) } {
+                Ok(n) => Response::Integer(n),
+                Err(e) => Response::Error(e),
+            },
+
+            Command::Decr { key } => match unsafe { mem::mem_incr(db_idx, key, -1) } {
+                Ok(n) => Response::Integer(n),
+                Err(e) => Response::Error(e),
+            },
+
+            Command::IncrBy { key, delta } => {
+                match unsafe { mem::mem_incr(db_idx, key, *delta) } {
+                    Ok(n) => Response::Integer(n),
+                    Err(e) => Response::Error(e),
+                }
+            }
+
+            Command::DecrBy { key, delta } => {
+                match unsafe { mem::mem_incr(db_idx, key, -delta) } {
+                    Ok(n) => Response::Integer(n),
+                    Err(e) => Response::Error(e),
+                }
+            }
+
+            Command::IncrByFloat { key, delta } => {
+                match unsafe { mem::mem_incr_float(db_idx, key, *delta) } {
+                    Ok(s) => Response::BulkString(s.into_bytes()),
+                    Err(e) => Response::Error(e),
+                }
+            }
+
+            Command::Append { key, value } => {
+                Response::Integer(unsafe { mem::mem_append(db_idx, key, value) })
+            }
+
+            Command::Strlen { key } => {
+                Response::Integer(unsafe { mem::mem_strlen(db_idx, key) })
+            }
+
+            Command::GetDel { key } => match unsafe { mem::mem_getdel(db_idx, key) } {
+                Some(v) => Response::BulkString(v),
+                None => Response::Null,
+            },
+
+            Command::GetSet { key, value } => {
+                let old = unsafe { mem::mem_getset(db_idx, key, value) };
+                match old {
+                    Some(v) => Response::BulkString(v),
+                    None => Response::Null,
+                }
+            }
+
+            Command::Ttl { key }         => mem_ttl_response(db_idx, key, 1_000_000, true),
+            Command::PTtl { key }        => mem_ttl_response(db_idx, key, 1_000, true),
+            Command::ExpireTime { key }  => mem_ttl_response(db_idx, key, 1_000_000, false),
+            Command::PExpireTime { key } => mem_ttl_response(db_idx, key, 1_000, false),
+
+            Command::Expire { key, secs } => {
+                let exp_us = now_micros() + secs * 1_000_000;
+                Response::Integer(unsafe { mem::mem_set_expiry(db_idx, key, exp_us) } as i64)
+            }
+
+            Command::PExpire { key, ms } => {
+                let exp_us = now_micros() + ms * 1000;
+                Response::Integer(unsafe { mem::mem_set_expiry(db_idx, key, exp_us) } as i64)
+            }
+
+            Command::ExpireAt { key, unix_secs } => {
+                let exp_us = unix_secs * 1_000_000;
+                Response::Integer(unsafe { mem::mem_set_expiry(db_idx, key, exp_us) } as i64)
+            }
+
+            Command::PExpireAt { key, unix_ms } => {
+                let exp_us = unix_ms * 1000;
+                Response::Integer(unsafe { mem::mem_set_expiry(db_idx, key, exp_us) } as i64)
+            }
+
+            Command::Persist { key } => {
+                Response::Integer(unsafe { mem::mem_persist(db_idx, key) } as i64)
+            }
+
+            Command::MGet { keys } => {
+                let results = unsafe { mem::mem_mget(db_idx, keys) };
+                Response::Array(
+                    results
+                        .into_iter()
+                        .collect(),
+                )
+            }
+
+            Command::MSet { pairs } => {
+                let p: Vec<(&str, &str)> =
+                    pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                unsafe { mem::mem_mset(db_idx, &p) };
+                Response::Ok
+            }
+
+            Command::Keys { pattern } => {
+                let keys = unsafe { mem::mem_scan(db_idx, pattern) };
+                Response::Array(keys.into_iter().map(Some).collect())
+            }
+
+            Command::Scan {
+                pattern,
+                ..
+            } => {
+                let pat = pattern.as_deref().unwrap_or("*");
+                let keys = unsafe { mem::mem_scan(db_idx, pat) };
+                Response::ScanResult {
+                    keys: keys.into_iter().map(Some).collect(),
+                }
+            }
+
+            Command::DbSize => Response::Integer(unsafe { mem::mem_dbsize(db_idx) }),
+
+            Command::Type { key } => {
+                let t = unsafe { mem::mem_type(db_idx, key) };
+                Response::SimpleString(t.to_string())
+            }
+
+            Command::Rename { key, newkey } => {
+                let val = unsafe { mem::mem_getdel(db_idx, key) };
+                match val {
+                    Some(v) => {
+                        let s = String::from_utf8_lossy(&v);
+                        unsafe { mem::mem_set(db_idx, newkey, &s, 0) };
+                        Response::Ok
+                    }
+                    None => Response::Error("ERR no such key".to_string()),
+                }
+            }
+
+            Command::RandomKey => match unsafe { mem::mem_random_key(db_idx) } {
+                Some(k) => Response::BulkString(k),
+                None => Response::Null,
+            },
+
+            // ── Hash commands ──────────────────────────────────────────────
+            Command::HSet { key, pairs } => {
+                let mut new_count = 0i64;
+                for (f, v) in pairs {
+                    if unsafe { mem::mem_hset(db_idx, key, f, v) } { new_count += 1; }
+                }
+                Response::Integer(new_count)
+            }
+            Command::HGet { key, field } => match unsafe { mem::mem_hget(db_idx, key, field) } {
+                Some(v) => Response::BulkString(v),
+                None => Response::Null,
+            },
+            Command::HGetAll { key } => {
+                let pairs = unsafe { mem::mem_hgetall(db_idx, key) };
+                let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(pairs.len() * 2);
+                for (f, v) in pairs { out.push(Some(f.into_bytes())); out.push(Some(v)); }
+                Response::Array(out)
+            }
+            Command::HDel { key, fields } => {
+                Response::Integer(unsafe { mem::mem_hdel(db_idx, key, &strs(fields)) })
+            }
+            Command::HExists { key, field } => {
+                Response::Integer(unsafe { mem::mem_hexists(db_idx, key, field) } as i64)
+            }
+            Command::HKeys { key } => {
+                let keys = unsafe { mem::mem_hkeys(db_idx, key) };
+                Response::Array(keys.into_iter().map(|k| Some(k.into_bytes())).collect())
+            }
+            Command::HVals { key } => {
+                let vals = unsafe { mem::mem_hvals(db_idx, key) };
+                Response::Array(vals.into_iter().map(Some).collect())
+            }
+            Command::HLen { key } => Response::Integer(unsafe { mem::mem_hlen(db_idx, key) }),
+            Command::HMGet { key, fields } => {
+                let results = unsafe { mem::mem_hmget(db_idx, key, &strs(fields)) };
+                Response::Array(results.into_iter().collect())
+            }
+            Command::HMSet { key, pairs } => {
+                for (f, v) in pairs { unsafe { mem::mem_hset(db_idx, key, f, v) }; }
+                Response::Ok
+            }
+            Command::HIncrBy { key, field, delta } => {
+                match unsafe { mem::mem_hincrby(db_idx, key, field, *delta) } {
+                    Ok(n) => Response::Integer(n),
+                    Err(e) => Response::Error(e),
+                }
+            }
+            Command::HSetNx { key, field, value } => {
+                Response::Integer(unsafe { mem::mem_hsetnx(db_idx, key, field, value) } as i64)
+            }
+
+            // ── Set commands ───────────────────────────────────────────────
+            Command::SAdd { key, members } => {
+                Response::Integer(unsafe { mem::mem_sadd(db_idx, key, &strs(members)) })
+            }
+            Command::SRem { key, members } => {
+                Response::Integer(unsafe { mem::mem_srem(db_idx, key, &strs(members)) })
+            }
+            Command::SIsMember { key, member } => {
+                Response::Integer(unsafe { mem::mem_sismember(db_idx, key, member) } as i64)
+            }
+            Command::SMisMember { key, members } => {
+                let results = unsafe { mem::mem_smismember(db_idx, key, &strs(members)) };
+                Response::IntegerArray(results.into_iter().map(|b| i64::from(b)).collect())
+            }
+            Command::SMembers { key } => {
+                let members = unsafe { mem::mem_smembers(db_idx, key) };
+                Response::Array(members.into_iter().map(|m| Some(m.into_bytes())).collect())
+            }
+            Command::SCard { key } => Response::Integer(unsafe { mem::mem_scard(db_idx, key) }),
+            Command::SPop { key, count } => {
+                let n = count.unwrap_or(1).max(0);
+                let popped = unsafe { mem::mem_spop(db_idx, key, n) };
+                if count.is_none() {
+                    match popped.into_iter().next() {
+                        Some(m) => Response::BulkString(m.into_bytes()),
+                        None => Response::Null,
+                    }
+                } else {
+                    Response::Array(popped.into_iter().map(|m| Some(m.into_bytes())).collect())
+                }
+            }
+            Command::SRandMember { key, count } => {
+                let n = count.unwrap_or(1);
+                let members = unsafe { mem::mem_srandmember(db_idx, key, n) };
+                if count.is_none() {
+                    match members.into_iter().next() {
+                        Some(m) => Response::BulkString(m.into_bytes()),
+                        None => Response::Null,
+                    }
+                } else {
+                    Response::Array(members.into_iter().map(|m| Some(m.into_bytes())).collect())
+                }
+            }
+            Command::SMove { src, dst, member } => {
+                Response::Integer(unsafe { mem::mem_smove(db_idx, src, dst, member) } as i64)
+            }
+            Command::SUnion { keys } => {
+                let members = unsafe { mem::mem_sunion(db_idx, &strs(keys)) };
+                Response::Array(members.into_iter().map(|m| Some(m.into_bytes())).collect())
+            }
+            Command::SInter { keys } => {
+                let members = unsafe { mem::mem_sinter(db_idx, &strs(keys)) };
+                Response::Array(members.into_iter().map(|m| Some(m.into_bytes())).collect())
+            }
+            Command::SDiff { keys } => {
+                let members = unsafe { mem::mem_sdiff(db_idx, &strs(keys)) };
+                Response::Array(members.into_iter().map(|m| Some(m.into_bytes())).collect())
+            }
+            Command::SUnionStore { dst, keys } => {
+                Response::Integer(unsafe { mem::mem_sunionstore(db_idx, dst, &strs(keys)) })
+            }
+            Command::SInterStore { dst, keys } => {
+                Response::Integer(unsafe { mem::mem_sinterstore(db_idx, dst, &strs(keys)) })
+            }
+            Command::SDiffStore { dst, keys } => {
+                Response::Integer(unsafe { mem::mem_sdiffstore(db_idx, dst, &strs(keys)) })
+            }
+
+            // ── Sorted set commands ────────────────────────────────────────
+            Command::ZAdd { key, nx, xx, gt, lt, ch, incr, pairs } => {
+                if *incr {
+                    let (delta, member) = &pairs[0];
+                    match unsafe { mem::mem_zadd_incr(db_idx, key, *delta, member, *nx, *xx, *gt, *lt) } {
+                        Some(s) => Response::BulkString(format_score(s).into_bytes()),
+                        None => Response::Null,
+                    }
+                } else {
+                    let ps: Vec<(f64, &str)> = pairs.iter().map(|(s, m)| (*s, m.as_str())).collect();
+                    Response::Integer(unsafe { mem::mem_zadd(db_idx, key, &ps, *nx, *xx, *gt, *lt, *ch) })
+                }
+            }
+            Command::ZRem { key, members } => {
+                Response::Integer(unsafe { mem::mem_zrem(db_idx, key, &strs(members)) })
+            }
+            Command::ZScore { key, member } => match unsafe { mem::mem_zscore(db_idx, key, member) } {
+                Some(s) => Response::BulkString(format_score(s).into_bytes()),
+                None => Response::Null,
+            },
+            Command::ZMScore { key, members } => {
+                let scores = unsafe { mem::mem_zmsmembers(db_idx, key, &strs(members)) };
+                Response::Array(scores.into_iter().map(|s| s.map(|v| format_score(v).into_bytes())).collect())
+            }
+            Command::ZIncrBy { key, increment, member } => {
+                let s = unsafe { mem::mem_zincrby(db_idx, key, *increment, member) };
+                Response::BulkString(format_score(s).into_bytes())
+            }
+            Command::ZCard { key } => Response::Integer(unsafe { mem::mem_zcard(db_idx, key) }),
+            Command::ZCount { key, min, max } => {
+                Response::Integer(unsafe { mem::mem_zcount(db_idx, key, min.value, max.value, min.exclusive, max.exclusive) })
+            }
+            Command::ZLexCount { key, min, max } => {
+                Response::Integer(unsafe { mem::mem_zlexcount(db_idx, key, min, max) })
+            }
+            Command::ZRank { key, member, rev, with_score } => {
+                match unsafe { mem::mem_zrank(db_idx, key, member, *rev) } {
+                    Some((rank, score)) => {
+                        if *with_score {
+                            let mut out: Vec<Option<Vec<u8>>> = vec![Some(rank.to_string().into_bytes())];
+                            if let Some(s) = score { out.push(Some(format_score(s).into_bytes())); }
+                            Response::Array(out)
+                        } else {
+                            Response::Integer(rank)
+                        }
+                    }
+                    None => Response::Null,
+                }
+            }
+            Command::ZRange { key, start, stop, by, rev, limit, with_scores } => {
+                use RangeBy;
+                match by {
+                    RangeBy::Index => {
+                        let s: i64 = start.parse().unwrap_or(0);
+                        let e: i64 = stop.parse().unwrap_or(-1);
+                        let results = unsafe { mem::mem_zrange_by_index(db_idx, key, s, e, *rev, *with_scores) };
+                        mem_zrange_response(results)
+                    }
+                    RangeBy::Score => {
+                        let (min, max, ex_min, ex_max) = parse_score_range(start, stop);
+                        let results = unsafe { mem::mem_zrange_by_score(db_idx, key, min, max, ex_min, ex_max, *rev, *limit) };
+                        mem_zrange_response(results)
+                    }
+                    RangeBy::Lex => {
+                        let min_b = parse_lex_bound_infallible(start);
+                        let max_b = parse_lex_bound_infallible(stop);
+                        let results = unsafe { mem::mem_zrangebylex(db_idx, key, &min_b, &max_b, *rev, *limit) };
+                        Response::Array(results.into_iter().map(|b| Some(b)).collect())
+                    }
+                }
+            }
+            Command::ZRangeByScore { key, min, max, rev, with_scores, limit } => {
+                let results = unsafe { mem::mem_zrange_by_score(db_idx, key, min.value, max.value, min.exclusive, max.exclusive, *rev, *limit) };
+                if *with_scores {
+                    let mut out = Vec::new();
+                    for (m, s) in results {
+                        out.push(Some(m));
+                        if let Some(sc) = s { out.push(Some(format_score(sc).into_bytes())); }
+                    }
+                    Response::Array(out)
+                } else {
+                    Response::Array(results.into_iter().map(|(m, _)| Some(m)).collect())
+                }
+            }
+            Command::ZRangeByLex { key, min, max, rev, limit } => {
+                let results = unsafe { mem::mem_zrangebylex(db_idx, key, min, max, *rev, *limit) };
+                Response::Array(results.into_iter().map(|b| Some(b)).collect())
+            }
+            Command::ZPopMin { key, count } => {
+                let n = count.unwrap_or(1).max(0);
+                let results = unsafe { mem::mem_zpopmin(db_idx, key, n) };
+                if count.is_none() && results.is_empty() {
+                    return Response::Array(vec![]);
+                }
+                let mut out = Vec::new();
+                for (m, s) in results { out.push(Some(m)); out.push(Some(format_score(s).into_bytes())); }
+                Response::Array(out)
+            }
+            Command::ZPopMax { key, count } => {
+                let n = count.unwrap_or(1).max(0);
+                let results = unsafe { mem::mem_zpopmax(db_idx, key, n) };
+                if count.is_none() && results.is_empty() {
+                    return Response::Array(vec![]);
+                }
+                let mut out = Vec::new();
+                for (m, s) in results { out.push(Some(m)); out.push(Some(format_score(s).into_bytes())); }
+                Response::Array(out)
+            }
+            Command::ZRandMember { key, count, with_scores } => {
+                let n = count.unwrap_or(1);
+                let results = unsafe { mem::mem_zrandmember(db_idx, key, n, *with_scores) };
+                if count.is_none() {
+                    match results.into_iter().next() {
+                        Some((m, _)) => Response::BulkString(m),
+                        None => Response::Null,
+                    }
+                } else if *with_scores {
+                    let mut out = Vec::new();
+                    for (m, s) in results { out.push(Some(m)); if let Some(sc) = s { out.push(Some(format_score(sc).into_bytes())); } }
+                    Response::Array(out)
+                } else {
+                    Response::Array(results.into_iter().map(|(m, _)| Some(m)).collect())
+                }
+            }
+            Command::ZRemRangeByRank { key, start, stop } => {
+                Response::Integer(unsafe { mem::mem_zremrangebyrank(db_idx, key, *start, *stop) })
+            }
+            Command::ZRemRangeByScore { key, min, max } => {
+                Response::Integer(unsafe { mem::mem_zremrangebyscore(db_idx, key, min.value, max.value, min.exclusive, max.exclusive) })
+            }
+            Command::ZRemRangeByLex { key, min, max } => {
+                Response::Integer(unsafe { mem::mem_zremrangebylex(db_idx, key, min, max) })
+            }
+            Command::ZUnionStore { dst, keys, weights, aggregate } => {
+                let ws: Vec<f64> = weights.as_deref().unwrap_or(&[]).to_vec();
+                Response::Integer(unsafe { mem::mem_zunionstore(db_idx, dst, &strs(keys), &ws, *aggregate) })
+            }
+            Command::ZInterStore { dst, keys, weights, aggregate } => {
+                let ws: Vec<f64> = weights.as_deref().unwrap_or(&[]).to_vec();
+                Response::Integer(unsafe { mem::mem_zinterstore(db_idx, dst, &strs(keys), &ws, *aggregate) })
+            }
+            Command::ZDiffStore { dst, keys } => {
+                Response::Integer(unsafe { mem::mem_zdiffstore(db_idx, dst, &strs(keys)) })
+            }
+            Command::ZUnion { keys, weights, aggregate, with_scores } => {
+                let ws: Vec<f64> = weights.as_deref().unwrap_or(&[]).to_vec();
+                let tmp_dst = "__mem_zunion_tmp__";
+                unsafe { mem::mem_zunionstore(db_idx, tmp_dst, &strs(keys), &ws, *aggregate) };
+                let htab_results = unsafe { mem::mem_zset_collect_all(db_idx, tmp_dst) };
+                unsafe { mem::mem_del_zset_key(db_idx, tmp_dst) };
+                if *with_scores {
+                    let mut out = Vec::new();
+                    for (m, s) in htab_results { out.push(Some(m.into_bytes())); out.push(Some(format_score(s).into_bytes())); }
+                    Response::Array(out)
+                } else {
+                    Response::Array(htab_results.into_iter().map(|(m, _)| Some(m.into_bytes())).collect())
+                }
+            }
+            Command::ZInter { keys, weights, aggregate, with_scores } => {
+                let ws: Vec<f64> = weights.as_deref().unwrap_or(&[]).to_vec();
+                let tmp_dst = "__mem_zinter_tmp__";
+                unsafe { mem::mem_zinterstore(db_idx, tmp_dst, &strs(keys), &ws, *aggregate) };
+                let htab_results = unsafe { mem::mem_zset_collect_all(db_idx, tmp_dst) };
+                unsafe { mem::mem_del_zset_key(db_idx, tmp_dst) };
+                if *with_scores {
+                    let mut out = Vec::new();
+                    for (m, s) in htab_results { out.push(Some(m.into_bytes())); out.push(Some(format_score(s).into_bytes())); }
+                    Response::Array(out)
+                } else {
+                    Response::Array(htab_results.into_iter().map(|(m, _)| Some(m.into_bytes())).collect())
+                }
+            }
+            Command::ZDiff { keys, with_scores } => {
+                let tmp_dst = "__mem_zdiff_tmp__";
+                unsafe { mem::mem_zdiffstore(db_idx, tmp_dst, &strs(keys)) };
+                let htab_results = unsafe { mem::mem_zset_collect_all(db_idx, tmp_dst) };
+                unsafe { mem::mem_del_zset_key(db_idx, tmp_dst) };
+                if *with_scores {
+                    let mut out = Vec::new();
+                    for (m, s) in htab_results { out.push(Some(m.into_bytes())); out.push(Some(format_score(s).into_bytes())); }
+                    Response::Array(out)
+                } else {
+                    Response::Array(htab_results.into_iter().map(|(m, _)| Some(m.into_bytes())).collect())
+                }
+            }
+
+            // ── List commands ──────────────────────────────────────────────
+            Command::LPush { key, values } => {
+                Response::Integer(unsafe { mem::mem_lpush(db_idx, key, &strs(values)) })
+            }
+            Command::RPush { key, values } => {
+                Response::Integer(unsafe { mem::mem_rpush(db_idx, key, &strs(values)) })
+            }
+            Command::LPushX { key, values } => {
+                Response::Integer(unsafe { mem::mem_lpushx(db_idx, key, &strs(values)) })
+            }
+            Command::RPushX { key, values } => {
+                Response::Integer(unsafe { mem::mem_rpushx(db_idx, key, &strs(values)) })
+            }
+            Command::LPop { key, count } => {
+                let popped = unsafe { mem::mem_lpop(db_idx, key, *count) };
+                if count.is_none() {
+                    match popped.into_iter().next() {
+                        Some(v) => Response::BulkString(v),
+                        None => Response::Null,
+                    }
+                } else if popped.is_empty() {
+                    Response::Null
+                } else {
+                    Response::Array(popped.into_iter().map(Some).collect())
+                }
+            }
+            Command::RPop { key, count } => {
+                let popped = unsafe { mem::mem_rpop(db_idx, key, *count) };
+                if count.is_none() {
+                    match popped.into_iter().next() {
+                        Some(v) => Response::BulkString(v),
+                        None => Response::Null,
+                    }
+                } else if popped.is_empty() {
+                    Response::Null
+                } else {
+                    Response::Array(popped.into_iter().map(Some).collect())
+                }
+            }
+            Command::LLen { key } => Response::Integer(unsafe { mem::mem_llen(db_idx, key) }),
+            Command::LRange { key, start, stop } => {
+                let items = unsafe { mem::mem_lrange(db_idx, key, *start, *stop) };
+                Response::Array(items.into_iter().map(Some).collect())
+            }
+            Command::LIndex { key, index } => match unsafe { mem::mem_lindex(db_idx, key, *index) } {
+                Some(v) => Response::BulkString(v),
+                None => Response::Null,
+            },
+            Command::LSet { key, index, value } => {
+                if unsafe { mem::mem_lset(db_idx, key, *index, value) } {
+                    Response::Ok
+                } else {
+                    Response::Error("ERR index out of range".to_string())
+                }
+            }
+            Command::LRem { key, count, value } => {
+                Response::Integer(unsafe { mem::mem_lrem(db_idx, key, *count, value) })
+            }
+            Command::LTrim { key, start, stop } => {
+                unsafe { mem::mem_ltrim(db_idx, key, *start, *stop) };
+                Response::Ok
+            }
+            Command::LMove { src, dst, src_left, dst_left } => {
+                match unsafe { mem::mem_lmove(db_idx, src, dst, *src_left, *dst_left) } {
+                    Some(v) => Response::BulkString(v),
+                    None => Response::Null,
+                }
+            }
+            Command::LPos { key, element, rank, count } => {
+                let r = rank.unwrap_or(1);
+                let positions = unsafe { mem::mem_lpos(db_idx, key, element, r, *count) };
+                if count.is_none() {
+                    match positions.into_iter().next() {
+                        Some(p) => Response::Integer(p),
+                        None => Response::Null,
+                    }
+                } else {
+                    Response::IntegerArray(positions)
+                }
+            }
+
+            // LInsert is rare and positional — fall back to SPI.
+            // Any truly unhandled commands also fall back.
+            _ => {
+                use pgrx::bgworkers::BackgroundWorker;
+                use pgrx::prelude::*;
+                BackgroundWorker::transaction(|| {
+                    Spi::connect_mut(|client| self.execute(client, db))
+                })
+            }
+        }
+    }
+}
+
+fn mem_zrange_response(results: Vec<(Vec<u8>, Option<f64>)>) -> Response {
+    let has_scores = results.first().map(|(_, s)| s.is_some()).unwrap_or(false);
+    if has_scores {
+        let mut out = Vec::new();
+        for (m, s) in results {
+            out.push(Some(m));
+            if let Some(sc) = s { out.push(Some(format_score(sc).into_bytes())); }
+        }
+        Response::Array(out)
+    } else {
+        Response::Array(results.into_iter().map(|(m, _)| Some(m)).collect())
+    }
+}
+
+fn parse_score_range(start: &str, stop: &str) -> (f64, f64, bool, bool) {
+    fn parse_one(s: &str) -> (f64, bool) {
+        if let Some(rest) = s.strip_prefix('(') {
+            (rest.parse().unwrap_or(f64::NEG_INFINITY), true)
+        } else if s == "+inf" || s == "+Inf" {
+            (f64::INFINITY, false)
+        } else if s == "-inf" || s == "-Inf" {
+            (f64::NEG_INFINITY, false)
+        } else {
+            (s.parse().unwrap_or(0.0), false)
+        }
+    }
+    let (min, ex_min) = parse_one(start);
+    let (max, ex_max) = parse_one(stop);
+    (min, max, ex_min, ex_max)
+}
+
+fn parse_lex_bound_infallible(s: &str) -> LexBound {
+    if s == "-" { LexBound::NegInf }
+    else if s == "+" { LexBound::PosInf }
+    else if let Some(rest) = s.strip_prefix('[') { LexBound::Inclusive(rest.to_string()) }
+    else if let Some(rest) = s.strip_prefix('(') { LexBound::Exclusive(rest.to_string()) }
+    else { LexBound::Inclusive(s.to_string()) }
+}
+
+fn now_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as i64
 }
 
 fn build_inter_sql(db: u8, n_keys: usize, first_param: usize) -> String {

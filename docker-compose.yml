@@ -14,9 +14,10 @@ services:
       postgres
         -c shared_preload_libraries=pg_redis
         -c redis.port=6379
-        -c redis.use_logged=true
+        -c redis.use_logged=${PG_REDIS_USE_LOGGED:-true}
         -c redis.workers=${PG_REDIS_WORKERS:-4}
         -c redis.batch_size=${PG_REDIS_BATCH_SIZE:-64}
+        -c redis.storage_mode=${PG_REDIS_STORAGE_MODE:-auto}
         -c redis.password=testpass
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]

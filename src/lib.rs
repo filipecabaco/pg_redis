@@ -1,4 +1,5 @@
 mod commands;
+pub(crate) mod mem;
 mod resp;
 mod worker;
 
@@ -24,6 +25,92 @@ pub(crate) static PASSWORD: GucSetting<Option<std::ffi::CString>> =
 pub(crate) static BATCH_SIZE: GucSetting<i32> = GucSetting::<i32>::new(64);
 pub(crate) static DATABASE: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(Some(c"postgres"));
+
+pub(crate) static STORAGE_MODE: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"auto"));
+
+pub(crate) static MEM_MAX_ENTRIES: GucSetting<i32> = GucSetting::<i32>::new(16384);
+
+#[derive(Copy, Clone, PartialEq)]
+pub enum StorageMode {
+    Auto,
+    Memory,
+}
+
+pub fn storage_mode() -> StorageMode {
+    match STORAGE_MODE
+        .get()
+        .as_deref()
+        .and_then(|s| s.to_str().ok())
+    {
+        Some("memory") => StorageMode::Memory,
+        _ => StorageMode::Auto,
+    }
+}
+
+static mut SHMEM_CTL: *mut mem::MemControlBlock = std::ptr::null_mut();
+static mut PREV_SHMEM_REQUEST_HOOK: pg_sys::shmem_request_hook_type = None;
+static mut PREV_SHMEM_STARTUP_HOOK: pg_sys::shmem_startup_hook_type = None;
+
+unsafe extern "C-unwind" fn pg_redis_shmem_request() {
+    if let Some(prev) = PREV_SHMEM_REQUEST_HOOK {
+        prev();
+    }
+    // MemControlBlock (holds pointers to the 8 HTABs + LWLock)
+    pg_sys::RequestAddinShmemSpace(mem::mem_ctl_size());
+    // HTAB storage: PostgreSQL needs pre-allocated space for HASH_SHARED_MEM tables.
+    // Each table holds HTAB_INIT_SIZE entries of size KvEntry, plus ~25% HTAB overhead.
+    pg_sys::RequestAddinShmemSpace(mem::mem_htab_total_size());
+    pg_sys::RequestAddinShmemSpace(mem::mem_hash_htab_total_size());
+    pg_sys::RequestAddinShmemSpace(mem::mem_set_htab_total_size());
+    pg_sys::RequestAddinShmemSpace(mem::mem_zset_htab_total_size());
+    pg_sys::RequestAddinShmemSpace(mem::mem_list_htab_total_size());
+    pg_sys::RequestAddinShmemSpace(mem::mem_list_meta_htab_total_size());
+    pg_sys::RequestAddinShmemSpace(mem::mem_zset_meta_htab_total_size());
+    pg_sys::RequestAddinShmemSpace(mem::mem_set_meta_htab_total_size());
+    pg_sys::RequestAddinShmemSpace(mem::mem_kv_overflow_total_size());
+    pg_sys::RequestAddinShmemSpace(mem::mem_hash_overflow_total_size());
+    pg_sys::RequestAddinShmemSpace(mem::mem_list_overflow_total_size());
+    // 5 lock sets (KV, hash, set, zset, list) × 8 even-dbs = 40 locks.
+    pg_sys::RequestNamedLWLockTranche(c"pg_redis_mem".as_ptr(), (mem::NUM_MEM_DBS * 5) as i32);
+}
+
+unsafe extern "C-unwind" fn pg_redis_shmem_startup() {
+    if let Some(prev) = PREV_SHMEM_STARTUP_HOOK {
+        prev();
+    }
+    let mut found = false;
+    let ctl: *mut mem::MemControlBlock = pg_sys::ShmemInitStruct(
+        c"pg_redis_ctl".as_ptr(),
+        mem::mem_ctl_size(),
+        &mut found,
+    )
+    .cast();
+
+    // Assign locks: 0..7=KV, 8..15=hash, 16..23=set, 24..31=zset, 32..39=list
+    let locks = pg_sys::GetNamedLWLockTranche(c"pg_redis_mem".as_ptr());
+    for i in 0..mem::NUM_MEM_DBS {
+        (*ctl).lwlock[i]      = std::ptr::addr_of_mut!((*locks.add(i)).lock);
+        (*ctl).hash_lwlock[i] = std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS + i)).lock);
+        (*ctl).set_lwlock[i]  = std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS * 2 + i)).lock);
+        (*ctl).zset_lwlock[i] = std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS * 3 + i)).lock);
+        (*ctl).list_lwlock[i] = std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS * 4 + i)).lock);
+    }
+
+    if !found {
+        // First time: create all 8 HTAB tables. ShmemInitHash with HASH_SHARED_MEM
+        // MUST be called from the postmaster startup path (here), not from bgworkers.
+        mem::mem_init_tables(ctl);
+    }
+    // On re-attach (found=true) the HTABs are already in shared memory; pointers
+    // stored in ctl are valid for all backends after this point.
+
+    SHMEM_CTL = ctl;
+}
+
+pub(crate) fn shmem_ctl() -> *mut mem::MemControlBlock {
+    unsafe { SHMEM_CTL }
+}
 
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
@@ -111,6 +198,38 @@ pub extern "C-unwind" fn _PG_init() {
         GucContext::Postmaster,
         GucFlags::default(),
     );
+
+    GucRegistry::define_string_guc(
+        c"redis.storage_mode",
+        c"Storage backend for even-numbered databases",
+        c"'auto' (default): use UNLOGGED PostgreSQL tables. 'memory': use shared-memory \
+          hash tables, bypassing SPI and transactions entirely. Data is lost on server \
+          restart. Requires restart to take effect.",
+        &STORAGE_MODE,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"redis.mem_max_entries",
+        c"Maximum keys per data type per even-numbered database in memory mode",
+        c"Controls the size of each shared-memory hash table. Larger values use more RAM \
+          (proportional). Default 16384. Requires server restart.",
+        &MEM_MAX_ENTRIES,
+        256,
+        1048576,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    if storage_mode() == StorageMode::Memory {
+        unsafe {
+            PREV_SHMEM_REQUEST_HOOK = pg_sys::shmem_request_hook;
+            pg_sys::shmem_request_hook = Some(pg_redis_shmem_request);
+            PREV_SHMEM_STARTUP_HOOK = pg_sys::shmem_startup_hook;
+            pg_sys::shmem_startup_hook = Some(pg_redis_shmem_startup);
+        }
+    }
 
     let my_db: pg_sys::Oid = unsafe { pg_sys::MyDatabaseId };
     let db_oid_datum = pg_sys::Datum::from(my_db);

@@ -22,6 +22,8 @@ pub(crate) static MAX_CONNECTIONS: GucSetting<i32> = GucSetting::<i32>::new(128)
 pub(crate) static PASSWORD: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
 pub(crate) static BATCH_SIZE: GucSetting<i32> = GucSetting::<i32>::new(64);
+pub(crate) static DATABASE: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"postgres"));
 
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
@@ -98,12 +100,26 @@ pub extern "C-unwind" fn _PG_init() {
         GucFlags::default(),
     );
 
+    GucRegistry::define_string_guc(
+        c"redis.database",
+        c"Database name for pg_redis workers",
+        c"Used when the extension is loaded via shared_preload_libraries, where no \
+          database is selected at startup. Workers connect to this database by name. \
+          Ignored when loaded via CREATE EXTENSION (workers use that database's OID). \
+          Default: 'postgres'.",
+        &DATABASE,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    let my_db: pg_sys::Oid = unsafe { pg_sys::MyDatabaseId };
+    let db_oid_datum = pg_sys::Datum::from(my_db);
     let n = NUM_WORKERS.get() as usize;
     for idx in 0..n {
         BackgroundWorkerBuilder::new(&format!("pg_redis worker {}", idx))
             .set_function("pg_redis_worker_main")
             .set_library("pg_redis")
-            .set_argument(None)
+            .set_argument(Some(db_oid_datum))
             .enable_spi_access()
             .set_start_time(BgWorkerStartTime::RecoveryFinished)
             .load();
@@ -112,20 +128,30 @@ pub extern "C-unwind" fn _PG_init() {
 
 #[pg_guard]
 #[no_mangle]
-pub extern "C-unwind" fn pg_redis_worker_main(_arg: pg_sys::Datum) {
-    worker::worker_main();
+pub extern "C-unwind" fn pg_redis_worker_main(arg: pg_sys::Datum) {
+    worker::worker_main(arg);
 }
 
 /// Add n additional pg_redis workers dynamically (no server restart required).
 /// Dynamic workers will not restart after being terminated.
 #[pg_extern(schema = "redis")]
 fn add_workers(n: i32) -> i32 {
+    let schema_exists =
+        Spi::get_one::<bool>("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'redis')")
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+    if !schema_exists {
+        error!("pg_redis is not installed in the current database");
+    }
+    let my_db: pg_sys::Oid = unsafe { pg_sys::MyDatabaseId };
+    let db_oid_datum = pg_sys::Datum::from(my_db);
     let mut added = 0i32;
     for _ in 0..n.max(0) {
         match BackgroundWorkerBuilder::new("pg_redis worker")
             .set_function("pg_redis_worker_main")
             .set_library("pg_redis")
-            .set_argument(None)
+            .set_argument(Some(db_oid_datum))
             .enable_spi_access()
             .set_start_time(BgWorkerStartTime::RecoveryFinished)
             .set_restart_time(None)

@@ -2737,7 +2737,7 @@ impl Command {
                        AND (SELECT s FROM nrm) <= (SELECT e FROM nrm) \
                      ORDER BY l.pos ASC \
                      OFFSET (SELECT s FROM nrm) \
-                     LIMIT (SELECT e - s + 1 FROM nrm)"
+                     LIMIT (SELECT GREATEST(0, e - s + 1) FROM nrm)"
                 );
                 match client.select(
                     &sql,
@@ -3596,7 +3596,7 @@ impl Command {
                            AND (SELECT s FROM nrm) <= (SELECT e FROM nrm) \
                          ORDER BY score ASC, member ASC \
                          OFFSET (SELECT s FROM nrm) \
-                         LIMIT (SELECT e - s + 1 FROM nrm) \
+                         LIMIT (SELECT GREATEST(0, e - s + 1) FROM nrm) \
                      ), \
                      d AS ( \
                          DELETE FROM redis.zset_{db} z USING victims v \
@@ -4818,7 +4818,7 @@ fn zrange_by_index(
            AND (SELECT s FROM nrm) <= (SELECT e FROM nrm) \
          ORDER BY score {order}, member {order} \
          OFFSET (SELECT s FROM nrm) \
-         LIMIT (SELECT e - s + 1 FROM nrm)"
+         LIMIT (SELECT GREATEST(0, e - s + 1) FROM nrm)"
     );
     zrange_collect(
         client,

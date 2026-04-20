@@ -3675,8 +3675,12 @@ impl Command {
 
         fn mem_ttl_response(db_idx: usize, key: &str, divisor: i64, relative: bool) -> Response {
             let (exists, exp_us) = unsafe { crate::mem::mem_ttl_raw(db_idx, key) };
-            if !exists { return Response::Integer(-2); }
-            if exp_us == 0 { return Response::Integer(-1); }
+            if !exists {
+                return Response::Integer(-2);
+            }
+            if exp_us == 0 {
+                return Response::Integer(-1);
+            }
             let value = if relative {
                 ((exp_us - now_micros()).max(-divisor) / divisor).max(-1)
             } else {
@@ -3705,9 +3709,7 @@ impl Command {
                 get,
                 keepttl,
             } => {
-                let expires_at_us = ex_ms
-                    .map(|ms| now_micros() + ms * 1000)
-                    .unwrap_or(0);
+                let expires_at_us = ex_ms.map(|ms| now_micros() + ms * 1000).unwrap_or(0);
 
                 unsafe {
                     if *nx {
@@ -3749,7 +3751,11 @@ impl Command {
                 }
             }
 
-            Command::SetEx { key, value, ex_secs } => {
+            Command::SetEx {
+                key,
+                value,
+                ex_secs,
+            } => {
                 let expires_at_us = now_micros() + ex_secs * 1_000_000;
                 unsafe { mem::mem_set(db_idx, key, value, expires_at_us) };
                 Response::Ok
@@ -3777,8 +3783,10 @@ impl Command {
                 if any_exists {
                     Response::Integer(0)
                 } else {
-                    let p: Vec<(&str, &str)> =
-                        pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                    let p: Vec<(&str, &str)> = pairs
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.as_str()))
+                        .collect();
                     unsafe { mem::mem_mset(db_idx, &p) };
                     Response::Integer(1)
                 }
@@ -3789,7 +3797,9 @@ impl Command {
                 for k in keys {
                     let kv = unsafe { mem::mem_del(db_idx, &[k.as_str()]) };
                     let sub = unsafe { mem::mem_del_all_types(db_idx, k) };
-                    if kv > 0 || sub > 0 { count += 1; }
+                    if kv > 0 || sub > 0 {
+                        count += 1;
+                    }
                 }
                 Response::Integer(count)
             }
@@ -3808,19 +3818,15 @@ impl Command {
                 Err(e) => Response::Error(e),
             },
 
-            Command::IncrBy { key, delta } => {
-                match unsafe { mem::mem_incr(db_idx, key, *delta) } {
-                    Ok(n) => Response::Integer(n),
-                    Err(e) => Response::Error(e),
-                }
-            }
+            Command::IncrBy { key, delta } => match unsafe { mem::mem_incr(db_idx, key, *delta) } {
+                Ok(n) => Response::Integer(n),
+                Err(e) => Response::Error(e),
+            },
 
-            Command::DecrBy { key, delta } => {
-                match unsafe { mem::mem_incr(db_idx, key, -delta) } {
-                    Ok(n) => Response::Integer(n),
-                    Err(e) => Response::Error(e),
-                }
-            }
+            Command::DecrBy { key, delta } => match unsafe { mem::mem_incr(db_idx, key, -delta) } {
+                Ok(n) => Response::Integer(n),
+                Err(e) => Response::Error(e),
+            },
 
             Command::IncrByFloat { key, delta } => {
                 match unsafe { mem::mem_incr_float(db_idx, key, *delta) } {
@@ -3833,9 +3839,7 @@ impl Command {
                 Response::Integer(unsafe { mem::mem_append(db_idx, key, value) })
             }
 
-            Command::Strlen { key } => {
-                Response::Integer(unsafe { mem::mem_strlen(db_idx, key) })
-            }
+            Command::Strlen { key } => Response::Integer(unsafe { mem::mem_strlen(db_idx, key) }),
 
             Command::GetDel { key } => match unsafe { mem::mem_getdel(db_idx, key) } {
                 Some(v) => Response::BulkString(v),
@@ -3850,9 +3854,9 @@ impl Command {
                 }
             }
 
-            Command::Ttl { key }         => mem_ttl_response(db_idx, key, 1_000_000, true),
-            Command::PTtl { key }        => mem_ttl_response(db_idx, key, 1_000, true),
-            Command::ExpireTime { key }  => mem_ttl_response(db_idx, key, 1_000_000, false),
+            Command::Ttl { key } => mem_ttl_response(db_idx, key, 1_000_000, true),
+            Command::PTtl { key } => mem_ttl_response(db_idx, key, 1_000, true),
+            Command::ExpireTime { key } => mem_ttl_response(db_idx, key, 1_000_000, false),
             Command::PExpireTime { key } => mem_ttl_response(db_idx, key, 1_000, false),
 
             Command::Expire { key, secs } => {
@@ -3881,16 +3885,14 @@ impl Command {
 
             Command::MGet { keys } => {
                 let results = unsafe { mem::mem_mget(db_idx, keys) };
-                Response::Array(
-                    results
-                        .into_iter()
-                        .collect(),
-                )
+                Response::Array(results.into_iter().collect())
             }
 
             Command::MSet { pairs } => {
-                let p: Vec<(&str, &str)> =
-                    pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                let p: Vec<(&str, &str)> = pairs
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
                 unsafe { mem::mem_mset(db_idx, &p) };
                 Response::Ok
             }
@@ -3900,10 +3902,7 @@ impl Command {
                 Response::Array(keys.into_iter().map(Some).collect())
             }
 
-            Command::Scan {
-                pattern,
-                ..
-            } => {
+            Command::Scan { pattern, .. } => {
                 let pat = pattern.as_deref().unwrap_or("*");
                 let keys = unsafe { mem::mem_scan(db_idx, pat) };
                 Response::ScanResult {
@@ -3939,7 +3938,9 @@ impl Command {
             Command::HSet { key, pairs } => {
                 let mut new_count = 0i64;
                 for (f, v) in pairs {
-                    if unsafe { mem::mem_hset(db_idx, key, f, v) } { new_count += 1; }
+                    if unsafe { mem::mem_hset(db_idx, key, f, v) } {
+                        new_count += 1;
+                    }
                 }
                 Response::Integer(new_count)
             }
@@ -3950,7 +3951,10 @@ impl Command {
             Command::HGetAll { key } => {
                 let pairs = unsafe { mem::mem_hgetall(db_idx, key) };
                 let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(pairs.len() * 2);
-                for (f, v) in pairs { out.push(Some(f.into_bytes())); out.push(Some(v)); }
+                for (f, v) in pairs {
+                    out.push(Some(f.into_bytes()));
+                    out.push(Some(v));
+                }
                 Response::Array(out)
             }
             Command::HDel { key, fields } => {
@@ -3973,7 +3977,9 @@ impl Command {
                 Response::Array(results.into_iter().collect())
             }
             Command::HMSet { key, pairs } => {
-                for (f, v) in pairs { unsafe { mem::mem_hset(db_idx, key, f, v) }; }
+                for (f, v) in pairs {
+                    unsafe { mem::mem_hset(db_idx, key, f, v) };
+                }
                 Response::Ok
             }
             Command::HIncrBy { key, field, delta } => {
@@ -4055,90 +4061,170 @@ impl Command {
             }
 
             // ── Sorted set commands ────────────────────────────────────────
-            Command::ZAdd { key, nx, xx, gt, lt, ch, incr, pairs } => {
+            Command::ZAdd {
+                key,
+                nx,
+                xx,
+                gt,
+                lt,
+                ch,
+                incr,
+                pairs,
+            } => {
                 if *incr {
                     let (delta, member) = &pairs[0];
-                    match unsafe { mem::mem_zadd_incr(db_idx, key, *delta, member, *nx, *xx, *gt, *lt) } {
+                    match unsafe {
+                        mem::mem_zadd_incr(db_idx, key, *delta, member, *nx, *xx, *gt, *lt)
+                    } {
                         Some(s) => Response::BulkString(format_score(s).into_bytes()),
                         None => Response::Null,
                     }
                 } else {
-                    let ps: Vec<(f64, &str)> = pairs.iter().map(|(s, m)| (*s, m.as_str())).collect();
-                    Response::Integer(unsafe { mem::mem_zadd(db_idx, key, &ps, *nx, *xx, *gt, *lt, *ch) })
+                    let ps: Vec<(f64, &str)> =
+                        pairs.iter().map(|(s, m)| (*s, m.as_str())).collect();
+                    Response::Integer(unsafe {
+                        mem::mem_zadd(db_idx, key, &ps, *nx, *xx, *gt, *lt, *ch)
+                    })
                 }
             }
             Command::ZRem { key, members } => {
                 Response::Integer(unsafe { mem::mem_zrem(db_idx, key, &strs(members)) })
             }
-            Command::ZScore { key, member } => match unsafe { mem::mem_zscore(db_idx, key, member) } {
-                Some(s) => Response::BulkString(format_score(s).into_bytes()),
-                None => Response::Null,
-            },
+            Command::ZScore { key, member } => {
+                match unsafe { mem::mem_zscore(db_idx, key, member) } {
+                    Some(s) => Response::BulkString(format_score(s).into_bytes()),
+                    None => Response::Null,
+                }
+            }
             Command::ZMScore { key, members } => {
                 let scores = unsafe { mem::mem_zmsmembers(db_idx, key, &strs(members)) };
-                Response::Array(scores.into_iter().map(|s| s.map(|v| format_score(v).into_bytes())).collect())
+                Response::Array(
+                    scores
+                        .into_iter()
+                        .map(|s| s.map(|v| format_score(v).into_bytes()))
+                        .collect(),
+                )
             }
-            Command::ZIncrBy { key, increment, member } => {
+            Command::ZIncrBy {
+                key,
+                increment,
+                member,
+            } => {
                 let s = unsafe { mem::mem_zincrby(db_idx, key, *increment, member) };
                 Response::BulkString(format_score(s).into_bytes())
             }
             Command::ZCard { key } => Response::Integer(unsafe { mem::mem_zcard(db_idx, key) }),
-            Command::ZCount { key, min, max } => {
-                Response::Integer(unsafe { mem::mem_zcount(db_idx, key, min.value, max.value, min.exclusive, max.exclusive) })
-            }
+            Command::ZCount { key, min, max } => Response::Integer(unsafe {
+                mem::mem_zcount(
+                    db_idx,
+                    key,
+                    min.value,
+                    max.value,
+                    min.exclusive,
+                    max.exclusive,
+                )
+            }),
             Command::ZLexCount { key, min, max } => {
                 Response::Integer(unsafe { mem::mem_zlexcount(db_idx, key, min, max) })
             }
-            Command::ZRank { key, member, rev, with_score } => {
-                match unsafe { mem::mem_zrank(db_idx, key, member, *rev) } {
-                    Some((rank, score)) => {
-                        if *with_score {
-                            let mut out: Vec<Option<Vec<u8>>> = vec![Some(rank.to_string().into_bytes())];
-                            if let Some(s) = score { out.push(Some(format_score(s).into_bytes())); }
-                            Response::Array(out)
-                        } else {
-                            Response::Integer(rank)
+            Command::ZRank {
+                key,
+                member,
+                rev,
+                with_score,
+            } => match unsafe { mem::mem_zrank(db_idx, key, member, *rev) } {
+                Some((rank, score)) => {
+                    if *with_score {
+                        let mut out: Vec<Option<Vec<u8>>> =
+                            vec![Some(rank.to_string().into_bytes())];
+                        if let Some(s) = score {
+                            out.push(Some(format_score(s).into_bytes()));
                         }
+                        Response::Array(out)
+                    } else {
+                        Response::Integer(rank)
                     }
-                    None => Response::Null,
                 }
-            }
-            Command::ZRange { key, start, stop, by, rev, limit, with_scores } => {
+                None => Response::Null,
+            },
+            Command::ZRange {
+                key,
+                start,
+                stop,
+                by,
+                rev,
+                limit,
+                with_scores,
+            } => {
                 use RangeBy;
                 match by {
                     RangeBy::Index => {
                         let s: i64 = start.parse().unwrap_or(0);
                         let e: i64 = stop.parse().unwrap_or(-1);
-                        let results = unsafe { mem::mem_zrange_by_index(db_idx, key, s, e, *rev, *with_scores) };
+                        let results = unsafe {
+                            mem::mem_zrange_by_index(db_idx, key, s, e, *rev, *with_scores)
+                        };
                         mem_zrange_response(results)
                     }
                     RangeBy::Score => {
                         let (min, max, ex_min, ex_max) = parse_score_range(start, stop);
-                        let results = unsafe { mem::mem_zrange_by_score(db_idx, key, min, max, ex_min, ex_max, *rev, *limit) };
+                        let results = unsafe {
+                            mem::mem_zrange_by_score(
+                                db_idx, key, min, max, ex_min, ex_max, *rev, *limit,
+                            )
+                        };
                         mem_zrange_response(results)
                     }
                     RangeBy::Lex => {
                         let min_b = parse_lex_bound_infallible(start);
                         let max_b = parse_lex_bound_infallible(stop);
-                        let results = unsafe { mem::mem_zrangebylex(db_idx, key, &min_b, &max_b, *rev, *limit) };
+                        let results = unsafe {
+                            mem::mem_zrangebylex(db_idx, key, &min_b, &max_b, *rev, *limit)
+                        };
                         Response::Array(results.into_iter().map(|b| Some(b)).collect())
                     }
                 }
             }
-            Command::ZRangeByScore { key, min, max, rev, with_scores, limit } => {
-                let results = unsafe { mem::mem_zrange_by_score(db_idx, key, min.value, max.value, min.exclusive, max.exclusive, *rev, *limit) };
+            Command::ZRangeByScore {
+                key,
+                min,
+                max,
+                rev,
+                with_scores,
+                limit,
+            } => {
+                let results = unsafe {
+                    mem::mem_zrange_by_score(
+                        db_idx,
+                        key,
+                        min.value,
+                        max.value,
+                        min.exclusive,
+                        max.exclusive,
+                        *rev,
+                        *limit,
+                    )
+                };
                 if *with_scores {
                     let mut out = Vec::new();
                     for (m, s) in results {
                         out.push(Some(m));
-                        if let Some(sc) = s { out.push(Some(format_score(sc).into_bytes())); }
+                        if let Some(sc) = s {
+                            out.push(Some(format_score(sc).into_bytes()));
+                        }
                     }
                     Response::Array(out)
                 } else {
                     Response::Array(results.into_iter().map(|(m, _)| Some(m)).collect())
                 }
             }
-            Command::ZRangeByLex { key, min, max, rev, limit } => {
+            Command::ZRangeByLex {
+                key,
+                min,
+                max,
+                rev,
+                limit,
+            } => {
                 let results = unsafe { mem::mem_zrangebylex(db_idx, key, min, max, *rev, *limit) };
                 Response::Array(results.into_iter().map(|b| Some(b)).collect())
             }
@@ -4149,7 +4235,10 @@ impl Command {
                     return Response::Array(vec![]);
                 }
                 let mut out = Vec::new();
-                for (m, s) in results { out.push(Some(m)); out.push(Some(format_score(s).into_bytes())); }
+                for (m, s) in results {
+                    out.push(Some(m));
+                    out.push(Some(format_score(s).into_bytes()));
+                }
                 Response::Array(out)
             }
             Command::ZPopMax { key, count } => {
@@ -4159,10 +4248,17 @@ impl Command {
                     return Response::Array(vec![]);
                 }
                 let mut out = Vec::new();
-                for (m, s) in results { out.push(Some(m)); out.push(Some(format_score(s).into_bytes())); }
+                for (m, s) in results {
+                    out.push(Some(m));
+                    out.push(Some(format_score(s).into_bytes()));
+                }
                 Response::Array(out)
             }
-            Command::ZRandMember { key, count, with_scores } => {
+            Command::ZRandMember {
+                key,
+                count,
+                with_scores,
+            } => {
                 let n = count.unwrap_or(1);
                 let results = unsafe { mem::mem_zrandmember(db_idx, key, n, *with_scores) };
                 if count.is_none() {
@@ -4172,7 +4268,12 @@ impl Command {
                     }
                 } else if *with_scores {
                     let mut out = Vec::new();
-                    for (m, s) in results { out.push(Some(m)); if let Some(sc) = s { out.push(Some(format_score(sc).into_bytes())); } }
+                    for (m, s) in results {
+                        out.push(Some(m));
+                        if let Some(sc) = s {
+                            out.push(Some(format_score(sc).into_bytes()));
+                        }
+                    }
                     Response::Array(out)
                 } else {
                     Response::Array(results.into_iter().map(|(m, _)| Some(m)).collect())
@@ -4181,24 +4282,50 @@ impl Command {
             Command::ZRemRangeByRank { key, start, stop } => {
                 Response::Integer(unsafe { mem::mem_zremrangebyrank(db_idx, key, *start, *stop) })
             }
-            Command::ZRemRangeByScore { key, min, max } => {
-                Response::Integer(unsafe { mem::mem_zremrangebyscore(db_idx, key, min.value, max.value, min.exclusive, max.exclusive) })
-            }
+            Command::ZRemRangeByScore { key, min, max } => Response::Integer(unsafe {
+                mem::mem_zremrangebyscore(
+                    db_idx,
+                    key,
+                    min.value,
+                    max.value,
+                    min.exclusive,
+                    max.exclusive,
+                )
+            }),
             Command::ZRemRangeByLex { key, min, max } => {
                 Response::Integer(unsafe { mem::mem_zremrangebylex(db_idx, key, min, max) })
             }
-            Command::ZUnionStore { dst, keys, weights, aggregate } => {
+            Command::ZUnionStore {
+                dst,
+                keys,
+                weights,
+                aggregate,
+            } => {
                 let ws: Vec<f64> = weights.as_deref().unwrap_or(&[]).to_vec();
-                Response::Integer(unsafe { mem::mem_zunionstore(db_idx, dst, &strs(keys), &ws, *aggregate) })
+                Response::Integer(unsafe {
+                    mem::mem_zunionstore(db_idx, dst, &strs(keys), &ws, *aggregate)
+                })
             }
-            Command::ZInterStore { dst, keys, weights, aggregate } => {
+            Command::ZInterStore {
+                dst,
+                keys,
+                weights,
+                aggregate,
+            } => {
                 let ws: Vec<f64> = weights.as_deref().unwrap_or(&[]).to_vec();
-                Response::Integer(unsafe { mem::mem_zinterstore(db_idx, dst, &strs(keys), &ws, *aggregate) })
+                Response::Integer(unsafe {
+                    mem::mem_zinterstore(db_idx, dst, &strs(keys), &ws, *aggregate)
+                })
             }
             Command::ZDiffStore { dst, keys } => {
                 Response::Integer(unsafe { mem::mem_zdiffstore(db_idx, dst, &strs(keys)) })
             }
-            Command::ZUnion { keys, weights, aggregate, with_scores } => {
+            Command::ZUnion {
+                keys,
+                weights,
+                aggregate,
+                with_scores,
+            } => {
                 let ws: Vec<f64> = weights.as_deref().unwrap_or(&[]).to_vec();
                 let tmp_dst = "__mem_zunion_tmp__";
                 unsafe { mem::mem_zunionstore(db_idx, tmp_dst, &strs(keys), &ws, *aggregate) };
@@ -4206,13 +4333,26 @@ impl Command {
                 unsafe { mem::mem_del_zset_key(db_idx, tmp_dst) };
                 if *with_scores {
                     let mut out = Vec::new();
-                    for (m, s) in htab_results { out.push(Some(m.into_bytes())); out.push(Some(format_score(s).into_bytes())); }
+                    for (m, s) in htab_results {
+                        out.push(Some(m.into_bytes()));
+                        out.push(Some(format_score(s).into_bytes()));
+                    }
                     Response::Array(out)
                 } else {
-                    Response::Array(htab_results.into_iter().map(|(m, _)| Some(m.into_bytes())).collect())
+                    Response::Array(
+                        htab_results
+                            .into_iter()
+                            .map(|(m, _)| Some(m.into_bytes()))
+                            .collect(),
+                    )
                 }
             }
-            Command::ZInter { keys, weights, aggregate, with_scores } => {
+            Command::ZInter {
+                keys,
+                weights,
+                aggregate,
+                with_scores,
+            } => {
                 let ws: Vec<f64> = weights.as_deref().unwrap_or(&[]).to_vec();
                 let tmp_dst = "__mem_zinter_tmp__";
                 unsafe { mem::mem_zinterstore(db_idx, tmp_dst, &strs(keys), &ws, *aggregate) };
@@ -4220,10 +4360,18 @@ impl Command {
                 unsafe { mem::mem_del_zset_key(db_idx, tmp_dst) };
                 if *with_scores {
                     let mut out = Vec::new();
-                    for (m, s) in htab_results { out.push(Some(m.into_bytes())); out.push(Some(format_score(s).into_bytes())); }
+                    for (m, s) in htab_results {
+                        out.push(Some(m.into_bytes()));
+                        out.push(Some(format_score(s).into_bytes()));
+                    }
                     Response::Array(out)
                 } else {
-                    Response::Array(htab_results.into_iter().map(|(m, _)| Some(m.into_bytes())).collect())
+                    Response::Array(
+                        htab_results
+                            .into_iter()
+                            .map(|(m, _)| Some(m.into_bytes()))
+                            .collect(),
+                    )
                 }
             }
             Command::ZDiff { keys, with_scores } => {
@@ -4233,10 +4381,18 @@ impl Command {
                 unsafe { mem::mem_del_zset_key(db_idx, tmp_dst) };
                 if *with_scores {
                     let mut out = Vec::new();
-                    for (m, s) in htab_results { out.push(Some(m.into_bytes())); out.push(Some(format_score(s).into_bytes())); }
+                    for (m, s) in htab_results {
+                        out.push(Some(m.into_bytes()));
+                        out.push(Some(format_score(s).into_bytes()));
+                    }
                     Response::Array(out)
                 } else {
-                    Response::Array(htab_results.into_iter().map(|(m, _)| Some(m.into_bytes())).collect())
+                    Response::Array(
+                        htab_results
+                            .into_iter()
+                            .map(|(m, _)| Some(m.into_bytes()))
+                            .collect(),
+                    )
                 }
             }
 
@@ -4284,7 +4440,8 @@ impl Command {
                 let items = unsafe { mem::mem_lrange(db_idx, key, *start, *stop) };
                 Response::Array(items.into_iter().map(Some).collect())
             }
-            Command::LIndex { key, index } => match unsafe { mem::mem_lindex(db_idx, key, *index) } {
+            Command::LIndex { key, index } => match unsafe { mem::mem_lindex(db_idx, key, *index) }
+            {
                 Some(v) => Response::BulkString(v),
                 None => Response::Null,
             },
@@ -4302,13 +4459,21 @@ impl Command {
                 unsafe { mem::mem_ltrim(db_idx, key, *start, *stop) };
                 Response::Ok
             }
-            Command::LMove { src, dst, src_left, dst_left } => {
-                match unsafe { mem::mem_lmove(db_idx, src, dst, *src_left, *dst_left) } {
-                    Some(v) => Response::BulkString(v),
-                    None => Response::Null,
-                }
-            }
-            Command::LPos { key, element, rank, count } => {
+            Command::LMove {
+                src,
+                dst,
+                src_left,
+                dst_left,
+            } => match unsafe { mem::mem_lmove(db_idx, src, dst, *src_left, *dst_left) } {
+                Some(v) => Response::BulkString(v),
+                None => Response::Null,
+            },
+            Command::LPos {
+                key,
+                element,
+                rank,
+                count,
+            } => {
                 let r = rank.unwrap_or(1);
                 let positions = unsafe { mem::mem_lpos(db_idx, key, element, r, *count) };
                 if count.is_none() {
@@ -4340,7 +4505,9 @@ fn mem_zrange_response(results: Vec<(Vec<u8>, Option<f64>)>) -> Response {
         let mut out = Vec::new();
         for (m, s) in results {
             out.push(Some(m));
-            if let Some(sc) = s { out.push(Some(format_score(sc).into_bytes())); }
+            if let Some(sc) = s {
+                out.push(Some(format_score(sc).into_bytes()));
+            }
         }
         Response::Array(out)
     } else {
@@ -4366,11 +4533,17 @@ fn parse_score_range(start: &str, stop: &str) -> (f64, f64, bool, bool) {
 }
 
 fn parse_lex_bound_infallible(s: &str) -> LexBound {
-    if s == "-" { LexBound::NegInf }
-    else if s == "+" { LexBound::PosInf }
-    else if let Some(rest) = s.strip_prefix('[') { LexBound::Inclusive(rest.to_string()) }
-    else if let Some(rest) = s.strip_prefix('(') { LexBound::Exclusive(rest.to_string()) }
-    else { LexBound::Inclusive(s.to_string()) }
+    if s == "-" {
+        LexBound::NegInf
+    } else if s == "+" {
+        LexBound::PosInf
+    } else if let Some(rest) = s.strip_prefix('[') {
+        LexBound::Inclusive(rest.to_string())
+    } else if let Some(rest) = s.strip_prefix('(') {
+        LexBound::Exclusive(rest.to_string())
+    } else {
+        LexBound::Inclusive(s.to_string())
+    }
 }
 
 fn now_micros() -> i64 {

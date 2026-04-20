@@ -38,11 +38,7 @@ pub enum StorageMode {
 }
 
 pub fn storage_mode() -> StorageMode {
-    match STORAGE_MODE
-        .get()
-        .as_deref()
-        .and_then(|s| s.to_str().ok())
-    {
+    match STORAGE_MODE.get().as_deref().and_then(|s| s.to_str().ok()) {
         Some("memory") => StorageMode::Memory,
         _ => StorageMode::Auto,
     }
@@ -80,19 +76,15 @@ unsafe extern "C-unwind" fn pg_redis_shmem_startup() {
         prev();
     }
     let mut found = false;
-    let ctl: *mut mem::MemControlBlock = pg_sys::ShmemInitStruct(
-        c"pg_redis_ctl".as_ptr(),
-        mem::mem_ctl_size(),
-        &mut found,
-    )
-    .cast();
+    let ctl: *mut mem::MemControlBlock =
+        pg_sys::ShmemInitStruct(c"pg_redis_ctl".as_ptr(), mem::mem_ctl_size(), &mut found).cast();
 
     // Assign locks: 0..7=KV, 8..15=hash, 16..23=set, 24..31=zset, 32..39=list
     let locks = pg_sys::GetNamedLWLockTranche(c"pg_redis_mem".as_ptr());
     for i in 0..mem::NUM_MEM_DBS {
-        (*ctl).lwlock[i]      = std::ptr::addr_of_mut!((*locks.add(i)).lock);
+        (*ctl).lwlock[i] = std::ptr::addr_of_mut!((*locks.add(i)).lock);
         (*ctl).hash_lwlock[i] = std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS + i)).lock);
-        (*ctl).set_lwlock[i]  = std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS * 2 + i)).lock);
+        (*ctl).set_lwlock[i] = std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS * 2 + i)).lock);
         (*ctl).zset_lwlock[i] = std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS * 3 + i)).lock);
         (*ctl).list_lwlock[i] = std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS * 4 + i)).lock);
     }

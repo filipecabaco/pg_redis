@@ -101,7 +101,10 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                         unsafe {
                             pg_sys::CurrentMemoryContext = pg_sys::TopMemoryContext;
                         }
-                        batch.iter().map(|(cmd, db, _)| cmd.execute_mem(*db)).collect()
+                        batch
+                            .iter()
+                            .map(|(cmd, db, _)| cmd.execute_mem(*db))
+                            .collect()
                     } else {
                         BackgroundWorker::transaction(|| {
                             Spi::connect_mut(|client| {

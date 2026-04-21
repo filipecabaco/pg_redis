@@ -23,7 +23,7 @@ jobs:
         id: current
         run: |
           set -euo pipefail
-          VERSION=$(grep '^  CARGO_PGRX_VERSION:' .github/workflows/ci.yml | sed 's/.*: "//' | tr -d '"')
+          VERSION=$(yq '.env.CARGO_PGRX_VERSION' .github/workflows/ci.yml)
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "ERROR: could not parse current pgrx version from ci.yml (got: '$VERSION')" >&2
             exit 1
@@ -44,7 +44,7 @@ jobs:
           fi
           echo "version=$LATEST" >> "$GITHUB_OUTPUT"
 
-      - name: Check for existing PR or branch
+      - name: Check for existing PR
         id: existing
         if: steps.latest.outputs.version != steps.current.outputs.version
         env:
@@ -53,35 +53,44 @@ jobs:
         run: |
           set -euo pipefail
           BRANCH="update-pgrx-${NEW}"
-          # Check open AND merged/closed PRs to avoid re-opening for an already-handled version
           PR=$(gh pr list --head "$BRANCH" --state all --json number --jq '.[0].number // empty')
           echo "pr=$PR" >> "$GITHUB_OUTPUT"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
 
+      - name: Gate
+        id: gate
+        env:
+          LATEST: ${{ steps.latest.outputs.version }}
+          CURRENT: ${{ steps.current.outputs.version }}
+          PR: ${{ steps.existing.outputs.pr }}
+        run: |
+          if [[ "$LATEST" != "$CURRENT" && -z "$PR" ]]; then
+            echo "should_update=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install Rust toolchain
-        if: steps.latest.outputs.version != steps.current.outputs.version && steps.existing.outputs.pr == ''
+        if: steps.gate.outputs.should_update == 'true'
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: stable
 
       - name: Update pgrx version in files
-        if: steps.latest.outputs.version != steps.current.outputs.version && steps.existing.outputs.pr == ''
+        if: steps.gate.outputs.should_update == 'true'
         env:
           OLD: ${{ steps.current.outputs.version }}
           NEW: ${{ steps.latest.outputs.version }}
         run: |
           set -euo pipefail
 
-          # Use | as sed delimiter to avoid conflicts with version dots
+          # | delimiter avoids misreading dots in version strings as regex wildcards
           sed -i "s|CARGO_PGRX_VERSION: \"${OLD}\"|CARGO_PGRX_VERSION: \"${NEW}\"|" .github/workflows/ci.yml
           sed -i "s|pgrx = \"=${OLD}\"|pgrx = \"=${NEW}\"|" Cargo.toml
           sed -i "s|pgrx-tests = \"=${OLD}\"|pgrx-tests = \"=${NEW}\"|" Cargo.toml
 
-          # Cargo.toml already pins the new version; update the lock file to match
-          cargo update -p pgrx -p pgrx-tests
+          cargo update -p pgrx -p pgrx-tests --precise "${NEW}"
 
       - name: Open pull request
-        if: steps.latest.outputs.version != steps.current.outputs.version && steps.existing.outputs.pr == ''
+        if: steps.gate.outputs.should_update == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           OLD: ${{ steps.current.outputs.version }}
@@ -109,7 +118,3 @@ Changes:
 CI will run the full test matrix (pg15, pg16, pg17) automatically." \
             --base main \
             --head "$BRANCH"
-
-      - name: Already up to date
-        if: steps.latest.outputs.version == steps.current.outputs.version
-        run: echo "pgrx is already at the latest version (${{ steps.current.outputs.version }})"

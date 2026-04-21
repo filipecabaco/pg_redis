@@ -4854,11 +4854,7 @@ fn parse_score_value(s: &str) -> Option<f64> {
         "-inf" | "-infinity" => Some(f64::NEG_INFINITY),
         _ => {
             let v: f64 = s.parse().ok()?;
-            if v.is_nan() {
-                None
-            } else {
-                Some(v)
-            }
+            if v.is_nan() { None } else { Some(v) }
         }
     }
 }
@@ -5308,18 +5304,10 @@ fn format_score(s: f64) -> String {
 }
 
 fn score_ge_op(b: &ScoreBound) -> &'static str {
-    if b.exclusive {
-        ">"
-    } else {
-        ">="
-    }
+    if b.exclusive { ">" } else { ">=" }
 }
 fn score_le_op(b: &ScoreBound) -> &'static str {
-    if b.exclusive {
-        "<"
-    } else {
-        "<="
-    }
+    if b.exclusive { "<" } else { "<=" }
 }
 
 /// Build the lex `AND member ...` where-clause fragment plus the string

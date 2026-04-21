@@ -1549,3 +1549,190 @@ describe("Transactions", () => {
 		expect(results).toEqual([]);
 	});
 });
+
+describe("Pub/Sub table routing", () => {
+	const ROUTE_TABLE = "pg_redis_e2e_route_test";
+
+	beforeAll(async () => {
+		await sql`DROP TABLE IF EXISTS public.${sql.unsafe(ROUTE_TABLE)}`;
+		await sql`SELECT redis.create_pubsub_table('public', ${ROUTE_TABLE})`;
+		await sql`SELECT redis.route_publish('e2e-route-ch', 'public', ${ROUTE_TABLE})`;
+	});
+
+	afterAll(async () => {
+		await sql`SELECT redis.unroute_publish('e2e-route-ch')`;
+		await sql`DROP TABLE IF EXISTS public.${sql.unsafe(ROUTE_TABLE)}`;
+	});
+
+	test("PUBLISH to routed channel inserts a row in the target table", async () => {
+		await client.send("PUBLISH", ["e2e-route-ch", "hello-world"]);
+		// Give the BGW dispatcher time to process the fire-and-forget INSERT
+		await Bun.sleep(500);
+		const rows =
+			await sql`SELECT channel, payload FROM public.${sql.unsafe(ROUTE_TABLE)} WHERE channel = 'e2e-route-ch'`;
+		expect(rows.length).toBeGreaterThanOrEqual(1);
+		expect(rows[0].payload).toBe("hello-world");
+	});
+
+	test("PUBLISH to unrouted channel does not insert a row", async () => {
+		const before =
+			await sql`SELECT count(*) AS n FROM public.${sql.unsafe(ROUTE_TABLE)}`;
+		await client.send("PUBLISH", ["no-route-ch", "ignored"]);
+		await Bun.sleep(300);
+		const after =
+			await sql`SELECT count(*) AS n FROM public.${sql.unsafe(ROUTE_TABLE)}`;
+		expect(Number(after[0].n)).toBe(Number(before[0].n));
+	});
+
+	test("unroute_publish stops future inserts", async () => {
+		const TABLE2 = "pg_redis_e2e_route_test2";
+		await sql`DROP TABLE IF EXISTS public.${sql.unsafe(TABLE2)}`;
+		await sql`SELECT redis.create_pubsub_table('public', ${TABLE2})`;
+		await sql`SELECT redis.route_publish('e2e-tmp-ch', 'public', ${TABLE2})`;
+		await sql`SELECT redis.unroute_publish('e2e-tmp-ch')`;
+		await client.send("PUBLISH", ["e2e-tmp-ch", "should-not-appear"]);
+		await Bun.sleep(300);
+		const rows =
+			await sql`SELECT count(*) AS n FROM public.${sql.unsafe(TABLE2)}`;
+		expect(Number(rows[0].n)).toBe(0);
+		await sql`DROP TABLE IF EXISTS public.${sql.unsafe(TABLE2)}`;
+	});
+});
+
+describe("Pub/Sub multi-channel persistency", () => {
+	const ORDERS_TABLE = "pubsub_e2e_orders";
+	const ALERTS_TABLE = "pubsub_e2e_alerts";
+	const AUDIT_TABLE = "pubsub_e2e_audit";
+
+	beforeAll(async () => {
+		await sql`DROP TABLE IF EXISTS public.${sql.unsafe(ORDERS_TABLE)}`;
+		await sql`DROP TABLE IF EXISTS public.${sql.unsafe(ALERTS_TABLE)}`;
+		await sql`DROP TABLE IF EXISTS public.${sql.unsafe(AUDIT_TABLE)}`;
+
+		await sql`SELECT redis.create_pubsub_table('public', ${ORDERS_TABLE})`;
+		await sql`SELECT redis.create_pubsub_table('public', ${ALERTS_TABLE})`;
+		await sql`SELECT redis.create_pubsub_table('public', ${AUDIT_TABLE})`;
+
+		// orders channel → orders table (dedicated)
+		await sql`SELECT redis.route_publish('orders', 'public', ${ORDERS_TABLE})`;
+		// alerts channel → alerts table (dedicated)
+		await sql`SELECT redis.route_publish('alerts', 'public', ${ALERTS_TABLE})`;
+		// two channels sharing the same audit table
+		await sql`SELECT redis.route_publish('user.created', 'public', ${AUDIT_TABLE})`;
+		await sql`SELECT redis.route_publish('user.deleted', 'public', ${AUDIT_TABLE})`;
+	});
+
+	afterAll(async () => {
+		await sql`SELECT redis.unroute_publish('orders')`;
+		await sql`SELECT redis.unroute_publish('alerts')`;
+		await sql`SELECT redis.unroute_publish('user.created')`;
+		await sql`SELECT redis.unroute_publish('user.deleted')`;
+		await sql`DROP TABLE IF EXISTS public.${sql.unsafe(ORDERS_TABLE)}`;
+		await sql`DROP TABLE IF EXISTS public.${sql.unsafe(ALERTS_TABLE)}`;
+		await sql`DROP TABLE IF EXISTS public.${sql.unsafe(AUDIT_TABLE)}`;
+	});
+
+	test("each channel routes only to its own dedicated table", async () => {
+		await client.send("PUBLISH", ["orders", "order-123"]);
+		await client.send("PUBLISH", ["alerts", "alert-456"]);
+		await Bun.sleep(500);
+
+		const orderRows =
+			await sql`SELECT channel, payload FROM public.${sql.unsafe(ORDERS_TABLE)}`;
+		const alertRows =
+			await sql`SELECT channel, payload FROM public.${sql.unsafe(ALERTS_TABLE)}`;
+
+		expect(orderRows.length).toBe(1);
+		expect(orderRows[0].channel).toBe("orders");
+		expect(orderRows[0].payload).toBe("order-123");
+
+		expect(alertRows.length).toBe(1);
+		expect(alertRows[0].channel).toBe("alerts");
+		expect(alertRows[0].payload).toBe("alert-456");
+
+		// cross-contamination check: orders payload must not appear in alerts table
+		const crossCheck =
+			await sql`SELECT count(*) AS n FROM public.${sql.unsafe(ALERTS_TABLE)} WHERE channel = 'orders'`;
+		expect(Number(crossCheck[0].n)).toBe(0);
+	});
+
+	test("multiple messages on the same channel all persist in order", async () => {
+		await client.send("PUBLISH", ["orders", "order-A"]);
+		await client.send("PUBLISH", ["orders", "order-B"]);
+		await client.send("PUBLISH", ["orders", "order-C"]);
+		await Bun.sleep(500);
+
+		const rows =
+			await sql`SELECT payload FROM public.${sql.unsafe(ORDERS_TABLE)} WHERE channel = 'orders' ORDER BY inserted_at, id`;
+		const payloads = rows.map((r: { payload: string }) => r.payload);
+		expect(payloads).toContain("order-A");
+		expect(payloads).toContain("order-B");
+		expect(payloads).toContain("order-C");
+	});
+
+	test("two channels routing to the same table both write rows with correct channel labels", async () => {
+		await client.send("PUBLISH", ["user.created", "user-1"]);
+		await client.send("PUBLISH", ["user.deleted", "user-2"]);
+		await client.send("PUBLISH", ["user.created", "user-3"]);
+		await Bun.sleep(500);
+
+		const createdRows =
+			await sql`SELECT payload FROM public.${sql.unsafe(AUDIT_TABLE)} WHERE channel = 'user.created' ORDER BY inserted_at, id`;
+		const deletedRows =
+			await sql`SELECT payload FROM public.${sql.unsafe(AUDIT_TABLE)} WHERE channel = 'user.deleted' ORDER BY inserted_at, id`;
+
+		expect(createdRows.length).toBe(2);
+		expect(createdRows[0].payload).toBe("user-1");
+		expect(createdRows[1].payload).toBe("user-3");
+
+		expect(deletedRows.length).toBe(1);
+		expect(deletedRows[0].payload).toBe("user-2");
+
+		const total =
+			await sql`SELECT count(*) AS n FROM public.${sql.unsafe(AUDIT_TABLE)}`;
+		expect(Number(total[0].n)).toBe(3);
+	});
+
+	test("unrouted channel does not pollute any persistence table", async () => {
+		const before = {
+			orders: Number(
+				(
+					await sql`SELECT count(*) AS n FROM public.${sql.unsafe(ORDERS_TABLE)}`
+				)[0].n,
+			),
+			alerts: Number(
+				(
+					await sql`SELECT count(*) AS n FROM public.${sql.unsafe(ALERTS_TABLE)}`
+				)[0].n,
+			),
+			audit: Number(
+				(
+					await sql`SELECT count(*) AS n FROM public.${sql.unsafe(AUDIT_TABLE)}`
+				)[0].n,
+			),
+		};
+
+		await client.send("PUBLISH", ["unregistered.channel", "ghost-message"]);
+		await Bun.sleep(300);
+
+		const ordersAfter = Number(
+			(
+				await sql`SELECT count(*) AS n FROM public.${sql.unsafe(ORDERS_TABLE)}`
+			)[0].n,
+		);
+		const alertsAfter = Number(
+			(
+				await sql`SELECT count(*) AS n FROM public.${sql.unsafe(ALERTS_TABLE)}`
+			)[0].n,
+		);
+		const auditAfter = Number(
+			(
+				await sql`SELECT count(*) AS n FROM public.${sql.unsafe(AUDIT_TABLE)}`
+			)[0].n,
+		);
+
+		expect(ordersAfter).toBe(before.orders);
+		expect(alertsAfter).toBe(before.alerts);
+		expect(auditAfter).toBe(before.audit);
+	});
+});

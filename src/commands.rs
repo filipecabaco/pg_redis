@@ -749,6 +749,14 @@ pub enum Command {
     },
     PubSubNumPat,
     PubSubHelp,
+    // Internal: dispatched fire-and-forget when a PUBLISH channel has a table route.
+    // Never parsed from the wire protocol.
+    TablePublish {
+        schema: Vec<u8>,
+        table: Vec<u8>,
+        channel: Vec<u8>,
+        payload: Vec<u8>,
+    },
 
     Multi,
     Exec,
@@ -3744,6 +3752,24 @@ impl Command {
             Command::ZDiffStore { dst, keys } => {
                 zaggregate_execute(client, db, keys, None, ZAggregateOptions { aggregate: Aggregate::Sum, with_scores: false, op: AggOp::Diff, store_into: Some(dst) })
             }
+            Command::TablePublish { schema, table, channel, payload } => {
+                let schema_str = String::from_utf8_lossy(schema);
+                let table_str = String::from_utf8_lossy(table);
+                let sql = format!(
+                    "INSERT INTO {}.{} (channel, payload) VALUES ($1, $2)",
+                    pg_quote_ident(&schema_str),
+                    pg_quote_ident(&table_str),
+                );
+                let ch = String::from_utf8_lossy(channel);
+                let pl = String::from_utf8_lossy(payload);
+                match client.update(&sql, None, &[ch.as_ref().into(), pl.as_ref().into()]) {
+                    Ok(_) => Response::Null,
+                    Err(e) => {
+                        pgrx::warning!("pg_redis: table publish failed: {e}");
+                        Response::Null
+                    }
+                }
+            }
             Command::Multi | Command::Exec | Command::Discard | Command::Watch { .. }
             | Command::Unwatch
             | Command::Subscribe { .. }
@@ -4601,6 +4627,7 @@ impl Command {
             }
 
             // LInsert is rare and positional — fall back to SPI.
+            // TablePublish also falls back: it always needs SPI regardless of storage mode.
             // Any truly unhandled commands also fall back.
             _ => {
                 use pgrx::bgworkers::BackgroundWorker;
@@ -4693,6 +4720,10 @@ fn mem_zrange_response(results: Vec<(Vec<u8>, Option<f64>)>) -> Response {
     } else {
         Response::Array(results.into_iter().map(|(m, _)| Some(m)).collect())
     }
+}
+
+fn pg_quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 fn parse_score_range(start: &str, stop: &str) -> (f64, f64, bool, bool) {

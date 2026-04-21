@@ -18,6 +18,7 @@ type PendingBatch = Option<(Vec<(Command, u8)>, mpsc::SyncSender<Vec<Response>>)
 enum DispatchMsg {
     Cmd(Command, u8, mpsc::SyncSender<Response>),
     Batch(Vec<(Command, u8)>, mpsc::SyncSender<Vec<Response>>),
+    FireAndForget(Command, u8),
 }
 
 const QUEUE_LIMIT: usize = 10_000;
@@ -45,6 +46,47 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                 pg_sys::CurrentMemoryContext = pg_sys::TopMemoryContext;
                 crate::mem::mem_init_worker(ctl);
             }
+        }
+    }
+
+    // Load persisted routes into shared memory. Only the first BGW to win the CAS does the load;
+    // others skip (routes are already in shared memory).
+    if let Some(route_ctl) = crate::route_state() {
+        use std::sync::atomic::Ordering;
+        let init = unsafe { &(*route_ctl).initialised };
+        if init
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            BackgroundWorker::transaction(|| {
+                Spi::connect(|client| {
+                    match client.select(
+                        "SELECT channel, schema, tbl FROM redis.pubsub_routes",
+                        None,
+                        &[],
+                    ) {
+                        Ok(rows) => {
+                            for row in rows {
+                                let ch: Option<String> = row.get(1).unwrap_or(None);
+                                let sc: Option<String> = row.get(2).unwrap_or(None);
+                                let tb: Option<String> = row.get(3).unwrap_or(None);
+                                if let (Some(ch), Some(sc), Some(tb)) = (ch, sc, tb) {
+                                    unsafe {
+                                        crate::pubsub::route_add(
+                                            route_ctl,
+                                            ch.as_bytes(),
+                                            sc.as_bytes(),
+                                            tb.as_bytes(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => pgrx::warning!("pg_redis: failed to load routes: {e}"),
+                    }
+                })
+            });
+            init.store(2, Ordering::Release);
         }
     }
 
@@ -84,6 +126,9 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
         }
         match cmd_rx.recv_timeout(Duration::from_millis(250)) {
             Ok(first) => match first {
+                DispatchMsg::FireAndForget(cmd, db) => {
+                    run_dispatch_batch(&[(cmd, db)], mem_mode, &version_map);
+                }
                 DispatchMsg::Batch(cmds, resp_tx) => {
                     let responses = run_dispatch_batch(&cmds, mem_mode, &version_map);
                     resp_tx.send(responses).ok();
@@ -91,6 +136,7 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                 DispatchMsg::Cmd(first_cmd, first_db, first_resp_tx) => {
                     let mut cmds: Vec<(Command, u8)> = Vec::with_capacity(batch_size);
                     let mut txs: Vec<mpsc::SyncSender<Response>> = Vec::with_capacity(batch_size);
+                    let mut faf_cmds: Vec<(Command, u8)> = Vec::new();
                     let mut pending_batch: PendingBatch = None;
 
                     cmds.push((first_cmd, first_db));
@@ -106,6 +152,9 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                                 pending_batch = Some((batch_cmds, batch_tx));
                                 break;
                             }
+                            Ok(DispatchMsg::FireAndForget(c, d)) => {
+                                faf_cmds.push((c, d));
+                            }
                             Err(_) => break,
                         }
                     }
@@ -113,6 +162,10 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                     let responses = run_dispatch_batch(&cmds, mem_mode, &version_map);
                     for (tx, resp) in txs.into_iter().zip(responses) {
                         tx.send(resp).ok();
+                    }
+
+                    if !faf_cmds.is_empty() {
+                        run_dispatch_batch(&faf_cmds, mem_mode, &version_map);
                     }
 
                     if let Some((batch_cmds, batch_tx)) = pending_batch {
@@ -161,7 +214,10 @@ fn run_dispatch_batch(
     mem_mode: bool,
     version_map: &VersionMap,
 ) -> Vec<Response> {
-    let all_mem = mem_mode && cmds.iter().all(|(_, db)| db % 2 == 0);
+    let all_mem = mem_mode
+        && cmds
+            .iter()
+            .all(|(cmd, db)| db % 2 == 0 && !matches!(cmd, Command::TablePublish { .. }));
     let responses: Vec<Response> = if all_mem {
         unsafe {
             pg_sys::CurrentMemoryContext = pg_sys::TopMemoryContext;
@@ -629,6 +685,20 @@ fn conn_loop(
                 }),
                 Some((ctl, slots)) => {
                     let n = unsafe { crate::pubsub::publish(ctl, slots, channel, message) };
+                    if let Some(route_ctl) = crate::route_state()
+                        && let Some((schema, table)) =
+                            unsafe { crate::pubsub::route_lookup(route_ctl, channel) }
+                    {
+                        let cmd = Command::TablePublish {
+                            schema,
+                            table,
+                            channel: channel.to_vec(),
+                            payload: message.to_vec(),
+                        };
+                        if cmd_tx.try_send(DispatchMsg::FireAndForget(cmd, 0)).is_err() {
+                            eprintln!("pg_redis: route publish dropped — dispatcher queue full");
+                        }
+                    }
                     reply(&mut writer, |w| write_integer(w, n));
                 }
             },
@@ -1066,6 +1136,7 @@ mod tests {
                         let responses = cmds.iter().map(|_| Response::Ok).collect();
                         resp_tx.send(responses).ok();
                     }
+                    DispatchMsg::FireAndForget(..) => {}
                 }
             }
         });

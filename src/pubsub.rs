@@ -6,6 +6,54 @@ pub const MAX_SUBS_PER_SLOT: usize = 16;
 pub const PUBSUB_MSG_LEN: usize = 128;
 pub const CHAN_LEN: usize = 64;
 
+pub const MAX_ROUTES: usize = 64;
+pub const ROUTE_SCHEMA_LEN: usize = 64;
+pub const ROUTE_TABLE_LEN: usize = 64;
+
+#[repr(C, align(8))]
+pub struct RouteEntry {
+    pub channel: [u8; CHAN_LEN],
+    pub channel_len: u16,
+    pub schema: [u8; ROUTE_SCHEMA_LEN],
+    pub schema_len: u16,
+    pub table: [u8; ROUTE_TABLE_LEN],
+    pub table_len: u16,
+    pub active: u8,
+    pub _pad: u8,
+}
+
+#[repr(C, align(8))]
+pub struct RouteCtl {
+    pub lock: AtomicU8,
+    pub initialised: AtomicU8,
+    pub route_count: AtomicU8,
+    pub _pad: [u8; 5],
+    pub entries: [RouteEntry; MAX_ROUTES],
+}
+
+pub fn route_ctl_size() -> usize {
+    std::mem::size_of::<RouteCtl>()
+}
+
+// Works on any *mut T where T has a `lock: AtomicU8` field.
+macro_rules! acquire_lock {
+    ($ctl:expr) => {
+        while (*$ctl)
+            .lock
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            std::hint::spin_loop();
+        }
+    };
+}
+
+macro_rules! release_lock {
+    ($ctl:expr) => {
+        (*$ctl).lock.store(0, Ordering::Release);
+    };
+}
+
 /// Header block: global spinlock protecting subscription map changes and PUBLISH scans.
 /// AtomicU8 CAS works correctly across Postgres BGW processes sharing this physical memory
 /// page — no pg_sys calls required, safe from any thread.
@@ -53,18 +101,104 @@ pub fn pubsub_slots_size() -> usize {
 
 unsafe fn spin_acquire(ctl: *mut PubsubCtl) {
     unsafe {
-        while (*ctl)
-            .lock
-            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            std::hint::spin_loop();
-        }
+        acquire_lock!(ctl);
     }
 }
 
 unsafe fn spin_release(ctl: *mut PubsubCtl) {
-    unsafe { (*ctl).lock.store(0, Ordering::Release) }
+    unsafe {
+        release_lock!(ctl);
+    }
+}
+
+pub unsafe fn route_add(ctl: *mut RouteCtl, channel: &[u8], schema: &[u8], table: &[u8]) -> bool {
+    unsafe {
+        let ch_len = channel.len().min(CHAN_LEN - 1);
+        let sc_len = schema.len().min(ROUTE_SCHEMA_LEN - 1);
+        let tb_len = table.len().min(ROUTE_TABLE_LEN - 1);
+
+        acquire_lock!(ctl);
+        let mut free_idx = None;
+        for i in 0..MAX_ROUTES {
+            let e = &mut (*ctl).entries[i];
+            if e.active == 0 {
+                if free_idx.is_none() {
+                    free_idx = Some(i);
+                }
+                continue;
+            }
+            if e.channel_len as usize == ch_len && e.channel[..ch_len] == channel[..ch_len] {
+                e.schema[..sc_len].copy_from_slice(&schema[..sc_len]);
+                e.schema_len = sc_len as u16;
+                e.table[..tb_len].copy_from_slice(&table[..tb_len]);
+                e.table_len = tb_len as u16;
+                release_lock!(ctl);
+                return true;
+            }
+        }
+        if let Some(idx) = free_idx {
+            let e = &mut (*ctl).entries[idx];
+            e.channel[..ch_len].copy_from_slice(&channel[..ch_len]);
+            e.channel_len = ch_len as u16;
+            e.schema[..sc_len].copy_from_slice(&schema[..sc_len]);
+            e.schema_len = sc_len as u16;
+            e.table[..tb_len].copy_from_slice(&table[..tb_len]);
+            e.table_len = tb_len as u16;
+            e.active = 1;
+            (*ctl).route_count.fetch_add(1, Ordering::Relaxed);
+            release_lock!(ctl);
+            return true;
+        }
+        release_lock!(ctl);
+        false
+    }
+}
+
+pub unsafe fn route_remove(ctl: *mut RouteCtl, channel: &[u8]) -> bool {
+    unsafe {
+        acquire_lock!(ctl);
+        for i in 0..MAX_ROUTES {
+            let e = &mut (*ctl).entries[i];
+            if e.active == 0 {
+                continue;
+            }
+            let ch_len = e.channel_len as usize;
+            if ch_len == channel.len() && e.channel[..ch_len] == *channel {
+                e.active = 0;
+                (*ctl).route_count.fetch_sub(1, Ordering::Relaxed);
+                release_lock!(ctl);
+                return true;
+            }
+        }
+        release_lock!(ctl);
+        false
+    }
+}
+
+pub unsafe fn route_lookup(ctl: *mut RouteCtl, channel: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    unsafe {
+        if (*ctl).route_count.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        acquire_lock!(ctl);
+        let mut result = None;
+        for i in 0..MAX_ROUTES {
+            let e = &(*ctl).entries[i];
+            if e.active == 0 {
+                continue;
+            }
+            let ch_len = e.channel_len as usize;
+            if ch_len == channel.len() && e.channel[..ch_len] == *channel {
+                result = Some((
+                    e.schema[..e.schema_len as usize].to_vec(),
+                    e.table[..e.table_len as usize].to_vec(),
+                ));
+                break;
+            }
+        }
+        release_lock!(ctl);
+        result
+    }
 }
 
 unsafe fn slot_reset(slot: *mut PubsubSlot) {

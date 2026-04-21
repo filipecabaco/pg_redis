@@ -84,6 +84,7 @@ jobs:
 
           # | delimiter avoids misreading dots in version strings as regex wildcards
           sed -i "s|CARGO_PGRX_VERSION: \"${OLD}\"|CARGO_PGRX_VERSION: \"${NEW}\"|" .github/workflows/ci.yml
+          sed -i "s|ARG CARGO_PGRX_VERSION=${OLD}|ARG CARGO_PGRX_VERSION=${NEW}|" Dockerfile
           sed -i "s|pgrx = \"=${OLD}\"|pgrx = \"=${NEW}\"|" Cargo.toml
           sed -i "s|pgrx-tests = \"=${OLD}\"|pgrx-tests = \"=${NEW}\"|" Cargo.toml
 
@@ -102,7 +103,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
-          git add .github/workflows/ci.yml Cargo.toml Cargo.lock
+          git add .github/workflows/ci.yml Dockerfile Cargo.toml Cargo.lock
           git commit -m "chore: update pgrx ${OLD} -> ${NEW}"
           git push origin "$BRANCH"
 
@@ -112,6 +113,7 @@ jobs:
 
 Changes:
 - \`.github/workflows/ci.yml\`: \`CARGO_PGRX_VERSION\`
+- \`Dockerfile\`: \`ARG CARGO_PGRX_VERSION\` default
 - \`Cargo.toml\`: \`pgrx\` and \`pgrx-tests\` dependencies
 - \`Cargo.lock\`: updated lock entries
 

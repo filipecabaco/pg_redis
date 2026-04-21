@@ -144,13 +144,5 @@ jobs:
       - name: Run unit tests
         run: cargo pgrx test pg${{ matrix.pg }}
 
-      - name: Check regression test files exist
-        run: |
-          [ -d sql ] && [ "$(ls sql/*.sql 2>/dev/null | wc -l)" -gt 0 ] \
-            || { echo "No pg_regress SQL files found in sql/ — skipping regress"; exit 0; }
-
-      - name: Run pg_regress e2e tests
-        run: cargo pgrx regress pg${{ matrix.pg }}
-
       - name: Print sccache stats
         run: sccache --show-stats

@@ -241,15 +241,16 @@ unsafe fn kv_read_full_value(
     }
     let key_buf = make_key(key);
     if let Some(table) = unsafe { SharedTable::<KvOverflow>::from_raw(overflow_htab) }
-        && let Some(of) = unsafe { table.find(key_buf.as_ptr().cast()) } {
-            let tail = total_len - INLINE_VAL_LEN;
-            unsafe {
-                buf.extend_from_slice(std::slice::from_raw_parts(
-                    addr_of!((*of).value) as *const u8,
-                    tail,
-                ));
-            }
+        && let Some(of) = unsafe { table.find(key_buf.as_ptr().cast()) }
+    {
+        let tail = total_len - INLINE_VAL_LEN;
+        unsafe {
+            buf.extend_from_slice(std::slice::from_raw_parts(
+                addr_of!((*of).value) as *const u8,
+                tail,
+            ));
         }
+    }
     buf
 }
 
@@ -334,15 +335,16 @@ unsafe fn hash_read_full_value(
     }
     let k = make_composite_key(key, field);
     if let Some(table) = unsafe { SharedTable::<HashOverflow>::from_raw(overflow_htab) }
-        && let Some(of) = unsafe { table.find(k.as_ptr().cast()) } {
-            let tail = total_len - INLINE_VAL_LEN;
-            unsafe {
-                buf.extend_from_slice(std::slice::from_raw_parts(
-                    addr_of!((*of).value) as *const u8,
-                    tail,
-                ));
-            }
+        && let Some(of) = unsafe { table.find(k.as_ptr().cast()) }
+    {
+        let tail = total_len - INLINE_VAL_LEN;
+        unsafe {
+            buf.extend_from_slice(std::slice::from_raw_parts(
+                addr_of!((*of).value) as *const u8,
+                tail,
+            ));
         }
+    }
     buf
 }
 
@@ -417,15 +419,16 @@ unsafe fn list_read_full_value(
     }
     let k = make_list_key(key, pos);
     if let Some(table) = unsafe { SharedTable::<ListOverflow>::from_raw(overflow_htab) }
-        && let Some(of) = unsafe { table.find(k.as_ptr().cast()) } {
-            let tail = total_len - INLINE_VAL_LEN;
-            unsafe {
-                buf.extend_from_slice(std::slice::from_raw_parts(
-                    addr_of!((*of).value) as *const u8,
-                    tail,
-                ));
-            }
+        && let Some(of) = unsafe { table.find(k.as_ptr().cast()) }
+    {
+        let tail = total_len - INLINE_VAL_LEN;
+        unsafe {
+            buf.extend_from_slice(std::slice::from_raw_parts(
+                addr_of!((*of).value) as *const u8,
+                tail,
+            ));
         }
+    }
     buf
 }
 
@@ -518,7 +521,10 @@ pub unsafe fn mem_get(db_idx: usize, key: &str) -> Option<Vec<u8>> {
 
     let (result, was_expired) = match unsafe { table.find(key_buf.as_ptr().cast()) } {
         Some(entry) if unsafe { entry_is_expired(entry) } => (None, true),
-        Some(entry) => (Some(unsafe { kv_read_full_value(entry, overflow_htab, key) }), false),
+        Some(entry) => (
+            Some(unsafe { kv_read_full_value(entry, overflow_htab, key) }),
+            false,
+        ),
         None => (None, false),
     };
 
@@ -527,10 +533,11 @@ pub unsafe fn mem_get(db_idx: usize, key: &str) -> Option<Vec<u8>> {
     if was_expired {
         unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
         if let Some(entry2) = unsafe { table.find(key_buf.as_ptr().cast()) }
-            && unsafe { entry_is_expired(entry2) } {
-                unsafe { table.remove(key_buf.as_ptr().cast()) };
-                unsafe { kv_delete_overflow(overflow_htab, key) };
-            }
+            && unsafe { entry_is_expired(entry2) }
+        {
+            unsafe { table.remove(key_buf.as_ptr().cast()) };
+            unsafe { kv_delete_overflow(overflow_htab, key) };
+        }
         unsafe { pg_sys::LWLockRelease(lk) };
     }
 
@@ -543,7 +550,9 @@ pub unsafe fn mem_get(db_idx: usize, key: &str) -> Option<Vec<u8>> {
 /// Must be called from bgworker thread with mem_init_worker already called.
 pub unsafe fn mem_set(db_idx: usize, key: &str, value: &str, expires_at_us: i64) {
     let htab = htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else { return };
+    let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else {
+        return;
+    };
     let overflow_htab = kv_overflow_htab_for(db_idx);
     let lk = lwlock(db_idx);
     let key_buf = make_key(key);
@@ -564,7 +573,9 @@ pub unsafe fn mem_set(db_idx: usize, key: &str, value: &str, expires_at_us: i64)
 /// Must be called from bgworker thread with mem_init_worker already called.
 pub unsafe fn mem_del(db_idx: usize, keys: &[&str]) -> i64 {
     let htab = htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else { return 0 };
+    let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else {
+        return 0;
+    };
     let overflow_htab = kv_overflow_htab_for(db_idx);
     let lk = lwlock(db_idx);
     let mut count = 0i64;
@@ -591,7 +602,9 @@ pub unsafe fn mem_del(db_idx: usize, keys: &[&str]) -> i64 {
 /// Must be called from bgworker thread with mem_init_worker already called.
 pub unsafe fn mem_exists(db_idx: usize, keys: &[&str]) -> i64 {
     let htab = htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else { return 0 };
+    let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else {
+        return 0;
+    };
     let lk = lwlock(db_idx);
     let mut count = 0i64;
 
@@ -599,9 +612,10 @@ pub unsafe fn mem_exists(db_idx: usize, keys: &[&str]) -> i64 {
     for key in keys {
         let key_buf = make_key(key);
         if let Some(entry) = unsafe { table.find(key_buf.as_ptr().cast()) }
-            && !unsafe { entry_is_expired(entry) } {
-                count += 1;
-            }
+            && !unsafe { entry_is_expired(entry) }
+        {
+            count += 1;
+        }
     }
     unsafe { pg_sys::LWLockRelease(lk) };
     count
@@ -773,7 +787,9 @@ pub unsafe fn mem_getdel(db_idx: usize, key: &str) -> Option<Vec<u8>> {
 /// Must be called from bgworker thread with mem_init_worker already called.
 pub unsafe fn mem_append(db_idx: usize, key: &str, suffix: &str) -> i64 {
     let htab = htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else { return 0 };
+    let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else {
+        return 0;
+    };
     let lk = lwlock(db_idx);
     let key_buf = make_key(key);
     let suffix_bytes = suffix.as_bytes();
@@ -810,7 +826,9 @@ pub unsafe fn mem_append(db_idx: usize, key: &str, suffix: &str) -> i64 {
 /// Must be called from bgworker thread with mem_init_worker already called.
 pub unsafe fn mem_strlen(db_idx: usize, key: &str) -> i64 {
     let htab = htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else { return 0 };
+    let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else {
+        return 0;
+    };
     let lk = lwlock(db_idx);
     let key_buf = make_key(key);
 
@@ -831,14 +849,18 @@ pub unsafe fn mem_strlen(db_idx: usize, key: &str) -> i64 {
 /// Must be called from bgworker thread with mem_init_worker already called.
 pub unsafe fn mem_ttl_raw(db_idx: usize, key: &str) -> (bool, i64) {
     let htab = htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else { return (false, 0) };
+    let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else {
+        return (false, 0);
+    };
     let lk = lwlock(db_idx);
     let key_buf = make_key(key);
 
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED) };
 
     let result = match unsafe { table.find(key_buf.as_ptr().cast()) } {
-        Some(entry) if !unsafe { entry_is_expired(entry) } => (true, unsafe { (*entry).expires_at }),
+        Some(entry) if !unsafe { entry_is_expired(entry) } => {
+            (true, unsafe { (*entry).expires_at })
+        }
         _ => (false, 0),
     };
 
@@ -852,7 +874,9 @@ pub unsafe fn mem_ttl_raw(db_idx: usize, key: &str) -> (bool, i64) {
 /// Must be called from bgworker thread with mem_init_worker already called.
 pub unsafe fn mem_set_expiry(db_idx: usize, key: &str, expires_at_us: i64) -> bool {
     let htab = htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else { return false };
+    let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else {
+        return false;
+    };
     let lk = lwlock(db_idx);
     let key_buf = make_key(key);
 
@@ -879,7 +903,9 @@ pub unsafe fn mem_set_expiry(db_idx: usize, key: &str, expires_at_us: i64) -> bo
 /// Must be called from bgworker thread with mem_init_worker already called.
 pub unsafe fn mem_persist(db_idx: usize, key: &str) -> bool {
     let htab = htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else { return false };
+    let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else {
+        return false;
+    };
     let lk = lwlock(db_idx);
     let key_buf = make_key(key);
 
@@ -940,7 +966,9 @@ pub unsafe fn mem_mget(db_idx: usize, keys: &[String]) -> Vec<Option<Vec<u8>>> {
 /// Must be called from bgworker thread with mem_init_worker already called.
 pub unsafe fn mem_mset(db_idx: usize, pairs: &[(&str, &str)]) {
     let htab = htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else { return };
+    let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else {
+        return;
+    };
     let overflow_htab = kv_overflow_htab_for(db_idx);
     let lk = lwlock(db_idx);
 
@@ -963,7 +991,9 @@ pub unsafe fn mem_mset(db_idx: usize, pairs: &[(&str, &str)]) {
 /// Must be called from bgworker thread with mem_init_worker already called.
 pub unsafe fn mem_scan(db_idx: usize, pattern: &str) -> Vec<Vec<u8>> {
     let htab = htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else { return vec![] };
+    let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else {
+        return vec![];
+    };
     let lk = lwlock(db_idx);
     let now = now_micros();
     let mut results = Vec::new();
@@ -978,7 +1008,10 @@ pub unsafe fn mem_scan(db_idx: usize, pattern: &str) -> Vec<Vec<u8>> {
         }
         let key_ptr = unsafe { addr_of!((*entry).key) as *const u8 };
         let key_slice = unsafe { std::slice::from_raw_parts(key_ptr, MAX_KEY_LEN) };
-        let key_end = key_slice.iter().position(|&b| b == 0).unwrap_or(MAX_KEY_LEN);
+        let key_end = key_slice
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(MAX_KEY_LEN);
         let key_str = std::str::from_utf8(&key_slice[..key_end]).unwrap_or("");
         if glob_matches(pattern, key_str) {
             results.push(key_str.as_bytes().to_vec());
@@ -995,7 +1028,9 @@ pub unsafe fn mem_scan(db_idx: usize, pattern: &str) -> Vec<Vec<u8>> {
 /// Must be called from bgworker thread with mem_init_worker already called.
 pub unsafe fn mem_dbsize(db_idx: usize) -> i64 {
     let htab = htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else { return 0 };
+    let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else {
+        return 0;
+    };
     let lk = lwlock(db_idx);
     let now = now_micros();
     let mut count = 0i64;
@@ -1020,7 +1055,9 @@ pub unsafe fn mem_dbsize(db_idx: usize) -> i64 {
 /// Must be called from bgworker thread with mem_init_worker already called.
 pub unsafe fn mem_sweep_expired(db_idx: usize) {
     let htab = htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else { return };
+    let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else {
+        return;
+    };
     let lk = lwlock(db_idx);
     let now = now_micros();
 
@@ -1125,7 +1162,9 @@ pub unsafe fn mem_type(db_idx: usize, key: &str) -> &'static str {
 }
 
 unsafe fn has_any_entry_for_key(htab: *mut pg_sys::HTAB, key: &str) -> bool {
-    let Some(table) = (unsafe { SharedTable::<HashEntry>::from_raw(htab) }) else { return false };
+    let Some(table) = (unsafe { SharedTable::<HashEntry>::from_raw(htab) }) else {
+        return false;
+    };
     let key_bytes = key.as_bytes();
     let mut scan = unsafe { table.scan() };
     while let Some(entry) = unsafe { scan.next() } {
@@ -1142,7 +1181,9 @@ unsafe fn has_any_entry_for_key(htab: *mut pg_sys::HTAB, key: &str) -> bool {
 }
 
 unsafe fn has_any_set_entry_for_key(htab: *mut pg_sys::HTAB, key: &str) -> bool {
-    let Some(table) = (unsafe { SharedTable::<SetEntry>::from_raw(htab) }) else { return false };
+    let Some(table) = (unsafe { SharedTable::<SetEntry>::from_raw(htab) }) else {
+        return false;
+    };
     let key_bytes = key.as_bytes();
     let mut scan = unsafe { table.scan() };
     while let Some(entry) = unsafe { scan.next() } {
@@ -1159,7 +1200,9 @@ unsafe fn has_any_set_entry_for_key(htab: *mut pg_sys::HTAB, key: &str) -> bool 
 }
 
 unsafe fn has_any_zset_entry_for_key(htab: *mut pg_sys::HTAB, key: &str) -> bool {
-    let Some(table) = (unsafe { SharedTable::<ZsetEntry>::from_raw(htab) }) else { return false };
+    let Some(table) = (unsafe { SharedTable::<ZsetEntry>::from_raw(htab) }) else {
+        return false;
+    };
     let key_bytes = key.as_bytes();
     let mut scan = unsafe { table.scan() };
     while let Some(entry) = unsafe { scan.next() } {
@@ -1176,7 +1219,9 @@ unsafe fn has_any_zset_entry_for_key(htab: *mut pg_sys::HTAB, key: &str) -> bool
 }
 
 unsafe fn has_any_list_entry_for_key(meta_htab: *mut pg_sys::HTAB, key: &str) -> bool {
-    let Some(table) = (unsafe { SharedTable::<ListMeta>::from_raw(meta_htab) }) else { return false };
+    let Some(table) = (unsafe { SharedTable::<ListMeta>::from_raw(meta_htab) }) else {
+        return false;
+    };
     let key_buf = make_key(key);
     match unsafe { table.find(key_buf.as_ptr().cast()) } {
         Some(meta) => unsafe { (*meta).count > 0 },
@@ -1294,163 +1339,165 @@ pub unsafe fn mem_init_tables(ctl: *mut MemControlBlock) {
     let sz = htab_init_size();
     let sz_small = htab_init_size_small();
 
-    for i in 0..NUM_MEM_DBS { unsafe {
-        let name = format!("pg_redis_kv_{}\0", i * 2);
-        let mut info = pg_sys::HASHCTL {
-            keysize: MAX_KEY_LEN as pg_sys::Size,
-            entrysize: std::mem::size_of::<KvEntry>() as pg_sys::Size,
-            ..Default::default()
-        };
-        let htab = pg_sys::ShmemInitHash(name.as_ptr().cast(), sz, sz, &mut info, str_flags);
-        std::ptr::addr_of_mut!((*ctl).htab[i]).write(htab);
+    for i in 0..NUM_MEM_DBS {
+        unsafe {
+            let name = format!("pg_redis_kv_{}\0", i * 2);
+            let mut info = pg_sys::HASHCTL {
+                keysize: MAX_KEY_LEN as pg_sys::Size,
+                entrysize: std::mem::size_of::<KvEntry>() as pg_sys::Size,
+                ..Default::default()
+            };
+            let htab = pg_sys::ShmemInitHash(name.as_ptr().cast(), sz, sz, &mut info, str_flags);
+            std::ptr::addr_of_mut!((*ctl).htab[i]).write(htab);
 
-        let name = format!("pg_redis_hash_{}\0", i * 2);
-        let mut info = pg_sys::HASHCTL {
-            keysize: (MAX_KEY_LEN * 2) as pg_sys::Size,
-            entrysize: std::mem::size_of::<HashEntry>() as pg_sys::Size,
-            ..Default::default()
-        };
-        let htab = pg_sys::ShmemInitHash(
-            name.as_ptr().cast(),
-            sz_small,
-            sz_small,
-            &mut info,
-            blob_flags,
-        );
-        std::ptr::addr_of_mut!((*ctl).hash_htab[i]).write(htab);
+            let name = format!("pg_redis_hash_{}\0", i * 2);
+            let mut info = pg_sys::HASHCTL {
+                keysize: (MAX_KEY_LEN * 2) as pg_sys::Size,
+                entrysize: std::mem::size_of::<HashEntry>() as pg_sys::Size,
+                ..Default::default()
+            };
+            let htab = pg_sys::ShmemInitHash(
+                name.as_ptr().cast(),
+                sz_small,
+                sz_small,
+                &mut info,
+                blob_flags,
+            );
+            std::ptr::addr_of_mut!((*ctl).hash_htab[i]).write(htab);
 
-        let name = format!("pg_redis_set_{}\0", i * 2);
-        let mut info = pg_sys::HASHCTL {
-            keysize: (MAX_KEY_LEN * 2) as pg_sys::Size,
-            entrysize: std::mem::size_of::<SetEntry>() as pg_sys::Size,
-            ..Default::default()
-        };
-        let htab = pg_sys::ShmemInitHash(
-            name.as_ptr().cast(),
-            sz_small,
-            sz_small,
-            &mut info,
-            blob_flags,
-        );
-        std::ptr::addr_of_mut!((*ctl).set_htab[i]).write(htab);
+            let name = format!("pg_redis_set_{}\0", i * 2);
+            let mut info = pg_sys::HASHCTL {
+                keysize: (MAX_KEY_LEN * 2) as pg_sys::Size,
+                entrysize: std::mem::size_of::<SetEntry>() as pg_sys::Size,
+                ..Default::default()
+            };
+            let htab = pg_sys::ShmemInitHash(
+                name.as_ptr().cast(),
+                sz_small,
+                sz_small,
+                &mut info,
+                blob_flags,
+            );
+            std::ptr::addr_of_mut!((*ctl).set_htab[i]).write(htab);
 
-        let name = format!("pg_redis_zset_{}\0", i * 2);
-        let mut info = pg_sys::HASHCTL {
-            keysize: (MAX_KEY_LEN * 2) as pg_sys::Size,
-            entrysize: std::mem::size_of::<ZsetEntry>() as pg_sys::Size,
-            ..Default::default()
-        };
-        let htab = pg_sys::ShmemInitHash(
-            name.as_ptr().cast(),
-            sz_small,
-            sz_small,
-            &mut info,
-            blob_flags,
-        );
-        std::ptr::addr_of_mut!((*ctl).zset_htab[i]).write(htab);
+            let name = format!("pg_redis_zset_{}\0", i * 2);
+            let mut info = pg_sys::HASHCTL {
+                keysize: (MAX_KEY_LEN * 2) as pg_sys::Size,
+                entrysize: std::mem::size_of::<ZsetEntry>() as pg_sys::Size,
+                ..Default::default()
+            };
+            let htab = pg_sys::ShmemInitHash(
+                name.as_ptr().cast(),
+                sz_small,
+                sz_small,
+                &mut info,
+                blob_flags,
+            );
+            std::ptr::addr_of_mut!((*ctl).zset_htab[i]).write(htab);
 
-        let name = format!("pg_redis_list_{}\0", i * 2);
-        let mut info = pg_sys::HASHCTL {
-            keysize: (MAX_KEY_LEN + 8) as pg_sys::Size,
-            entrysize: std::mem::size_of::<ListEntry>() as pg_sys::Size,
-            ..Default::default()
-        };
-        let htab = pg_sys::ShmemInitHash(
-            name.as_ptr().cast(),
-            sz_small,
-            sz_small,
-            &mut info,
-            blob_flags,
-        );
-        std::ptr::addr_of_mut!((*ctl).list_htab[i]).write(htab);
+            let name = format!("pg_redis_list_{}\0", i * 2);
+            let mut info = pg_sys::HASHCTL {
+                keysize: (MAX_KEY_LEN + 8) as pg_sys::Size,
+                entrysize: std::mem::size_of::<ListEntry>() as pg_sys::Size,
+                ..Default::default()
+            };
+            let htab = pg_sys::ShmemInitHash(
+                name.as_ptr().cast(),
+                sz_small,
+                sz_small,
+                &mut info,
+                blob_flags,
+            );
+            std::ptr::addr_of_mut!((*ctl).list_htab[i]).write(htab);
 
-        let name = format!("pg_redis_list_meta_{}\0", i * 2);
-        let mut info = pg_sys::HASHCTL {
-            keysize: MAX_KEY_LEN as pg_sys::Size,
-            entrysize: std::mem::size_of::<ListMeta>() as pg_sys::Size,
-            ..Default::default()
-        };
-        let htab = pg_sys::ShmemInitHash(
-            name.as_ptr().cast(),
-            sz_small,
-            sz_small,
-            &mut info,
-            str_flags,
-        );
-        std::ptr::addr_of_mut!((*ctl).list_meta_htab[i]).write(htab);
+            let name = format!("pg_redis_list_meta_{}\0", i * 2);
+            let mut info = pg_sys::HASHCTL {
+                keysize: MAX_KEY_LEN as pg_sys::Size,
+                entrysize: std::mem::size_of::<ListMeta>() as pg_sys::Size,
+                ..Default::default()
+            };
+            let htab = pg_sys::ShmemInitHash(
+                name.as_ptr().cast(),
+                sz_small,
+                sz_small,
+                &mut info,
+                str_flags,
+            );
+            std::ptr::addr_of_mut!((*ctl).list_meta_htab[i]).write(htab);
 
-        let name = format!("pg_redis_zset_meta_{}\0", i * 2);
-        let mut info = pg_sys::HASHCTL {
-            keysize: MAX_KEY_LEN as pg_sys::Size,
-            entrysize: std::mem::size_of::<ZsetMeta>() as pg_sys::Size,
-            ..Default::default()
-        };
-        let htab = pg_sys::ShmemInitHash(
-            name.as_ptr().cast(),
-            sz_small,
-            sz_small,
-            &mut info,
-            str_flags,
-        );
-        std::ptr::addr_of_mut!((*ctl).zset_meta_htab[i]).write(htab);
+            let name = format!("pg_redis_zset_meta_{}\0", i * 2);
+            let mut info = pg_sys::HASHCTL {
+                keysize: MAX_KEY_LEN as pg_sys::Size,
+                entrysize: std::mem::size_of::<ZsetMeta>() as pg_sys::Size,
+                ..Default::default()
+            };
+            let htab = pg_sys::ShmemInitHash(
+                name.as_ptr().cast(),
+                sz_small,
+                sz_small,
+                &mut info,
+                str_flags,
+            );
+            std::ptr::addr_of_mut!((*ctl).zset_meta_htab[i]).write(htab);
 
-        let name = format!("pg_redis_set_meta_{}\0", i * 2);
-        let mut info = pg_sys::HASHCTL {
-            keysize: MAX_KEY_LEN as pg_sys::Size,
-            entrysize: std::mem::size_of::<SetMeta>() as pg_sys::Size,
-            ..Default::default()
-        };
-        let htab = pg_sys::ShmemInitHash(
-            name.as_ptr().cast(),
-            sz_small,
-            sz_small,
-            &mut info,
-            str_flags,
-        );
-        std::ptr::addr_of_mut!((*ctl).set_meta_htab[i]).write(htab);
+            let name = format!("pg_redis_set_meta_{}\0", i * 2);
+            let mut info = pg_sys::HASHCTL {
+                keysize: MAX_KEY_LEN as pg_sys::Size,
+                entrysize: std::mem::size_of::<SetMeta>() as pg_sys::Size,
+                ..Default::default()
+            };
+            let htab = pg_sys::ShmemInitHash(
+                name.as_ptr().cast(),
+                sz_small,
+                sz_small,
+                &mut info,
+                str_flags,
+            );
+            std::ptr::addr_of_mut!((*ctl).set_meta_htab[i]).write(htab);
 
-        // KV overflow: HASH_STRINGS, key = MAX_KEY_LEN (same as KvEntry)
-        let name = format!("pg_redis_kv_of_{}\0", i * 2);
-        let mut info = pg_sys::HASHCTL {
-            keysize: MAX_KEY_LEN as pg_sys::Size,
-            entrysize: std::mem::size_of::<KvOverflow>() as pg_sys::Size,
-            ..Default::default()
-        };
-        let htab = pg_sys::ShmemInitHash(name.as_ptr().cast(), sz, sz, &mut info, str_flags);
-        std::ptr::addr_of_mut!((*ctl).kv_overflow_htab[i]).write(htab);
+            // KV overflow: HASH_STRINGS, key = MAX_KEY_LEN (same as KvEntry)
+            let name = format!("pg_redis_kv_of_{}\0", i * 2);
+            let mut info = pg_sys::HASHCTL {
+                keysize: MAX_KEY_LEN as pg_sys::Size,
+                entrysize: std::mem::size_of::<KvOverflow>() as pg_sys::Size,
+                ..Default::default()
+            };
+            let htab = pg_sys::ShmemInitHash(name.as_ptr().cast(), sz, sz, &mut info, str_flags);
+            std::ptr::addr_of_mut!((*ctl).kv_overflow_htab[i]).write(htab);
 
-        // Hash overflow: HASH_BLOBS, composite key key[128] + field[128] = 256 bytes
-        let name = format!("pg_redis_hash_of_{}\0", i * 2);
-        let mut info = pg_sys::HASHCTL {
-            keysize: (MAX_KEY_LEN * 2) as pg_sys::Size,
-            entrysize: std::mem::size_of::<HashOverflow>() as pg_sys::Size,
-            ..Default::default()
-        };
-        let htab = pg_sys::ShmemInitHash(
-            name.as_ptr().cast(),
-            sz_small,
-            sz_small,
-            &mut info,
-            blob_flags,
-        );
-        std::ptr::addr_of_mut!((*ctl).hash_overflow_htab[i]).write(htab);
+            // Hash overflow: HASH_BLOBS, composite key key[128] + field[128] = 256 bytes
+            let name = format!("pg_redis_hash_of_{}\0", i * 2);
+            let mut info = pg_sys::HASHCTL {
+                keysize: (MAX_KEY_LEN * 2) as pg_sys::Size,
+                entrysize: std::mem::size_of::<HashOverflow>() as pg_sys::Size,
+                ..Default::default()
+            };
+            let htab = pg_sys::ShmemInitHash(
+                name.as_ptr().cast(),
+                sz_small,
+                sz_small,
+                &mut info,
+                blob_flags,
+            );
+            std::ptr::addr_of_mut!((*ctl).hash_overflow_htab[i]).write(htab);
 
-        // List overflow: HASH_BLOBS, key[128] + pos_bytes[8] = 136 bytes
-        let name = format!("pg_redis_list_of_{}\0", i * 2);
-        let mut info = pg_sys::HASHCTL {
-            keysize: (MAX_KEY_LEN + 8) as pg_sys::Size,
-            entrysize: std::mem::size_of::<ListOverflow>() as pg_sys::Size,
-            ..Default::default()
-        };
-        let htab = pg_sys::ShmemInitHash(
-            name.as_ptr().cast(),
-            sz_small,
-            sz_small,
-            &mut info,
-            blob_flags,
-        );
-        std::ptr::addr_of_mut!((*ctl).list_overflow_htab[i]).write(htab);
-    } }
+            // List overflow: HASH_BLOBS, key[128] + pos_bytes[8] = 136 bytes
+            let name = format!("pg_redis_list_of_{}\0", i * 2);
+            let mut info = pg_sys::HASHCTL {
+                keysize: (MAX_KEY_LEN + 8) as pg_sys::Size,
+                entrysize: std::mem::size_of::<ListOverflow>() as pg_sys::Size,
+                ..Default::default()
+            };
+            let htab = pg_sys::ShmemInitHash(
+                name.as_ptr().cast(),
+                sz_small,
+                sz_small,
+                &mut info,
+                blob_flags,
+            );
+            std::ptr::addr_of_mut!((*ctl).list_overflow_htab[i]).write(htab);
+        }
+    }
 }
 
 // ─────────────────────────── Key helpers ────────────────────────────────────
@@ -1567,7 +1614,9 @@ fn key_matches_entry(entry_key_ptr: *const u8, key: &str) -> bool {
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
 pub unsafe fn mem_hset(db_idx: usize, key: &str, field: &str, value: &str) -> bool {
     let htab = hash_htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<HashEntry>::from_raw(htab) }) else { return false };
+    let Some(table) = (unsafe { SharedTable::<HashEntry>::from_raw(htab) }) else {
+        return false;
+    };
     let overflow_htab = hash_overflow_htab_for(db_idx);
     let lk = hash_lwlock(db_idx);
     let k = make_composite_key(key, field);
@@ -1602,7 +1651,9 @@ pub unsafe fn mem_hget(db_idx: usize, key: &str, field: &str) -> Option<Vec<u8>>
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
 pub unsafe fn mem_hdel(db_idx: usize, key: &str, fields: &[&str]) -> i64 {
     let htab = hash_htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<HashEntry>::from_raw(htab) }) else { return 0 };
+    let Some(table) = (unsafe { SharedTable::<HashEntry>::from_raw(htab) }) else {
+        return 0;
+    };
     let overflow_htab = hash_overflow_htab_for(db_idx);
     let lk = hash_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
@@ -1625,7 +1676,9 @@ pub unsafe fn mem_hdel(db_idx: usize, key: &str, fields: &[&str]) -> i64 {
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
 pub unsafe fn mem_hexists(db_idx: usize, key: &str, field: &str) -> bool {
     let htab = hash_htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<HashEntry>::from_raw(htab) }) else { return false };
+    let Some(table) = (unsafe { SharedTable::<HashEntry>::from_raw(htab) }) else {
+        return false;
+    };
     let lk = hash_lwlock(db_idx);
     let k = make_composite_key(key, field);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED) };
@@ -1639,7 +1692,9 @@ pub unsafe fn mem_hexists(db_idx: usize, key: &str, field: &str) -> bool {
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
 pub unsafe fn mem_hgetall(db_idx: usize, key: &str) -> Vec<(String, Vec<u8>)> {
     let htab = hash_htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<HashEntry>::from_raw(htab) }) else { return vec![] };
+    let Some(table) = (unsafe { SharedTable::<HashEntry>::from_raw(htab) }) else {
+        return vec![];
+    };
     let overflow_htab = hash_overflow_htab_for(db_idx);
     let lk = hash_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED) };
@@ -1686,7 +1741,9 @@ pub unsafe fn mem_hvals(db_idx: usize, key: &str) -> Vec<Vec<u8>> {
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
 pub unsafe fn mem_hlen(db_idx: usize, key: &str) -> i64 {
     let htab = hash_htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<HashEntry>::from_raw(htab) }) else { return 0 };
+    let Some(table) = (unsafe { SharedTable::<HashEntry>::from_raw(htab) }) else {
+        return 0;
+    };
     let lk = hash_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED) };
     let mut count = 0i64;
@@ -1770,7 +1827,9 @@ pub unsafe fn mem_hincrby(
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
 pub unsafe fn mem_hsetnx(db_idx: usize, key: &str, field: &str, value: &str) -> bool {
     let htab = hash_htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<HashEntry>::from_raw(htab) }) else { return false };
+    let Some(table) = (unsafe { SharedTable::<HashEntry>::from_raw(htab) }) else {
+        return false;
+    };
     let overflow_htab = hash_overflow_htab_for(db_idx);
     let lk = hash_lwlock(db_idx);
     let k = make_composite_key(key, field);
@@ -1791,7 +1850,9 @@ pub unsafe fn mem_hsetnx(db_idx: usize, key: &str, field: &str, value: &str) -> 
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
 pub unsafe fn mem_del_hash_key(db_idx: usize, key: &str) -> i64 {
     let htab = hash_htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<HashEntry>::from_raw(htab) }) else { return 0 };
+    let Some(table) = (unsafe { SharedTable::<HashEntry>::from_raw(htab) }) else {
+        return 0;
+    };
     let overflow_htab = hash_overflow_htab_for(db_idx);
     let lk = hash_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
@@ -1825,7 +1886,9 @@ pub unsafe fn mem_del_hash_key(db_idx: usize, key: &str) -> i64 {
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
 pub unsafe fn mem_sadd(db_idx: usize, key: &str, members: &[&str]) -> i64 {
     let htab = set_htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<SetEntry>::from_raw(htab) }) else { return 0 };
+    let Some(table) = (unsafe { SharedTable::<SetEntry>::from_raw(htab) }) else {
+        return 0;
+    };
     let meta_htab = set_meta_htab_for(db_idx);
     let lk = set_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
@@ -1853,7 +1916,9 @@ pub unsafe fn mem_sadd(db_idx: usize, key: &str, members: &[&str]) -> i64 {
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
 pub unsafe fn mem_srem(db_idx: usize, key: &str, members: &[&str]) -> i64 {
     let htab = set_htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<SetEntry>::from_raw(htab) }) else { return 0 };
+    let Some(table) = (unsafe { SharedTable::<SetEntry>::from_raw(htab) }) else {
+        return 0;
+    };
     let meta_htab = set_meta_htab_for(db_idx);
     let lk = set_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
@@ -1887,7 +1952,9 @@ pub unsafe fn mem_srem(db_idx: usize, key: &str, members: &[&str]) -> i64 {
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
 pub unsafe fn mem_sismember(db_idx: usize, key: &str, member: &str) -> bool {
     let htab = set_htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<SetEntry>::from_raw(htab) }) else { return false };
+    let Some(table) = (unsafe { SharedTable::<SetEntry>::from_raw(htab) }) else {
+        return false;
+    };
     let lk = set_lwlock(db_idx);
     let k = make_composite_key(key, member);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED) };
@@ -1918,7 +1985,9 @@ pub unsafe fn mem_smismember(db_idx: usize, key: &str, members: &[&str]) -> Vec<
 }
 
 unsafe fn set_collect_members(htab: *mut pg_sys::HTAB, key: &str) -> Vec<String> {
-    let Some(table) = (unsafe { SharedTable::<SetEntry>::from_raw(htab) }) else { return vec![] };
+    let Some(table) = (unsafe { SharedTable::<SetEntry>::from_raw(htab) }) else {
+        return vec![];
+    };
     let mut members = Vec::new();
     let mut scan = unsafe { table.scan() };
     while let Some(entry) = unsafe { scan.next() } {
@@ -1960,7 +2029,11 @@ pub unsafe fn mem_scard(db_idx: usize, key: &str) -> i64 {
     let lk = set_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED) };
     let meta = unsafe { find_set_meta(meta_htab, key) };
-    let count = if !meta.is_null() { unsafe { (*meta).count } } else { 0 };
+    let count = if !meta.is_null() {
+        unsafe { (*meta).count }
+    } else {
+        0
+    };
     unsafe { pg_sys::LWLockRelease(lk) };
     count
 }
@@ -1970,7 +2043,9 @@ pub unsafe fn mem_scard(db_idx: usize, key: &str) -> i64 {
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
 pub unsafe fn mem_spop(db_idx: usize, key: &str, count: i64) -> Vec<String> {
     let htab = set_htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<SetEntry>::from_raw(htab) }) else { return vec![] };
+    let Some(table) = (unsafe { SharedTable::<SetEntry>::from_raw(htab) }) else {
+        return vec![];
+    };
     let meta_htab = set_meta_htab_for(db_idx);
     let lk = set_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
@@ -2010,7 +2085,9 @@ pub unsafe fn mem_spop(db_idx: usize, key: &str, count: i64) -> Vec<String> {
                 let me = ms.iter().position(|&b| b == 0).unwrap_or(MAX_KEY_LEN);
                 let member = String::from_utf8_lossy(&ms[..me]).into_owned();
                 let mut composite = [0u8; 256];
-                unsafe { std::ptr::copy_nonoverlapping(entry as *const u8, composite.as_mut_ptr(), 256) };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(entry as *const u8, composite.as_mut_ptr(), 256)
+                };
                 to_remove = Some(composite);
                 to_remove_member = member;
                 break;
@@ -2070,7 +2147,9 @@ pub unsafe fn mem_srandmember(db_idx: usize, key: &str, count: i64) -> Vec<Strin
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
 pub unsafe fn mem_smove(db_idx: usize, src: &str, dst: &str, member: &str) -> bool {
     let htab = set_htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<SetEntry>::from_raw(htab) }) else { return false };
+    let Some(table) = (unsafe { SharedTable::<SetEntry>::from_raw(htab) }) else {
+        return false;
+    };
     let meta_htab = set_meta_htab_for(db_idx);
     let lk = set_lwlock(db_idx);
     let src_k = make_composite_key(src, member);
@@ -2139,12 +2218,14 @@ pub unsafe fn mem_sinter(db_idx: usize, keys: &[&str]) -> Vec<String> {
     }
     let lk = set_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED) };
-    let first: std::collections::HashSet<String> =
-        unsafe { set_collect_members(htab, keys[0]) }.into_iter().collect();
+    let first: std::collections::HashSet<String> = unsafe { set_collect_members(htab, keys[0]) }
+        .into_iter()
+        .collect();
     let mut result: std::collections::HashSet<String> = first;
     for k in &keys[1..] {
-        let other: std::collections::HashSet<String> =
-            unsafe { set_collect_members(htab, k) }.into_iter().collect();
+        let other: std::collections::HashSet<String> = unsafe { set_collect_members(htab, k) }
+            .into_iter()
+            .collect();
         result = result.intersection(&other).cloned().collect();
     }
     unsafe { pg_sys::LWLockRelease(lk) };
@@ -2166,12 +2247,14 @@ pub unsafe fn mem_sdiff(db_idx: usize, keys: &[&str]) -> Vec<String> {
     }
     let lk = set_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED) };
-    let first: std::collections::HashSet<String> =
-        unsafe { set_collect_members(htab, keys[0]) }.into_iter().collect();
+    let first: std::collections::HashSet<String> = unsafe { set_collect_members(htab, keys[0]) }
+        .into_iter()
+        .collect();
     let mut result = first;
     for k in &keys[1..] {
-        let other: std::collections::HashSet<String> =
-            unsafe { set_collect_members(htab, k) }.into_iter().collect();
+        let other: std::collections::HashSet<String> = unsafe { set_collect_members(htab, k) }
+            .into_iter()
+            .collect();
         result = result.difference(&other).cloned().collect();
     }
     unsafe { pg_sys::LWLockRelease(lk) };
@@ -2215,7 +2298,9 @@ pub unsafe fn mem_sdiffstore(db_idx: usize, dst: &str, keys: &[&str]) -> i64 {
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
 pub unsafe fn mem_del_set_key(db_idx: usize, key: &str) -> i64 {
     let htab = set_htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<SetEntry>::from_raw(htab) }) else { return 0 };
+    let Some(table) = (unsafe { SharedTable::<SetEntry>::from_raw(htab) }) else {
+        return 0;
+    };
     let meta_htab = set_meta_htab_for(db_idx);
     let lk = set_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
@@ -2242,7 +2327,9 @@ pub unsafe fn mem_del_set_key(db_idx: usize, key: &str) -> i64 {
 // ─────────────────────────── Sorted set operations ──────────────────────────
 
 unsafe fn zset_collect(htab: *mut pg_sys::HTAB, key: &str) -> Vec<(String, f64)> {
-    let Some(table) = (unsafe { SharedTable::<ZsetEntry>::from_raw(htab) }) else { return vec![] };
+    let Some(table) = (unsafe { SharedTable::<ZsetEntry>::from_raw(htab) }) else {
+        return vec![];
+    };
     let mut entries = Vec::new();
     let mut scan = unsafe { table.scan() };
     while let Some(entry) = unsafe { scan.next() } {
@@ -2274,7 +2361,9 @@ pub unsafe fn mem_zadd(
     ch: bool,
 ) -> i64 {
     let htab = zset_htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<ZsetEntry>::from_raw(htab) }) else { return 0 };
+    let Some(table) = (unsafe { SharedTable::<ZsetEntry>::from_raw(htab) }) else {
+        return 0;
+    };
     let meta_htab = zset_meta_htab_for(db_idx);
     let lk = zset_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
@@ -2333,12 +2422,12 @@ pub unsafe fn mem_zadd(
                 if !meta.is_null() {
                     let cur_min = unsafe { (*meta).min_score };
                     let cur_max = unsafe { (*meta).max_score };
-                    let was_min = unsafe {
-                        read_meta_member(&(*meta).min_member, (*meta).min_member_len)
-                    } == *member;
-                    let was_max = unsafe {
-                        read_meta_member(&(*meta).max_member, (*meta).max_member_len)
-                    } == *member;
+                    let was_min =
+                        unsafe { read_meta_member(&(*meta).min_member, (*meta).min_member_len) }
+                            == *member;
+                    let was_max =
+                        unsafe { read_meta_member(&(*meta).max_member, (*meta).max_member_len) }
+                            == *member;
                     if *score < cur_min {
                         unsafe { addr_of_mut!((*meta).min_score).write(*score) };
                         let len = unsafe { &mut *addr_of_mut!((*meta).min_member_len) };
@@ -2419,7 +2508,9 @@ pub unsafe fn mem_zadd_incr(
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
 pub unsafe fn mem_zrem(db_idx: usize, key: &str, members: &[&str]) -> i64 {
     let htab = zset_htab_for(db_idx);
-    let Some(table) = (unsafe { SharedTable::<ZsetEntry>::from_raw(htab) }) else { return 0 };
+    let Some(table) = (unsafe { SharedTable::<ZsetEntry>::from_raw(htab) }) else {
+        return 0;
+    };
     let meta_htab = zset_meta_htab_for(db_idx);
     let lk = zset_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
@@ -2458,8 +2549,7 @@ pub unsafe fn mem_zscore(db_idx: usize, key: &str, member: &str) -> Option<f64> 
     let lk = zset_lwlock(db_idx);
     let k = make_composite_key(key, member);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED) };
-    let result = unsafe { table.find(k.as_ptr().cast()) }
-        .map(|entry| unsafe { (*entry).score });
+    let result = unsafe { table.find(k.as_ptr().cast()) }.map(|entry| unsafe { (*entry).score });
     unsafe { pg_sys::LWLockRelease(lk) };
     result
 }
@@ -2475,7 +2565,11 @@ pub unsafe fn mem_zcard(db_idx: usize, key: &str) -> i64 {
     let lk = zset_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED) };
     let meta = unsafe { find_zset_meta(meta_htab, key) };
-    let count = if !meta.is_null() { unsafe { (*meta).count } } else { 0 };
+    let count = if !meta.is_null() {
+        unsafe { (*meta).count }
+    } else {
+        0
+    };
     unsafe { pg_sys::LWLockRelease(lk) };
     count
 }
@@ -2484,7 +2578,8 @@ pub unsafe fn mem_zcard(db_idx: usize, key: &str) -> i64 {
 /// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
 pub unsafe fn mem_zincrby(db_idx: usize, key: &str, delta: f64, member: &str) -> f64 {
-    unsafe { mem_zadd_incr(db_idx, key, delta, member, false, false, false, false) }.unwrap_or(delta)
+    unsafe { mem_zadd_incr(db_idx, key, delta, member, false, false, false, false) }
+        .unwrap_or(delta)
 }
 
 /// # Safety
@@ -2530,23 +2625,25 @@ pub unsafe fn mem_zcount(
     max: f64,
     ex_min: bool,
     ex_max: bool,
-) -> i64 { unsafe {
-    let htab = zset_htab_for(db_idx);
-    if htab.is_null() {
-        return 0;
+) -> i64 {
+    unsafe {
+        let htab = zset_htab_for(db_idx);
+        if htab.is_null() {
+            return 0;
+        }
+        let lk = zset_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
+        let all = zset_collect(htab, key);
+        pg_sys::LWLockRelease(lk);
+        all.iter()
+            .filter(|(_, s)| {
+                let lo = if ex_min { *s > min } else { *s >= min };
+                let hi = if ex_max { *s < max } else { *s <= max };
+                lo && hi
+            })
+            .count() as i64
     }
-    let lk = zset_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
-    let all = zset_collect(htab, key);
-    pg_sys::LWLockRelease(lk);
-    all.iter()
-        .filter(|(_, s)| {
-            let lo = if ex_min { *s > min } else { *s >= min };
-            let hi = if ex_max { *s < max } else { *s <= max };
-            lo && hi
-        })
-        .count() as i64
-}}
+}
 
 /// # Safety
 /// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
@@ -2558,51 +2655,53 @@ pub unsafe fn mem_zrange_by_index(
     stop: i64,
     rev: bool,
     withscores: bool,
-) -> Vec<(Vec<u8>, Option<f64>)> { unsafe {
-    let htab = zset_htab_for(db_idx);
-    if htab.is_null() {
-        return vec![];
+) -> Vec<(Vec<u8>, Option<f64>)> {
+    unsafe {
+        let htab = zset_htab_for(db_idx);
+        if htab.is_null() {
+            return vec![];
+        }
+        let lk = zset_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
+        let mut all = zset_collect(htab, key);
+        pg_sys::LWLockRelease(lk);
+        all.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        if rev {
+            all.reverse();
+        }
+        let len = all.len();
+        if len == 0 {
+            return vec![];
+        }
+        let s = if start < 0 {
+            (start + len as i64).max(0) as usize
+        } else {
+            start as usize
+        };
+        let e = if stop < 0 {
+            (stop + len as i64) as usize
+        } else {
+            stop as usize
+        };
+        if s >= len || s > e {
+            return vec![];
+        }
+        let e = e.min(len - 1);
+        all[s..=e]
+            .iter()
+            .map(|(m, sc)| {
+                (
+                    m.as_bytes().to_vec(),
+                    if withscores { Some(*sc) } else { None },
+                )
+            })
+            .collect()
     }
-    let lk = zset_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
-    let mut all = zset_collect(htab, key);
-    pg_sys::LWLockRelease(lk);
-    all.sort_by(|a, b| {
-        a.1.partial_cmp(&b.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.0.cmp(&b.0))
-    });
-    if rev {
-        all.reverse();
-    }
-    let len = all.len();
-    if len == 0 {
-        return vec![];
-    }
-    let s = if start < 0 {
-        (start + len as i64).max(0) as usize
-    } else {
-        start as usize
-    };
-    let e = if stop < 0 {
-        (stop + len as i64) as usize
-    } else {
-        stop as usize
-    };
-    if s >= len || s > e {
-        return vec![];
-    }
-    let e = e.min(len - 1);
-    all[s..=e]
-        .iter()
-        .map(|(m, sc)| {
-            (
-                m.as_bytes().to_vec(),
-                if withscores { Some(*sc) } else { None },
-            )
-        })
-        .collect()
-}}
+}
 
 /// # Safety
 /// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
@@ -2617,45 +2716,47 @@ pub unsafe fn mem_zrange_by_score(
     ex_max: bool,
     rev: bool,
     limit: Option<(i64, i64)>,
-) -> Vec<(Vec<u8>, Option<f64>)> { unsafe {
-    let htab = zset_htab_for(db_idx);
-    if htab.is_null() {
-        return vec![];
-    }
-    let lk = zset_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
-    let mut all = zset_collect(htab, key);
-    pg_sys::LWLockRelease(lk);
-    all.sort_by(|a, b| {
-        a.1.partial_cmp(&b.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.0.cmp(&b.0))
-    });
-    if rev {
-        all.reverse();
-    }
-    let mut filtered: Vec<(Vec<u8>, Option<f64>)> = all
-        .into_iter()
-        .filter(|(_, s)| {
-            let lo = if ex_min { *s > min } else { *s >= min };
-            let hi = if ex_max { *s < max } else { *s <= max };
-            lo && hi
-        })
-        .map(|(m, s)| (m.into_bytes(), Some(s)))
-        .collect();
-    if let Some((offset, count)) = limit {
-        let off = offset.max(0) as usize;
-        if off >= filtered.len() {
+) -> Vec<(Vec<u8>, Option<f64>)> {
+    unsafe {
+        let htab = zset_htab_for(db_idx);
+        if htab.is_null() {
             return vec![];
         }
-        filtered = filtered
+        let lk = zset_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
+        let mut all = zset_collect(htab, key);
+        pg_sys::LWLockRelease(lk);
+        all.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        if rev {
+            all.reverse();
+        }
+        let mut filtered: Vec<(Vec<u8>, Option<f64>)> = all
             .into_iter()
-            .skip(off)
-            .take(count.max(0) as usize)
+            .filter(|(_, s)| {
+                let lo = if ex_min { *s > min } else { *s >= min };
+                let hi = if ex_max { *s < max } else { *s <= max };
+                lo && hi
+            })
+            .map(|(m, s)| (m.into_bytes(), Some(s)))
             .collect();
+        if let Some((offset, count)) = limit {
+            let off = offset.max(0) as usize;
+            if off >= filtered.len() {
+                return vec![];
+            }
+            filtered = filtered
+                .into_iter()
+                .skip(off)
+                .take(count.max(0) as usize)
+                .collect();
+        }
+        filtered
     }
-    filtered
-}}
+}
 
 /// # Safety
 /// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
@@ -2667,37 +2768,39 @@ pub unsafe fn mem_zrangebylex(
     max: &crate::commands::LexBound,
     rev: bool,
     limit: Option<(i64, i64)>,
-) -> Vec<Vec<u8>> { unsafe {
-    let htab = zset_htab_for(db_idx);
-    if htab.is_null() {
-        return vec![];
-    }
-    let lk = zset_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
-    let mut all = zset_collect(htab, key);
-    pg_sys::LWLockRelease(lk);
-    all.sort_by(|a, b| a.0.cmp(&b.0));
-    if rev {
-        all.reverse();
-    }
-    let mut filtered: Vec<Vec<u8>> = all
-        .into_iter()
-        .filter(|(m, _)| lex_in_range(m, min, max))
-        .map(|(m, _)| m.into_bytes())
-        .collect();
-    if let Some((offset, count)) = limit {
-        let off = offset.max(0) as usize;
-        if off >= filtered.len() {
+) -> Vec<Vec<u8>> {
+    unsafe {
+        let htab = zset_htab_for(db_idx);
+        if htab.is_null() {
             return vec![];
         }
-        filtered = filtered
+        let lk = zset_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
+        let mut all = zset_collect(htab, key);
+        pg_sys::LWLockRelease(lk);
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        if rev {
+            all.reverse();
+        }
+        let mut filtered: Vec<Vec<u8>> = all
             .into_iter()
-            .skip(off)
-            .take(count.max(0) as usize)
+            .filter(|(m, _)| lex_in_range(m, min, max))
+            .map(|(m, _)| m.into_bytes())
             .collect();
+        if let Some((offset, count)) = limit {
+            let off = offset.max(0) as usize;
+            if off >= filtered.len() {
+                return vec![];
+            }
+            filtered = filtered
+                .into_iter()
+                .skip(off)
+                .take(count.max(0) as usize)
+                .collect();
+        }
+        filtered
     }
-    filtered
-}}
+}
 
 fn lex_in_range(m: &str, min: &crate::commands::LexBound, max: &crate::commands::LexBound) -> bool {
     use crate::commands::LexBound;
@@ -2724,33 +2827,65 @@ pub unsafe fn mem_zlexcount(
     key: &str,
     min: &crate::commands::LexBound,
     max: &crate::commands::LexBound,
-) -> i64 { unsafe {
-    mem_zrangebylex(db_idx, key, min, max, false, None).len() as i64
-}}
+) -> i64 {
+    unsafe { mem_zrangebylex(db_idx, key, min, max, false, None).len() as i64 }
+}
 
 /// # Safety
 /// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
-pub unsafe fn mem_zpopmin(db_idx: usize, key: &str, count: i64) -> Vec<(Vec<u8>, f64)> { unsafe {
-    let htab = zset_htab_for(db_idx);
-    if htab.is_null() {
-        return vec![];
-    }
-    let meta_htab = zset_meta_htab_for(db_idx);
-    let lk = zset_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
+pub unsafe fn mem_zpopmin(db_idx: usize, key: &str, count: i64) -> Vec<(Vec<u8>, f64)> {
+    unsafe {
+        let htab = zset_htab_for(db_idx);
+        if htab.is_null() {
+            return vec![];
+        }
+        let meta_htab = zset_meta_htab_for(db_idx);
+        let lk = zset_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
 
-    if !meta_htab.is_null() {
-        let mut results = Vec::new();
-        for _ in 0..count.max(0) {
-            let meta = find_zset_meta(meta_htab, key);
-            if meta.is_null() || (*meta).count == 0 {
-                break;
+        if !meta_htab.is_null() {
+            let mut results = Vec::new();
+            for _ in 0..count.max(0) {
+                let meta = find_zset_meta(meta_htab, key);
+                if meta.is_null() || (*meta).count == 0 {
+                    break;
+                }
+                let min_score = (*meta).min_score;
+                let min_len = (*meta).min_member_len;
+                let min_member = read_meta_member(&(*meta).min_member, min_len);
+                let k = make_composite_key(key, &min_member);
+                let mut found = false;
+                pg_sys::hash_search(
+                    htab,
+                    k.as_ptr().cast::<c_void>(),
+                    pg_sys::HASHACTION::HASH_REMOVE,
+                    &mut found,
+                );
+                results.push((min_member.into_bytes(), min_score));
+                let old_count = (*meta).count;
+                let new_count = old_count - 1;
+                if new_count == 0 {
+                    remove_zset_meta(meta_htab, key);
+                } else {
+                    addr_of_mut!((*meta).count).write(new_count);
+                    refresh_zset_meta(htab, meta, key);
+                }
             }
-            let min_score = (*meta).min_score;
-            let min_len = (*meta).min_member_len;
-            let min_member = read_meta_member(&(*meta).min_member, min_len);
-            let k = make_composite_key(key, &min_member);
+            pg_sys::LWLockRelease(lk);
+            return results;
+        }
+
+        let mut all = zset_collect(htab, key);
+        all.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        let take = count.max(0) as usize;
+        let chosen: Vec<(String, f64)> = all.into_iter().take(take).collect();
+        for (m, _) in &chosen {
+            let k = make_composite_key(key, m);
             let mut found = false;
             pg_sys::hash_search(
                 htab,
@@ -2758,68 +2893,70 @@ pub unsafe fn mem_zpopmin(db_idx: usize, key: &str, count: i64) -> Vec<(Vec<u8>,
                 pg_sys::HASHACTION::HASH_REMOVE,
                 &mut found,
             );
-            results.push((min_member.into_bytes(), min_score));
-            let old_count = (*meta).count;
-            let new_count = old_count - 1;
-            if new_count == 0 {
-                remove_zset_meta(meta_htab, key);
-            } else {
-                addr_of_mut!((*meta).count).write(new_count);
-                refresh_zset_meta(htab, meta, key);
-            }
         }
         pg_sys::LWLockRelease(lk);
-        return results;
+        chosen
+            .into_iter()
+            .map(|(m, s)| (m.into_bytes(), s))
+            .collect()
     }
-
-    let mut all = zset_collect(htab, key);
-    all.sort_by(|a, b| {
-        a.1.partial_cmp(&b.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.0.cmp(&b.0))
-    });
-    let take = count.max(0) as usize;
-    let chosen: Vec<(String, f64)> = all.into_iter().take(take).collect();
-    for (m, _) in &chosen {
-        let k = make_composite_key(key, m);
-        let mut found = false;
-        pg_sys::hash_search(
-            htab,
-            k.as_ptr().cast::<c_void>(),
-            pg_sys::HASHACTION::HASH_REMOVE,
-            &mut found,
-        );
-    }
-    pg_sys::LWLockRelease(lk);
-    chosen
-        .into_iter()
-        .map(|(m, s)| (m.into_bytes(), s))
-        .collect()
-}}
+}
 
 /// # Safety
 /// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
-pub unsafe fn mem_zpopmax(db_idx: usize, key: &str, count: i64) -> Vec<(Vec<u8>, f64)> { unsafe {
-    let htab = zset_htab_for(db_idx);
-    if htab.is_null() {
-        return vec![];
-    }
-    let meta_htab = zset_meta_htab_for(db_idx);
-    let lk = zset_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
+pub unsafe fn mem_zpopmax(db_idx: usize, key: &str, count: i64) -> Vec<(Vec<u8>, f64)> {
+    unsafe {
+        let htab = zset_htab_for(db_idx);
+        if htab.is_null() {
+            return vec![];
+        }
+        let meta_htab = zset_meta_htab_for(db_idx);
+        let lk = zset_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
 
-    if !meta_htab.is_null() {
-        let mut results = Vec::new();
-        for _ in 0..count.max(0) {
-            let meta = find_zset_meta(meta_htab, key);
-            if meta.is_null() || (*meta).count == 0 {
-                break;
+        if !meta_htab.is_null() {
+            let mut results = Vec::new();
+            for _ in 0..count.max(0) {
+                let meta = find_zset_meta(meta_htab, key);
+                if meta.is_null() || (*meta).count == 0 {
+                    break;
+                }
+                let max_score = (*meta).max_score;
+                let max_len = (*meta).max_member_len;
+                let max_member = read_meta_member(&(*meta).max_member, max_len);
+                let k = make_composite_key(key, &max_member);
+                let mut found = false;
+                pg_sys::hash_search(
+                    htab,
+                    k.as_ptr().cast::<c_void>(),
+                    pg_sys::HASHACTION::HASH_REMOVE,
+                    &mut found,
+                );
+                results.push((max_member.into_bytes(), max_score));
+                let old_count = (*meta).count;
+                let new_count = old_count - 1;
+                if new_count == 0 {
+                    remove_zset_meta(meta_htab, key);
+                } else {
+                    addr_of_mut!((*meta).count).write(new_count);
+                    refresh_zset_meta(htab, meta, key);
+                }
             }
-            let max_score = (*meta).max_score;
-            let max_len = (*meta).max_member_len;
-            let max_member = read_meta_member(&(*meta).max_member, max_len);
-            let k = make_composite_key(key, &max_member);
+            pg_sys::LWLockRelease(lk);
+            return results;
+        }
+
+        let mut all = zset_collect(htab, key);
+        all.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        let take = count.max(0) as usize;
+        let chosen: Vec<(String, f64)> = all.into_iter().take(take).collect();
+        for (m, _) in &chosen {
+            let k = make_composite_key(key, m);
             let mut found = false;
             pg_sys::hash_search(
                 htab,
@@ -2827,44 +2964,14 @@ pub unsafe fn mem_zpopmax(db_idx: usize, key: &str, count: i64) -> Vec<(Vec<u8>,
                 pg_sys::HASHACTION::HASH_REMOVE,
                 &mut found,
             );
-            results.push((max_member.into_bytes(), max_score));
-            let old_count = (*meta).count;
-            let new_count = old_count - 1;
-            if new_count == 0 {
-                remove_zset_meta(meta_htab, key);
-            } else {
-                addr_of_mut!((*meta).count).write(new_count);
-                refresh_zset_meta(htab, meta, key);
-            }
         }
         pg_sys::LWLockRelease(lk);
-        return results;
+        chosen
+            .into_iter()
+            .map(|(m, s)| (m.into_bytes(), s))
+            .collect()
     }
-
-    let mut all = zset_collect(htab, key);
-    all.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.0.cmp(&b.0))
-    });
-    let take = count.max(0) as usize;
-    let chosen: Vec<(String, f64)> = all.into_iter().take(take).collect();
-    for (m, _) in &chosen {
-        let k = make_composite_key(key, m);
-        let mut found = false;
-        pg_sys::hash_search(
-            htab,
-            k.as_ptr().cast::<c_void>(),
-            pg_sys::HASHACTION::HASH_REMOVE,
-            &mut found,
-        );
-    }
-    pg_sys::LWLockRelease(lk);
-    chosen
-        .into_iter()
-        .map(|(m, s)| (m.into_bytes(), s))
-        .collect()
-}}
+}
 
 /// # Safety
 /// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
@@ -2874,102 +2981,106 @@ pub unsafe fn mem_zrandmember(
     key: &str,
     count: i64,
     withscores: bool,
-) -> Vec<(Vec<u8>, Option<f64>)> { unsafe {
-    let htab = zset_htab_for(db_idx);
-    if htab.is_null() {
-        return vec![];
+) -> Vec<(Vec<u8>, Option<f64>)> {
+    unsafe {
+        let htab = zset_htab_for(db_idx);
+        if htab.is_null() {
+            return vec![];
+        }
+        let lk = zset_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
+        let mut all = zset_collect(htab, key);
+        pg_sys::LWLockRelease(lk);
+        if all.is_empty() {
+            return vec![];
+        }
+        if count >= 0 {
+            let take = (count as usize).min(all.len());
+            all.truncate(take);
+            all.into_iter()
+                .map(|(m, s)| (m.into_bytes(), if withscores { Some(s) } else { None }))
+                .collect()
+        } else {
+            let need = (-count) as usize;
+            let len = all.len();
+            (0..need)
+                .map(|i| {
+                    let (m, s) = &all[i % len];
+                    (
+                        m.as_bytes().to_vec(),
+                        if withscores { Some(*s) } else { None },
+                    )
+                })
+                .collect()
+        }
     }
-    let lk = zset_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
-    let mut all = zset_collect(htab, key);
-    pg_sys::LWLockRelease(lk);
-    if all.is_empty() {
-        return vec![];
-    }
-    if count >= 0 {
-        let take = (count as usize).min(all.len());
-        all.truncate(take);
-        all.into_iter()
-            .map(|(m, s)| (m.into_bytes(), if withscores { Some(s) } else { None }))
-            .collect()
-    } else {
-        let need = (-count) as usize;
-        let len = all.len();
-        (0..need)
-            .map(|i| {
-                let (m, s) = &all[i % len];
-                (
-                    m.as_bytes().to_vec(),
-                    if withscores { Some(*s) } else { None },
-                )
-            })
-            .collect()
-    }
-}}
+}
 
 /// # Safety
 /// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
-pub unsafe fn mem_zremrangebyrank(db_idx: usize, key: &str, start: i64, stop: i64) -> i64 { unsafe {
-    let htab = zset_htab_for(db_idx);
-    if htab.is_null() {
-        return 0;
-    }
-    let meta_htab = zset_meta_htab_for(db_idx);
-    let lk = zset_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
-    let mut all = zset_collect(htab, key);
-    all.sort_by(|a, b| {
-        a.1.partial_cmp(&b.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.0.cmp(&b.0))
-    });
-    let len = all.len();
-    if len == 0 {
-        pg_sys::LWLockRelease(lk);
-        return 0;
-    }
-    let s = if start < 0 {
-        (start + len as i64).max(0) as usize
-    } else {
-        start as usize
-    };
-    let e = if stop < 0 {
-        (stop + len as i64) as usize
-    } else {
-        stop as usize
-    };
-    let e = e.min(len - 1);
-    if s >= len || s > e {
-        pg_sys::LWLockRelease(lk);
-        return 0;
-    }
-    let to_del: Vec<String> = all[s..=e].iter().map(|(m, _)| m.clone()).collect();
-    for m in &to_del {
-        let k = make_composite_key(key, m);
-        let mut found = false;
-        pg_sys::hash_search(
-            htab,
-            k.as_ptr().cast::<c_void>(),
-            pg_sys::HASHACTION::HASH_REMOVE,
-            &mut found,
-        );
-    }
-    if !to_del.is_empty() && !meta_htab.is_null() {
-        let new_count = (len - to_del.len()) as i64;
-        if new_count == 0 {
-            remove_zset_meta(meta_htab, key);
+pub unsafe fn mem_zremrangebyrank(db_idx: usize, key: &str, start: i64, stop: i64) -> i64 {
+    unsafe {
+        let htab = zset_htab_for(db_idx);
+        if htab.is_null() {
+            return 0;
+        }
+        let meta_htab = zset_meta_htab_for(db_idx);
+        let lk = zset_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
+        let mut all = zset_collect(htab, key);
+        all.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        let len = all.len();
+        if len == 0 {
+            pg_sys::LWLockRelease(lk);
+            return 0;
+        }
+        let s = if start < 0 {
+            (start + len as i64).max(0) as usize
         } else {
-            let meta = find_zset_meta(meta_htab, key);
-            if !meta.is_null() {
-                addr_of_mut!((*meta).count).write(new_count);
-                refresh_zset_meta(htab, meta, key);
+            start as usize
+        };
+        let e = if stop < 0 {
+            (stop + len as i64) as usize
+        } else {
+            stop as usize
+        };
+        let e = e.min(len - 1);
+        if s >= len || s > e {
+            pg_sys::LWLockRelease(lk);
+            return 0;
+        }
+        let to_del: Vec<String> = all[s..=e].iter().map(|(m, _)| m.clone()).collect();
+        for m in &to_del {
+            let k = make_composite_key(key, m);
+            let mut found = false;
+            pg_sys::hash_search(
+                htab,
+                k.as_ptr().cast::<c_void>(),
+                pg_sys::HASHACTION::HASH_REMOVE,
+                &mut found,
+            );
+        }
+        if !to_del.is_empty() && !meta_htab.is_null() {
+            let new_count = (len - to_del.len()) as i64;
+            if new_count == 0 {
+                remove_zset_meta(meta_htab, key);
+            } else {
+                let meta = find_zset_meta(meta_htab, key);
+                if !meta.is_null() {
+                    addr_of_mut!((*meta).count).write(new_count);
+                    refresh_zset_meta(htab, meta, key);
+                }
             }
         }
+        pg_sys::LWLockRelease(lk);
+        to_del.len() as i64
     }
-    pg_sys::LWLockRelease(lk);
-    to_del.len() as i64
-}}
+}
 
 /// # Safety
 /// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
@@ -2981,50 +3092,52 @@ pub unsafe fn mem_zremrangebyscore(
     max: f64,
     ex_min: bool,
     ex_max: bool,
-) -> i64 { unsafe {
-    let htab = zset_htab_for(db_idx);
-    if htab.is_null() {
-        return 0;
-    }
-    let meta_htab = zset_meta_htab_for(db_idx);
-    let lk = zset_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
-    let all = zset_collect(htab, key);
-    let total = all.len();
-    let to_del: Vec<String> = all
-        .into_iter()
-        .filter(|(_, s)| {
-            let lo = if ex_min { *s > min } else { *s >= min };
-            let hi = if ex_max { *s < max } else { *s <= max };
-            lo && hi
-        })
-        .map(|(m, _)| m)
-        .collect();
-    for m in &to_del {
-        let k = make_composite_key(key, m);
-        let mut found = false;
-        pg_sys::hash_search(
-            htab,
-            k.as_ptr().cast::<c_void>(),
-            pg_sys::HASHACTION::HASH_REMOVE,
-            &mut found,
-        );
-    }
-    if !to_del.is_empty() && !meta_htab.is_null() {
-        let new_count = (total - to_del.len()) as i64;
-        if new_count == 0 {
-            remove_zset_meta(meta_htab, key);
-        } else {
-            let meta = find_zset_meta(meta_htab, key);
-            if !meta.is_null() {
-                addr_of_mut!((*meta).count).write(new_count);
-                refresh_zset_meta(htab, meta, key);
+) -> i64 {
+    unsafe {
+        let htab = zset_htab_for(db_idx);
+        if htab.is_null() {
+            return 0;
+        }
+        let meta_htab = zset_meta_htab_for(db_idx);
+        let lk = zset_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
+        let all = zset_collect(htab, key);
+        let total = all.len();
+        let to_del: Vec<String> = all
+            .into_iter()
+            .filter(|(_, s)| {
+                let lo = if ex_min { *s > min } else { *s >= min };
+                let hi = if ex_max { *s < max } else { *s <= max };
+                lo && hi
+            })
+            .map(|(m, _)| m)
+            .collect();
+        for m in &to_del {
+            let k = make_composite_key(key, m);
+            let mut found = false;
+            pg_sys::hash_search(
+                htab,
+                k.as_ptr().cast::<c_void>(),
+                pg_sys::HASHACTION::HASH_REMOVE,
+                &mut found,
+            );
+        }
+        if !to_del.is_empty() && !meta_htab.is_null() {
+            let new_count = (total - to_del.len()) as i64;
+            if new_count == 0 {
+                remove_zset_meta(meta_htab, key);
+            } else {
+                let meta = find_zset_meta(meta_htab, key);
+                if !meta.is_null() {
+                    addr_of_mut!((*meta).count).write(new_count);
+                    refresh_zset_meta(htab, meta, key);
+                }
             }
         }
+        pg_sys::LWLockRelease(lk);
+        to_del.len() as i64
     }
-    pg_sys::LWLockRelease(lk);
-    to_del.len() as i64
-}}
+}
 
 /// # Safety
 /// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
@@ -3034,78 +3147,82 @@ pub unsafe fn mem_zremrangebylex(
     key: &str,
     min: &crate::commands::LexBound,
     max: &crate::commands::LexBound,
-) -> i64 { unsafe {
-    let htab = zset_htab_for(db_idx);
-    if htab.is_null() {
-        return 0;
-    }
-    let meta_htab = zset_meta_htab_for(db_idx);
-    let lk = zset_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
-    let all = zset_collect(htab, key);
-    let total = all.len();
-    let to_del: Vec<String> = all
-        .into_iter()
-        .filter(|(m, _)| lex_in_range(m, min, max))
-        .map(|(m, _)| m)
-        .collect();
-    for m in &to_del {
-        let k = make_composite_key(key, m);
-        let mut found = false;
-        pg_sys::hash_search(
-            htab,
-            k.as_ptr().cast::<c_void>(),
-            pg_sys::HASHACTION::HASH_REMOVE,
-            &mut found,
-        );
-    }
-    if !to_del.is_empty() && !meta_htab.is_null() {
-        let new_count = (total - to_del.len()) as i64;
-        if new_count == 0 {
-            remove_zset_meta(meta_htab, key);
-        } else {
-            let meta = find_zset_meta(meta_htab, key);
-            if !meta.is_null() {
-                addr_of_mut!((*meta).count).write(new_count);
-                refresh_zset_meta(htab, meta, key);
+) -> i64 {
+    unsafe {
+        let htab = zset_htab_for(db_idx);
+        if htab.is_null() {
+            return 0;
+        }
+        let meta_htab = zset_meta_htab_for(db_idx);
+        let lk = zset_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
+        let all = zset_collect(htab, key);
+        let total = all.len();
+        let to_del: Vec<String> = all
+            .into_iter()
+            .filter(|(m, _)| lex_in_range(m, min, max))
+            .map(|(m, _)| m)
+            .collect();
+        for m in &to_del {
+            let k = make_composite_key(key, m);
+            let mut found = false;
+            pg_sys::hash_search(
+                htab,
+                k.as_ptr().cast::<c_void>(),
+                pg_sys::HASHACTION::HASH_REMOVE,
+                &mut found,
+            );
+        }
+        if !to_del.is_empty() && !meta_htab.is_null() {
+            let new_count = (total - to_del.len()) as i64;
+            if new_count == 0 {
+                remove_zset_meta(meta_htab, key);
+            } else {
+                let meta = find_zset_meta(meta_htab, key);
+                if !meta.is_null() {
+                    addr_of_mut!((*meta).count).write(new_count);
+                    refresh_zset_meta(htab, meta, key);
+                }
             }
         }
+        pg_sys::LWLockRelease(lk);
+        to_del.len() as i64
     }
-    pg_sys::LWLockRelease(lk);
-    to_del.len() as i64
-}}
+}
 
 /// # Safety
 /// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
-pub unsafe fn mem_zmsmembers(db_idx: usize, key: &str, members: &[&str]) -> Vec<Option<f64>> { unsafe {
-    let htab = zset_htab_for(db_idx);
-    if htab.is_null() {
-        return members.iter().map(|_| None).collect();
+pub unsafe fn mem_zmsmembers(db_idx: usize, key: &str, members: &[&str]) -> Vec<Option<f64>> {
+    unsafe {
+        let htab = zset_htab_for(db_idx);
+        if htab.is_null() {
+            return members.iter().map(|_| None).collect();
+        }
+        let lk = zset_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
+        let results: Vec<Option<f64>> = members
+            .iter()
+            .map(|m| {
+                let k = make_composite_key(key, m);
+                let mut found = false;
+                let entry = pg_sys::hash_search(
+                    htab,
+                    k.as_ptr().cast::<c_void>(),
+                    pg_sys::HASHACTION::HASH_FIND,
+                    &mut found,
+                ) as *mut ZsetEntry;
+                if found && !entry.is_null() {
+                    Some((*entry).score)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        pg_sys::LWLockRelease(lk);
+        results
     }
-    let lk = zset_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
-    let results: Vec<Option<f64>> = members
-        .iter()
-        .map(|m| {
-            let k = make_composite_key(key, m);
-            let mut found = false;
-            let entry = pg_sys::hash_search(
-                htab,
-                k.as_ptr().cast::<c_void>(),
-                pg_sys::HASHACTION::HASH_FIND,
-                &mut found,
-            ) as *mut ZsetEntry;
-            if found && !entry.is_null() {
-                Some((*entry).score)
-            } else {
-                None
-            }
-        })
-        .collect();
-    pg_sys::LWLockRelease(lk);
-    results
-}}
+}
 
 fn apply_aggregate(existing: f64, new: f64, agg: crate::commands::Aggregate) -> f64 {
     match agg {
@@ -3124,67 +3241,69 @@ pub unsafe fn mem_zunionstore(
     keys: &[&str],
     weights: &[f64],
     aggregate: crate::commands::Aggregate,
-) -> i64 { unsafe {
-    let htab = zset_htab_for(db_idx);
-    if htab.is_null() {
-        return 0;
-    }
-    let meta_htab = zset_meta_htab_for(db_idx);
-    let lk = zset_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
-    let mut map: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-    for (ki, k) in keys.iter().enumerate() {
-        let w = weights.get(ki).copied().unwrap_or(1.0);
-        let entries = zset_collect(htab, k);
-        for (m, s) in entries {
-            let weighted = s * w;
-            map.entry(m)
-                .and_modify(|e| *e = apply_aggregate(*e, weighted, aggregate))
-                .or_insert(weighted);
+) -> i64 {
+    unsafe {
+        let htab = zset_htab_for(db_idx);
+        if htab.is_null() {
+            return 0;
         }
-    }
-    let to_del: Vec<String> = {
-        let old = zset_collect(htab, dst);
-        old.into_iter().map(|(m, _)| m).collect()
-    };
-    for m in &to_del {
-        let k = make_composite_key(dst, m);
-        let mut found = false;
-        pg_sys::hash_search(
-            htab,
-            k.as_ptr().cast::<c_void>(),
-            pg_sys::HASHACTION::HASH_REMOVE,
-            &mut found,
-        );
-    }
-    let count = map.len() as i64;
-    for (m, s) in &map {
-        let k = make_composite_key(dst, m);
-        let mut found = false;
-        let entry = pg_sys::hash_search(
-            htab,
-            k.as_ptr().cast::<c_void>(),
-            pg_sys::HASHACTION::HASH_ENTER,
-            &mut found,
-        ) as *mut ZsetEntry;
-        if !entry.is_null() {
-            addr_of_mut!((*entry).score).write(*s);
-        }
-    }
-    if !meta_htab.is_null() {
-        if count == 0 {
-            remove_zset_meta(meta_htab, dst);
-        } else {
-            let meta = get_or_create_zset_meta(meta_htab, dst);
-            if !meta.is_null() {
-                addr_of_mut!((*meta).count).write(count);
-                refresh_zset_meta(htab, meta, dst);
+        let meta_htab = zset_meta_htab_for(db_idx);
+        let lk = zset_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
+        let mut map: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        for (ki, k) in keys.iter().enumerate() {
+            let w = weights.get(ki).copied().unwrap_or(1.0);
+            let entries = zset_collect(htab, k);
+            for (m, s) in entries {
+                let weighted = s * w;
+                map.entry(m)
+                    .and_modify(|e| *e = apply_aggregate(*e, weighted, aggregate))
+                    .or_insert(weighted);
             }
         }
+        let to_del: Vec<String> = {
+            let old = zset_collect(htab, dst);
+            old.into_iter().map(|(m, _)| m).collect()
+        };
+        for m in &to_del {
+            let k = make_composite_key(dst, m);
+            let mut found = false;
+            pg_sys::hash_search(
+                htab,
+                k.as_ptr().cast::<c_void>(),
+                pg_sys::HASHACTION::HASH_REMOVE,
+                &mut found,
+            );
+        }
+        let count = map.len() as i64;
+        for (m, s) in &map {
+            let k = make_composite_key(dst, m);
+            let mut found = false;
+            let entry = pg_sys::hash_search(
+                htab,
+                k.as_ptr().cast::<c_void>(),
+                pg_sys::HASHACTION::HASH_ENTER,
+                &mut found,
+            ) as *mut ZsetEntry;
+            if !entry.is_null() {
+                addr_of_mut!((*entry).score).write(*s);
+            }
+        }
+        if !meta_htab.is_null() {
+            if count == 0 {
+                remove_zset_meta(meta_htab, dst);
+            } else {
+                let meta = get_or_create_zset_meta(meta_htab, dst);
+                if !meta.is_null() {
+                    addr_of_mut!((*meta).count).write(count);
+                    refresh_zset_meta(htab, meta, dst);
+                }
+            }
+        }
+        pg_sys::LWLockRelease(lk);
+        count
     }
-    pg_sys::LWLockRelease(lk);
-    count
-}}
+}
 
 /// # Safety
 /// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
@@ -3195,177 +3314,183 @@ pub unsafe fn mem_zinterstore(
     keys: &[&str],
     weights: &[f64],
     aggregate: crate::commands::Aggregate,
-) -> i64 { unsafe {
-    if keys.is_empty() {
-        return 0;
-    }
-    let htab = zset_htab_for(db_idx);
-    if htab.is_null() {
-        return 0;
-    }
-    let meta_htab = zset_meta_htab_for(db_idx);
-    let lk = zset_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
-    let w0 = weights.first().copied().unwrap_or(1.0);
-    let first: std::collections::HashMap<String, f64> = zset_collect(htab, keys[0])
-        .into_iter()
-        .map(|(m, s)| (m, s * w0))
-        .collect();
-    let mut result = first;
-    for (ki, k) in keys[1..].iter().enumerate() {
-        let w = weights.get(ki + 1).copied().unwrap_or(1.0);
-        let other: std::collections::HashMap<String, f64> = zset_collect(htab, k)
-            .into_iter()
-            .map(|(m, s)| (m, s * w))
-            .collect();
-        result = result
-            .into_iter()
-            .filter_map(|(m, s)| {
-                other
-                    .get(&m)
-                    .map(|&os| (m, apply_aggregate(s, os, aggregate)))
-            })
-            .collect();
-    }
-    let to_del: Vec<String> = zset_collect(htab, dst)
-        .into_iter()
-        .map(|(m, _)| m)
-        .collect();
-    for m in &to_del {
-        let k = make_composite_key(dst, m);
-        let mut found = false;
-        pg_sys::hash_search(
-            htab,
-            k.as_ptr().cast::<c_void>(),
-            pg_sys::HASHACTION::HASH_REMOVE,
-            &mut found,
-        );
-    }
-    let count = result.len() as i64;
-    for (m, s) in &result {
-        let k = make_composite_key(dst, m);
-        let mut found = false;
-        let entry = pg_sys::hash_search(
-            htab,
-            k.as_ptr().cast::<c_void>(),
-            pg_sys::HASHACTION::HASH_ENTER,
-            &mut found,
-        ) as *mut ZsetEntry;
-        if !entry.is_null() {
-            addr_of_mut!((*entry).score).write(*s);
+) -> i64 {
+    unsafe {
+        if keys.is_empty() {
+            return 0;
         }
-    }
-    if !meta_htab.is_null() {
-        if count == 0 {
-            remove_zset_meta(meta_htab, dst);
-        } else {
-            let meta = get_or_create_zset_meta(meta_htab, dst);
-            if !meta.is_null() {
-                addr_of_mut!((*meta).count).write(count);
-                refresh_zset_meta(htab, meta, dst);
+        let htab = zset_htab_for(db_idx);
+        if htab.is_null() {
+            return 0;
+        }
+        let meta_htab = zset_meta_htab_for(db_idx);
+        let lk = zset_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
+        let w0 = weights.first().copied().unwrap_or(1.0);
+        let first: std::collections::HashMap<String, f64> = zset_collect(htab, keys[0])
+            .into_iter()
+            .map(|(m, s)| (m, s * w0))
+            .collect();
+        let mut result = first;
+        for (ki, k) in keys[1..].iter().enumerate() {
+            let w = weights.get(ki + 1).copied().unwrap_or(1.0);
+            let other: std::collections::HashMap<String, f64> = zset_collect(htab, k)
+                .into_iter()
+                .map(|(m, s)| (m, s * w))
+                .collect();
+            result = result
+                .into_iter()
+                .filter_map(|(m, s)| {
+                    other
+                        .get(&m)
+                        .map(|&os| (m, apply_aggregate(s, os, aggregate)))
+                })
+                .collect();
+        }
+        let to_del: Vec<String> = zset_collect(htab, dst)
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect();
+        for m in &to_del {
+            let k = make_composite_key(dst, m);
+            let mut found = false;
+            pg_sys::hash_search(
+                htab,
+                k.as_ptr().cast::<c_void>(),
+                pg_sys::HASHACTION::HASH_REMOVE,
+                &mut found,
+            );
+        }
+        let count = result.len() as i64;
+        for (m, s) in &result {
+            let k = make_composite_key(dst, m);
+            let mut found = false;
+            let entry = pg_sys::hash_search(
+                htab,
+                k.as_ptr().cast::<c_void>(),
+                pg_sys::HASHACTION::HASH_ENTER,
+                &mut found,
+            ) as *mut ZsetEntry;
+            if !entry.is_null() {
+                addr_of_mut!((*entry).score).write(*s);
             }
         }
+        if !meta_htab.is_null() {
+            if count == 0 {
+                remove_zset_meta(meta_htab, dst);
+            } else {
+                let meta = get_or_create_zset_meta(meta_htab, dst);
+                if !meta.is_null() {
+                    addr_of_mut!((*meta).count).write(count);
+                    refresh_zset_meta(htab, meta, dst);
+                }
+            }
+        }
+        pg_sys::LWLockRelease(lk);
+        count
     }
-    pg_sys::LWLockRelease(lk);
-    count
-}}
+}
 
 /// # Safety
 /// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
-pub unsafe fn mem_zdiffstore(db_idx: usize, dst: &str, keys: &[&str]) -> i64 { unsafe {
-    if keys.is_empty() {
-        return 0;
-    }
-    let htab = zset_htab_for(db_idx);
-    if htab.is_null() {
-        return 0;
-    }
-    let meta_htab = zset_meta_htab_for(db_idx);
-    let lk = zset_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
-    let first: std::collections::HashMap<String, f64> =
-        zset_collect(htab, keys[0]).into_iter().collect();
-    let mut result = first;
-    for k in &keys[1..] {
-        let other: std::collections::HashSet<String> =
-            zset_collect(htab, k).into_iter().map(|(m, _)| m).collect();
-        result.retain(|m, _| !other.contains(m));
-    }
-    let to_del: Vec<String> = zset_collect(htab, dst)
-        .into_iter()
-        .map(|(m, _)| m)
-        .collect();
-    for m in &to_del {
-        let k = make_composite_key(dst, m);
-        let mut found = false;
-        pg_sys::hash_search(
-            htab,
-            k.as_ptr().cast::<c_void>(),
-            pg_sys::HASHACTION::HASH_REMOVE,
-            &mut found,
-        );
-    }
-    let count = result.len() as i64;
-    for (m, s) in &result {
-        let k = make_composite_key(dst, m);
-        let mut found = false;
-        let entry = pg_sys::hash_search(
-            htab,
-            k.as_ptr().cast::<c_void>(),
-            pg_sys::HASHACTION::HASH_ENTER,
-            &mut found,
-        ) as *mut ZsetEntry;
-        if !entry.is_null() {
-            addr_of_mut!((*entry).score).write(*s);
+pub unsafe fn mem_zdiffstore(db_idx: usize, dst: &str, keys: &[&str]) -> i64 {
+    unsafe {
+        if keys.is_empty() {
+            return 0;
         }
-    }
-    if !meta_htab.is_null() {
-        if count == 0 {
-            remove_zset_meta(meta_htab, dst);
-        } else {
-            let meta = get_or_create_zset_meta(meta_htab, dst);
-            if !meta.is_null() {
-                addr_of_mut!((*meta).count).write(count);
-                refresh_zset_meta(htab, meta, dst);
+        let htab = zset_htab_for(db_idx);
+        if htab.is_null() {
+            return 0;
+        }
+        let meta_htab = zset_meta_htab_for(db_idx);
+        let lk = zset_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
+        let first: std::collections::HashMap<String, f64> =
+            zset_collect(htab, keys[0]).into_iter().collect();
+        let mut result = first;
+        for k in &keys[1..] {
+            let other: std::collections::HashSet<String> =
+                zset_collect(htab, k).into_iter().map(|(m, _)| m).collect();
+            result.retain(|m, _| !other.contains(m));
+        }
+        let to_del: Vec<String> = zset_collect(htab, dst)
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect();
+        for m in &to_del {
+            let k = make_composite_key(dst, m);
+            let mut found = false;
+            pg_sys::hash_search(
+                htab,
+                k.as_ptr().cast::<c_void>(),
+                pg_sys::HASHACTION::HASH_REMOVE,
+                &mut found,
+            );
+        }
+        let count = result.len() as i64;
+        for (m, s) in &result {
+            let k = make_composite_key(dst, m);
+            let mut found = false;
+            let entry = pg_sys::hash_search(
+                htab,
+                k.as_ptr().cast::<c_void>(),
+                pg_sys::HASHACTION::HASH_ENTER,
+                &mut found,
+            ) as *mut ZsetEntry;
+            if !entry.is_null() {
+                addr_of_mut!((*entry).score).write(*s);
             }
         }
+        if !meta_htab.is_null() {
+            if count == 0 {
+                remove_zset_meta(meta_htab, dst);
+            } else {
+                let meta = get_or_create_zset_meta(meta_htab, dst);
+                if !meta.is_null() {
+                    addr_of_mut!((*meta).count).write(count);
+                    refresh_zset_meta(htab, meta, dst);
+                }
+            }
+        }
+        pg_sys::LWLockRelease(lk);
+        count
     }
-    pg_sys::LWLockRelease(lk);
-    count
-}}
+}
 
 /// # Safety
 /// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
-pub unsafe fn mem_del_zset_key(db_idx: usize, key: &str) -> i64 { unsafe {
-    let htab = zset_htab_for(db_idx);
-    if htab.is_null() {
-        return 0;
+pub unsafe fn mem_del_zset_key(db_idx: usize, key: &str) -> i64 {
+    unsafe {
+        let htab = zset_htab_for(db_idx);
+        if htab.is_null() {
+            return 0;
+        }
+        let meta_htab = zset_meta_htab_for(db_idx);
+        let lk = zset_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
+        let to_del: Vec<String> = zset_collect(htab, key)
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect();
+        for m in &to_del {
+            let k = make_composite_key(key, m);
+            let mut found = false;
+            pg_sys::hash_search(
+                htab,
+                k.as_ptr().cast::<c_void>(),
+                pg_sys::HASHACTION::HASH_REMOVE,
+                &mut found,
+            );
+        }
+        if !to_del.is_empty() {
+            remove_zset_meta(meta_htab, key);
+        }
+        pg_sys::LWLockRelease(lk);
+        to_del.len() as i64
     }
-    let meta_htab = zset_meta_htab_for(db_idx);
-    let lk = zset_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
-    let to_del: Vec<String> = zset_collect(htab, key)
-        .into_iter()
-        .map(|(m, _)| m)
-        .collect();
-    for m in &to_del {
-        let k = make_composite_key(key, m);
-        let mut found = false;
-        pg_sys::hash_search(
-            htab,
-            k.as_ptr().cast::<c_void>(),
-            pg_sys::HASHACTION::HASH_REMOVE,
-            &mut found,
-        );
-    }
-    if !to_del.is_empty() {
-        remove_zset_meta(meta_htab, key);
-    }
-    pg_sys::LWLockRelease(lk);
-    to_del.len() as i64
-}}
+}
 
 // ─────────────────────────── List operations ────────────────────────────────
 
@@ -3436,760 +3561,366 @@ unsafe fn read_meta_member(src: &[u8; MAX_KEY_LEN], len: u16) -> String {
     String::from_utf8_lossy(&src[..l]).into_owned()
 }
 
-unsafe fn get_or_create_zset_meta(meta_htab: *mut pg_sys::HTAB, key: &str) -> *mut ZsetMeta { unsafe {
-    let key_buf = make_key(key);
-    let mut found = false;
-    let meta = pg_sys::hash_search(
-        meta_htab,
-        key_buf.as_ptr().cast::<c_void>(),
-        pg_sys::HASHACTION::HASH_ENTER,
-        &mut found,
-    ) as *mut ZsetMeta;
-    if !meta.is_null() && !found {
-        addr_of_mut!((*meta).count).write(0);
-        addr_of_mut!((*meta).min_score).write(f64::INFINITY);
-        addr_of_mut!((*meta).max_score).write(f64::NEG_INFINITY);
-        addr_of_mut!((*meta).min_member_len).write(0);
-        addr_of_mut!((*meta).max_member_len).write(0);
-    }
-    meta
-}}
-
-unsafe fn find_zset_meta(meta_htab: *mut pg_sys::HTAB, key: &str) -> *mut ZsetMeta { unsafe {
-    if meta_htab.is_null() {
-        return std::ptr::null_mut();
-    }
-    let key_buf = make_key(key);
-    let mut found = false;
-    let meta = pg_sys::hash_search(
-        meta_htab,
-        key_buf.as_ptr().cast::<c_void>(),
-        pg_sys::HASHACTION::HASH_FIND,
-        &mut found,
-    ) as *mut ZsetMeta;
-    if found { meta } else { std::ptr::null_mut() }
-}}
-
-unsafe fn remove_zset_meta(meta_htab: *mut pg_sys::HTAB, key: &str) { unsafe {
-    if meta_htab.is_null() {
-        return;
-    }
-    let key_buf = make_key(key);
-    let mut found = false;
-    pg_sys::hash_search(
-        meta_htab,
-        key_buf.as_ptr().cast::<c_void>(),
-        pg_sys::HASHACTION::HASH_REMOVE,
-        &mut found,
-    );
-}}
-
-unsafe fn refresh_zset_meta(zset_htab: *mut pg_sys::HTAB, meta: *mut ZsetMeta, key: &str) { unsafe {
-    let mut new_min = f64::INFINITY;
-    let mut new_max = f64::NEG_INFINITY;
-    let mut min_member = String::new();
-    let mut max_member = String::new();
-
-    let mut status: pg_sys::HASH_SEQ_STATUS = std::mem::zeroed();
-    pg_sys::hash_seq_init(&mut status, zset_htab);
-    loop {
-        let entry = pg_sys::hash_seq_search(&mut status) as *mut ZsetEntry;
-        if entry.is_null() {
-            break;
+unsafe fn get_or_create_zset_meta(meta_htab: *mut pg_sys::HTAB, key: &str) -> *mut ZsetMeta {
+    unsafe {
+        let key_buf = make_key(key);
+        let mut found = false;
+        let meta = pg_sys::hash_search(
+            meta_htab,
+            key_buf.as_ptr().cast::<c_void>(),
+            pg_sys::HASHACTION::HASH_ENTER,
+            &mut found,
+        ) as *mut ZsetMeta;
+        if !meta.is_null() && !found {
+            addr_of_mut!((*meta).count).write(0);
+            addr_of_mut!((*meta).min_score).write(f64::INFINITY);
+            addr_of_mut!((*meta).max_score).write(f64::NEG_INFINITY);
+            addr_of_mut!((*meta).min_member_len).write(0);
+            addr_of_mut!((*meta).max_member_len).write(0);
         }
-        if !key_matches_entry(addr_of!((*entry).key) as *const u8, key) {
-            continue;
-        }
-        let score = (*entry).score;
-        let mb = addr_of!((*entry).member) as *const u8;
-        let ms = std::slice::from_raw_parts(mb, MAX_KEY_LEN);
-        let me = ms.iter().position(|&b| b == 0).unwrap_or(MAX_KEY_LEN);
-        let member = String::from_utf8_lossy(&ms[..me]).into_owned();
-        if score < new_min || (score == new_min && member < min_member) {
-            new_min = score;
-            min_member = member.clone();
-        }
-        if score > new_max || (score == new_max && member > max_member) {
-            new_max = score;
-            max_member = member;
-        }
+        meta
     }
+}
 
-    addr_of_mut!((*meta).min_score).write(new_min);
-    addr_of_mut!((*meta).max_score).write(new_max);
-    let min_len = &mut *addr_of_mut!((*meta).min_member_len);
-    let max_len = &mut *addr_of_mut!((*meta).max_member_len);
-    write_meta_member(&mut (*meta).min_member, min_len, &min_member);
-    write_meta_member(&mut (*meta).max_member, max_len, &max_member);
-}}
+unsafe fn find_zset_meta(meta_htab: *mut pg_sys::HTAB, key: &str) -> *mut ZsetMeta {
+    unsafe {
+        if meta_htab.is_null() {
+            return std::ptr::null_mut();
+        }
+        let key_buf = make_key(key);
+        let mut found = false;
+        let meta = pg_sys::hash_search(
+            meta_htab,
+            key_buf.as_ptr().cast::<c_void>(),
+            pg_sys::HASHACTION::HASH_FIND,
+            &mut found,
+        ) as *mut ZsetMeta;
+        if found { meta } else { std::ptr::null_mut() }
+    }
+}
+
+unsafe fn remove_zset_meta(meta_htab: *mut pg_sys::HTAB, key: &str) {
+    unsafe {
+        if meta_htab.is_null() {
+            return;
+        }
+        let key_buf = make_key(key);
+        let mut found = false;
+        pg_sys::hash_search(
+            meta_htab,
+            key_buf.as_ptr().cast::<c_void>(),
+            pg_sys::HASHACTION::HASH_REMOVE,
+            &mut found,
+        );
+    }
+}
+
+unsafe fn refresh_zset_meta(zset_htab: *mut pg_sys::HTAB, meta: *mut ZsetMeta, key: &str) {
+    unsafe {
+        let mut new_min = f64::INFINITY;
+        let mut new_max = f64::NEG_INFINITY;
+        let mut min_member = String::new();
+        let mut max_member = String::new();
+
+        let mut status: pg_sys::HASH_SEQ_STATUS = std::mem::zeroed();
+        pg_sys::hash_seq_init(&mut status, zset_htab);
+        loop {
+            let entry = pg_sys::hash_seq_search(&mut status) as *mut ZsetEntry;
+            if entry.is_null() {
+                break;
+            }
+            if !key_matches_entry(addr_of!((*entry).key) as *const u8, key) {
+                continue;
+            }
+            let score = (*entry).score;
+            let mb = addr_of!((*entry).member) as *const u8;
+            let ms = std::slice::from_raw_parts(mb, MAX_KEY_LEN);
+            let me = ms.iter().position(|&b| b == 0).unwrap_or(MAX_KEY_LEN);
+            let member = String::from_utf8_lossy(&ms[..me]).into_owned();
+            if score < new_min || (score == new_min && member < min_member) {
+                new_min = score;
+                min_member = member.clone();
+            }
+            if score > new_max || (score == new_max && member > max_member) {
+                new_max = score;
+                max_member = member;
+            }
+        }
+
+        addr_of_mut!((*meta).min_score).write(new_min);
+        addr_of_mut!((*meta).max_score).write(new_max);
+        let min_len = &mut *addr_of_mut!((*meta).min_member_len);
+        let max_len = &mut *addr_of_mut!((*meta).max_member_len);
+        write_meta_member(&mut (*meta).min_member, min_len, &min_member);
+        write_meta_member(&mut (*meta).max_member, max_len, &max_member);
+    }
+}
 
 // ─────────────────────────── SetMeta helpers ────────────────────────────────
 
-unsafe fn get_or_create_set_meta(meta_htab: *mut pg_sys::HTAB, key: &str) -> *mut SetMeta { unsafe {
-    if meta_htab.is_null() {
-        return std::ptr::null_mut();
-    }
-    let key_buf = make_key(key);
-    let mut found = false;
-    let meta = pg_sys::hash_search(
-        meta_htab,
-        key_buf.as_ptr().cast::<c_void>(),
-        pg_sys::HASHACTION::HASH_ENTER,
-        &mut found,
-    ) as *mut SetMeta;
-    if !meta.is_null() && !found {
-        addr_of_mut!((*meta).count).write(0);
-    }
-    meta
-}}
-
-unsafe fn find_set_meta(meta_htab: *mut pg_sys::HTAB, key: &str) -> *mut SetMeta { unsafe {
-    if meta_htab.is_null() {
-        return std::ptr::null_mut();
-    }
-    let key_buf = make_key(key);
-    let mut found = false;
-    let meta = pg_sys::hash_search(
-        meta_htab,
-        key_buf.as_ptr().cast::<c_void>(),
-        pg_sys::HASHACTION::HASH_FIND,
-        &mut found,
-    ) as *mut SetMeta;
-    if found { meta } else { std::ptr::null_mut() }
-}}
-
-unsafe fn remove_set_meta(meta_htab: *mut pg_sys::HTAB, key: &str) { unsafe {
-    if meta_htab.is_null() {
-        return;
-    }
-    let key_buf = make_key(key);
-    let mut found = false;
-    pg_sys::hash_search(
-        meta_htab,
-        key_buf.as_ptr().cast::<c_void>(),
-        pg_sys::HASHACTION::HASH_REMOVE,
-        &mut found,
-    );
-}}
-
-/// # Safety
-/// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
-/// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
-pub unsafe fn mem_lpush(db_idx: usize, key: &str, values: &[&str]) -> i64 { unsafe {
-    let htab = list_htab_for(db_idx);
-    let meta_htab = list_meta_htab_for(db_idx);
-    if htab.is_null() || meta_htab.is_null() {
-        return 0;
-    }
-    let overflow_htab = list_overflow_htab_for(db_idx);
-    let lk = list_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
-
-    let meta = get_or_create_meta(meta_htab, key);
-    if meta.is_null() {
-        pg_sys::LWLockRelease(lk);
-        return 0;
-    }
-
-    let current_count = (*meta).count;
-    let current_min = if current_count == 0 {
-        0
-    } else {
-        (*meta).min_pos
-    };
-    let current_max = if current_count == 0 {
-        0
-    } else {
-        (*meta).max_pos
-    };
-
-    for (i, v) in values.iter().enumerate() {
-        let pos = current_min - LIST_POS_STEP * (i as i64 + 1);
-        let k = make_list_key(key, pos);
+unsafe fn get_or_create_set_meta(meta_htab: *mut pg_sys::HTAB, key: &str) -> *mut SetMeta {
+    unsafe {
+        if meta_htab.is_null() {
+            return std::ptr::null_mut();
+        }
+        let key_buf = make_key(key);
         let mut found = false;
-        let entry = pg_sys::hash_search(
-            htab,
-            k.as_ptr().cast::<c_void>(),
+        let meta = pg_sys::hash_search(
+            meta_htab,
+            key_buf.as_ptr().cast::<c_void>(),
             pg_sys::HASHACTION::HASH_ENTER,
             &mut found,
-        ) as *mut ListEntry;
-        if !entry.is_null() {
-            list_write_full_value(entry, overflow_htab, key, pos, v.as_bytes());
+        ) as *mut SetMeta;
+        if !meta.is_null() && !found {
+            addr_of_mut!((*meta).count).write(0);
         }
+        meta
     }
+}
 
-    let new_min = current_min - LIST_POS_STEP * values.len() as i64;
-    addr_of_mut!((*meta).min_pos).write(new_min);
-    if current_count == 0 {
-        addr_of_mut!((*meta).max_pos).write(new_min + LIST_POS_STEP * (values.len() as i64 - 1));
-    } else {
-        addr_of_mut!((*meta).max_pos).write(current_max);
-    }
-    let new_count = current_count + values.len() as i64;
-    addr_of_mut!((*meta).count).write(new_count);
-
-    pg_sys::LWLockRelease(lk);
-    new_count
-}}
-
-/// # Safety
-/// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
-/// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
-pub unsafe fn mem_rpush(db_idx: usize, key: &str, values: &[&str]) -> i64 { unsafe {
-    let htab = list_htab_for(db_idx);
-    let meta_htab = list_meta_htab_for(db_idx);
-    if htab.is_null() || meta_htab.is_null() {
-        return 0;
-    }
-    let overflow_htab = list_overflow_htab_for(db_idx);
-    let lk = list_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
-
-    let meta = get_or_create_meta(meta_htab, key);
-    if meta.is_null() {
-        pg_sys::LWLockRelease(lk);
-        return 0;
-    }
-
-    let current_count = (*meta).count;
-    let current_min = if current_count == 0 {
-        0
-    } else {
-        (*meta).min_pos
-    };
-    let current_max = if current_count == 0 {
-        0
-    } else {
-        (*meta).max_pos
-    };
-
-    for (i, v) in values.iter().enumerate() {
-        let pos = current_max + LIST_POS_STEP * (i as i64 + 1);
-        let k = make_list_key(key, pos);
-        let mut found = false;
-        let entry = pg_sys::hash_search(
-            htab,
-            k.as_ptr().cast::<c_void>(),
-            pg_sys::HASHACTION::HASH_ENTER,
-            &mut found,
-        ) as *mut ListEntry;
-        if !entry.is_null() {
-            list_write_full_value(entry, overflow_htab, key, pos, v.as_bytes());
+unsafe fn find_set_meta(meta_htab: *mut pg_sys::HTAB, key: &str) -> *mut SetMeta {
+    unsafe {
+        if meta_htab.is_null() {
+            return std::ptr::null_mut();
         }
-    }
-
-    let new_max = current_max + LIST_POS_STEP * values.len() as i64;
-    if current_count == 0 {
-        addr_of_mut!((*meta).min_pos).write(new_max - LIST_POS_STEP * (values.len() as i64 - 1));
-    } else {
-        addr_of_mut!((*meta).min_pos).write(current_min);
-    }
-    addr_of_mut!((*meta).max_pos).write(new_max);
-    let new_count = current_count + values.len() as i64;
-    addr_of_mut!((*meta).count).write(new_count);
-
-    pg_sys::LWLockRelease(lk);
-    new_count
-}}
-
-/// # Safety
-/// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
-/// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
-pub unsafe fn mem_lpushx(db_idx: usize, key: &str, values: &[&str]) -> i64 { unsafe {
-    let meta_htab = list_meta_htab_for(db_idx);
-    if meta_htab.is_null() {
-        return 0;
-    }
-    let lk = list_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
-    let meta = find_meta(meta_htab, key);
-    let exists = !meta.is_null() && (*meta).count > 0;
-    pg_sys::LWLockRelease(lk);
-    if !exists {
-        return 0;
-    }
-    mem_lpush(db_idx, key, values)
-}}
-
-/// # Safety
-/// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
-/// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
-pub unsafe fn mem_rpushx(db_idx: usize, key: &str, values: &[&str]) -> i64 { unsafe {
-    let meta_htab = list_meta_htab_for(db_idx);
-    if meta_htab.is_null() {
-        return 0;
-    }
-    let lk = list_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
-    let meta = find_meta(meta_htab, key);
-    let exists = !meta.is_null() && (*meta).count > 0;
-    pg_sys::LWLockRelease(lk);
-    if !exists {
-        return 0;
-    }
-    mem_rpush(db_idx, key, values)
-}}
-
-/// # Safety
-/// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
-/// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
-pub unsafe fn mem_lpop(db_idx: usize, key: &str, count: Option<i64>) -> Vec<Vec<u8>> { unsafe {
-    let htab = list_htab_for(db_idx);
-    let meta_htab = list_meta_htab_for(db_idx);
-    if htab.is_null() || meta_htab.is_null() {
-        return vec![];
-    }
-    let lk = list_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
-
-    let meta = find_meta(meta_htab, key);
-    if meta.is_null() {
-        pg_sys::LWLockRelease(lk);
-        return vec![];
-    }
-
-    let current_count = (*meta).count;
-    if current_count == 0 {
-        pg_sys::LWLockRelease(lk);
-        return vec![];
-    }
-
-    let overflow_htab = list_overflow_htab_for(db_idx);
-    let take = count.map(|c| c.max(0)).unwrap_or(1).min(current_count) as usize;
-    let mut results = Vec::with_capacity(take);
-    let mut pos = (*meta).min_pos;
-
-    for _ in 0..take {
-        let k = make_list_key(key, pos);
+        let key_buf = make_key(key);
         let mut found = false;
-        let entry = pg_sys::hash_search(
-            htab,
-            k.as_ptr().cast::<c_void>(),
+        let meta = pg_sys::hash_search(
+            meta_htab,
+            key_buf.as_ptr().cast::<c_void>(),
             pg_sys::HASHACTION::HASH_FIND,
             &mut found,
-        ) as *mut ListEntry;
-        if found && !entry.is_null() {
-            results.push(list_read_full_value(entry, overflow_htab, key, pos));
+        ) as *mut SetMeta;
+        if found { meta } else { std::ptr::null_mut() }
+    }
+}
+
+unsafe fn remove_set_meta(meta_htab: *mut pg_sys::HTAB, key: &str) {
+    unsafe {
+        if meta_htab.is_null() {
+            return;
         }
+        let key_buf = make_key(key);
+        let mut found = false;
         pg_sys::hash_search(
-            htab,
-            k.as_ptr().cast::<c_void>(),
+            meta_htab,
+            key_buf.as_ptr().cast::<c_void>(),
             pg_sys::HASHACTION::HASH_REMOVE,
             &mut found,
         );
-        list_delete_overflow(overflow_htab, key, pos);
-        pos += LIST_POS_STEP;
     }
-
-    let new_count = current_count - take as i64;
-    if new_count == 0 {
-        remove_meta(meta_htab, key);
-    } else {
-        addr_of_mut!((*meta).min_pos).write(pos);
-        addr_of_mut!((*meta).count).write(new_count);
-    }
-
-    pg_sys::LWLockRelease(lk);
-    results
-}}
+}
 
 /// # Safety
 /// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
-pub unsafe fn mem_rpop(db_idx: usize, key: &str, count: Option<i64>) -> Vec<Vec<u8>> { unsafe {
-    let htab = list_htab_for(db_idx);
-    let meta_htab = list_meta_htab_for(db_idx);
-    if htab.is_null() || meta_htab.is_null() {
-        return vec![];
-    }
-    let lk = list_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
-
-    let meta = find_meta(meta_htab, key);
-    if meta.is_null() {
-        pg_sys::LWLockRelease(lk);
-        return vec![];
-    }
-
-    let current_count = (*meta).count;
-    if current_count == 0 {
-        pg_sys::LWLockRelease(lk);
-        return vec![];
-    }
-
-    let overflow_htab = list_overflow_htab_for(db_idx);
-    let take = count.map(|c| c.max(0)).unwrap_or(1).min(current_count) as usize;
-    let mut results = Vec::with_capacity(take);
-    let mut pos = (*meta).max_pos;
-
-    for _ in 0..take {
-        let k = make_list_key(key, pos);
-        let mut found = false;
-        let entry = pg_sys::hash_search(
-            htab,
-            k.as_ptr().cast::<c_void>(),
-            pg_sys::HASHACTION::HASH_FIND,
-            &mut found,
-        ) as *mut ListEntry;
-        if found && !entry.is_null() {
-            results.push(list_read_full_value(entry, overflow_htab, key, pos));
+pub unsafe fn mem_lpush(db_idx: usize, key: &str, values: &[&str]) -> i64 {
+    unsafe {
+        let htab = list_htab_for(db_idx);
+        let meta_htab = list_meta_htab_for(db_idx);
+        if htab.is_null() || meta_htab.is_null() {
+            return 0;
         }
-        pg_sys::hash_search(
-            htab,
-            k.as_ptr().cast::<c_void>(),
-            pg_sys::HASHACTION::HASH_REMOVE,
-            &mut found,
-        );
-        list_delete_overflow(overflow_htab, key, pos);
-        pos -= LIST_POS_STEP;
-    }
+        let overflow_htab = list_overflow_htab_for(db_idx);
+        let lk = list_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
 
-    let new_count = current_count - take as i64;
-    if new_count == 0 {
-        remove_meta(meta_htab, key);
-    } else {
-        addr_of_mut!((*meta).max_pos).write(pos);
-        addr_of_mut!((*meta).count).write(new_count);
-    }
-
-    pg_sys::LWLockRelease(lk);
-    results
-}}
-
-/// # Safety
-/// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
-/// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
-pub unsafe fn mem_llen(db_idx: usize, key: &str) -> i64 { unsafe {
-    let meta_htab = list_meta_htab_for(db_idx);
-    if meta_htab.is_null() {
-        return 0;
-    }
-    let lk = list_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
-    let meta = find_meta(meta_htab, key);
-    let count = if meta.is_null() { 0 } else { (*meta).count };
-    pg_sys::LWLockRelease(lk);
-    count
-}}
-
-/// # Safety
-/// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
-/// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
-pub unsafe fn mem_lrange(db_idx: usize, key: &str, start: i64, stop: i64) -> Vec<Vec<u8>> { unsafe {
-    let htab = list_htab_for(db_idx);
-    let meta_htab = list_meta_htab_for(db_idx);
-    if htab.is_null() || meta_htab.is_null() {
-        return vec![];
-    }
-    let lk = list_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
-
-    let meta = find_meta(meta_htab, key);
-    if meta.is_null() {
-        pg_sys::LWLockRelease(lk);
-        return vec![];
-    }
-    let count = (*meta).count;
-    if count == 0 {
-        pg_sys::LWLockRelease(lk);
-        return vec![];
-    }
-
-    let min_pos = (*meta).min_pos;
-    let len = count as usize;
-    let s = if start < 0 {
-        (start + count).max(0) as usize
-    } else {
-        start as usize
-    };
-    let e = if stop < 0 {
-        (stop + count) as usize
-    } else {
-        stop as usize
-    };
-    if s >= len || s > e {
-        pg_sys::LWLockRelease(lk);
-        return vec![];
-    }
-    let e = e.min(len - 1);
-
-    let overflow_htab = list_overflow_htab_for(db_idx);
-    let mut results = Vec::with_capacity(e - s + 1);
-    for i in s..=e {
-        let pos = min_pos + i as i64 * LIST_POS_STEP;
-        let k = make_list_key(key, pos);
-        let mut found = false;
-        let entry = pg_sys::hash_search(
-            htab,
-            k.as_ptr().cast::<c_void>(),
-            pg_sys::HASHACTION::HASH_FIND,
-            &mut found,
-        ) as *mut ListEntry;
-        if found && !entry.is_null() {
-            results.push(list_read_full_value(entry, overflow_htab, key, pos));
+        let meta = get_or_create_meta(meta_htab, key);
+        if meta.is_null() {
+            pg_sys::LWLockRelease(lk);
+            return 0;
         }
-    }
 
-    pg_sys::LWLockRelease(lk);
-    results
-}}
+        let current_count = (*meta).count;
+        let current_min = if current_count == 0 {
+            0
+        } else {
+            (*meta).min_pos
+        };
+        let current_max = if current_count == 0 {
+            0
+        } else {
+            (*meta).max_pos
+        };
 
-/// # Safety
-/// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
-/// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
-pub unsafe fn mem_lindex(db_idx: usize, key: &str, index: i64) -> Option<Vec<u8>> { unsafe {
-    let htab = list_htab_for(db_idx);
-    let meta_htab = list_meta_htab_for(db_idx);
-    if htab.is_null() || meta_htab.is_null() {
-        return None;
-    }
-    let lk = list_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
-
-    let meta = find_meta(meta_htab, key);
-    if meta.is_null() {
-        pg_sys::LWLockRelease(lk);
-        return None;
-    }
-    let count = (*meta).count;
-    if count == 0 {
-        pg_sys::LWLockRelease(lk);
-        return None;
-    }
-
-    let idx = if index < 0 { index + count } else { index };
-    if idx < 0 || idx >= count {
-        pg_sys::LWLockRelease(lk);
-        return None;
-    }
-
-    let min_pos = (*meta).min_pos;
-    let pos = min_pos + idx * LIST_POS_STEP;
-    let k = make_list_key(key, pos);
-    let mut found = false;
-    let entry = pg_sys::hash_search(
-        htab,
-        k.as_ptr().cast::<c_void>(),
-        pg_sys::HASHACTION::HASH_FIND,
-        &mut found,
-    ) as *mut ListEntry;
-    let overflow_htab = list_overflow_htab_for(db_idx);
-    let result = if found && !entry.is_null() {
-        Some(list_read_full_value(entry, overflow_htab, key, pos))
-    } else {
-        None
-    };
-
-    pg_sys::LWLockRelease(lk);
-    result
-}}
-
-/// # Safety
-/// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
-/// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
-pub unsafe fn mem_lset(db_idx: usize, key: &str, index: i64, value: &str) -> bool { unsafe {
-    let htab = list_htab_for(db_idx);
-    let meta_htab = list_meta_htab_for(db_idx);
-    if htab.is_null() || meta_htab.is_null() {
-        return false;
-    }
-    let overflow_htab = list_overflow_htab_for(db_idx);
-    let lk = list_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
-
-    let meta = find_meta(meta_htab, key);
-    if meta.is_null() {
-        pg_sys::LWLockRelease(lk);
-        return false;
-    }
-    let count = (*meta).count;
-    if count == 0 {
-        pg_sys::LWLockRelease(lk);
-        return false;
-    }
-
-    let idx = if index < 0 { index + count } else { index };
-    if idx < 0 || idx >= count {
-        pg_sys::LWLockRelease(lk);
-        return false;
-    }
-
-    let min_pos = (*meta).min_pos;
-    let pos = min_pos + idx * LIST_POS_STEP;
-    let k = make_list_key(key, pos);
-    let mut found = false;
-    let entry = pg_sys::hash_search(
-        htab,
-        k.as_ptr().cast::<c_void>(),
-        pg_sys::HASHACTION::HASH_FIND,
-        &mut found,
-    ) as *mut ListEntry;
-    if found && !entry.is_null() {
-        list_write_full_value(entry, overflow_htab, key, pos, value.as_bytes());
-    }
-    pg_sys::LWLockRelease(lk);
-    found
-}}
-
-/// # Safety
-/// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
-/// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
-pub unsafe fn mem_lrem(db_idx: usize, key: &str, count: i64, value: &str) -> i64 { unsafe {
-    let htab = list_htab_for(db_idx);
-    let meta_htab = list_meta_htab_for(db_idx);
-    if htab.is_null() || meta_htab.is_null() {
-        return 0;
-    }
-    let lk = list_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
-
-    let meta = find_meta(meta_htab, key);
-    if meta.is_null() {
-        pg_sys::LWLockRelease(lk);
-        return 0;
-    }
-    let current_count = (*meta).count;
-    if current_count == 0 {
-        pg_sys::LWLockRelease(lk);
-        return 0;
-    }
-
-    let overflow_htab = list_overflow_htab_for(db_idx);
-    let min_pos = (*meta).min_pos;
-    let limit = if count == 0 {
-        usize::MAX
-    } else {
-        count.unsigned_abs() as usize
-    };
-
-    let mut positions: Vec<i64> = (0..current_count)
-        .map(|i| min_pos + i * LIST_POS_STEP)
-        .collect();
-    if count < 0 {
-        positions.reverse();
-    }
-
-    let mut to_del = Vec::new();
-    for pos in &positions {
-        if to_del.len() >= limit {
-            break;
-        }
-        let k = make_list_key(key, *pos);
-        let mut found = false;
-        let entry = pg_sys::hash_search(
-            htab,
-            k.as_ptr().cast::<c_void>(),
-            pg_sys::HASHACTION::HASH_FIND,
-            &mut found,
-        ) as *mut ListEntry;
-        if found && !entry.is_null() {
-            let v = list_read_full_value(entry, overflow_htab, key, *pos);
-            if v == value.as_bytes() {
-                to_del.push(*pos);
-            }
-        }
-    }
-
-    for pos in &to_del {
-        let k = make_list_key(key, *pos);
-        let mut found = false;
-        pg_sys::hash_search(
-            htab,
-            k.as_ptr().cast::<c_void>(),
-            pg_sys::HASHACTION::HASH_REMOVE,
-            &mut found,
-        );
-        list_delete_overflow(overflow_htab, key, *pos);
-    }
-
-    let removed = to_del.len() as i64;
-    let new_count = current_count - removed;
-    if new_count == 0 {
-        remove_meta(meta_htab, key);
-    } else {
-        addr_of_mut!((*meta).count).write(new_count);
-        if !to_del.is_empty() {
-            let new_min_pos = (0..current_count)
-                .map(|i| min_pos + i * LIST_POS_STEP)
-                .find(|p| {
-                    let k = make_list_key(key, *p);
-                    let mut f = false;
-                    pg_sys::hash_search(
-                        htab,
-                        k.as_ptr().cast::<c_void>(),
-                        pg_sys::HASHACTION::HASH_FIND,
-                        &mut f,
-                    );
-                    f
-                })
-                .unwrap_or(min_pos);
-            let new_max_pos = (0..current_count)
-                .rev()
-                .map(|i| min_pos + i * LIST_POS_STEP)
-                .find(|p| {
-                    let k = make_list_key(key, *p);
-                    let mut f = false;
-                    pg_sys::hash_search(
-                        htab,
-                        k.as_ptr().cast::<c_void>(),
-                        pg_sys::HASHACTION::HASH_FIND,
-                        &mut f,
-                    );
-                    f
-                })
-                .unwrap_or(min_pos);
-            addr_of_mut!((*meta).min_pos).write(new_min_pos);
-            addr_of_mut!((*meta).max_pos).write(new_max_pos);
-        }
-    }
-
-    pg_sys::LWLockRelease(lk);
-    removed
-}}
-
-/// # Safety
-/// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
-/// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
-pub unsafe fn mem_ltrim(db_idx: usize, key: &str, start: i64, stop: i64) { unsafe {
-    let htab = list_htab_for(db_idx);
-    let meta_htab = list_meta_htab_for(db_idx);
-    if htab.is_null() || meta_htab.is_null() {
-        return;
-    }
-    let lk = list_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
-
-    let meta = find_meta(meta_htab, key);
-    if meta.is_null() {
-        pg_sys::LWLockRelease(lk);
-        return;
-    }
-    let current_count = (*meta).count;
-    if current_count == 0 {
-        pg_sys::LWLockRelease(lk);
-        return;
-    }
-
-    let min_pos = (*meta).min_pos;
-    let len = current_count as usize;
-    let s = if start < 0 {
-        (start + current_count).max(0) as usize
-    } else {
-        start as usize
-    };
-    let e = if stop < 0 {
-        (stop + current_count) as usize
-    } else {
-        stop as usize
-    };
-    let e = e.min(len.saturating_sub(1));
-
-    let overflow_htab = list_overflow_htab_for(db_idx);
-    for i in 0..len {
-        if i < s || i > e {
-            let pos = min_pos + i as i64 * LIST_POS_STEP;
+        for (i, v) in values.iter().enumerate() {
+            let pos = current_min - LIST_POS_STEP * (i as i64 + 1);
             let k = make_list_key(key, pos);
             let mut found = false;
+            let entry = pg_sys::hash_search(
+                htab,
+                k.as_ptr().cast::<c_void>(),
+                pg_sys::HASHACTION::HASH_ENTER,
+                &mut found,
+            ) as *mut ListEntry;
+            if !entry.is_null() {
+                list_write_full_value(entry, overflow_htab, key, pos, v.as_bytes());
+            }
+        }
+
+        let new_min = current_min - LIST_POS_STEP * values.len() as i64;
+        addr_of_mut!((*meta).min_pos).write(new_min);
+        if current_count == 0 {
+            addr_of_mut!((*meta).max_pos)
+                .write(new_min + LIST_POS_STEP * (values.len() as i64 - 1));
+        } else {
+            addr_of_mut!((*meta).max_pos).write(current_max);
+        }
+        let new_count = current_count + values.len() as i64;
+        addr_of_mut!((*meta).count).write(new_count);
+
+        pg_sys::LWLockRelease(lk);
+        new_count
+    }
+}
+
+/// # Safety
+/// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
+/// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
+pub unsafe fn mem_rpush(db_idx: usize, key: &str, values: &[&str]) -> i64 {
+    unsafe {
+        let htab = list_htab_for(db_idx);
+        let meta_htab = list_meta_htab_for(db_idx);
+        if htab.is_null() || meta_htab.is_null() {
+            return 0;
+        }
+        let overflow_htab = list_overflow_htab_for(db_idx);
+        let lk = list_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
+
+        let meta = get_or_create_meta(meta_htab, key);
+        if meta.is_null() {
+            pg_sys::LWLockRelease(lk);
+            return 0;
+        }
+
+        let current_count = (*meta).count;
+        let current_min = if current_count == 0 {
+            0
+        } else {
+            (*meta).min_pos
+        };
+        let current_max = if current_count == 0 {
+            0
+        } else {
+            (*meta).max_pos
+        };
+
+        for (i, v) in values.iter().enumerate() {
+            let pos = current_max + LIST_POS_STEP * (i as i64 + 1);
+            let k = make_list_key(key, pos);
+            let mut found = false;
+            let entry = pg_sys::hash_search(
+                htab,
+                k.as_ptr().cast::<c_void>(),
+                pg_sys::HASHACTION::HASH_ENTER,
+                &mut found,
+            ) as *mut ListEntry;
+            if !entry.is_null() {
+                list_write_full_value(entry, overflow_htab, key, pos, v.as_bytes());
+            }
+        }
+
+        let new_max = current_max + LIST_POS_STEP * values.len() as i64;
+        if current_count == 0 {
+            addr_of_mut!((*meta).min_pos)
+                .write(new_max - LIST_POS_STEP * (values.len() as i64 - 1));
+        } else {
+            addr_of_mut!((*meta).min_pos).write(current_min);
+        }
+        addr_of_mut!((*meta).max_pos).write(new_max);
+        let new_count = current_count + values.len() as i64;
+        addr_of_mut!((*meta).count).write(new_count);
+
+        pg_sys::LWLockRelease(lk);
+        new_count
+    }
+}
+
+/// # Safety
+/// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
+/// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
+pub unsafe fn mem_lpushx(db_idx: usize, key: &str, values: &[&str]) -> i64 {
+    unsafe {
+        let meta_htab = list_meta_htab_for(db_idx);
+        if meta_htab.is_null() {
+            return 0;
+        }
+        let lk = list_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
+        let meta = find_meta(meta_htab, key);
+        let exists = !meta.is_null() && (*meta).count > 0;
+        pg_sys::LWLockRelease(lk);
+        if !exists {
+            return 0;
+        }
+        mem_lpush(db_idx, key, values)
+    }
+}
+
+/// # Safety
+/// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
+/// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
+pub unsafe fn mem_rpushx(db_idx: usize, key: &str, values: &[&str]) -> i64 {
+    unsafe {
+        let meta_htab = list_meta_htab_for(db_idx);
+        if meta_htab.is_null() {
+            return 0;
+        }
+        let lk = list_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
+        let meta = find_meta(meta_htab, key);
+        let exists = !meta.is_null() && (*meta).count > 0;
+        pg_sys::LWLockRelease(lk);
+        if !exists {
+            return 0;
+        }
+        mem_rpush(db_idx, key, values)
+    }
+}
+
+/// # Safety
+/// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
+/// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
+pub unsafe fn mem_lpop(db_idx: usize, key: &str, count: Option<i64>) -> Vec<Vec<u8>> {
+    unsafe {
+        let htab = list_htab_for(db_idx);
+        let meta_htab = list_meta_htab_for(db_idx);
+        if htab.is_null() || meta_htab.is_null() {
+            return vec![];
+        }
+        let lk = list_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
+
+        let meta = find_meta(meta_htab, key);
+        if meta.is_null() {
+            pg_sys::LWLockRelease(lk);
+            return vec![];
+        }
+
+        let current_count = (*meta).count;
+        if current_count == 0 {
+            pg_sys::LWLockRelease(lk);
+            return vec![];
+        }
+
+        let overflow_htab = list_overflow_htab_for(db_idx);
+        let take = count.map(|c| c.max(0)).unwrap_or(1).min(current_count) as usize;
+        let mut results = Vec::with_capacity(take);
+        let mut pos = (*meta).min_pos;
+
+        for _ in 0..take {
+            let k = make_list_key(key, pos);
+            let mut found = false;
+            let entry = pg_sys::hash_search(
+                htab,
+                k.as_ptr().cast::<c_void>(),
+                pg_sys::HASHACTION::HASH_FIND,
+                &mut found,
+            ) as *mut ListEntry;
+            if found && !entry.is_null() {
+                results.push(list_read_full_value(entry, overflow_htab, key, pos));
+            }
             pg_sys::hash_search(
                 htab,
                 k.as_ptr().cast::<c_void>(),
@@ -4197,22 +3928,456 @@ pub unsafe fn mem_ltrim(db_idx: usize, key: &str, start: i64, stop: i64) { unsaf
                 &mut found,
             );
             list_delete_overflow(overflow_htab, key, pos);
+            pos += LIST_POS_STEP;
         }
-    }
 
-    if s >= len || s > e {
-        remove_meta(meta_htab, key);
-    } else {
-        let new_count = (e - s + 1) as i64;
-        let new_min = min_pos + s as i64 * LIST_POS_STEP;
-        let new_max = min_pos + e as i64 * LIST_POS_STEP;
-        addr_of_mut!((*meta).min_pos).write(new_min);
-        addr_of_mut!((*meta).max_pos).write(new_max);
-        addr_of_mut!((*meta).count).write(new_count);
-    }
+        let new_count = current_count - take as i64;
+        if new_count == 0 {
+            remove_meta(meta_htab, key);
+        } else {
+            addr_of_mut!((*meta).min_pos).write(pos);
+            addr_of_mut!((*meta).count).write(new_count);
+        }
 
-    pg_sys::LWLockRelease(lk);
-}}
+        pg_sys::LWLockRelease(lk);
+        results
+    }
+}
+
+/// # Safety
+/// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
+/// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
+pub unsafe fn mem_rpop(db_idx: usize, key: &str, count: Option<i64>) -> Vec<Vec<u8>> {
+    unsafe {
+        let htab = list_htab_for(db_idx);
+        let meta_htab = list_meta_htab_for(db_idx);
+        if htab.is_null() || meta_htab.is_null() {
+            return vec![];
+        }
+        let lk = list_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
+
+        let meta = find_meta(meta_htab, key);
+        if meta.is_null() {
+            pg_sys::LWLockRelease(lk);
+            return vec![];
+        }
+
+        let current_count = (*meta).count;
+        if current_count == 0 {
+            pg_sys::LWLockRelease(lk);
+            return vec![];
+        }
+
+        let overflow_htab = list_overflow_htab_for(db_idx);
+        let take = count.map(|c| c.max(0)).unwrap_or(1).min(current_count) as usize;
+        let mut results = Vec::with_capacity(take);
+        let mut pos = (*meta).max_pos;
+
+        for _ in 0..take {
+            let k = make_list_key(key, pos);
+            let mut found = false;
+            let entry = pg_sys::hash_search(
+                htab,
+                k.as_ptr().cast::<c_void>(),
+                pg_sys::HASHACTION::HASH_FIND,
+                &mut found,
+            ) as *mut ListEntry;
+            if found && !entry.is_null() {
+                results.push(list_read_full_value(entry, overflow_htab, key, pos));
+            }
+            pg_sys::hash_search(
+                htab,
+                k.as_ptr().cast::<c_void>(),
+                pg_sys::HASHACTION::HASH_REMOVE,
+                &mut found,
+            );
+            list_delete_overflow(overflow_htab, key, pos);
+            pos -= LIST_POS_STEP;
+        }
+
+        let new_count = current_count - take as i64;
+        if new_count == 0 {
+            remove_meta(meta_htab, key);
+        } else {
+            addr_of_mut!((*meta).max_pos).write(pos);
+            addr_of_mut!((*meta).count).write(new_count);
+        }
+
+        pg_sys::LWLockRelease(lk);
+        results
+    }
+}
+
+/// # Safety
+/// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
+/// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
+pub unsafe fn mem_llen(db_idx: usize, key: &str) -> i64 {
+    unsafe {
+        let meta_htab = list_meta_htab_for(db_idx);
+        if meta_htab.is_null() {
+            return 0;
+        }
+        let lk = list_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
+        let meta = find_meta(meta_htab, key);
+        let count = if meta.is_null() { 0 } else { (*meta).count };
+        pg_sys::LWLockRelease(lk);
+        count
+    }
+}
+
+/// # Safety
+/// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
+/// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
+pub unsafe fn mem_lrange(db_idx: usize, key: &str, start: i64, stop: i64) -> Vec<Vec<u8>> {
+    unsafe {
+        let htab = list_htab_for(db_idx);
+        let meta_htab = list_meta_htab_for(db_idx);
+        if htab.is_null() || meta_htab.is_null() {
+            return vec![];
+        }
+        let lk = list_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
+
+        let meta = find_meta(meta_htab, key);
+        if meta.is_null() {
+            pg_sys::LWLockRelease(lk);
+            return vec![];
+        }
+        let count = (*meta).count;
+        if count == 0 {
+            pg_sys::LWLockRelease(lk);
+            return vec![];
+        }
+
+        let min_pos = (*meta).min_pos;
+        let len = count as usize;
+        let s = if start < 0 {
+            (start + count).max(0) as usize
+        } else {
+            start as usize
+        };
+        let e = if stop < 0 {
+            (stop + count) as usize
+        } else {
+            stop as usize
+        };
+        if s >= len || s > e {
+            pg_sys::LWLockRelease(lk);
+            return vec![];
+        }
+        let e = e.min(len - 1);
+
+        let overflow_htab = list_overflow_htab_for(db_idx);
+        let mut results = Vec::with_capacity(e - s + 1);
+        for i in s..=e {
+            let pos = min_pos + i as i64 * LIST_POS_STEP;
+            let k = make_list_key(key, pos);
+            let mut found = false;
+            let entry = pg_sys::hash_search(
+                htab,
+                k.as_ptr().cast::<c_void>(),
+                pg_sys::HASHACTION::HASH_FIND,
+                &mut found,
+            ) as *mut ListEntry;
+            if found && !entry.is_null() {
+                results.push(list_read_full_value(entry, overflow_htab, key, pos));
+            }
+        }
+
+        pg_sys::LWLockRelease(lk);
+        results
+    }
+}
+
+/// # Safety
+/// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
+/// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
+pub unsafe fn mem_lindex(db_idx: usize, key: &str, index: i64) -> Option<Vec<u8>> {
+    unsafe {
+        let htab = list_htab_for(db_idx);
+        let meta_htab = list_meta_htab_for(db_idx);
+        if htab.is_null() || meta_htab.is_null() {
+            return None;
+        }
+        let lk = list_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
+
+        let meta = find_meta(meta_htab, key);
+        if meta.is_null() {
+            pg_sys::LWLockRelease(lk);
+            return None;
+        }
+        let count = (*meta).count;
+        if count == 0 {
+            pg_sys::LWLockRelease(lk);
+            return None;
+        }
+
+        let idx = if index < 0 { index + count } else { index };
+        if idx < 0 || idx >= count {
+            pg_sys::LWLockRelease(lk);
+            return None;
+        }
+
+        let min_pos = (*meta).min_pos;
+        let pos = min_pos + idx * LIST_POS_STEP;
+        let k = make_list_key(key, pos);
+        let mut found = false;
+        let entry = pg_sys::hash_search(
+            htab,
+            k.as_ptr().cast::<c_void>(),
+            pg_sys::HASHACTION::HASH_FIND,
+            &mut found,
+        ) as *mut ListEntry;
+        let overflow_htab = list_overflow_htab_for(db_idx);
+        let result = if found && !entry.is_null() {
+            Some(list_read_full_value(entry, overflow_htab, key, pos))
+        } else {
+            None
+        };
+
+        pg_sys::LWLockRelease(lk);
+        result
+    }
+}
+
+/// # Safety
+/// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
+/// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
+pub unsafe fn mem_lset(db_idx: usize, key: &str, index: i64, value: &str) -> bool {
+    unsafe {
+        let htab = list_htab_for(db_idx);
+        let meta_htab = list_meta_htab_for(db_idx);
+        if htab.is_null() || meta_htab.is_null() {
+            return false;
+        }
+        let overflow_htab = list_overflow_htab_for(db_idx);
+        let lk = list_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
+
+        let meta = find_meta(meta_htab, key);
+        if meta.is_null() {
+            pg_sys::LWLockRelease(lk);
+            return false;
+        }
+        let count = (*meta).count;
+        if count == 0 {
+            pg_sys::LWLockRelease(lk);
+            return false;
+        }
+
+        let idx = if index < 0 { index + count } else { index };
+        if idx < 0 || idx >= count {
+            pg_sys::LWLockRelease(lk);
+            return false;
+        }
+
+        let min_pos = (*meta).min_pos;
+        let pos = min_pos + idx * LIST_POS_STEP;
+        let k = make_list_key(key, pos);
+        let mut found = false;
+        let entry = pg_sys::hash_search(
+            htab,
+            k.as_ptr().cast::<c_void>(),
+            pg_sys::HASHACTION::HASH_FIND,
+            &mut found,
+        ) as *mut ListEntry;
+        if found && !entry.is_null() {
+            list_write_full_value(entry, overflow_htab, key, pos, value.as_bytes());
+        }
+        pg_sys::LWLockRelease(lk);
+        found
+    }
+}
+
+/// # Safety
+/// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
+/// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
+pub unsafe fn mem_lrem(db_idx: usize, key: &str, count: i64, value: &str) -> i64 {
+    unsafe {
+        let htab = list_htab_for(db_idx);
+        let meta_htab = list_meta_htab_for(db_idx);
+        if htab.is_null() || meta_htab.is_null() {
+            return 0;
+        }
+        let lk = list_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
+
+        let meta = find_meta(meta_htab, key);
+        if meta.is_null() {
+            pg_sys::LWLockRelease(lk);
+            return 0;
+        }
+        let current_count = (*meta).count;
+        if current_count == 0 {
+            pg_sys::LWLockRelease(lk);
+            return 0;
+        }
+
+        let overflow_htab = list_overflow_htab_for(db_idx);
+        let min_pos = (*meta).min_pos;
+        let limit = if count == 0 {
+            usize::MAX
+        } else {
+            count.unsigned_abs() as usize
+        };
+
+        let mut positions: Vec<i64> = (0..current_count)
+            .map(|i| min_pos + i * LIST_POS_STEP)
+            .collect();
+        if count < 0 {
+            positions.reverse();
+        }
+
+        let mut to_del = Vec::new();
+        for pos in &positions {
+            if to_del.len() >= limit {
+                break;
+            }
+            let k = make_list_key(key, *pos);
+            let mut found = false;
+            let entry = pg_sys::hash_search(
+                htab,
+                k.as_ptr().cast::<c_void>(),
+                pg_sys::HASHACTION::HASH_FIND,
+                &mut found,
+            ) as *mut ListEntry;
+            if found && !entry.is_null() {
+                let v = list_read_full_value(entry, overflow_htab, key, *pos);
+                if v == value.as_bytes() {
+                    to_del.push(*pos);
+                }
+            }
+        }
+
+        for pos in &to_del {
+            let k = make_list_key(key, *pos);
+            let mut found = false;
+            pg_sys::hash_search(
+                htab,
+                k.as_ptr().cast::<c_void>(),
+                pg_sys::HASHACTION::HASH_REMOVE,
+                &mut found,
+            );
+            list_delete_overflow(overflow_htab, key, *pos);
+        }
+
+        let removed = to_del.len() as i64;
+        let new_count = current_count - removed;
+        if new_count == 0 {
+            remove_meta(meta_htab, key);
+        } else {
+            addr_of_mut!((*meta).count).write(new_count);
+            if !to_del.is_empty() {
+                let new_min_pos = (0..current_count)
+                    .map(|i| min_pos + i * LIST_POS_STEP)
+                    .find(|p| {
+                        let k = make_list_key(key, *p);
+                        let mut f = false;
+                        pg_sys::hash_search(
+                            htab,
+                            k.as_ptr().cast::<c_void>(),
+                            pg_sys::HASHACTION::HASH_FIND,
+                            &mut f,
+                        );
+                        f
+                    })
+                    .unwrap_or(min_pos);
+                let new_max_pos = (0..current_count)
+                    .rev()
+                    .map(|i| min_pos + i * LIST_POS_STEP)
+                    .find(|p| {
+                        let k = make_list_key(key, *p);
+                        let mut f = false;
+                        pg_sys::hash_search(
+                            htab,
+                            k.as_ptr().cast::<c_void>(),
+                            pg_sys::HASHACTION::HASH_FIND,
+                            &mut f,
+                        );
+                        f
+                    })
+                    .unwrap_or(min_pos);
+                addr_of_mut!((*meta).min_pos).write(new_min_pos);
+                addr_of_mut!((*meta).max_pos).write(new_max_pos);
+            }
+        }
+
+        pg_sys::LWLockRelease(lk);
+        removed
+    }
+}
+
+/// # Safety
+/// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
+/// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
+pub unsafe fn mem_ltrim(db_idx: usize, key: &str, start: i64, stop: i64) {
+    unsafe {
+        let htab = list_htab_for(db_idx);
+        let meta_htab = list_meta_htab_for(db_idx);
+        if htab.is_null() || meta_htab.is_null() {
+            return;
+        }
+        let lk = list_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
+
+        let meta = find_meta(meta_htab, key);
+        if meta.is_null() {
+            pg_sys::LWLockRelease(lk);
+            return;
+        }
+        let current_count = (*meta).count;
+        if current_count == 0 {
+            pg_sys::LWLockRelease(lk);
+            return;
+        }
+
+        let min_pos = (*meta).min_pos;
+        let len = current_count as usize;
+        let s = if start < 0 {
+            (start + current_count).max(0) as usize
+        } else {
+            start as usize
+        };
+        let e = if stop < 0 {
+            (stop + current_count) as usize
+        } else {
+            stop as usize
+        };
+        let e = e.min(len.saturating_sub(1));
+
+        let overflow_htab = list_overflow_htab_for(db_idx);
+        for i in 0..len {
+            if i < s || i > e {
+                let pos = min_pos + i as i64 * LIST_POS_STEP;
+                let k = make_list_key(key, pos);
+                let mut found = false;
+                pg_sys::hash_search(
+                    htab,
+                    k.as_ptr().cast::<c_void>(),
+                    pg_sys::HASHACTION::HASH_REMOVE,
+                    &mut found,
+                );
+                list_delete_overflow(overflow_htab, key, pos);
+            }
+        }
+
+        if s >= len || s > e {
+            remove_meta(meta_htab, key);
+        } else {
+            let new_count = (e - s + 1) as i64;
+            let new_min = min_pos + s as i64 * LIST_POS_STEP;
+            let new_max = min_pos + e as i64 * LIST_POS_STEP;
+            addr_of_mut!((*meta).min_pos).write(new_min);
+            addr_of_mut!((*meta).max_pos).write(new_max);
+            addr_of_mut!((*meta).count).write(new_count);
+        }
+
+        pg_sys::LWLockRelease(lk);
+    }
+}
 
 /// # Safety
 /// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
@@ -4223,119 +4388,121 @@ pub unsafe fn mem_lmove(
     dst: &str,
     src_left: bool,
     dst_left: bool,
-) -> Option<Vec<u8>> { unsafe {
-    let htab = list_htab_for(db_idx);
-    let meta_htab = list_meta_htab_for(db_idx);
-    if htab.is_null() || meta_htab.is_null() {
-        return None;
-    }
-    let lk = list_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
-
-    let src_meta = find_meta(meta_htab, src);
-    if src_meta.is_null() {
-        pg_sys::LWLockRelease(lk);
-        return None;
-    }
-    let src_count = (*src_meta).count;
-    if src_count == 0 {
-        pg_sys::LWLockRelease(lk);
-        return None;
-    }
-
-    let src_min = (*src_meta).min_pos;
-    let src_max = (*src_meta).max_pos;
-    let src_pos = if src_left { src_min } else { src_max };
-
-    let overflow_htab = list_overflow_htab_for(db_idx);
-    let sk = make_list_key(src, src_pos);
-    let mut found = false;
-    let src_entry = pg_sys::hash_search(
-        htab,
-        sk.as_ptr().cast::<c_void>(),
-        pg_sys::HASHACTION::HASH_FIND,
-        &mut found,
-    ) as *mut ListEntry;
-    if !found || src_entry.is_null() {
-        pg_sys::LWLockRelease(lk);
-        return None;
-    }
-    let value = list_read_full_value(src_entry, overflow_htab, src, src_pos);
-    pg_sys::hash_search(
-        htab,
-        sk.as_ptr().cast::<c_void>(),
-        pg_sys::HASHACTION::HASH_REMOVE,
-        &mut found,
-    );
-    list_delete_overflow(overflow_htab, src, src_pos);
-
-    let new_src_count = src_count - 1;
-    if new_src_count == 0 {
-        remove_meta(meta_htab, src);
-    } else {
-        if src_left {
-            addr_of_mut!((*src_meta).min_pos).write(src_min + LIST_POS_STEP);
-        } else {
-            addr_of_mut!((*src_meta).max_pos).write(src_max - LIST_POS_STEP);
+) -> Option<Vec<u8>> {
+    unsafe {
+        let htab = list_htab_for(db_idx);
+        let meta_htab = list_meta_htab_for(db_idx);
+        if htab.is_null() || meta_htab.is_null() {
+            return None;
         }
-        addr_of_mut!((*src_meta).count).write(new_src_count);
-    }
+        let lk = list_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
 
-    let dst_meta = get_or_create_meta(meta_htab, dst);
-    if dst_meta.is_null() {
-        pg_sys::LWLockRelease(lk);
-        return Some(value);
-    }
-    let dst_count = (*dst_meta).count;
-    let dst_min = if dst_count == 0 {
-        0
-    } else {
-        (*dst_meta).min_pos
-    };
-    let dst_max = if dst_count == 0 {
-        0
-    } else {
-        (*dst_meta).max_pos
-    };
+        let src_meta = find_meta(meta_htab, src);
+        if src_meta.is_null() {
+            pg_sys::LWLockRelease(lk);
+            return None;
+        }
+        let src_count = (*src_meta).count;
+        if src_count == 0 {
+            pg_sys::LWLockRelease(lk);
+            return None;
+        }
 
-    let dst_pos = if dst_left {
-        if dst_count == 0 {
+        let src_min = (*src_meta).min_pos;
+        let src_max = (*src_meta).max_pos;
+        let src_pos = if src_left { src_min } else { src_max };
+
+        let overflow_htab = list_overflow_htab_for(db_idx);
+        let sk = make_list_key(src, src_pos);
+        let mut found = false;
+        let src_entry = pg_sys::hash_search(
+            htab,
+            sk.as_ptr().cast::<c_void>(),
+            pg_sys::HASHACTION::HASH_FIND,
+            &mut found,
+        ) as *mut ListEntry;
+        if !found || src_entry.is_null() {
+            pg_sys::LWLockRelease(lk);
+            return None;
+        }
+        let value = list_read_full_value(src_entry, overflow_htab, src, src_pos);
+        pg_sys::hash_search(
+            htab,
+            sk.as_ptr().cast::<c_void>(),
+            pg_sys::HASHACTION::HASH_REMOVE,
+            &mut found,
+        );
+        list_delete_overflow(overflow_htab, src, src_pos);
+
+        let new_src_count = src_count - 1;
+        if new_src_count == 0 {
+            remove_meta(meta_htab, src);
+        } else {
+            if src_left {
+                addr_of_mut!((*src_meta).min_pos).write(src_min + LIST_POS_STEP);
+            } else {
+                addr_of_mut!((*src_meta).max_pos).write(src_max - LIST_POS_STEP);
+            }
+            addr_of_mut!((*src_meta).count).write(new_src_count);
+        }
+
+        let dst_meta = get_or_create_meta(meta_htab, dst);
+        if dst_meta.is_null() {
+            pg_sys::LWLockRelease(lk);
+            return Some(value);
+        }
+        let dst_count = (*dst_meta).count;
+        let dst_min = if dst_count == 0 {
             0
         } else {
-            dst_min - LIST_POS_STEP
+            (*dst_meta).min_pos
+        };
+        let dst_max = if dst_count == 0 {
+            0
+        } else {
+            (*dst_meta).max_pos
+        };
+
+        let dst_pos = if dst_left {
+            if dst_count == 0 {
+                0
+            } else {
+                dst_min - LIST_POS_STEP
+            }
+        } else if dst_count == 0 {
+            0
+        } else {
+            dst_max + LIST_POS_STEP
+        };
+
+        let dk = make_list_key(dst, dst_pos);
+        let mut f2 = false;
+        let entry = pg_sys::hash_search(
+            htab,
+            dk.as_ptr().cast::<c_void>(),
+            pg_sys::HASHACTION::HASH_ENTER,
+            &mut f2,
+        ) as *mut ListEntry;
+        if !entry.is_null() {
+            list_write_full_value(entry, overflow_htab, dst, dst_pos, &value);
         }
-    } else if dst_count == 0 {
-        0
-    } else {
-        dst_max + LIST_POS_STEP
-    };
 
-    let dk = make_list_key(dst, dst_pos);
-    let mut f2 = false;
-    let entry = pg_sys::hash_search(
-        htab,
-        dk.as_ptr().cast::<c_void>(),
-        pg_sys::HASHACTION::HASH_ENTER,
-        &mut f2,
-    ) as *mut ListEntry;
-    if !entry.is_null() {
-        list_write_full_value(entry, overflow_htab, dst, dst_pos, &value);
+        let new_dst_count = dst_count + 1;
+        if dst_count == 0 {
+            addr_of_mut!((*dst_meta).min_pos).write(dst_pos);
+            addr_of_mut!((*dst_meta).max_pos).write(dst_pos);
+        } else if dst_left {
+            addr_of_mut!((*dst_meta).min_pos).write(dst_pos);
+        } else {
+            addr_of_mut!((*dst_meta).max_pos).write(dst_pos);
+        }
+        addr_of_mut!((*dst_meta).count).write(new_dst_count);
+
+        pg_sys::LWLockRelease(lk);
+        Some(value)
     }
-
-    let new_dst_count = dst_count + 1;
-    if dst_count == 0 {
-        addr_of_mut!((*dst_meta).min_pos).write(dst_pos);
-        addr_of_mut!((*dst_meta).max_pos).write(dst_pos);
-    } else if dst_left {
-        addr_of_mut!((*dst_meta).min_pos).write(dst_pos);
-    } else {
-        addr_of_mut!((*dst_meta).max_pos).write(dst_pos);
-    }
-    addr_of_mut!((*dst_meta).count).write(new_dst_count);
-
-    pg_sys::LWLockRelease(lk);
-    Some(value)
-}}
+}
 
 /// # Safety
 /// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
@@ -4346,140 +4513,146 @@ pub unsafe fn mem_lpos(
     value: &str,
     rank: i64,
     count: Option<i64>,
-) -> Vec<i64> { unsafe {
-    let htab = list_htab_for(db_idx);
-    let meta_htab = list_meta_htab_for(db_idx);
-    if htab.is_null() || meta_htab.is_null() {
-        return vec![];
-    }
-    let lk = list_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
+) -> Vec<i64> {
+    unsafe {
+        let htab = list_htab_for(db_idx);
+        let meta_htab = list_meta_htab_for(db_idx);
+        if htab.is_null() || meta_htab.is_null() {
+            return vec![];
+        }
+        let lk = list_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
 
-    let meta = find_meta(meta_htab, key);
-    if meta.is_null() {
-        pg_sys::LWLockRelease(lk);
-        return vec![];
-    }
-    let current_count = (*meta).count;
-    if current_count == 0 {
-        pg_sys::LWLockRelease(lk);
-        return vec![];
-    }
+        let meta = find_meta(meta_htab, key);
+        if meta.is_null() {
+            pg_sys::LWLockRelease(lk);
+            return vec![];
+        }
+        let current_count = (*meta).count;
+        if current_count == 0 {
+            pg_sys::LWLockRelease(lk);
+            return vec![];
+        }
 
-    let min_pos = (*meta).min_pos;
-    let mut indices: Vec<i64> = (0..current_count).collect();
-    if rank < 0 {
-        indices.reverse();
-    }
+        let min_pos = (*meta).min_pos;
+        let mut indices: Vec<i64> = (0..current_count).collect();
+        if rank < 0 {
+            indices.reverse();
+        }
 
-    let overflow_htab = list_overflow_htab_for(db_idx);
-    let abs_rank = rank.unsigned_abs() as usize;
-    let limit = count.map(|c| c.max(0) as usize).unwrap_or(1);
-    let mut skip = if abs_rank > 0 { abs_rank - 1 } else { 0 };
-    let mut results = Vec::new();
+        let overflow_htab = list_overflow_htab_for(db_idx);
+        let abs_rank = rank.unsigned_abs() as usize;
+        let limit = count.map(|c| c.max(0) as usize).unwrap_or(1);
+        let mut skip = if abs_rank > 0 { abs_rank - 1 } else { 0 };
+        let mut results = Vec::new();
 
-    for logical_i in indices {
-        let pos = min_pos + logical_i * LIST_POS_STEP;
-        let k = make_list_key(key, pos);
-        let mut found = false;
-        let entry = pg_sys::hash_search(
-            htab,
-            k.as_ptr().cast::<c_void>(),
-            pg_sys::HASHACTION::HASH_FIND,
-            &mut found,
-        ) as *mut ListEntry;
-        if found && !entry.is_null() {
-            let v = list_read_full_value(entry, overflow_htab, key, pos);
-            if v == value.as_bytes() {
-                if skip > 0 {
-                    skip -= 1;
-                    continue;
-                }
-                let display_idx = if rank < 0 {
-                    current_count - 1 - logical_i
-                } else {
-                    logical_i
-                };
-                if count.is_some() {
-                    results.push(display_idx);
-                    if results.len() >= limit {
+        for logical_i in indices {
+            let pos = min_pos + logical_i * LIST_POS_STEP;
+            let k = make_list_key(key, pos);
+            let mut found = false;
+            let entry = pg_sys::hash_search(
+                htab,
+                k.as_ptr().cast::<c_void>(),
+                pg_sys::HASHACTION::HASH_FIND,
+                &mut found,
+            ) as *mut ListEntry;
+            if found && !entry.is_null() {
+                let v = list_read_full_value(entry, overflow_htab, key, pos);
+                if v == value.as_bytes() {
+                    if skip > 0 {
+                        skip -= 1;
+                        continue;
+                    }
+                    let display_idx = if rank < 0 {
+                        current_count - 1 - logical_i
+                    } else {
+                        logical_i
+                    };
+                    if count.is_some() {
+                        results.push(display_idx);
+                        if results.len() >= limit {
+                            break;
+                        }
+                    } else {
+                        results.push(display_idx);
                         break;
                     }
-                } else {
-                    results.push(display_idx);
-                    break;
                 }
             }
         }
-    }
 
-    pg_sys::LWLockRelease(lk);
-    results
-}}
+        pg_sys::LWLockRelease(lk);
+        results
+    }
+}
 
 /// # Safety
 /// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
-pub unsafe fn mem_del_list_key(db_idx: usize, key: &str) -> i64 { unsafe {
-    let htab = list_htab_for(db_idx);
-    let meta_htab = list_meta_htab_for(db_idx);
-    if htab.is_null() || meta_htab.is_null() {
-        return 0;
-    }
-    let overflow_htab = list_overflow_htab_for(db_idx);
-    let lk = list_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
+pub unsafe fn mem_del_list_key(db_idx: usize, key: &str) -> i64 {
+    unsafe {
+        let htab = list_htab_for(db_idx);
+        let meta_htab = list_meta_htab_for(db_idx);
+        if htab.is_null() || meta_htab.is_null() {
+            return 0;
+        }
+        let overflow_htab = list_overflow_htab_for(db_idx);
+        let lk = list_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
 
-    let meta = find_meta(meta_htab, key);
-    if meta.is_null() {
-        pg_sys::LWLockRelease(lk);
-        return 0;
-    }
-    let current_count = (*meta).count;
-    if current_count == 0 {
+        let meta = find_meta(meta_htab, key);
+        if meta.is_null() {
+            pg_sys::LWLockRelease(lk);
+            return 0;
+        }
+        let current_count = (*meta).count;
+        if current_count == 0 {
+            remove_meta(meta_htab, key);
+            pg_sys::LWLockRelease(lk);
+            return 0;
+        }
+
+        let min_pos = (*meta).min_pos;
+        for i in 0..current_count {
+            let pos = min_pos + i * LIST_POS_STEP;
+            let k = make_list_key(key, pos);
+            let mut found = false;
+            pg_sys::hash_search(
+                htab,
+                k.as_ptr().cast::<c_void>(),
+                pg_sys::HASHACTION::HASH_REMOVE,
+                &mut found,
+            );
+            list_delete_overflow(overflow_htab, key, pos);
+        }
         remove_meta(meta_htab, key);
+
         pg_sys::LWLockRelease(lk);
-        return 0;
+        current_count
     }
-
-    let min_pos = (*meta).min_pos;
-    for i in 0..current_count {
-        let pos = min_pos + i * LIST_POS_STEP;
-        let k = make_list_key(key, pos);
-        let mut found = false;
-        pg_sys::hash_search(
-            htab,
-            k.as_ptr().cast::<c_void>(),
-            pg_sys::HASHACTION::HASH_REMOVE,
-            &mut found,
-        );
-        list_delete_overflow(overflow_htab, key, pos);
-    }
-    remove_meta(meta_htab, key);
-
-    pg_sys::LWLockRelease(lk);
-    current_count
-}}
+}
 
 /// # Safety
 /// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
-pub unsafe fn mem_zset_collect_all(db_idx: usize, key: &str) -> Vec<(String, f64)> { unsafe {
-    let htab = zset_htab_for(db_idx);
-    if htab.is_null() {
-        return vec![];
+pub unsafe fn mem_zset_collect_all(db_idx: usize, key: &str) -> Vec<(String, f64)> {
+    unsafe {
+        let htab = zset_htab_for(db_idx);
+        if htab.is_null() {
+            return vec![];
+        }
+        let lk = zset_lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
+        let mut all = zset_collect(htab, key);
+        pg_sys::LWLockRelease(lk);
+        all.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        all
     }
-    let lk = zset_lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
-    let mut all = zset_collect(htab, key);
-    pg_sys::LWLockRelease(lk);
-    all.sort_by(|a, b| {
-        a.1.partial_cmp(&b.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.0.cmp(&b.0))
-    });
-    all
-}}
+}
 
 // ─────────────── Random key ─────────────────────────────────────────────────
 
@@ -4487,48 +4660,52 @@ pub unsafe fn mem_zset_collect_all(db_idx: usize, key: &str) -> Vec<(String, f64
 ///
 /// # Safety
 /// Must be called from bgworker thread with mem_init_worker already called.
-pub unsafe fn mem_random_key(db_idx: usize) -> Option<Vec<u8>> { unsafe {
-    let htab = htab_for(db_idx);
-    if htab.is_null() {
-        return None;
-    }
-    let lk = lwlock(db_idx);
-    pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
-    let now = now_micros();
-    let mut result: Option<Vec<u8>> = None;
-    let mut status: pg_sys::HASH_SEQ_STATUS = std::mem::zeroed();
-    pg_sys::hash_seq_init(&mut status, htab);
-    loop {
-        let entry = pg_sys::hash_seq_search(&mut status) as *mut KvEntry;
-        if entry.is_null() {
+pub unsafe fn mem_random_key(db_idx: usize) -> Option<Vec<u8>> {
+    unsafe {
+        let htab = htab_for(db_idx);
+        if htab.is_null() {
+            return None;
+        }
+        let lk = lwlock(db_idx);
+        pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
+        let now = now_micros();
+        let mut result: Option<Vec<u8>> = None;
+        let mut status: pg_sys::HASH_SEQ_STATUS = std::mem::zeroed();
+        pg_sys::hash_seq_init(&mut status, htab);
+        loop {
+            let entry = pg_sys::hash_seq_search(&mut status) as *mut KvEntry;
+            if entry.is_null() {
+                break;
+            }
+            let exp = (*entry).expires_at;
+            if exp != 0 && exp <= now {
+                continue;
+            }
+            let key_end = (*entry)
+                .key
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(MAX_KEY_LEN);
+            result = Some((&(*entry).key)[..key_end].to_vec());
+            pg_sys::hash_seq_term(&mut status);
             break;
         }
-        let exp = (*entry).expires_at;
-        if exp != 0 && exp <= now {
-            continue;
-        }
-        let key_end = (*entry)
-            .key
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(MAX_KEY_LEN);
-        result = Some((&(*entry).key)[..key_end].to_vec());
-        pg_sys::hash_seq_term(&mut status);
-        break;
+        pg_sys::LWLockRelease(lk);
+        result
     }
-    pg_sys::LWLockRelease(lk);
-    result
-}}
+}
 
 // ─────────────── Extended DEL (wipes all type tables for a key) ─────────────
 
 /// # Safety
 /// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
-pub unsafe fn mem_del_all_types(db_idx: usize, key: &str) -> i64 { unsafe {
-    let sum = mem_del_hash_key(db_idx, key)
-        + mem_del_set_key(db_idx, key)
-        + mem_del_zset_key(db_idx, key)
-        + mem_del_list_key(db_idx, key);
-    sum.min(1)
-}}
+pub unsafe fn mem_del_all_types(db_idx: usize, key: &str) -> i64 {
+    unsafe {
+        let sum = mem_del_hash_key(db_idx, key)
+            + mem_del_set_key(db_idx, key)
+            + mem_del_zset_key(db_idx, key)
+            + mem_del_list_key(db_idx, key);
+        sum.min(1)
+    }
+}

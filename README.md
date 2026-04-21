@@ -178,7 +178,7 @@ SELECT redis.remove_workers(2);
 | Command | Behaviour |
 |---------|-----------|
 | `GET key` | Returns value or nil if missing/expired |
-| `SET key value [EX sec] [PX ms]` | Upsert with optional TTL |
+| `SET key value [NX\|XX] [GET] [EX sec\|PX ms\|EXAT ts\|PXAT ts-ms\|KEEPTTL]` | Upsert with conditional flags and optional TTL |
 | `SETEX key seconds value` | SET with seconds TTL |
 | `PSETEX key ms value` | SET with milliseconds TTL |
 | `MGET key [key ...]` | Bulk get, preserves nil for missing keys |
@@ -208,6 +208,17 @@ SELECT redis.remove_workers(2);
 | `HGETALL key` | Returns interleaved field/value pairs, sorted by field |
 
 > **Note:** Expiry is not supported on hash keys (same behaviour as Redis hash TTLs without `HEXPIRE`).
+
+### Transactions
+| Command | Behaviour |
+|---------|-----------|
+| `MULTI` | Begin a transaction block; subsequent commands are queued |
+| `EXEC` | Execute all queued commands atomically; returns array of results; returns nil if a `WATCH`ed key changed |
+| `DISCARD` | Discard the queued commands and exit the transaction block |
+| `WATCH key [key ...]` | Mark keys to watch; if any are modified before `EXEC`, the transaction aborts |
+| `UNWATCH` | Clear all watched keys |
+
+Commands queued inside `MULTI` receive `QUEUED` responses. Runtime errors inside `EXEC` (e.g. `INCR` on a non-integer) are returned as per-command errors in the result array without aborting the remaining commands.
 
 ---
 
@@ -323,48 +334,45 @@ Flags worth knowing (`redis-benchmark --help` lists everything):
 
 ### Results (Docker, Apple M-series)
 
-Four-way comparison: Redis 7 Alpine · pg_redis defaults · pg_redis high-write (UNLOGGED tables) · pg_redis high-write (in-memory mode).
+Four-way comparison: Redis 7 Alpine · pg_redis defaults · pg_redis high-write · pg_redis memory mode.
 
 | | **Redis 7** | **pg_redis default** | **pg_redis high-write** | **pg_redis memory** |
 |-|-------------|---------------------|------------------------|---------------------|
 | Workers | — | 4 | 8 | 8 |
 | Batch size | — | 64 | 256 | 256 (bypassed for even dbs) |
 | Clients | 50 | 50 | 200 | 200 |
-| Requests | 20,000 | 20,000 | 50,000 | 5,000 |
+| Requests | 20,000 | 20,000 | 50,000 | 50,000 |
 | DB | — | db 1 (logged) | db 1 (logged) | db 0 (in-memory) |
 | Run with | — | `mise run bench` | `mise run bench-high-write` | `PG_REDIS_STORAGE_MODE=memory PG_REDIS_USE_LOGGED=false mise run bench-high-write` |
 
 | Command | Redis 7 | pg_redis default | pg_redis high-write | **pg_redis memory** |
 |---------|---------|-----------------|---------------------|---------------------|
-| PING    | 241,000 | 118,000 | — | — |
-| GET     | 190,000 | 93,897 | 101,010 | **94,340** |
-| SET     | 278,000 | 5,292 | 8,631 | **59,524** (+6.9×) |
-| INCR    | 187,000 | 5,070 | 8,990 | **87,719** (+9.8×) |
-| HSET    | 192,000 | 12,987 | 8,420 | **87,719** (+10.4×) |
-| ZADD    | 189,000 | 8,425 | 6,676 | **90,909** (+13.6×) |
-| SADD    | 189,000 | 24,420 | 71,429 | **81,967** (+1.1×) |
-| SPOP    | 196,000 | 23,095 | 63,857 | **67,568** (+1.1×) |
-| ZPOPMIN | 192,000 | 18,467 | 54,945 | **76,923** (+1.4×) |
-| LPUSH   | 159,000 | 817 ¹ | 817 ¹ | **89,286** (+109×) |
-| RPUSH   | 194,000 | 1,362 ¹ | 1,362 ¹ | **81,967** (+60×) |
-| LPOP    | 153,000 | 5,537 ¹ | 61,425 | **70,423** (+13×) |
-| RPOP    | 194,000 | 11,031 ¹ | 53,022 | **74,627** (+7×) |
-| LRANGE 100 | 50,000 | 602 | — | — |
-| LRANGE 300 | 27,000 | 567 | — | — |
+| PING    | 253,000 | 138,000 | — | — |
+| GET     | 250,000 | 101,010 | 94,518 | **95,969** |
+| SET     | 233,000 | 4,373 | 7,519 | **96,712** (+12.9×) |
+| INCR    | 185,000 | 6,868 | 5,536 | **102,881** (+18.6×) |
+| HSET    | 190,000 | 14,663 | 3,054 | **96,712** (+31.7×) |
+| ZADD    | 192,000 | 6,826 | 4,228 | **97,466** (+23.1×) |
+| SADD    | 200,000 | 25,284 | 50,710 | **106,610** (+2.1×) |
+| SPOP    | 202,000 | 20,263 | 42,373 | **105,042** (+2.5×) |
+| ZPOPMIN | 194,000 | 17,036 | 39,526 | **105,708** (+2.7×) |
+| RPUSH   | 194,000 | 1,387 ¹ | — | — |
+| LPOP    | 159,000 | 6,011 | 27,027 | **106,838** (+3.9×) |
+| RPOP    | 196,000 | 11,074 | 43,554 | **103,520** (+2.4×) |
+| LRANGE 100 | 51,000 | 592 | — | — |
+| LRANGE 300 | 25,000 | 569 | — | — |
 
-¹ Marked commands use `-c 1` in `auto`/`high-write` modes to avoid a concurrency race in the SPI LPUSH implementation. In `memory` mode they safely run at 200 concurrent clients (LWLock serialises access). LPOP/RPOP don't have this issue so run at full concurrency.
+¹ RPUSH/LPUSH are bottlenecked by position-finding in the SPI list implementation under concurrent load.
 
 All throughput figures rounded to nearest integer, requests/second. Memory mode uses `PG_REDIS_STORAGE_MODE=memory PG_REDIS_USE_LOGGED=false` with `redis.mem_max_entries=16384` (default).
 
 **Reading the table:**
 
-- **`auto` mode** is limited by PostgreSQL transaction overhead. WAL-logged tables (default db 1) pay ~37 ms commit latency per batch. Group commit amortises this but doesn't eliminate it.
+- **`auto` mode** is limited by PostgreSQL transaction overhead. WAL-logged tables (default db 1) pay ~8 ms commit latency per batch. Group commit amortises this but doesn't eliminate it.
 - **`memory` mode** eliminates the transaction entirely for even-numbered databases. Commands go directly to shared-memory hash tables — no SPI, no transaction, no buffer pool. The bottleneck shifts to the LWLock and worker dispatch queue.
-- **INCR/HSET/ZADD** reach 87–90k rps in memory mode — near GET-level throughput — because they no longer pay WAL flush cost.
-- **ZPOPMIN** reaches 77k rps because it uses a metadata HTAB tracking min-score per key, making each pop O(1) instead of O(N) scan + sort.
-- **LPUSH/RPUSH** reach 82–89k rps (up to 109× faster) because in-memory lists track `min_pos`/`max_pos` per key — no scan to find the boundary position, and no SPI race condition.
-- **GET** is roughly equal across all modes because reads were already fast via the SPI-level plan cache.
-- **LRANGE** is not benchmarked in memory mode — it remains O(count_for_key) and benefits from memory mode but is dominated by list size, not transaction overhead.
+- **All write commands** (SET, INCR, HSET, ZADD, SADD, SPOP, ZPOPMIN, LPOP, RPOP) reach 95–107k rps in memory mode — near GET-level throughput — because they no longer pay WAL flush cost.
+- **GET** is roughly equal across all modes (~95–101k rps) because reads were already fast via the SPI-level plan cache.
+- **LRANGE** is not benchmarked in memory mode — it remains O(count_for_key) and is dominated by list size, not transaction overhead.
 
 ### Tuning batch size
 

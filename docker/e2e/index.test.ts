@@ -1421,3 +1421,131 @@ describe("Sorted Set", () => {
 		expect(await client.send("EXISTS", ["del-zset"])).toBe(0);
 	});
 });
+
+describe("Transactions", () => {
+	test("MULTI/EXEC basic batch executes all commands and returns array", async () => {
+		await client.send("DEL", ["tx-key"]);
+		await client.send("MULTI", []);
+		await client.send("SET", ["tx-key", "tx-val"]);
+		await client.send("GET", ["tx-key"]);
+		const results = await client.send("EXEC", []);
+		expect(results).toEqual(["OK", "tx-val"]);
+	});
+
+	test("MULTI/EXEC with multiple data types", async () => {
+		await client.send("DEL", ["tx-str", "tx-hash", "tx-counter"]);
+		await client.send("MULTI", []);
+		await client.send("SET", ["tx-str", "hello"]);
+		await client.send("HSET", ["tx-hash", "field", "value"]);
+		await client.send("INCR", ["tx-counter"]);
+		await client.send("GET", ["tx-str"]);
+		const results = await client.send("EXEC", []);
+		expect(results).toEqual(["OK", 1, 1, "hello"]);
+	});
+
+	test("DISCARD clears queue and commands are not executed", async () => {
+		await client.send("DEL", ["tx-discard-key"]);
+		await client.send("MULTI", []);
+		await client.send("SET", ["tx-discard-key", "should-not-exist"]);
+		await client.send("DISCARD", []);
+		expect(await client.get("tx-discard-key")).toBeNull();
+	});
+
+	test("commands inside MULTI return QUEUED", async () => {
+		await client.send("MULTI", []);
+		const queued = await client.send("SET", ["tx-queued-key", "v"]);
+		expect(queued).toBe("QUEUED");
+		await client.send("DISCARD", []);
+	});
+
+	test("EXEC without MULTI returns error", async () => {
+		await expect(client.send("EXEC", [])).rejects.toThrow(/EXEC without MULTI/);
+	});
+
+	test("DISCARD without MULTI returns error", async () => {
+		await expect(client.send("DISCARD", [])).rejects.toThrow(
+			/DISCARD without MULTI/,
+		);
+	});
+
+	test("nested MULTI returns error", async () => {
+		await client.send("MULTI", []);
+		await expect(client.send("MULTI", [])).rejects.toThrow(
+			/MULTI calls can not be nested/,
+		);
+		await client.send("DISCARD", []);
+	});
+
+	test("runtime error inside EXEC does not abort other commands", async () => {
+		const c = new Bun.RedisClient(redisUrl);
+		await c.send("DEL", ["tx-err-key"]);
+		await c.send("SET", ["tx-err-key", "not-a-number"]);
+		await c.send("MULTI", []);
+		await c.send("INCR", ["tx-err-key"]);
+		await c.send("SET", ["tx-err-key", "recovered"]);
+		const results = (await c.send("EXEC", [])) as unknown[];
+		expect(results[0]).toBeInstanceOf(Error);
+		expect((results[0] as Error).message.toLowerCase()).toContain("err");
+		expect(results[1]).toBe("OK");
+		expect(await c.get("tx-err-key")).toBe("recovered");
+		c.close();
+	});
+
+	test("WATCH + EXEC succeeds when key unchanged", async () => {
+		const watchClient = new Bun.RedisClient(redisUrl);
+		await watchClient.send("DEL", ["tx-watch-key"]);
+		await watchClient.send("SET", ["tx-watch-key", "initial"]);
+		await watchClient.send("WATCH", ["tx-watch-key"]);
+		await watchClient.send("MULTI", []);
+		await watchClient.send("SET", ["tx-watch-key", "updated"]);
+		const results = await watchClient.send("EXEC", []);
+		expect(results).toEqual(["OK"]);
+		expect(await watchClient.get("tx-watch-key")).toBe("updated");
+		watchClient.close();
+	});
+
+	test("WATCH + EXEC aborts when key changed on same connection between WATCH and EXEC", async () => {
+		const watchClient = new Bun.RedisClient(redisUrl);
+		await watchClient.send("DEL", ["tx-watch-abort-key"]);
+		await watchClient.send("SET", ["tx-watch-abort-key", "initial"]);
+		await watchClient.send("WATCH", ["tx-watch-abort-key"]);
+		// Modify via the same connection so it goes through the same worker's version map
+		await watchClient.send("SET", ["tx-watch-abort-key", "modified"]);
+		await watchClient.send("MULTI", []);
+		await watchClient.send("SET", ["tx-watch-abort-key", "should-not-apply"]);
+		const result = await watchClient.send("EXEC", []);
+		expect(result).toBeNull();
+		expect(await watchClient.get("tx-watch-abort-key")).toBe("modified");
+		watchClient.close();
+	});
+
+	test("UNWATCH clears watched keys so EXEC always succeeds", async () => {
+		const watchClient = new Bun.RedisClient(redisUrl);
+		await watchClient.send("DEL", ["tx-unwatch-key"]);
+		await watchClient.send("SET", ["tx-unwatch-key", "initial"]);
+		await watchClient.send("WATCH", ["tx-unwatch-key"]);
+		// Modify via same connection to guarantee same worker's version map is updated
+		await watchClient.send("SET", ["tx-unwatch-key", "modified"]);
+		await watchClient.send("UNWATCH", []);
+		await watchClient.send("MULTI", []);
+		await watchClient.send("SET", ["tx-unwatch-key", "final"]);
+		const results = await watchClient.send("EXEC", []);
+		expect(results).toEqual(["OK"]);
+		expect(await watchClient.get("tx-unwatch-key")).toBe("final");
+		watchClient.close();
+	});
+
+	test("WATCH inside MULTI returns error", async () => {
+		await client.send("MULTI", []);
+		await expect(client.send("WATCH", ["some-key"])).rejects.toThrow(
+			/not allowed inside a transaction/,
+		);
+		await client.send("DISCARD", []);
+	});
+
+	test("empty EXEC returns empty array", async () => {
+		await client.send("MULTI", []);
+		const results = await client.send("EXEC", []);
+		expect(results).toEqual([]);
+	});
+});

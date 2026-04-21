@@ -145,6 +145,10 @@ pub fn write_null_bulk(w: &mut impl Write) -> io::Result<()> {
     write!(w, "$-1\r\n")
 }
 
+pub fn write_null_array(w: &mut impl Write) -> io::Result<()> {
+    write!(w, "*-1\r\n")
+}
+
 pub fn write_array_header(w: &mut impl Write, count: usize) -> io::Result<()> {
     write!(w, "*{}\r\n", count)
 }

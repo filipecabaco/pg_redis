@@ -13,6 +13,7 @@ import Redis from "ioredis";
 
 const HOST = process.env.REDIS_HOST ?? "localhost";
 const PORT = Number(process.env.REDIS_PORT ?? 6379);
+const PASSWORD = process.env.REDIS_PASSWORD ?? undefined;
 
 let pass = 0;
 let fail = 0;
@@ -61,7 +62,7 @@ function expectNull(label, actual) {
 // Sends: CLIENT SETINFO lib-name, CLIENT SETINFO lib-ver (no HELLO by default)
 // ─────────────────────────────────────────────────────────────────────────────
 await section("node-redis (redis@4)", async () => {
-  const client = createClient({ socket: { host: HOST, port: PORT } });
+  const client = createClient({ socket: { host: HOST, port: PORT }, password: PASSWORD });
   client.on("error", () => {}); // suppress unhandled-error noise
 
   await assert("connects", () => client.connect());
@@ -174,6 +175,7 @@ await section("ioredis (ioredis@5)", async () => {
   const client = new Redis({
     host: HOST,
     port: PORT,
+    password: PASSWORD,
     enableReadyCheck: false,
     lazyConnect: true,
     maxRetriesPerRequest: 1,

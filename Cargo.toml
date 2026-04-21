@@ -1,14 +1,11 @@
 [package]
 name = "pg_redis"
 version = "0.0.0"
-edition = "2021"
+edition = "2024"
+resolver = "3"
 
 [lib]
-crate-type = ["cdylib", "lib"]
-
-[[bin]]
-name = "pgrx_embed_pg_redis"
-path = "./src/bin/pgrx_embed.rs"
+crate-type = ["cdylib"]
 
 [features]
 default = ["pg17"]
@@ -19,11 +16,11 @@ pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
 pg_test = []
 
 [dependencies]
-pgrx = "=0.16.1"
+pgrx = "=0.18.0"
 socket2 = { version = "0.5", features = ["all"] }
 
 [dev-dependencies]
-pgrx-tests = "=0.16.1"
+pgrx-tests = "=0.18.0"
 
 [profile.dev]
 panic = "unwind"

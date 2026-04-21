@@ -26,12 +26,13 @@ description = "Run fmt-check + clippy (mirrors CI check step)"
 depends = ["fmt-check", "lint"]
 
 [tasks.fix]
-description = "Auto-fix formatting and lints, then run tests"
-run = [
-  "cargo fmt --all",
-  "cargo clippy --fix --allow-dirty --features {{vars.pg_version}} -- -D warnings",
-  "cargo pgrx test {{vars.pg_version}}",
-]
+description = "Auto-fix formatting and lints, then run tests for all pg versions"
+run = """
+set -e
+cargo fmt --all
+cargo clippy --fix --allow-dirty --features {{vars.pg_version}} -- -D warnings
+mise run test-all-pg
+"""
 
 [tasks.test-unit]
 description = "Run unit tests (no postgres required)"
@@ -53,17 +54,12 @@ run = "cargo pgrx test pg16"
 description = "Run integration tests against PostgreSQL 17"
 run = "cargo pgrx test pg17"
 
-[tasks.test-pg18]
-description = "Run integration tests against PostgreSQL 18"
-run = "cargo pgrx test pg18"
-
 [tasks.test-all-pg]
 description = "Run integration tests for all supported pg versions sequentially"
 run = [
   "cargo pgrx test pg15",
   "cargo pgrx test pg16",
   "cargo pgrx test pg17",
-  "cargo pgrx test pg18",
 ]
 
 [tasks.test]

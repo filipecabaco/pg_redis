@@ -1,4 +1,7 @@
+ARG CARGO_PGRX_VERSION=0.18.0
+
 FROM postgres:17-alpine AS builder
+ARG CARGO_PGRX_VERSION
 
 # Capture pg_config from the base image BEFORE apk adds any competing version.
 # postgres:17-alpine builds from source and puts pg_config in /usr/local/bin.
@@ -28,7 +31,7 @@ COPY sql/ sql/
 COPY pg_redis.control pg_redis.control
 
 # Install cargo-pgrx matching the project version
-RUN cargo install cargo-pgrx --version "=0.16.1" --locked
+RUN cargo install cargo-pgrx --version "=${CARGO_PGRX_VERSION}" --locked
 
 RUN PG_CONFIG=$(cat /pg_config_path) && \
     echo "Building with pg_config: $PG_CONFIG ($($PG_CONFIG --version))" && \

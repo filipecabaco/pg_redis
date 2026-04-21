@@ -6,9 +6,9 @@ use pgrx::prelude::*;
 use socket2::{Domain, Socket, Type};
 use std::io::BufWriter;
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 type CmdMsg = (Command, u8, mpsc::SyncSender<Response>);
@@ -254,11 +254,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 fn configured_password() -> Option<Vec<u8>> {
     crate::PASSWORD.get().as_deref().and_then(|s| {
         let b = s.to_bytes();
-        if b.is_empty() {
-            None
-        } else {
-            Some(b.to_vec())
-        }
+        if b.is_empty() { None } else { Some(b.to_vec()) }
     })
 }
 
@@ -457,7 +453,11 @@ fn conn_loop(
                 let info = format!(
                     "# Server\r\nredis_version:7.0.0\r\nmode:standalone\r\nos:PostgreSQL\r\ndb:{}\r\ntable_mode:{}\r\n",
                     db,
-                    if db.is_multiple_of(2) { "unlogged" } else { "logged" }
+                    if db.is_multiple_of(2) {
+                        "unlogged"
+                    } else {
+                        "logged"
+                    }
                 );
                 reply(&mut writer, |w| write_bulk_string(w, info.as_bytes()));
             }

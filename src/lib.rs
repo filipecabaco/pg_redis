@@ -1,4 +1,5 @@
 mod commands;
+pub(crate) mod htab;
 pub(crate) mod mem;
 mod resp;
 mod worker;
@@ -49,55 +50,54 @@ static mut PREV_SHMEM_REQUEST_HOOK: pg_sys::shmem_request_hook_type = None;
 static mut PREV_SHMEM_STARTUP_HOOK: pg_sys::shmem_startup_hook_type = None;
 
 unsafe extern "C-unwind" fn pg_redis_shmem_request() {
-    if let Some(prev) = PREV_SHMEM_REQUEST_HOOK {
-        prev();
+    unsafe {
+        if let Some(prev) = PREV_SHMEM_REQUEST_HOOK {
+            prev();
+        }
+        pg_sys::RequestAddinShmemSpace(mem::mem_ctl_size());
+        pg_sys::RequestAddinShmemSpace(mem::mem_htab_total_size());
+        pg_sys::RequestAddinShmemSpace(mem::mem_hash_htab_total_size());
+        pg_sys::RequestAddinShmemSpace(mem::mem_set_htab_total_size());
+        pg_sys::RequestAddinShmemSpace(mem::mem_zset_htab_total_size());
+        pg_sys::RequestAddinShmemSpace(mem::mem_list_htab_total_size());
+        pg_sys::RequestAddinShmemSpace(mem::mem_list_meta_htab_total_size());
+        pg_sys::RequestAddinShmemSpace(mem::mem_zset_meta_htab_total_size());
+        pg_sys::RequestAddinShmemSpace(mem::mem_set_meta_htab_total_size());
+        pg_sys::RequestAddinShmemSpace(mem::mem_kv_overflow_total_size());
+        pg_sys::RequestAddinShmemSpace(mem::mem_hash_overflow_total_size());
+        pg_sys::RequestAddinShmemSpace(mem::mem_list_overflow_total_size());
+        pg_sys::RequestNamedLWLockTranche(c"pg_redis_mem".as_ptr(), (mem::NUM_MEM_DBS * 5) as i32);
     }
-    // MemControlBlock (holds pointers to the 8 HTABs + LWLock)
-    pg_sys::RequestAddinShmemSpace(mem::mem_ctl_size());
-    // HTAB storage: PostgreSQL needs pre-allocated space for HASH_SHARED_MEM tables.
-    // Each table holds HTAB_INIT_SIZE entries of size KvEntry, plus ~25% HTAB overhead.
-    pg_sys::RequestAddinShmemSpace(mem::mem_htab_total_size());
-    pg_sys::RequestAddinShmemSpace(mem::mem_hash_htab_total_size());
-    pg_sys::RequestAddinShmemSpace(mem::mem_set_htab_total_size());
-    pg_sys::RequestAddinShmemSpace(mem::mem_zset_htab_total_size());
-    pg_sys::RequestAddinShmemSpace(mem::mem_list_htab_total_size());
-    pg_sys::RequestAddinShmemSpace(mem::mem_list_meta_htab_total_size());
-    pg_sys::RequestAddinShmemSpace(mem::mem_zset_meta_htab_total_size());
-    pg_sys::RequestAddinShmemSpace(mem::mem_set_meta_htab_total_size());
-    pg_sys::RequestAddinShmemSpace(mem::mem_kv_overflow_total_size());
-    pg_sys::RequestAddinShmemSpace(mem::mem_hash_overflow_total_size());
-    pg_sys::RequestAddinShmemSpace(mem::mem_list_overflow_total_size());
-    // 5 lock sets (KV, hash, set, zset, list) × 8 even-dbs = 40 locks.
-    pg_sys::RequestNamedLWLockTranche(c"pg_redis_mem".as_ptr(), (mem::NUM_MEM_DBS * 5) as i32);
 }
 
 unsafe extern "C-unwind" fn pg_redis_shmem_startup() {
-    if let Some(prev) = PREV_SHMEM_STARTUP_HOOK {
-        prev();
-    }
-    let mut found = false;
-    let ctl: *mut mem::MemControlBlock =
-        pg_sys::ShmemInitStruct(c"pg_redis_ctl".as_ptr(), mem::mem_ctl_size(), &mut found).cast();
+    unsafe {
+        if let Some(prev) = PREV_SHMEM_STARTUP_HOOK {
+            prev();
+        }
+        let mut found = false;
+        let ctl: *mut mem::MemControlBlock =
+            pg_sys::ShmemInitStruct(c"pg_redis_ctl".as_ptr(), mem::mem_ctl_size(), &mut found)
+                .cast();
 
-    // Assign locks: 0..7=KV, 8..15=hash, 16..23=set, 24..31=zset, 32..39=list
-    let locks = pg_sys::GetNamedLWLockTranche(c"pg_redis_mem".as_ptr());
-    for i in 0..mem::NUM_MEM_DBS {
-        (*ctl).lwlock[i] = std::ptr::addr_of_mut!((*locks.add(i)).lock);
-        (*ctl).hash_lwlock[i] = std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS + i)).lock);
-        (*ctl).set_lwlock[i] = std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS * 2 + i)).lock);
-        (*ctl).zset_lwlock[i] = std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS * 3 + i)).lock);
-        (*ctl).list_lwlock[i] = std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS * 4 + i)).lock);
-    }
+        let locks = pg_sys::GetNamedLWLockTranche(c"pg_redis_mem".as_ptr());
+        for i in 0..mem::NUM_MEM_DBS {
+            (*ctl).lwlock[i] = std::ptr::addr_of_mut!((*locks.add(i)).lock);
+            (*ctl).hash_lwlock[i] = std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS + i)).lock);
+            (*ctl).set_lwlock[i] =
+                std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS * 2 + i)).lock);
+            (*ctl).zset_lwlock[i] =
+                std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS * 3 + i)).lock);
+            (*ctl).list_lwlock[i] =
+                std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS * 4 + i)).lock);
+        }
 
-    if !found {
-        // First time: create all 8 HTAB tables. ShmemInitHash with HASH_SHARED_MEM
-        // MUST be called from the postmaster startup path (here), not from bgworkers.
-        mem::mem_init_tables(ctl);
-    }
-    // On re-attach (found=true) the HTABs are already in shared memory; pointers
-    // stored in ctl are valid for all backends after this point.
+        if !found {
+            mem::mem_init_tables(ctl);
+        }
 
-    SHMEM_CTL = ctl;
+        SHMEM_CTL = ctl;
+    }
 }
 
 pub(crate) fn shmem_ctl() -> *mut mem::MemControlBlock {
@@ -238,7 +238,7 @@ pub extern "C-unwind" fn _PG_init() {
 }
 
 #[pg_guard]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C-unwind" fn pg_redis_worker_main(arg: pg_sys::Datum) {
     worker::worker_main(arg);
 }

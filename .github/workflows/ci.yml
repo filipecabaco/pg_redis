@@ -180,6 +180,9 @@ jobs:
           rm -rf /tmp/.buildx-cache
           mv /tmp/.buildx-cache-new /tmp/.buildx-cache
 
+      - name: Build e2e image
+        run: docker compose --profile e2e build e2e
+
       - name: Run e2e tests
         run: |
           docker compose --profile e2e up \

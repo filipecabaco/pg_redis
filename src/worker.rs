@@ -60,6 +60,24 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
         {
             BackgroundWorker::transaction(|| {
                 Spi::connect(|client| {
+                    // Guard against the extension not yet being installed (e.g. during pgrx tests
+                    // workers start before CREATE EXTENSION runs and the table doesn't exist yet).
+                    let table_exists: bool = client
+                        .select(
+                            "SELECT 1 FROM pg_catalog.pg_class c \
+                             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                             WHERE n.nspname = 'redis' AND c.relname = 'pubsub_routes'",
+                            Some(1),
+                            &[],
+                        )
+                        .ok()
+                        .map(|t| !t.is_empty())
+                        .unwrap_or(false);
+
+                    if !table_exists {
+                        return;
+                    }
+
                     match client.select(
                         "SELECT channel, schema, tbl FROM redis.pubsub_routes",
                         None,

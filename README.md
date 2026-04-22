@@ -40,6 +40,8 @@ SELECT key, value, expires_at FROM redis.kv_1;
 
 ## Documentation
 
+Full docs at **[filipecabaco.github.io/pg_redis](https://filipecabaco.github.io/pg_redis/)**.
+
 - [Installation](./docs/installation.md) — requirements, building from source, enabling the extension
 - [Configuration](./docs/configuration.md) — GUC reference, database selection, worker management
 - [Commands](./docs/commands.md) — supported Redis commands

@@ -8,23 +8,35 @@ edit_uri: edit/main/docs/
 theme:
   name: material
   palette:
-    - scheme: default
-      primary: indigo
-      accent: indigo
+    - scheme: slate
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-7
-        name: Switch to dark mode
-    - scheme: slate
-      primary: indigo
-      accent: indigo
+        name: Switch to light mode
+    - scheme: default
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-4
-        name: Switch to light mode
+        name: Switch to dark mode
+  logo: https://supabase.com/favicon/favicon-32x32.png
+  favicon: https://supabase.com/favicon/favicon-32x32.png
   features:
     - navigation.sections
     - navigation.top
     - content.code.copy
     - content.action.edit
+
+extra_css:
+  - stylesheets/supabase.css
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/filipecabaco/pg_redis
+    - icon: simple/supabase
+      link: https://supabase.com
 
 markdown_extensions:
   - tables

@@ -1,0 +1,56 @@
+:root,
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: #3ecf8e;
+  --md-primary-fg-color--light: #5dd9a2;
+  --md-primary-fg-color--dark: #29a96e;
+  --md-primary-bg-color: #1c1c1c;
+  --md-primary-bg-color--light: #2a2a2a;
+  --md-accent-fg-color: #3ecf8e;
+  --md-accent-fg-color--transparent: #3ecf8e1a;
+  --md-default-bg-color: #1c1c1c;
+  --md-default-bg-color--light: #242424;
+  --md-default-bg-color--lighter: #2a2a2a;
+  --md-default-bg-color--lightest: #303030;
+  --md-default-fg-color: #ededed;
+  --md-default-fg-color--light: #b0b0b0;
+  --md-default-fg-color--lighter: #787878;
+  --md-default-fg-color--lightest: #505050;
+  --md-code-bg-color: #141414;
+  --md-code-fg-color: #ededed;
+}
+
+[data-md-color-scheme="default"] {
+  --md-primary-fg-color: #3ecf8e;
+  --md-primary-fg-color--light: #5dd9a2;
+  --md-primary-fg-color--dark: #29a96e;
+  --md-primary-bg-color: #ffffff;
+  --md-accent-fg-color: #3ecf8e;
+  --md-accent-fg-color--transparent: #3ecf8e1a;
+}
+
+.md-header {
+  background-color: #1c1c1c;
+}
+
+.md-tabs {
+  background-color: #1c1c1c;
+}
+
+.md-header__button.md-logo img,
+.md-header__button.md-logo svg {
+  fill: #3ecf8e;
+  height: 1.8rem;
+}
+
+.md-nav__link--active,
+.md-nav__link:hover {
+  color: #3ecf8e;
+}
+
+a {
+  color: #3ecf8e;
+}
+
+a:hover {
+  color: #5dd9a2;
+}

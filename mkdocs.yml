@@ -1,0 +1,51 @@
+site_name: pg_redis
+site_description: Redis protocol support for PostgreSQL — backed by real SQL tables
+site_url: https://filipecabaco.github.io/pg_redis
+repo_url: https://github.com/filipecabaco/pg_redis
+repo_name: filipecabaco/pg_redis
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - content.action.edit
+
+markdown_extensions:
+  - tables
+  - admonition
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Installation: installation.md
+      - Configuration: configuration.md
+  - Reference:
+      - Commands: commands.md
+      - Command coverage: command-coverage.md
+      - Storage modes: storage-modes.md
+      - Pub/Sub routing: pubsub.md
+  - Performance:
+      - Benchmarks: benchmarks.md
+  - Contributing:
+      - Development: development.md

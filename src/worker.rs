@@ -13,6 +13,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 type VersionMap = Arc<RwLock<HashMap<(u8, String), u64>>>;
+type PendingBatch = Option<(Vec<(Command, u8)>, mpsc::SyncSender<Vec<Response>>)>;
 
 enum DispatchMsg {
     Cmd(Command, u8, mpsc::SyncSender<Response>),
@@ -90,10 +91,7 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                 DispatchMsg::Cmd(first_cmd, first_db, first_resp_tx) => {
                     let mut cmds: Vec<(Command, u8)> = Vec::with_capacity(batch_size);
                     let mut txs: Vec<mpsc::SyncSender<Response>> = Vec::with_capacity(batch_size);
-                    let mut pending_batch: Option<(
-                        Vec<(Command, u8)>,
-                        mpsc::SyncSender<Vec<Response>>,
-                    )> = None;
+                    let mut pending_batch: PendingBatch = None;
 
                     cmds.push((first_cmd, first_db));
                     txs.push(first_resp_tx);
@@ -720,7 +718,7 @@ fn conn_loop(
                     break;
                 }
             }
-            Command::Unsubscribe { .. } | Command::PUnsubscribe { .. } => {
+            Command::Unsubscribe | Command::PUnsubscribe => {
                 // Called outside subscribe mode: send empty reply per Redis spec
                 write_pubsub_header(&mut writer, 3, proto).ok();
                 write_bulk_string(&mut writer, b"unsubscribe").ok();

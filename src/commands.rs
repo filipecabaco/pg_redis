@@ -732,15 +732,11 @@ pub enum Command {
     Subscribe {
         channels: Vec<Vec<u8>>,
     },
-    Unsubscribe {
-        channels: Vec<Vec<u8>>,
-    },
+    Unsubscribe,
     PSubscribe {
         patterns: Vec<Vec<u8>>,
     },
-    PUnsubscribe {
-        patterns: Vec<Vec<u8>>,
-    },
+    PUnsubscribe,
     Publish {
         channel: Vec<u8>,
         message: Vec<u8>,
@@ -1765,9 +1761,7 @@ impl Command {
                     channels: args.to_vec(),
                 })
             }
-            "UNSUBSCRIBE" => Ok(Command::Unsubscribe {
-                channels: args.to_vec(),
-            }),
+            "UNSUBSCRIBE" => Ok(Command::Unsubscribe),
             "PSUBSCRIBE" => {
                 if args.is_empty() {
                     return Err("PSUBSCRIBE requires at least one pattern".to_string());
@@ -1776,9 +1770,7 @@ impl Command {
                     patterns: args.to_vec(),
                 })
             }
-            "PUNSUBSCRIBE" => Ok(Command::PUnsubscribe {
-                patterns: args.to_vec(),
-            }),
+            "PUNSUBSCRIBE" => Ok(Command::PUnsubscribe),
             "PUBLISH" => {
                 if args.len() != 2 {
                     return Err("PUBLISH requires channel and message".to_string());
@@ -3755,9 +3747,9 @@ impl Command {
             Command::Multi | Command::Exec | Command::Discard | Command::Watch { .. }
             | Command::Unwatch
             | Command::Subscribe { .. }
-            | Command::Unsubscribe { .. }
+            | Command::Unsubscribe
             | Command::PSubscribe { .. }
-            | Command::PUnsubscribe { .. }
+            | Command::PUnsubscribe
             | Command::Publish { .. }
             | Command::PubSubChannels { .. }
             | Command::PubSubNumSub { .. }
@@ -4597,9 +4589,9 @@ impl Command {
             | Command::Watch { .. }
             | Command::Unwatch
             | Command::Subscribe { .. }
-            | Command::Unsubscribe { .. }
+            | Command::Unsubscribe
             | Command::PSubscribe { .. }
-            | Command::PUnsubscribe { .. }
+            | Command::PUnsubscribe
             | Command::Publish { .. }
             | Command::PubSubChannels { .. }
             | Command::PubSubNumSub { .. }

@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- Rounded dark background, favicon-friendly -->
+  <rect width="256" height="256" rx="48" fill="#1F1F1F"/>
+
+  <!-- =========================================================
+       Two stacked isometric cubes, centered in 256x256
+
+       Cube size = 56
+         half-width  dx = 56
+         half-depth  dy = 28
+         height      h  = 56
+
+       Stack total:
+         width  = 2 * dx = 112
+         height = 2 * h + 2 * dy = 168
+
+       Centered:
+         horizontal center at x = 128
+         vertical center of stack at y = 128
+         → bottom cube bottom-center at (128, 128 + 84) = (128, 212)
+         → bottom cube top-center    at (128, 156)
+         → top cube    top-center    at (128, 100)
+         → apex of stack              at (128, 72)
+         → base of stack              at (128, 240)
+       ========================================================= -->
+
+  <g transform="translate(0, -20)">
+    <!-- ================ BOTTOM CUBE ================ -->
+    <!-- LEFT face -->
+    <path d="M 72 156
+             L 128 184
+             L 128 240
+             L 72 212 Z"
+          fill="#249361"/>
+
+    <!-- RIGHT face -->
+    <path d="M 128 184
+             L 184 156
+             L 184 212
+             L 128 240 Z"
+          fill="#15553A"/>
+
+    <!-- TOP face -->
+    <path d="M 72 156
+             L 128 128
+             L 184 156
+             L 128 184 Z"
+          fill="#3ECF8E"/>
+
+    <!-- ================ TOP CUBE ================ -->
+    <!-- LEFT face -->
+    <path d="M 72 100
+             L 128 128
+             L 128 184
+             L 72 156 Z"
+          fill="#2FA873"/>
+
+    <!-- RIGHT face -->
+    <path d="M 128 128
+             L 184 100
+             L 184 156
+             L 128 184 Z"
+          fill="#1F7A52"/>
+
+    <!-- TOP face -->
+    <path d="M 72 100
+             L 128 72
+             L 184 100
+             L 128 128 Z"
+          fill="#4AE29E"/>
+
+    <!-- Top-edge highlight -->
+    <path d="M 72 100 L 128 72 L 184 100"
+          fill="none"
+          stroke="#6FE8B0"
+          stroke-width="1.5"/>
+  </g>
+</svg>

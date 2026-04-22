@@ -1,4 +1,4 @@
-# pg_redis
+<img src="logo.svg" alt="pg_redis" width="600"/>
 
 A PostgreSQL extension that lets you connect to Postgres using the **Redis protocol (RESP2)**. Drop-in Redis wire compatibility backed by real SQL tables — with two durability modes to match your performance needs.
 
@@ -39,6 +39,8 @@ SELECT key, value, expires_at FROM redis.kv_1;
 ```
 
 ## Documentation
+
+Full docs at **[filipecabaco.github.io/pg_redis](https://filipecabaco.github.io/pg_redis/)**.
 
 - [Installation](./docs/installation.md) — requirements, building from source, enabling the extension
 - [Configuration](./docs/configuration.md) — GUC reference, database selection, worker management

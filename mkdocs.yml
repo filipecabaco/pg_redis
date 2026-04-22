@@ -4,27 +4,40 @@ site_url: https://filipecabaco.github.io/pg_redis
 repo_url: https://github.com/filipecabaco/pg_redis
 repo_name: filipecabaco/pg_redis
 edit_uri: edit/main/docs/
+copyright: Copyright &copy; 2026 Filipe Cabaço — MIT License
 
 theme:
   name: material
   palette:
-    - scheme: default
-      primary: indigo
-      accent: indigo
+    - scheme: slate
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-7
-        name: Switch to dark mode
-    - scheme: slate
-      primary: indigo
-      accent: indigo
+        name: Switch to light mode
+    - scheme: default
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-4
-        name: Switch to light mode
+        name: Switch to dark mode
+  logo: assets/logo.svg
+  favicon: assets/favicon.svg
   features:
     - navigation.sections
     - navigation.top
     - content.code.copy
     - content.action.edit
+
+extra_css:
+  - stylesheets/supabase.css
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/filipecabaco/pg_redis
+    - icon: simple/supabase
+      link: https://supabase.com
 
 markdown_extensions:
   - tables

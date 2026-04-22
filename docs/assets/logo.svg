@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="105 185 145 220">
+  <!-- LEFT face bottom cube -->
+  <path d="M 105 295 L 175 330 L 175 400 L 105 365 Z" fill="#249361"/>
+  <!-- RIGHT face bottom cube -->
+  <path d="M 175 330 L 245 295 L 245 365 L 175 400 Z" fill="#15553A"/>
+  <!-- TOP face bottom cube -->
+  <path d="M 105 295 L 175 260 L 245 295 L 175 330 Z" fill="#3ECF8E"/>
+  <!-- LEFT face top cube -->
+  <path d="M 105 225 L 175 260 L 175 330 L 105 295 Z" fill="#2FA873"/>
+  <!-- RIGHT face top cube -->
+  <path d="M 175 260 L 245 225 L 245 295 L 175 330 Z" fill="#1F7A52"/>
+  <!-- TOP face top cube -->
+  <path d="M 105 225 L 175 190 L 245 225 L 175 260 Z" fill="#4AE29E"/>
+  <!-- Top edge highlight -->
+  <path d="M 105 225 L 175 190 L 245 225" fill="none" stroke="#6FE8B0" stroke-width="1.5"/>
+</svg>

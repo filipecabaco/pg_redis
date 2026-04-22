@@ -97,6 +97,7 @@ pub mod sql {
                 "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, '1') \
          ON CONFLICT (key) DO UPDATE \
          SET value = (CAST(redis.kv_{db}.value AS bigint) + 1)::text \
+         WHERE redis.kv_{db}.value ~ '^-?[0-9]+$' \
          RETURNING value::bigint"
             )
         })
@@ -108,6 +109,7 @@ pub mod sql {
                 "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, '-1') \
          ON CONFLICT (key) DO UPDATE \
          SET value = (CAST(redis.kv_{db}.value AS bigint) - 1)::text \
+         WHERE redis.kv_{db}.value ~ '^-?[0-9]+$' \
          RETURNING value::bigint"
             )
         })
@@ -119,6 +121,7 @@ pub mod sql {
                 "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, $2::text) \
          ON CONFLICT (key) DO UPDATE \
          SET value = (CAST(redis.kv_{db}.value AS bigint) + $3)::text \
+         WHERE redis.kv_{db}.value ~ '^-?[0-9]+$' \
          RETURNING value::bigint"
             )
         })
@@ -130,6 +133,7 @@ pub mod sql {
                 "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, $2::text) \
          ON CONFLICT (key) DO UPDATE \
          SET value = (CAST(redis.kv_{db}.value AS bigint) + $3)::text \
+         WHERE redis.kv_{db}.value ~ '^-?[0-9]+$' \
          RETURNING value::bigint"
             )
         })
@@ -141,6 +145,7 @@ pub mod sql {
                 "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, $2::text) \
          ON CONFLICT (key) DO UPDATE \
          SET value = (CAST(redis.kv_{db}.value AS float8) + $3)::text \
+         WHERE redis.kv_{db}.value ~ '^-?(\\d+\\.?\\d*|\\.\\d+)([eE][+-]?\\d+)?$' \
          RETURNING value"
             )
         })
@@ -724,6 +729,34 @@ pub enum Command {
         dst: String,
         keys: Vec<String>,
     },
+    Subscribe {
+        channels: Vec<Vec<u8>>,
+    },
+    Unsubscribe,
+    PSubscribe {
+        patterns: Vec<Vec<u8>>,
+    },
+    PUnsubscribe,
+    Publish {
+        channel: Vec<u8>,
+        message: Vec<u8>,
+    },
+    PubSubChannels {
+        pattern: Option<Vec<u8>>,
+    },
+    PubSubNumSub {
+        channels: Vec<Vec<u8>>,
+    },
+    PubSubNumPat,
+    PubSubHelp,
+
+    Multi,
+    Exec,
+    Discard,
+    Watch {
+        keys: Vec<String>,
+    },
+    Unwatch,
 }
 
 pub enum Response {
@@ -1720,6 +1753,66 @@ impl Command {
                 Ok(Command::ZDiffStore { dst, keys })
             }
 
+            "SUBSCRIBE" => {
+                if args.is_empty() {
+                    return Err("SUBSCRIBE requires at least one channel".to_string());
+                }
+                Ok(Command::Subscribe {
+                    channels: args.to_vec(),
+                })
+            }
+            "UNSUBSCRIBE" => Ok(Command::Unsubscribe),
+            "PSUBSCRIBE" => {
+                if args.is_empty() {
+                    return Err("PSUBSCRIBE requires at least one pattern".to_string());
+                }
+                Ok(Command::PSubscribe {
+                    patterns: args.to_vec(),
+                })
+            }
+            "PUNSUBSCRIBE" => Ok(Command::PUnsubscribe),
+            "PUBLISH" => {
+                if args.len() != 2 {
+                    return Err("PUBLISH requires channel and message".to_string());
+                }
+                Ok(Command::Publish {
+                    channel: args[0].clone(),
+                    message: args[1].clone(),
+                })
+            }
+            "PUBSUB" => {
+                let sub = args
+                    .first()
+                    .map(|a| String::from_utf8_lossy(a).to_uppercase());
+                match sub.as_deref() {
+                    Some("CHANNELS") => Ok(Command::PubSubChannels {
+                        pattern: args.get(1).cloned(),
+                    }),
+                    Some("NUMSUB") => Ok(Command::PubSubNumSub {
+                        channels: args[1..].to_vec(),
+                    }),
+                    Some("NUMPAT") => Ok(Command::PubSubNumPat),
+                    Some("HELP") | None => Ok(Command::PubSubHelp),
+                    Some(s) => Err(format!("PUBSUB subcommand '{}' not supported", s)),
+                }
+            }
+
+            "MULTI" => Ok(Command::Multi),
+            "EXEC" => Ok(Command::Exec),
+            "DISCARD" => Ok(Command::Discard),
+            "WATCH" => {
+                if args.is_empty() {
+                    return Err("WATCH requires at least one key".to_string());
+                }
+                Ok(Command::Watch {
+                    keys: args
+                        .iter()
+                        .map(|a| String::from_utf8_lossy(a).into_owned())
+                        .collect(),
+                })
+            }
+            "UNWATCH" => Ok(Command::Unwatch),
+
             _ => Err(format!("unknown command '{}'", cmd)),
         }
     }
@@ -2121,13 +2214,11 @@ impl Command {
                 match client.update(&sql::INCR[db as usize], None, &[key.as_str().into()]) {
                     Ok(tbl) => match tbl.first().get::<i64>(1) {
                         Ok(Some(n)) => Response::Integer(n),
-                        _ => Response::Integer(1),
+                        _ => Response::Error("ERR value is not an integer or out of range".to_string()),
                     },
                     Err(e) => {
                         eprintln!("pg_redis: INCR error: {}", e);
-                        Response::Error(
-                            "ERR value is not an integer or out of range".to_string(),
-                        )
+                        Response::Error("ERR value is not an integer or out of range".to_string())
                     }
                 }
             }
@@ -2136,13 +2227,11 @@ impl Command {
                 match client.update(&sql::DECR[db as usize], None, &[key.as_str().into()]) {
                     Ok(tbl) => match tbl.first().get::<i64>(1) {
                         Ok(Some(n)) => Response::Integer(n),
-                        _ => Response::Integer(-1),
+                        _ => Response::Error("ERR value is not an integer or out of range".to_string()),
                     },
                     Err(e) => {
                         eprintln!("pg_redis: DECR error: {}", e);
-                        Response::Error(
-                            "ERR value is not an integer or out of range".to_string(),
-                        )
+                        Response::Error("ERR value is not an integer or out of range".to_string())
                     }
                 }
             }
@@ -2151,13 +2240,11 @@ impl Command {
                 match client.update(&sql::INCRBY[db as usize], None, &[key.as_str().into(), (*delta).into(), (*delta).into()]) {
                     Ok(tbl) => match tbl.first().get::<i64>(1) {
                         Ok(Some(n)) => Response::Integer(n),
-                        _ => Response::Integer(*delta),
+                        _ => Response::Error("ERR value is not an integer or out of range".to_string()),
                     },
                     Err(e) => {
                         eprintln!("pg_redis: INCRBY error: {}", e);
-                        Response::Error(
-                            "ERR value is not an integer or out of range".to_string(),
-                        )
+                        Response::Error("ERR value is not an integer or out of range".to_string())
                     }
                 }
             }
@@ -2167,13 +2254,11 @@ impl Command {
                 match client.update(&sql::DECRBY[db as usize], None, &[key.as_str().into(), neg_delta.into(), neg_delta.into()]) {
                     Ok(tbl) => match tbl.first().get::<i64>(1) {
                         Ok(Some(n)) => Response::Integer(n),
-                        _ => Response::Integer(neg_delta),
+                        _ => Response::Error("ERR value is not an integer or out of range".to_string()),
                     },
                     Err(e) => {
                         eprintln!("pg_redis: DECRBY error: {}", e);
-                        Response::Error(
-                            "ERR value is not an integer or out of range".to_string(),
-                        )
+                        Response::Error("ERR value is not an integer or out of range".to_string())
                     }
                 }
             }
@@ -2182,7 +2267,7 @@ impl Command {
                 match client.update(&sql::INCRBYFLOAT[db as usize], None, &[key.as_str().into(), (*delta).into(), (*delta).into()]) {
                     Ok(tbl) => match tbl.first().get::<String>(1) {
                         Ok(Some(v)) => Response::BulkString(v.into_bytes()),
-                        _ => Response::BulkString(delta.to_string().into_bytes()),
+                        _ => Response::Error("ERR value is not a valid float".to_string()),
                     },
                     Err(e) => {
                         eprintln!("pg_redis: INCRBYFLOAT error: {}", e);
@@ -2662,6 +2747,7 @@ impl Command {
                     "INSERT INTO redis.hash_{db} (key, field, value) VALUES ($1, $2, $3::text) \
                      ON CONFLICT (key, field) DO UPDATE \
                      SET value = (CAST(redis.hash_{db}.value AS bigint) + $4)::text \
+                     WHERE redis.hash_{db}.value ~ '^-?[0-9]+$' \
                      RETURNING value::bigint"
                 );
                 match client.update(
@@ -2671,13 +2757,11 @@ impl Command {
                 ) {
                     Ok(tbl) => match tbl.first().get::<i64>(1) {
                         Ok(Some(n)) => Response::Integer(n),
-                        _ => Response::Integer(*delta),
+                        _ => Response::Error("ERR value is not an integer or out of range".to_string()),
                     },
                     Err(e) => {
                         eprintln!("pg_redis: HINCRBY error: {}", e);
-                        Response::Error(
-                            "ERR value is not an integer or out of range".to_string(),
-                        )
+                        Response::Error("ERR value is not an integer or out of range".to_string())
                     }
                 }
             }
@@ -3660,6 +3744,19 @@ impl Command {
             Command::ZDiffStore { dst, keys } => {
                 zaggregate_execute(client, db, keys, None, ZAggregateOptions { aggregate: Aggregate::Sum, with_scores: false, op: AggOp::Diff, store_into: Some(dst) })
             }
+            Command::Multi | Command::Exec | Command::Discard | Command::Watch { .. }
+            | Command::Unwatch
+            | Command::Subscribe { .. }
+            | Command::Unsubscribe
+            | Command::PSubscribe { .. }
+            | Command::PUnsubscribe
+            | Command::Publish { .. }
+            | Command::PubSubChannels { .. }
+            | Command::PubSubNumSub { .. }
+            | Command::PubSubNumPat
+            | Command::PubSubHelp => {
+                Response::Error("ERR command not allowed in this context".to_string())
+            }
         }
     }
 
@@ -4486,6 +4583,23 @@ impl Command {
                 }
             }
 
+            Command::Multi
+            | Command::Exec
+            | Command::Discard
+            | Command::Watch { .. }
+            | Command::Unwatch
+            | Command::Subscribe { .. }
+            | Command::Unsubscribe
+            | Command::PSubscribe { .. }
+            | Command::PUnsubscribe
+            | Command::Publish { .. }
+            | Command::PubSubChannels { .. }
+            | Command::PubSubNumSub { .. }
+            | Command::PubSubNumPat
+            | Command::PubSubHelp => {
+                Response::Error("ERR command not allowed in this context".to_string())
+            }
+
             // LInsert is rare and positional — fall back to SPI.
             // Any truly unhandled commands also fall back.
             _ => {
@@ -4495,6 +4609,72 @@ impl Command {
                     Spi::connect_mut(|client| self.execute(client, db))
                 })
             }
+        }
+    }
+
+    pub fn write_keys(&self) -> Vec<&str> {
+        match self {
+            Command::Set { key, .. }
+            | Command::SetEx { key, .. }
+            | Command::PSetEx { key, .. }
+            | Command::SetNx { key, .. }
+            | Command::GetSet { key, .. }
+            | Command::GetDel { key, .. }
+            | Command::Append { key, .. }
+            | Command::Incr { key }
+            | Command::Decr { key }
+            | Command::IncrBy { key, .. }
+            | Command::DecrBy { key, .. }
+            | Command::IncrByFloat { key, .. }
+            | Command::Expire { key, .. }
+            | Command::PExpire { key, .. }
+            | Command::ExpireAt { key, .. }
+            | Command::PExpireAt { key, .. }
+            | Command::Persist { key }
+            | Command::HSet { key, .. }
+            | Command::HDel { key, .. }
+            | Command::HMSet { key, .. }
+            | Command::HIncrBy { key, .. }
+            | Command::HSetNx { key, .. }
+            | Command::LPush { key, .. }
+            | Command::RPush { key, .. }
+            | Command::LPushX { key, .. }
+            | Command::RPushX { key, .. }
+            | Command::LPop { key, .. }
+            | Command::RPop { key, .. }
+            | Command::LInsert { key, .. }
+            | Command::LSet { key, .. }
+            | Command::LRem { key, .. }
+            | Command::LTrim { key, .. }
+            | Command::SAdd { key, .. }
+            | Command::SRem { key, .. }
+            | Command::SPop { key, .. }
+            | Command::ZAdd { key, .. }
+            | Command::ZRem { key, .. }
+            | Command::ZIncrBy { key, .. }
+            | Command::ZPopMin { key, .. }
+            | Command::ZPopMax { key, .. }
+            | Command::ZRemRangeByRank { key, .. }
+            | Command::ZRemRangeByScore { key, .. }
+            | Command::ZRemRangeByLex { key, .. } => vec![key.as_str()],
+
+            Command::Del { keys } | Command::Unlink { keys } => {
+                keys.iter().map(String::as_str).collect()
+            }
+            Command::MSet { pairs } | Command::MSetNx { pairs } => {
+                pairs.iter().map(|(k, _)| k.as_str()).collect()
+            }
+            Command::Rename { key, newkey } => vec![key.as_str(), newkey.as_str()],
+            Command::LMove { src, dst, .. } => vec![src.as_str(), dst.as_str()],
+            Command::SMove { src, dst, .. } => vec![src.as_str(), dst.as_str()],
+            Command::SUnionStore { dst, .. }
+            | Command::SInterStore { dst, .. }
+            | Command::SDiffStore { dst, .. }
+            | Command::ZUnionStore { dst, .. }
+            | Command::ZInterStore { dst, .. }
+            | Command::ZDiffStore { dst, .. } => vec![dst.as_str()],
+
+            _ => vec![],
         }
     }
 }
@@ -7573,5 +7753,41 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn multi_parses() {
+        let cmd = Command::parse(vec![b"MULTI".to_vec()]).unwrap();
+        assert!(matches!(cmd, Command::Multi));
+    }
+
+    #[test]
+    fn exec_parses() {
+        let cmd = Command::parse(vec![b"EXEC".to_vec()]).unwrap();
+        assert!(matches!(cmd, Command::Exec));
+    }
+
+    #[test]
+    fn discard_parses() {
+        let cmd = Command::parse(vec![b"DISCARD".to_vec()]).unwrap();
+        assert!(matches!(cmd, Command::Discard));
+    }
+
+    #[test]
+    fn watch_parses_keys() {
+        let cmd = Command::parse(vec![b"WATCH".to_vec(), b"k1".to_vec(), b"k2".to_vec()]).unwrap();
+        assert!(matches!(cmd, Command::Watch { ref keys } if keys == &vec!["k1", "k2"]));
+    }
+
+    #[test]
+    fn watch_requires_keys() {
+        let err = Command::parse(vec![b"WATCH".to_vec()]).unwrap_err();
+        assert!(err.contains("WATCH requires"));
+    }
+
+    #[test]
+    fn unwatch_parses() {
+        let cmd = Command::parse(vec![b"UNWATCH".to_vec()]).unwrap();
+        assert!(matches!(cmd, Command::Unwatch));
     }
 }

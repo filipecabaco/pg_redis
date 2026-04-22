@@ -4,6 +4,10 @@ on:
   schedule:
     - cron: '0 8 * * 1'  # Every Monday at 08:00 UTC
   workflow_dispatch:
+  push:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
 
 concurrency:
   group: update-pgrx
@@ -23,7 +27,7 @@ jobs:
         id: current
         run: |
           set -euo pipefail
-          VERSION=$(yq '.env.CARGO_PGRX_VERSION' .github/workflows/ci.yml)
+          VERSION=$(grep '^  CARGO_PGRX_VERSION:' .github/workflows/ci.yml | sed 's/.*: "//' | tr -d '"')
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "ERROR: could not parse current pgrx version from ci.yml (got: '$VERSION')" >&2
             exit 1
@@ -44,7 +48,7 @@ jobs:
           fi
           echo "version=$LATEST" >> "$GITHUB_OUTPUT"
 
-      - name: Check for existing PR
+      - name: Check for existing PR or branch
         id: existing
         if: steps.latest.outputs.version != steps.current.outputs.version
         env:
@@ -53,45 +57,35 @@ jobs:
         run: |
           set -euo pipefail
           BRANCH="update-pgrx-${NEW}"
+          # Check open AND merged/closed PRs to avoid re-opening for an already-handled version
           PR=$(gh pr list --head "$BRANCH" --state all --json number --jq '.[0].number // empty')
           echo "pr=$PR" >> "$GITHUB_OUTPUT"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
 
-      - name: Gate
-        id: gate
-        env:
-          LATEST: ${{ steps.latest.outputs.version }}
-          CURRENT: ${{ steps.current.outputs.version }}
-          PR: ${{ steps.existing.outputs.pr }}
-        run: |
-          if [[ "$LATEST" != "$CURRENT" && -z "$PR" ]]; then
-            echo "should_update=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Install Rust toolchain
-        if: steps.gate.outputs.should_update == 'true'
+        if: steps.latest.outputs.version != steps.current.outputs.version && steps.existing.outputs.pr == ''
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: stable
 
       - name: Update pgrx version in files
-        if: steps.gate.outputs.should_update == 'true'
+        if: steps.latest.outputs.version != steps.current.outputs.version && steps.existing.outputs.pr == ''
         env:
           OLD: ${{ steps.current.outputs.version }}
           NEW: ${{ steps.latest.outputs.version }}
         run: |
           set -euo pipefail
 
-          # | delimiter avoids misreading dots in version strings as regex wildcards
+          # Use | as sed delimiter to avoid conflicts with version dots
           sed -i "s|CARGO_PGRX_VERSION: \"${OLD}\"|CARGO_PGRX_VERSION: \"${NEW}\"|" .github/workflows/ci.yml
-          sed -i "s|ARG CARGO_PGRX_VERSION=${OLD}|ARG CARGO_PGRX_VERSION=${NEW}|" Dockerfile
           sed -i "s|pgrx = \"=${OLD}\"|pgrx = \"=${NEW}\"|" Cargo.toml
           sed -i "s|pgrx-tests = \"=${OLD}\"|pgrx-tests = \"=${NEW}\"|" Cargo.toml
 
-          cargo update -p pgrx -p pgrx-tests --precise "${NEW}"
+          # Cargo.toml already pins the new version; update the lock file to match
+          cargo update -p pgrx -p pgrx-tests
 
       - name: Open pull request
-        if: steps.gate.outputs.should_update == 'true'
+        if: steps.latest.outputs.version != steps.current.outputs.version && steps.existing.outputs.pr == ''
         env:
           GH_TOKEN: ${{ github.token }}
           OLD: ${{ steps.current.outputs.version }}
@@ -103,7 +97,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
-          git add .github/workflows/ci.yml Dockerfile Cargo.toml Cargo.lock
+          git add .github/workflows/ci.yml Cargo.toml Cargo.lock
           git commit -m "chore: update pgrx ${OLD} -> ${NEW}"
           git push origin "$BRANCH"
 
@@ -113,10 +107,13 @@ jobs:
 
 Changes:
 - \`.github/workflows/ci.yml\`: \`CARGO_PGRX_VERSION\`
-- \`Dockerfile\`: \`ARG CARGO_PGRX_VERSION\` default
 - \`Cargo.toml\`: \`pgrx\` and \`pgrx-tests\` dependencies
 - \`Cargo.lock\`: updated lock entries
 
 CI will run the full test matrix (pg15, pg16, pg17) automatically." \
             --base main \
             --head "$BRANCH"
+
+      - name: Already up to date
+        if: steps.latest.outputs.version == steps.current.outputs.version
+        run: echo "pgrx is already at the latest version (${{ steps.current.outputs.version }})"

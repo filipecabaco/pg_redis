@@ -1,5 +1,6 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::time::Duration;
 
 const MAX_BULK_LEN: usize = 512 * 1024 * 1024; // 512 MiB — matches Redis default
 const MAX_ARRAY_LEN: usize = 65_536;
@@ -16,6 +17,10 @@ impl RespParser {
             reader: BufReader::new(stream),
             line_buf: Vec::with_capacity(256),
         }
+    }
+
+    pub fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
+        self.reader.get_ref().set_read_timeout(dur)
     }
 
     fn read_line_bytes(&mut self) -> io::Result<&[u8]> {
@@ -145,12 +150,29 @@ pub fn write_null_bulk(w: &mut impl Write) -> io::Result<()> {
     write!(w, "$-1\r\n")
 }
 
+pub fn write_null_array(w: &mut impl Write) -> io::Result<()> {
+    write!(w, "*-1\r\n")
+}
+
 pub fn write_array_header(w: &mut impl Write, count: usize) -> io::Result<()> {
     write!(w, "*{}\r\n", count)
 }
 
 pub fn write_map_header(w: &mut impl Write, count: usize) -> io::Result<()> {
     write!(w, "%{}\r\n", count)
+}
+
+pub fn write_push_header(w: &mut impl Write, count: usize) -> io::Result<()> {
+    write!(w, ">{}\r\n", count)
+}
+
+/// Write the header for a pub/sub frame: push (RESP3) or array (RESP2).
+pub fn write_pubsub_header(w: &mut impl Write, count: usize, proto: u8) -> io::Result<()> {
+    if proto == 3 {
+        write_push_header(w, count)
+    } else {
+        write_array_header(w, count)
+    }
 }
 
 #[cfg(test)]

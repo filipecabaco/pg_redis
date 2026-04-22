@@ -178,7 +178,7 @@ SELECT redis.remove_workers(2);
 | Command | Behaviour |
 |---------|-----------|
 | `GET key` | Returns value or nil if missing/expired |
-| `SET key value [EX sec] [PX ms]` | Upsert with optional TTL |
+| `SET key value [NX\|XX] [GET] [EX sec\|PX ms\|EXAT ts\|PXAT ts-ms\|KEEPTTL]` | Upsert with conditional flags and optional TTL |
 | `SETEX key seconds value` | SET with seconds TTL |
 | `PSETEX key ms value` | SET with milliseconds TTL |
 | `MGET key [key ...]` | Bulk get, preserves nil for missing keys |
@@ -208,6 +208,17 @@ SELECT redis.remove_workers(2);
 | `HGETALL key` | Returns interleaved field/value pairs, sorted by field |
 
 > **Note:** Expiry is not supported on hash keys (same behaviour as Redis hash TTLs without `HEXPIRE`).
+
+### Transactions
+| Command | Behaviour |
+|---------|-----------|
+| `MULTI` | Begin a transaction block; subsequent commands are queued |
+| `EXEC` | Execute all queued commands atomically; returns array of results; returns nil if a `WATCH`ed key changed |
+| `DISCARD` | Discard the queued commands and exit the transaction block |
+| `WATCH key [key ...]` | Mark keys to watch; if any are modified before `EXEC`, the transaction aborts |
+| `UNWATCH` | Clear all watched keys |
+
+Commands queued inside `MULTI` receive `QUEUED` responses. Runtime errors inside `EXEC` (e.g. `INCR` on a non-integer) are returned as per-command errors in the result array without aborting the remaining commands.
 
 ---
 
@@ -323,48 +334,70 @@ Flags worth knowing (`redis-benchmark --help` lists everything):
 
 ### Results (Docker, Apple M-series)
 
-Four-way comparison: Redis 7 Alpine · pg_redis defaults · pg_redis high-write (UNLOGGED tables) · pg_redis high-write (in-memory mode).
+#### Standard commands (`redis-benchmark`)
+
+Four-way comparison: Redis 7 Alpine · pg_redis defaults · pg_redis high-write · pg_redis memory mode.
 
 | | **Redis 7** | **pg_redis default** | **pg_redis high-write** | **pg_redis memory** |
 |-|-------------|---------------------|------------------------|---------------------|
-| Workers | — | 4 | 8 | 8 |
-| Batch size | — | 64 | 256 | 256 (bypassed for even dbs) |
+| Workers | — | 4 | 8 | 4 |
+| Batch size | — | 64 | 256 | 64 |
 | Clients | 50 | 50 | 200 | 200 |
-| Requests | 20,000 | 20,000 | 50,000 | 5,000 |
+| Requests | 20,000 | 20,000 | 50,000 | 50,000 |
 | DB | — | db 1 (logged) | db 1 (logged) | db 0 (in-memory) |
 | Run with | — | `mise run bench` | `mise run bench-high-write` | `PG_REDIS_STORAGE_MODE=memory PG_REDIS_USE_LOGGED=false mise run bench-high-write` |
 
 | Command | Redis 7 | pg_redis default | pg_redis high-write | **pg_redis memory** |
 |---------|---------|-----------------|---------------------|---------------------|
-| PING    | 241,000 | 118,000 | — | — |
-| GET     | 190,000 | 93,897 | 101,010 | **94,340** |
-| SET     | 278,000 | 5,292 | 8,631 | **59,524** (+6.9×) |
-| INCR    | 187,000 | 5,070 | 8,990 | **87,719** (+9.8×) |
-| HSET    | 192,000 | 12,987 | 8,420 | **87,719** (+10.4×) |
-| ZADD    | 189,000 | 8,425 | 6,676 | **90,909** (+13.6×) |
-| SADD    | 189,000 | 24,420 | 71,429 | **81,967** (+1.1×) |
-| SPOP    | 196,000 | 23,095 | 63,857 | **67,568** (+1.1×) |
-| ZPOPMIN | 192,000 | 18,467 | 54,945 | **76,923** (+1.4×) |
-| LPUSH   | 159,000 | 817 ¹ | 817 ¹ | **89,286** (+109×) |
-| RPUSH   | 194,000 | 1,362 ¹ | 1,362 ¹ | **81,967** (+60×) |
-| LPOP    | 153,000 | 5,537 ¹ | 61,425 | **70,423** (+13×) |
-| RPOP    | 194,000 | 11,031 ¹ | 53,022 | **74,627** (+7×) |
-| LRANGE 100 | 50,000 | 602 | — | — |
-| LRANGE 300 | 27,000 | 567 | — | — |
+| PING    | 250,000 | 162,000 | — | — |
+| GET     | 250,000 | 94,000 | 100,000 | **100,000** |
+| SET     | 189,000 | 5,554 | 8,881 | **7,621** ² |
+| INCR    | 194,000 | 6,101 | 9,557 | **11,896** |
+| HSET    | 192,000 | 14,015 | 10,730 | **13,576** |
+| ZADD    | 192,000 | 5,759 | 6,115 | **5,898** |
+| SADD    | 196,000 | 31,008 | 77,280 | **84,890** |
+| SPOP    | 206,000 | 24,096 | 70,621 | **71,531** |
+| ZPOPMIN | 206,000 | 19,084 | 55,617 | **57,604** |
+| LPOP    | 161,000 | 6,250 | 61,050 | **61,050** |
+| RPOP    | 185,000 | 12,323 | 60,976 | **57,078** |
+| RPUSH   | 278,000 | 1,431 ¹ | — | — |
+| LRANGE 100 | 50,000 | 620 | — | — |
+| LRANGE 300 | 28,000 | 598 | — | — |
 
-¹ Marked commands use `-c 1` in `auto`/`high-write` modes to avoid a concurrency race in the SPI LPUSH implementation. In `memory` mode they safely run at 200 concurrent clients (LWLock serialises access). LPOP/RPOP don't have this issue so run at full concurrency.
+¹ RPUSH/LPUSH bottlenecked by position-finding in the SPI list implementation under concurrent load.
+² Memory mode uses even-numbered db 0; the benchmark default (USE_LOGGED=true) uses db 1 (logged), so memory mode may not show the full gain over the previous table.
 
-All throughput figures rounded to nearest integer, requests/second. Memory mode uses `PG_REDIS_STORAGE_MODE=memory PG_REDIS_USE_LOGGED=false` with `redis.mem_max_entries=16384` (default).
+All throughput figures rounded to nearest integer, requests/second.
 
 **Reading the table:**
 
-- **`auto` mode** is limited by PostgreSQL transaction overhead. WAL-logged tables (default db 1) pay ~37 ms commit latency per batch. Group commit amortises this but doesn't eliminate it.
-- **`memory` mode** eliminates the transaction entirely for even-numbered databases. Commands go directly to shared-memory hash tables — no SPI, no transaction, no buffer pool. The bottleneck shifts to the LWLock and worker dispatch queue.
-- **INCR/HSET/ZADD** reach 87–90k rps in memory mode — near GET-level throughput — because they no longer pay WAL flush cost.
-- **ZPOPMIN** reaches 77k rps because it uses a metadata HTAB tracking min-score per key, making each pop O(1) instead of O(N) scan + sort.
-- **LPUSH/RPUSH** reach 82–89k rps (up to 109× faster) because in-memory lists track `min_pos`/`max_pos` per key — no scan to find the boundary position, and no SPI race condition.
-- **GET** is roughly equal across all modes because reads were already fast via the SPI-level plan cache.
-- **LRANGE** is not benchmarked in memory mode — it remains O(count_for_key) and benefits from memory mode but is dominated by list size, not transaction overhead.
+- **`auto` mode** is limited by PostgreSQL transaction overhead. WAL-logged tables (default db 1) pay ~8 ms commit latency per batch. Group commit amortises this but doesn't eliminate it.
+- **`memory` mode** eliminates the transaction entirely for even-numbered databases. Commands go directly to shared-memory hash tables — no SPI, no transaction, no buffer pool.
+- **All read commands** (GET, PING) reach ~100k rps regardless of mode because reads hit the SPI plan cache without a transaction.
+- **Pop/scan writes** (SADD, SPOP, ZPOPMIN, LPOP, RPOP) reach 55–85k rps in memory mode — large gains over auto mode.
+
+#### Pub/Sub (`bench_pubsub.ts`, awaited PUBLISH)
+
+Measures end-to-end delivery: time from PUBLISH call to subscriber callback firing. Uses `await pub.publish(...)` (sequential) to avoid overrunning the ring buffer.
+
+| Scenario | Redis 7 | pg_redis | Notes |
+|----------|---------|---------|-------|
+| 1 pub → 1 sub | 19,503 | 15,511 | 5ms poll interval dominates for sparse traffic |
+| 1 pub → 4 subs (fan-out) | 31,481 | 24,751 | Total deliveries/sec |
+| 1 pub → 16 subs (fan-out) | 88,265 | 131,769 | pg_redis faster: writes 16 rings under one spinlock |
+| PUBLISH (no subscribers) | 11,718 | 36,178 | pg_redis spinlock scan faster than Redis's dict lookup |
+
+Run with:
+```bash
+mise run bench-pubsub
+```
+
+**Reading the pub/sub table:**
+
+- Pub/sub is **fire-and-forget** — no persistence, no ACK, at-most-once delivery, identical semantics to native Redis.
+- The **5ms poll interval** in `subscribe_loop` adds up to 5ms delivery latency per message (worst case when the subscriber is mid-timeout when a message arrives). This is the dominant cost for the 1-sub scenario.
+- **Fan-out at scale**: pg_redis writes to all matching ring buffers under a single spinlock acquisition, so 16-subscriber fan-out is faster than Redis's per-client linked-list walk with individual output-buffer writes.
+- **PUBLISH with no subscribers** is faster on pg_redis because it acquires one cross-process AtomicU8 spinlock, scans 256 slots (mostly zeroed cache lines), and releases — cheaper than Redis's dict hash + callback dispatch overhead under the same load.
 
 ### Tuning batch size
 

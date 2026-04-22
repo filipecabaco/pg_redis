@@ -17,7 +17,7 @@ use pgrx::prelude::*;
 mod redis {}
 
 pub(crate) static PORT: GucSetting<i32> = GucSetting::<i32>::new(6379);
-pub(crate) static USE_LOGGED: GucSetting<bool> = GucSetting::<bool>::new(true);
+pub(crate) static USE_LOGGED: GucSetting<bool> = GucSetting::<bool>::new(false);
 pub(crate) static NUM_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(4);
 pub(crate) static LISTEN_ADDRESS: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(Some(c"0.0.0.0"));
@@ -29,7 +29,7 @@ pub(crate) static DATABASE: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(Some(c"postgres"));
 
 pub(crate) static STORAGE_MODE: GucSetting<Option<std::ffi::CString>> =
-    GucSetting::<Option<std::ffi::CString>>::new(Some(c"auto"));
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"memory"));
 
 pub(crate) static MEM_MAX_ENTRIES: GucSetting<i32> = GucSetting::<i32>::new(16384);
 

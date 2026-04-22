@@ -1,6 +1,7 @@
 mod commands;
 pub(crate) mod htab;
 pub(crate) mod mem;
+pub(crate) mod pubsub;
 mod resp;
 mod worker;
 
@@ -46,6 +47,8 @@ pub fn storage_mode() -> StorageMode {
 }
 
 static mut SHMEM_CTL: *mut mem::MemControlBlock = std::ptr::null_mut();
+static mut PUBSUB_CTL: *mut pubsub::PubsubCtl = std::ptr::null_mut();
+static mut PUBSUB_SLOTS: *mut pubsub::PubsubSlot = std::ptr::null_mut();
 static mut PREV_SHMEM_REQUEST_HOOK: pg_sys::shmem_request_hook_type = None;
 static mut PREV_SHMEM_STARTUP_HOOK: pg_sys::shmem_startup_hook_type = None;
 
@@ -54,19 +57,30 @@ unsafe extern "C-unwind" fn pg_redis_shmem_request() {
         if let Some(prev) = PREV_SHMEM_REQUEST_HOOK {
             prev();
         }
-        pg_sys::RequestAddinShmemSpace(mem::mem_ctl_size());
-        pg_sys::RequestAddinShmemSpace(mem::mem_htab_total_size());
-        pg_sys::RequestAddinShmemSpace(mem::mem_hash_htab_total_size());
-        pg_sys::RequestAddinShmemSpace(mem::mem_set_htab_total_size());
-        pg_sys::RequestAddinShmemSpace(mem::mem_zset_htab_total_size());
-        pg_sys::RequestAddinShmemSpace(mem::mem_list_htab_total_size());
-        pg_sys::RequestAddinShmemSpace(mem::mem_list_meta_htab_total_size());
-        pg_sys::RequestAddinShmemSpace(mem::mem_zset_meta_htab_total_size());
-        pg_sys::RequestAddinShmemSpace(mem::mem_set_meta_htab_total_size());
-        pg_sys::RequestAddinShmemSpace(mem::mem_kv_overflow_total_size());
-        pg_sys::RequestAddinShmemSpace(mem::mem_hash_overflow_total_size());
-        pg_sys::RequestAddinShmemSpace(mem::mem_list_overflow_total_size());
-        pg_sys::RequestNamedLWLockTranche(c"pg_redis_mem".as_ptr(), (mem::NUM_MEM_DBS * 5) as i32);
+        // Pub/sub shared memory — always allocated.
+        // Uses an AtomicU8 spinlock (no pg_sys LWLock needed), so no LWLock tranche required.
+        pg_sys::RequestAddinShmemSpace(pubsub::pubsub_ctl_size());
+        pg_sys::RequestAddinShmemSpace(pubsub::pubsub_slots_size());
+
+        // Memory-mode shared memory — only when storage_mode = 'memory'.
+        if storage_mode() == StorageMode::Memory {
+            pg_sys::RequestAddinShmemSpace(mem::mem_ctl_size());
+            pg_sys::RequestAddinShmemSpace(mem::mem_htab_total_size());
+            pg_sys::RequestAddinShmemSpace(mem::mem_hash_htab_total_size());
+            pg_sys::RequestAddinShmemSpace(mem::mem_set_htab_total_size());
+            pg_sys::RequestAddinShmemSpace(mem::mem_zset_htab_total_size());
+            pg_sys::RequestAddinShmemSpace(mem::mem_list_htab_total_size());
+            pg_sys::RequestAddinShmemSpace(mem::mem_list_meta_htab_total_size());
+            pg_sys::RequestAddinShmemSpace(mem::mem_zset_meta_htab_total_size());
+            pg_sys::RequestAddinShmemSpace(mem::mem_set_meta_htab_total_size());
+            pg_sys::RequestAddinShmemSpace(mem::mem_kv_overflow_total_size());
+            pg_sys::RequestAddinShmemSpace(mem::mem_hash_overflow_total_size());
+            pg_sys::RequestAddinShmemSpace(mem::mem_list_overflow_total_size());
+            pg_sys::RequestNamedLWLockTranche(
+                c"pg_redis_mem".as_ptr(),
+                (mem::NUM_MEM_DBS * 5) as i32,
+            );
+        }
     }
 }
 
@@ -75,33 +89,67 @@ unsafe extern "C-unwind" fn pg_redis_shmem_startup() {
         if let Some(prev) = PREV_SHMEM_STARTUP_HOOK {
             prev();
         }
+
+        // Always init pub/sub ctl + slots.
         let mut found = false;
-        let ctl: *mut mem::MemControlBlock =
-            pg_sys::ShmemInitStruct(c"pg_redis_ctl".as_ptr(), mem::mem_ctl_size(), &mut found)
-                .cast();
+        PUBSUB_CTL = pg_sys::ShmemInitStruct(
+            c"pg_redis_pubsub_ctl".as_ptr(),
+            pubsub::pubsub_ctl_size(),
+            &mut found,
+        )
+        .cast();
+        PUBSUB_SLOTS = pg_sys::ShmemInitStruct(
+            c"pg_redis_pubsub_slots".as_ptr(),
+            pubsub::pubsub_slots_size(),
+            &mut found,
+        )
+        .cast();
 
-        let locks = pg_sys::GetNamedLWLockTranche(c"pg_redis_mem".as_ptr());
-        for i in 0..mem::NUM_MEM_DBS {
-            (*ctl).lwlock[i] = std::ptr::addr_of_mut!((*locks.add(i)).lock);
-            (*ctl).hash_lwlock[i] = std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS + i)).lock);
-            (*ctl).set_lwlock[i] =
-                std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS * 2 + i)).lock);
-            (*ctl).zset_lwlock[i] =
-                std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS * 3 + i)).lock);
-            (*ctl).list_lwlock[i] =
-                std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS * 4 + i)).lock);
+        // Memory-mode init — conditional.
+        if storage_mode() == StorageMode::Memory {
+            let mut mem_found = false;
+            let ctl: *mut mem::MemControlBlock = pg_sys::ShmemInitStruct(
+                c"pg_redis_ctl".as_ptr(),
+                mem::mem_ctl_size(),
+                &mut mem_found,
+            )
+            .cast();
+
+            let locks = pg_sys::GetNamedLWLockTranche(c"pg_redis_mem".as_ptr());
+            for i in 0..mem::NUM_MEM_DBS {
+                (*ctl).lwlock[i] = std::ptr::addr_of_mut!((*locks.add(i)).lock);
+                (*ctl).hash_lwlock[i] =
+                    std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS + i)).lock);
+                (*ctl).set_lwlock[i] =
+                    std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS * 2 + i)).lock);
+                (*ctl).zset_lwlock[i] =
+                    std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS * 3 + i)).lock);
+                (*ctl).list_lwlock[i] =
+                    std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS * 4 + i)).lock);
+            }
+
+            if !mem_found {
+                mem::mem_init_tables(ctl);
+            }
+
+            SHMEM_CTL = ctl;
         }
-
-        if !found {
-            mem::mem_init_tables(ctl);
-        }
-
-        SHMEM_CTL = ctl;
     }
 }
 
 pub(crate) fn shmem_ctl() -> *mut mem::MemControlBlock {
     unsafe { SHMEM_CTL }
+}
+
+/// Returns `Some((ctl, slots))` when pub/sub shared memory is initialised, `None` otherwise.
+pub(crate) fn pubsub_state() -> Option<(*mut pubsub::PubsubCtl, *mut pubsub::PubsubSlot)> {
+    let ctl = unsafe { PUBSUB_CTL };
+    let slots = unsafe { PUBSUB_SLOTS };
+    if ctl.is_null() || slots.is_null() {
+        None
+    } else {
+        Some((ctl, slots))
+    }
 }
 
 #[pg_guard]
@@ -214,13 +262,11 @@ pub extern "C-unwind" fn _PG_init() {
         GucFlags::default(),
     );
 
-    if storage_mode() == StorageMode::Memory {
-        unsafe {
-            PREV_SHMEM_REQUEST_HOOK = pg_sys::shmem_request_hook;
-            pg_sys::shmem_request_hook = Some(pg_redis_shmem_request);
-            PREV_SHMEM_STARTUP_HOOK = pg_sys::shmem_startup_hook;
-            pg_sys::shmem_startup_hook = Some(pg_redis_shmem_startup);
-        }
+    unsafe {
+        PREV_SHMEM_REQUEST_HOOK = pg_sys::shmem_request_hook;
+        pg_sys::shmem_request_hook = Some(pg_redis_shmem_request);
+        PREV_SHMEM_STARTUP_HOOK = pg_sys::shmem_startup_hook;
+        pg_sys::shmem_startup_hook = Some(pg_redis_shmem_startup);
     }
 
     let my_db: pg_sys::Oid = unsafe { pg_sys::MyDatabaseId };

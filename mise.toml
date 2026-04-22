@@ -142,3 +142,22 @@ run_suite() {
 run_suite 'Redis 7 (reference, 200 clients)' redis
 run_suite 'pg_redis (8 workers, batch_size=256, 200 clients)' postgres
 """
+
+[tasks.bench-pubsub]
+description = "Pub/Sub throughput benchmark against pg_redis (:6379) and Redis (:6380)"
+run = """
+set -e
+docker compose -f docker-compose.yml -f docker-compose.noports.yml --profile bench up -d --build --wait
+trap 'docker compose --profile bench down' EXIT INT TERM
+sleep 2
+
+echo ''
+echo '══ Redis 7 (reference) ══════════════════════════════════════'
+REDIS_HOST=localhost REDIS_PORT=6380 REDIS_PASSWORD=testpass \
+  bun run docker/e2e/bench_pubsub.ts
+
+echo ''
+echo '══ pg_redis ════════════════════════════════════════════════'
+REDIS_HOST=localhost REDIS_PORT=6379 REDIS_PASSWORD=testpass \
+  bun run docker/e2e/bench_pubsub.ts
+"""

@@ -729,6 +729,31 @@ pub enum Command {
         dst: String,
         keys: Vec<String>,
     },
+    Subscribe {
+        channels: Vec<Vec<u8>>,
+    },
+    Unsubscribe {
+        channels: Vec<Vec<u8>>,
+    },
+    PSubscribe {
+        patterns: Vec<Vec<u8>>,
+    },
+    PUnsubscribe {
+        patterns: Vec<Vec<u8>>,
+    },
+    Publish {
+        channel: Vec<u8>,
+        message: Vec<u8>,
+    },
+    PubSubChannels {
+        pattern: Option<Vec<u8>>,
+    },
+    PubSubNumSub {
+        channels: Vec<Vec<u8>>,
+    },
+    PubSubNumPat,
+    PubSubHelp,
+
     Multi,
     Exec,
     Discard,
@@ -1732,6 +1757,54 @@ impl Command {
                 Ok(Command::ZDiffStore { dst, keys })
             }
 
+            "SUBSCRIBE" => {
+                if args.is_empty() {
+                    return Err("SUBSCRIBE requires at least one channel".to_string());
+                }
+                Ok(Command::Subscribe {
+                    channels: args.to_vec(),
+                })
+            }
+            "UNSUBSCRIBE" => Ok(Command::Unsubscribe {
+                channels: args.to_vec(),
+            }),
+            "PSUBSCRIBE" => {
+                if args.is_empty() {
+                    return Err("PSUBSCRIBE requires at least one pattern".to_string());
+                }
+                Ok(Command::PSubscribe {
+                    patterns: args.to_vec(),
+                })
+            }
+            "PUNSUBSCRIBE" => Ok(Command::PUnsubscribe {
+                patterns: args.to_vec(),
+            }),
+            "PUBLISH" => {
+                if args.len() != 2 {
+                    return Err("PUBLISH requires channel and message".to_string());
+                }
+                Ok(Command::Publish {
+                    channel: args[0].clone(),
+                    message: args[1].clone(),
+                })
+            }
+            "PUBSUB" => {
+                let sub = args
+                    .first()
+                    .map(|a| String::from_utf8_lossy(a).to_uppercase());
+                match sub.as_deref() {
+                    Some("CHANNELS") => Ok(Command::PubSubChannels {
+                        pattern: args.get(1).cloned(),
+                    }),
+                    Some("NUMSUB") => Ok(Command::PubSubNumSub {
+                        channels: args[1..].to_vec(),
+                    }),
+                    Some("NUMPAT") => Ok(Command::PubSubNumPat),
+                    Some("HELP") | None => Ok(Command::PubSubHelp),
+                    Some(s) => Err(format!("PUBSUB subcommand '{}' not supported", s)),
+                }
+            }
+
             "MULTI" => Ok(Command::Multi),
             "EXEC" => Ok(Command::Exec),
             "DISCARD" => Ok(Command::Discard),
@@ -1740,7 +1813,10 @@ impl Command {
                     return Err("WATCH requires at least one key".to_string());
                 }
                 Ok(Command::Watch {
-                    keys: args.iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect(),
+                    keys: args
+                        .iter()
+                        .map(|a| String::from_utf8_lossy(a).into_owned())
+                        .collect(),
                 })
             }
             "UNWATCH" => Ok(Command::Unwatch),
@@ -3677,7 +3753,16 @@ impl Command {
                 zaggregate_execute(client, db, keys, None, ZAggregateOptions { aggregate: Aggregate::Sum, with_scores: false, op: AggOp::Diff, store_into: Some(dst) })
             }
             Command::Multi | Command::Exec | Command::Discard | Command::Watch { .. }
-            | Command::Unwatch => {
+            | Command::Unwatch
+            | Command::Subscribe { .. }
+            | Command::Unsubscribe { .. }
+            | Command::PSubscribe { .. }
+            | Command::PUnsubscribe { .. }
+            | Command::Publish { .. }
+            | Command::PubSubChannels { .. }
+            | Command::PubSubNumSub { .. }
+            | Command::PubSubNumPat
+            | Command::PubSubHelp => {
                 Response::Error("ERR command not allowed in this context".to_string())
             }
         }
@@ -4506,8 +4591,20 @@ impl Command {
                 }
             }
 
-            Command::Multi | Command::Exec | Command::Discard | Command::Watch { .. }
-            | Command::Unwatch => {
+            Command::Multi
+            | Command::Exec
+            | Command::Discard
+            | Command::Watch { .. }
+            | Command::Unwatch
+            | Command::Subscribe { .. }
+            | Command::Unsubscribe { .. }
+            | Command::PSubscribe { .. }
+            | Command::PUnsubscribe { .. }
+            | Command::Publish { .. }
+            | Command::PubSubChannels { .. }
+            | Command::PubSubNumSub { .. }
+            | Command::PubSubNumPat
+            | Command::PubSubHelp => {
                 Response::Error("ERR command not allowed in this context".to_string())
             }
 
@@ -7686,12 +7783,7 @@ mod tests {
 
     #[test]
     fn watch_parses_keys() {
-        let cmd = Command::parse(vec![
-            b"WATCH".to_vec(),
-            b"k1".to_vec(),
-            b"k2".to_vec(),
-        ])
-        .unwrap();
+        let cmd = Command::parse(vec![b"WATCH".to_vec(), b"k1".to_vec(), b"k2".to_vec()]).unwrap();
         assert!(matches!(cmd, Command::Watch { ref keys } if keys == &vec!["k1", "k2"]));
     }
 

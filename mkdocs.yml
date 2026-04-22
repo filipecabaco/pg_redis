@@ -22,7 +22,7 @@ theme:
         icon: material/brightness-4
         name: Switch to dark mode
   logo: assets/logo.svg
-  favicon: assets/logo.svg
+  favicon: assets/favicon.svg
   features:
     - navigation.sections
     - navigation.top

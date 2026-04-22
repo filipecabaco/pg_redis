@@ -4,6 +4,7 @@ site_url: https://filipecabaco.github.io/pg_redis
 repo_url: https://github.com/filipecabaco/pg_redis
 repo_name: filipecabaco/pg_redis
 edit_uri: edit/main/docs/
+copyright: Copyright &copy; 2026 Filipe Cabaço — MIT License
 
 theme:
   name: material

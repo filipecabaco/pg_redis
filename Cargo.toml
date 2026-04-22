@@ -3,6 +3,7 @@ name = "pg_redis"
 version = "0.0.0"
 edition = "2024"
 resolver = "3"
+license = "MIT"
 
 [lib]
 crate-type = ["cdylib"]

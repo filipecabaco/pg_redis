@@ -1,4 +1,6 @@
-<img src="logo.svg" alt="pg_redis" width="600"/>
+<div align="center">
+  <img src="logo.svg" alt="pg_redis" width="600"/>
+</div>
 
 A PostgreSQL extension that lets you connect to Postgres using the **Redis protocol (RESP2)**. Drop-in Redis wire compatibility backed by real SQL tables — with two durability modes to match your performance needs.
 

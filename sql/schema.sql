@@ -166,3 +166,30 @@ CREATE INDEX IF NOT EXISTS zset_12_key_score_member ON redis.zset_12 (key, score
 CREATE INDEX IF NOT EXISTS zset_13_key_score_member ON redis.zset_13 (key, score, member);
 CREATE INDEX IF NOT EXISTS zset_14_key_score_member ON redis.zset_14 (key, score, member);
 CREATE INDEX IF NOT EXISTS zset_15_key_score_member ON redis.zset_15 (key, score, member);
+
+-- Pub/sub table routing: persists channel→table mappings across server restarts.
+-- Loaded into shared memory by the first BGW on startup via CAS flag.
+CREATE TABLE IF NOT EXISTS redis.pubsub_routes (
+    channel TEXT PRIMARY KEY,
+    schema  TEXT NOT NULL,
+    tbl     TEXT NOT NULL
+);
+
+-- Helper to create a target table for pub/sub routing.
+-- The table must have `channel TEXT` and `payload TEXT` columns to receive routed messages.
+CREATE OR REPLACE FUNCTION redis.create_pubsub_table(p_schema text, p_tbl text)
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    EXECUTE format(
+        'CREATE TABLE IF NOT EXISTS %I.%I (
+            id          BIGSERIAL PRIMARY KEY,
+            channel     TEXT NOT NULL,
+            payload     TEXT NOT NULL,
+            inserted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )',
+        p_schema, p_tbl
+    );
+END;
+$$;

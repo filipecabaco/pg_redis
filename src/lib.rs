@@ -49,6 +49,7 @@ pub fn storage_mode() -> StorageMode {
 static mut SHMEM_CTL: *mut mem::MemControlBlock = std::ptr::null_mut();
 static mut PUBSUB_CTL: *mut pubsub::PubsubCtl = std::ptr::null_mut();
 static mut PUBSUB_SLOTS: *mut pubsub::PubsubSlot = std::ptr::null_mut();
+static mut ROUTE_CTL: *mut pubsub::RouteCtl = std::ptr::null_mut();
 static mut PREV_SHMEM_REQUEST_HOOK: pg_sys::shmem_request_hook_type = None;
 static mut PREV_SHMEM_STARTUP_HOOK: pg_sys::shmem_startup_hook_type = None;
 
@@ -61,6 +62,7 @@ unsafe extern "C-unwind" fn pg_redis_shmem_request() {
         // Uses an AtomicU8 spinlock (no pg_sys LWLock needed), so no LWLock tranche required.
         pg_sys::RequestAddinShmemSpace(pubsub::pubsub_ctl_size());
         pg_sys::RequestAddinShmemSpace(pubsub::pubsub_slots_size());
+        pg_sys::RequestAddinShmemSpace(pubsub::route_ctl_size());
 
         // Memory-mode shared memory — only when storage_mode = 'memory'.
         if storage_mode() == StorageMode::Memory {
@@ -104,6 +106,16 @@ unsafe extern "C-unwind" fn pg_redis_shmem_startup() {
             &mut found,
         )
         .cast();
+
+        ROUTE_CTL = pg_sys::ShmemInitStruct(
+            c"pg_redis_route_ctl".as_ptr(),
+            pubsub::route_ctl_size(),
+            &mut found,
+        )
+        .cast();
+        if !found {
+            std::ptr::write_bytes(ROUTE_CTL, 0, 1);
+        }
 
         // Memory-mode init — conditional.
         if storage_mode() == StorageMode::Memory {
@@ -150,6 +162,11 @@ pub(crate) fn pubsub_state() -> Option<(*mut pubsub::PubsubCtl, *mut pubsub::Pub
     } else {
         Some((ctl, slots))
     }
+}
+
+pub(crate) fn route_state() -> Option<*mut pubsub::RouteCtl> {
+    let ctl = unsafe { ROUTE_CTL };
+    if ctl.is_null() { None } else { Some(ctl) }
 }
 
 #[pg_guard]
@@ -349,6 +366,55 @@ fn worker_count() -> i64 {
     .ok()
     .flatten()
     .unwrap_or(0)
+}
+
+/// Route PUBLISH messages on `channel` to an INSERT into `schema`.`tbl`.
+/// The target table must have `channel TEXT` and `payload TEXT` columns.
+/// Call `redis.create_pubsub_table(schema, tbl)` to create a compatible table.
+#[pg_extern(schema = "redis")]
+fn route_publish(channel: &str, schema: &str, tbl: &str) {
+    for (name, val) in [("channel", channel), ("schema", schema), ("table", tbl)] {
+        if val.len() > 63 {
+            error!("{name} must be ≤ 63 bytes");
+        }
+        if val.contains('\0') {
+            error!("{name} must not contain NUL bytes");
+        }
+    }
+    Spi::connect_mut(|client| {
+        client
+            .update(
+                "INSERT INTO redis.pubsub_routes (channel, schema, tbl) VALUES ($1, $2, $3) \
+                 ON CONFLICT (channel) DO UPDATE SET schema = EXCLUDED.schema, tbl = EXCLUDED.tbl",
+                None,
+                &[channel.into(), schema.into(), tbl.into()],
+            )
+            .unwrap_or_else(|e| error!("failed to save route: {e}"));
+    });
+    if let Some(ctl) = crate::route_state() {
+        unsafe {
+            crate::pubsub::route_add(ctl, channel.as_bytes(), schema.as_bytes(), tbl.as_bytes());
+        }
+    }
+}
+
+/// Remove the PUBLISH→table route for `channel`.
+#[pg_extern(schema = "redis")]
+fn unroute_publish(channel: &str) {
+    Spi::connect_mut(|client| {
+        client
+            .update(
+                "DELETE FROM redis.pubsub_routes WHERE channel = $1",
+                None,
+                &[channel.into()],
+            )
+            .unwrap_or_else(|e| error!("failed to remove route: {e}"));
+    });
+    if let Some(ctl) = crate::route_state() {
+        unsafe {
+            crate::pubsub::route_remove(ctl, channel.as_bytes());
+        }
+    }
 }
 
 #[cfg(any(test, feature = "pg_test"))]
@@ -740,6 +806,76 @@ mod tests {
                 "partial index on expires_at must exist for redis.{table}"
             );
         }
+    }
+
+    // ──────────────────────────── Pub/sub routing ────────────────────────────
+
+    #[pg_test]
+    fn test_route_publish_inserts_row() {
+        Spi::run("DELETE FROM redis.pubsub_routes WHERE channel = 'test-route'").unwrap();
+        Spi::run("SELECT redis.route_publish('test-route', 'public', 'nonexistent_table')")
+            .unwrap();
+        let count = Spi::get_one::<i64>(
+            "SELECT count(*) FROM redis.pubsub_routes WHERE channel = 'test-route'",
+        )
+        .unwrap();
+        assert_eq!(count, Some(1));
+        Spi::run("DELETE FROM redis.pubsub_routes WHERE channel = 'test-route'").unwrap();
+    }
+
+    #[pg_test]
+    fn test_route_publish_upserts() {
+        Spi::run("DELETE FROM redis.pubsub_routes WHERE channel = 'upsert-ch'").unwrap();
+        Spi::run("SELECT redis.route_publish('upsert-ch', 'public', 'tbl1')").unwrap();
+        Spi::run("SELECT redis.route_publish('upsert-ch', 'public', 'tbl2')").unwrap();
+        let tbl = Spi::get_one::<String>(
+            "SELECT tbl FROM redis.pubsub_routes WHERE channel = 'upsert-ch'",
+        )
+        .unwrap();
+        assert_eq!(tbl, Some("tbl2".to_string()));
+        Spi::run("DELETE FROM redis.pubsub_routes WHERE channel = 'upsert-ch'").unwrap();
+    }
+
+    #[pg_test]
+    fn test_unroute_publish_removes_row() {
+        Spi::run("DELETE FROM redis.pubsub_routes WHERE channel = 'rm-route'").unwrap();
+        Spi::run("SELECT redis.route_publish('rm-route', 'public', 'some_tbl')").unwrap();
+        Spi::run("SELECT redis.unroute_publish('rm-route')").unwrap();
+        let count = Spi::get_one::<i64>(
+            "SELECT count(*) FROM redis.pubsub_routes WHERE channel = 'rm-route'",
+        )
+        .unwrap();
+        assert_eq!(count, Some(0));
+    }
+
+    #[pg_test]
+    fn test_create_pubsub_table_creates_table() {
+        Spi::run("DROP TABLE IF EXISTS public.pg_redis_test_route_tbl").unwrap();
+        Spi::run("SELECT redis.create_pubsub_table('public', 'pg_redis_test_route_tbl')").unwrap();
+        let exists = Spi::get_one::<bool>(
+            "SELECT EXISTS (SELECT 1 FROM pg_tables \
+             WHERE schemaname = 'public' AND tablename = 'pg_redis_test_route_tbl')",
+        )
+        .unwrap();
+        assert_eq!(exists, Some(true));
+        Spi::run("DROP TABLE IF EXISTS public.pg_redis_test_route_tbl").unwrap();
+    }
+
+    #[pg_test]
+    fn test_create_pubsub_table_accepts_channel_payload_insert() {
+        Spi::run("DROP TABLE IF EXISTS public.pg_redis_route_spi_test").unwrap();
+        Spi::run("SELECT redis.create_pubsub_table('public', 'pg_redis_route_spi_test')").unwrap();
+        // Insert via the exact column set that TablePublish::execute() uses
+        Spi::run(
+            "INSERT INTO public.pg_redis_route_spi_test (channel, payload) VALUES ('mychan', 'hello')",
+        )
+        .unwrap();
+        let count = Spi::get_one::<i64>(
+            "SELECT count(*) FROM public.pg_redis_route_spi_test WHERE channel = 'mychan'",
+        )
+        .unwrap();
+        assert_eq!(count, Some(1));
+        Spi::run("DROP TABLE IF EXISTS public.pg_redis_route_spi_test").unwrap();
     }
 }
 

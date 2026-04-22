@@ -82,7 +82,7 @@ depends = ["test-unit", "test-pg"]
 [tasks.e2e]
 description = "Run end-to-end tests in Docker (redis-cli based)"
 run = [
-  "docker compose --profile e2e up --build --abort-on-container-exit --exit-code-from e2e",
+  "docker compose -f docker-compose.yml -f docker-compose.noports.yml --profile e2e up --build --abort-on-container-exit --exit-code-from e2e",
   "docker compose --profile e2e down -v",
 ]
 
@@ -97,7 +97,7 @@ run = [
 description = "Run the full redis-benchmark suite against pg_redis (:6379) and Redis (:6380)"
 run = """
 set -e
-docker compose --profile bench up -d --build --wait
+docker compose -f docker-compose.yml -f docker-compose.noports.yml --profile bench up -d --build --wait
 trap 'docker compose --profile bench down' EXIT INT TERM
 sleep 2
 
@@ -122,7 +122,7 @@ run_suite 'pg_redis' postgres
 description = "High-concurrency write benchmark: 8 workers, batch_size=256, 200 clients"
 run = """
 set -e
-PG_REDIS_WORKERS=8 PG_REDIS_BATCH_SIZE=256 docker compose --profile bench up -d --build --wait
+PG_REDIS_WORKERS=8 PG_REDIS_BATCH_SIZE=256 docker compose -f docker-compose.yml -f docker-compose.noports.yml --profile bench up -d --build --wait
 trap 'docker compose --profile bench down' EXIT INT TERM
 sleep 2
 
@@ -158,6 +158,16 @@ REDIS_HOST=localhost REDIS_PORT=6380 REDIS_PASSWORD=testpass \
 
 echo ''
 echo '══ pg_redis ════════════════════════════════════════════════'
-REDIS_HOST=localhost REDIS_PORT=6379 REDIS_PASSWORD=testpass \
-  bun run docker/e2e/bench_pubsub.ts
+docker run --rm --network pg_redis_default \
+  -e REDIS_HOST=postgres -e REDIS_PORT=6379 -e REDIS_PASSWORD=testpass \
+  -v "$(pwd)/docker/e2e:/app" \
+  oven/bun:latest bun run /app/bench_pubsub.ts
+
+echo ''
+echo '══ pg_redis (with table routing) ═══════════════════════════'
+docker run --rm --network pg_redis_default \
+  -e REDIS_HOST=postgres -e REDIS_PORT=6379 -e REDIS_PASSWORD=testpass \
+  -e DATABASE_URL=postgres://postgres:postgres@postgres:5432/postgres \
+  -v "$(pwd)/docker/e2e:/app" \
+  oven/bun:latest bun run /app/bench_pubsub.ts
 """

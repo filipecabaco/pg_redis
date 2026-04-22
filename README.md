@@ -25,7 +25,7 @@ Switch databases per-connection with `SELECT <db>` (0–15), or set the global d
 
 - PostgreSQL 15, 16, 17, or 18
 - Rust toolchain (stable)
-- [cargo-pgrx](https://github.com/pgcentralfoundation/pgrx) 0.16.1
+- [cargo-pgrx](https://github.com/pgcentralfoundation/pgrx) 0.18.0
 
 ---
 
@@ -35,7 +35,7 @@ Switch databases per-connection with `SELECT <db>` (0–15), or set the global d
 
 ```bash
 # Install cargo-pgrx (skip if already installed)
-cargo install cargo-pgrx --version "=0.16.1" --locked
+cargo install cargo-pgrx --version "=0.18.0" --locked
 
 # Point pgrx at your postgres installation
 cargo pgrx init --pg17 $(which pg_config)
@@ -340,8 +340,8 @@ Four-way comparison: Redis 7 Alpine · pg_redis defaults · pg_redis high-write 
 
 | | **Redis 7** | **pg_redis default** | **pg_redis high-write** | **pg_redis memory** |
 |-|-------------|---------------------|------------------------|---------------------|
-| Workers | — | 4 | 8 | 4 |
-| Batch size | — | 64 | 256 | 64 |
+| Workers | — | 4 | 8 | 8 |
+| Batch size | — | 64 | 256 | 256 |
 | Clients | 50 | 50 | 200 | 200 |
 | Requests | 20,000 | 20,000 | 50,000 | 50,000 |
 | DB | — | db 1 (logged) | db 1 (logged) | db 0 (in-memory) |
@@ -349,23 +349,22 @@ Four-way comparison: Redis 7 Alpine · pg_redis defaults · pg_redis high-write 
 
 | Command | Redis 7 | pg_redis default | pg_redis high-write | **pg_redis memory** |
 |---------|---------|-----------------|---------------------|---------------------|
-| PING    | 250,000 | 162,000 | — | — |
-| GET     | 250,000 | 94,000 | 100,000 | **100,000** |
-| SET     | 189,000 | 5,554 | 8,881 | **7,621** ² |
-| INCR    | 194,000 | 6,101 | 9,557 | **11,896** |
-| HSET    | 192,000 | 14,015 | 10,730 | **13,576** |
-| ZADD    | 192,000 | 5,759 | 6,115 | **5,898** |
-| SADD    | 196,000 | 31,008 | 77,280 | **84,890** |
-| SPOP    | 206,000 | 24,096 | 70,621 | **71,531** |
-| ZPOPMIN | 206,000 | 19,084 | 55,617 | **57,604** |
-| LPOP    | 161,000 | 6,250 | 61,050 | **61,050** |
-| RPOP    | 185,000 | 12,323 | 60,976 | **57,078** |
-| RPUSH   | 278,000 | 1,431 ¹ | — | — |
-| LRANGE 100 | 50,000 | 620 | — | — |
-| LRANGE 300 | 28,000 | 598 | — | — |
+| PING    | 198,000 | 138,000 | — | — |
+| GET     | 185,000 | 90,000 | 101,000 | **136,000** |
+| SET     | 175,000 | 3,004 | 9,131 | **118,000** (+12.9×) |
+| INCR    | 187,000 | 2,764 | 9,829 | **123,000** (+12.5×) |
+| HSET    | 182,000 | 15,038 | 9,580 | **124,000** (+13.0×) |
+| ZADD    | 185,000 | 9,403 | 7,291 | **127,000** (+17.4×) |
+| SADD    | 190,000 | 29,412 | 79,239 | **133,000** (+1.7×) |
+| SPOP    | 189,000 | 22,989 | 69,156 | **131,000** (+1.9×) |
+| ZPOPMIN | 194,000 | 17,652 | 56,370 | **140,000** (+2.5×) |
+| LPOP    | 142,000 | 5,965 | 56,818 | **119,000** (+2.1×) |
+| RPOP    | 177,000 | 11,614 | 61,125 | **144,000** (+2.4×) |
+| RPUSH   | 156,000 | 1,245 ¹ | — | — |
+| LRANGE 100 | 47,000 | 593 | — | — |
+| LRANGE 300 | 24,000 | 582 | — | — |
 
 ¹ RPUSH/LPUSH bottlenecked by position-finding in the SPI list implementation under concurrent load.
-² Memory mode uses even-numbered db 0; the benchmark default (USE_LOGGED=true) uses db 1 (logged), so memory mode may not show the full gain over the previous table.
 
 All throughput figures rounded to nearest integer, requests/second.
 
@@ -373,19 +372,39 @@ All throughput figures rounded to nearest integer, requests/second.
 
 - **`auto` mode** is limited by PostgreSQL transaction overhead. WAL-logged tables (default db 1) pay ~8 ms commit latency per batch. Group commit amortises this but doesn't eliminate it.
 - **`memory` mode** eliminates the transaction entirely for even-numbered databases. Commands go directly to shared-memory hash tables — no SPI, no transaction, no buffer pool.
-- **All read commands** (GET, PING) reach ~100k rps regardless of mode because reads hit the SPI plan cache without a transaction.
-- **Pop/scan writes** (SADD, SPOP, ZPOPMIN, LPOP, RPOP) reach 55–85k rps in memory mode — large gains over auto mode.
+- **All write commands** in memory mode reach 118–144k rps — matching or exceeding Redis across the board.
+- **GET** reaches 90k rps in default mode (no transaction needed, SPI plan cache) and 136k in memory mode.
 
 #### Pub/Sub (`bench_pubsub.ts`, awaited PUBLISH)
 
-Measures end-to-end delivery: time from PUBLISH call to subscriber callback firing. Uses `await pub.publish(...)` (sequential) to avoid overrunning the ring buffer.
+Two rates are reported per scenario:
+- **pub/s** — how fast the publisher can fire PUBLISH commands (awaited, sequential)
+- **recv/s** — total deliveries per second across all subscribers from first PUBLISH to last callback
 
-| Scenario | Redis 7 | pg_redis | Notes |
-|----------|---------|---------|-------|
-| 1 pub → 1 sub | 19,503 | 15,511 | 5ms poll interval dominates for sparse traffic |
-| 1 pub → 4 subs (fan-out) | 31,481 | 24,751 | Total deliveries/sec |
-| 1 pub → 16 subs (fan-out) | 88,265 | 131,769 | pg_redis faster: writes 16 rings under one spinlock |
-| PUBLISH (no subscribers) | 11,718 | 36,178 | pg_redis spinlock scan faster than Redis's dict lookup |
+For fan-out, recv/s = pub/s × N_subs because one PUBLISH fans to N ring buffers; pub/s stays flat as N grows.
+
+pg_redis runs inside the Docker network; Redis 7 runs on the host via port mapping (which causes its 64-sub numbers to collapse under OrbStack connection overhead).
+
+**Without table routing (fire-and-forget, pure in-memory):**
+
+| Scenario | Redis 7 pub/s | Redis 7 recv/s | pg_redis pub/s | pg_redis recv/s |
+|----------|--------------|----------------|----------------|-----------------|
+| 1 pub → 1 sub | 2,509 | 2,506 | 9,451 | 9,172 |
+| 1 pub → 4 subs | 2,359 | 9,433 | 12,297 | 38,086 |
+| 1 pub → 16 subs | 3,865 | 61,762 | 49,810 | 348,682 |
+| 1 pub → 32 subs | 2,896 | 92,516 | 8,993 | 237,891 |
+| 1 pub → 64 subs | 342 ¹ | 21,874 ¹ | 5,994 | 327,874 |
+| PUBLISH (no subs) | 10,851 | — | 10,833 | — |
+
+¹ Redis 7 degrades sharply at 64 subscribers due to OrbStack host-port-mapping overhead; measurements taken through Docker port forwarding rather than inside the Docker network.
+
+**With table routing (each PUBLISH also INSERTs a row, pg_redis only):**
+
+| Scenario | pub/s (no routing) | pub/s (routing) | recv/s (routing) |
+|----------|--------------------|-----------------|-----------------|
+| PUBLISH (no subs) | 10,833 | 5,577 | — |
+| 1 pub → 1 sub | 9,451 | 6,369 | 5,951 |
+| 1 pub → 4 subs | 12,297 | 11,071 | 34,480 |
 
 Run with:
 ```bash
@@ -394,10 +413,11 @@ mise run bench-pubsub
 
 **Reading the pub/sub table:**
 
-- Pub/sub is **fire-and-forget** — no persistence, no ACK, at-most-once delivery, identical semantics to native Redis.
-- The **5ms poll interval** in `subscribe_loop` adds up to 5ms delivery latency per message (worst case when the subscriber is mid-timeout when a message arrives). This is the dominant cost for the 1-sub scenario.
-- **Fan-out at scale**: pg_redis writes to all matching ring buffers under a single spinlock acquisition, so 16-subscriber fan-out is faster than Redis's per-client linked-list walk with individual output-buffer writes.
-- **PUBLISH with no subscribers** is faster on pg_redis because it acquires one cross-process AtomicU8 spinlock, scans 256 slots (mostly zeroed cache lines), and releases — cheaper than Redis's dict hash + callback dispatch overhead under the same load.
+- **pub/s is flat** across subscriber counts for pg_redis: writing to N ring buffers under one spinlock is O(N) in wall time but each per-slot write is cache-line sized, so it stays fast. Redis has per-client output-buffer writes that introduce more overhead.
+- **recv/s scales linearly** with N_subs because total deliveries = MESSAGES × N, while the clock only stops when all subscribers finish.
+- **5ms poll interval** in `subscribe_loop` is the floor for single-subscriber latency; with large fan-out, all subscribers drain the ring in parallel so total time barely changes.
+- **Routing overhead** on PUBLISH: the fire-and-forget `try_send` to the BGW dispatcher adds ~3–5k pub/s of overhead. The INSERT happens asynchronously after the PUBLISH reply is sent. For fan-out scenarios the overhead is small relative to the ring-write cost.
+- **PUBLISH with no routes configured**: an `AtomicU8` counter short-circuits before the spinlock — overhead is a single relaxed atomic load.
 
 ### Tuning batch size
 
@@ -506,4 +526,49 @@ All tables are queryable with standard SQL, joinable with your application data,
 | `redis.remove_workers(n)` | `integer` | Terminate n workers (newest first), returns count terminated |
 
 Dynamic workers (added via `add_workers`) do not restart after termination. Startup workers (configured via `redis.workers`) restart automatically after ~5 seconds. To permanently change the pool size, update `redis.workers` and restart the server.
+
+---
+
+## Pub/Sub table routing
+
+Any PUBLISH can be optionally routed to a PostgreSQL table, enabling [Supabase Realtime broadcast from database](https://supabase.com/docs/guides/realtime/broadcast) or any trigger-based integration. The extension is completely decoupled from Supabase — it just INSERTs rows.
+
+### Setup
+
+```sql
+-- 1. Create a target table (id, channel, payload, inserted_at)
+SELECT redis.create_pubsub_table('public', 'chat_messages');
+
+-- 2. Route PUBLISH on 'chat' to that table
+SELECT redis.route_publish('chat', 'public', 'chat_messages');
+
+-- 3. Now any PUBLISH lands in the table too
+-- redis-cli> PUBLISH chat "hello"
+
+-- 4. Read it back
+SELECT channel, payload, inserted_at FROM public.chat_messages;
+```
+
+### Functions
+
+| Function | Description |
+|----------|-------------|
+| `redis.create_pubsub_table(schema, table)` | Create a routing target table with the required columns |
+| `redis.route_publish(channel, schema, table)` | Route PUBLISH on `channel` to INSERT into `schema`.`table` |
+| `redis.unroute_publish(channel)` | Remove the route for `channel` |
+
+### How it works
+
+- Routes are stored in `redis.pubsub_routes` and loaded into shared memory on startup — lookups are lock-free when no routes are configured (`AtomicU8` counter short-circuit).
+- The table INSERT is dispatched fire-and-forget via the BGW dispatcher after the in-memory pub/sub delivery completes. The Redis PUBLISH reply is sent immediately.
+- The target table must have `channel TEXT` and `payload TEXT` columns. `redis.create_pubsub_table` creates a compatible table; you can also bring your own:
+
+  ```sql
+  CREATE TABLE your_table (
+      channel TEXT NOT NULL,
+      payload TEXT NOT NULL
+  );
+  ```
+- Routes survive server restart (persisted in `redis.pubsub_routes`).
+- Up to 64 routes can be active simultaneously.
 

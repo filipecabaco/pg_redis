@@ -1,0 +1,136 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 520" font-family="ui-sans-serif, -apple-system, 'Inter', 'Helvetica Neue', Arial, sans-serif">
+  <defs>
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#3ECF8E" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#3ECF8E" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Dark background -->
+  <rect width="800" height="520" fill="#1F1F1F"/>
+
+  <!-- Ambient glow behind mark -->
+  <circle cx="175" cy="260" r="180" fill="url(#glow)"/>
+
+  <!-- =========================================================
+       THE MARK: Two stacked isometric cubes
+
+       Isometric cube geometry (cube size = 70):
+         - half-width  dx = 70
+         - half-depth  dy = 35  (dx / 2, for a 2:1 isometric)
+         - height      h  = 70
+
+       For a single cube with bottom-center at (cx, cy):
+         Front-bottom (hidden)
+         Top vertices (around top center at cx, cy - h):
+           top-back:   (cx,      cy - h - dy)
+           top-right:  (cx + dx, cy - h)
+           top-front:  (cx,      cy - h + dy)
+           top-left:   (cx - dx, cy - h)
+         Bottom vertices (around bottom center at cx, cy):
+           bot-right:  (cx + dx, cy)
+           bot-front:  (cx,      cy + dy)
+           bot-left:   (cx - dx, cy)
+
+       Stacking two cubes: the top cube's bottom-center
+       equals the bottom cube's top-center (cx, cy - h)
+       ========================================================= -->
+
+  <g>
+    <!-- ================================================
+         BOTTOM CUBE
+         Bottom-center at (175, 365)
+         Top-center    at (175, 295)
+         ================================================ -->
+
+    <!-- LEFT face: top-left → top-front → bot-front → bot-left -->
+    <path d="M 105 295
+             L 175 330
+             L 175 400
+             L 105 365 Z"
+          fill="#249361"/>
+
+    <!-- RIGHT face: top-front → top-right → bot-right → bot-front -->
+    <path d="M 175 330
+             L 245 295
+             L 245 365
+             L 175 400 Z"
+          fill="#15553A"/>
+
+    <!-- TOP face (only the visible front triangle, since the
+         back half is covered by the top cube sitting on it):
+         top-left → top-front → top-right (visible front edges) 
+         Actually we still draw the full rhombus; it will be 
+         covered by the upper cube anyway. -->
+    <path d="M 105 295
+             L 175 260
+             L 245 295
+             L 175 330 Z"
+          fill="#3ECF8E"/>
+
+    <!-- ================================================
+         TOP CUBE
+         Bottom-center at (175, 295)  ← matches bottom cube's top-center
+         Top-center    at (175, 225)
+         ================================================ -->
+
+    <!-- LEFT face -->
+    <path d="M 105 225
+             L 175 260
+             L 175 330
+             L 105 295 Z"
+          fill="#2FA873"/>
+
+    <!-- RIGHT face -->
+    <path d="M 175 260
+             L 245 225
+             L 245 295
+             L 175 330 Z"
+          fill="#1F7A52"/>
+
+    <!-- TOP face -->
+    <path d="M 105 225
+             L 175 190
+             L 245 225
+             L 175 260 Z"
+          fill="#4AE29E"/>
+
+    <!-- Subtle top-edge highlight on the uppermost cube -->
+    <path d="M 105 225 L 175 190 L 245 225"
+          fill="none"
+          stroke="#6FE8B0"
+          stroke-width="1.5"/>
+  </g>
+
+  <!-- =========================================================
+       WORDMARK — horizontally contained within the canvas
+       ========================================================= -->
+  <g transform="translate(310, 295)">
+    <text x="0" y="0"
+          font-size="100"
+          font-weight="800"
+          letter-spacing="-5"
+          fill="#FFFFFF">pg</text>
+
+    <!-- The underscore accent -->
+    <rect x="125" y="-8" width="48" height="11" rx="2" fill="#3ECF8E"/>
+
+    <text x="183" y="0"
+          font-size="100"
+          font-weight="800"
+          letter-spacing="-5"
+          fill="#FFFFFF">redis</text>
+  </g>
+
+  <!-- Tagline -->
+  <text x="310" y="340"
+        font-size="16"
+        font-weight="500"
+        letter-spacing="3"
+        fill="#8F8F8F">
+    REDIS PROTOCOL · POSTGRES INSIDE
+  </text>
+
+  <!-- Accent underline -->
+  <rect x="310" y="360" width="60" height="3" fill="#3ECF8E"/>
+</svg>

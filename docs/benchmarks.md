@@ -1,24 +1,28 @@
 # Benchmarks
 
-All figures are requests/second on Docker, Apple M-series. Benchmarks use [`redis-benchmark`](https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/benchmarks/) with `-n 50000 -c 200`.
+All figures are requests/second on Docker, Apple M-series. Benchmarks use [`redis-benchmark`](https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/benchmarks/) with `-n 50000 -c 200`, connecting to the default database (db 0 for memory/unlogged, db 1 for logged).
 
 ## Commands
 
-| Command | Redis 7 | pg_redis (memory) | pg_redis (logged) |
-|---------|---------|-------------------|-------------------|
-| PING    | 198,000 | —       | 138,000 |
-| GET     | 185,000 | 136,000 | 90,000  |
-| SET     | 175,000 | 118,000 | 3,004   |
-| INCR    | 187,000 | 123,000 | 2,764   |
-| HSET    | 182,000 | 124,000 | 15,038  |
-| ZADD    | 185,000 | 127,000 | 9,403   |
-| SADD    | 190,000 | 133,000 | 29,412  |
-| SPOP    | 189,000 | 131,000 | 22,989  |
-| ZPOPMIN | 194,000 | 140,000 | 17,652  |
-| LPOP    | 142,000 | 119,000 | 5,965   |
-| RPOP    | 177,000 | 144,000 | 11,614  |
+| Command | Redis 7 | pg_redis (memory) | pg_redis (SPI/unlogged) | pg_redis (SPI/logged) |
+|---------|---------|-------------------|-------------------------|-----------------------|
+| PING    | 234,000 | 112,000           | 113,000                 | 103,000               |
+| GET     | 243,000 | 106,000           | 85,000                  | 92,000                |
+| SET     | 224,000 | 103,000           | 22,000                  | 12,000                |
+| INCR    | 253,000 | 116,000           | 32,000                  | 14,000                |
+| HSET    | 227,000 | 83,000            | 26,000                  | 13,000                |
+| ZADD    | 185,000 | 118,000           | 15,000                  | 7,000                 |
+| SADD    | 194,000 | 82,000            | 71,000                  | 66,000                |
+| SPOP    | 183,000 | 116,000           | 51,000                  | 64,000                |
+| ZPOPMIN | 183,000 | 118,000           | 48,000                  | 47,000                |
 
-Memory mode (the default) reaches Redis-level throughput for all write commands. Logged databases pay PostgreSQL transaction overhead but survive crashes and are SQL-queryable.
+**Memory mode** (even-numbered databases with `redis.storage_mode=memory`) stores data in shared-memory hash tables with no transaction overhead. Write commands reach near-Redis throughput; reads are close behind.
+
+**SPI/unlogged** (even-numbered databases with `redis.storage_mode=auto`) uses PostgreSQL UNLOGGED tables. Reads remain fast; writes pay transaction and SPI overhead but survive worker restarts (though not a crash).
+
+**SPI/logged** (odd-numbered databases) uses WAL-logged PostgreSQL tables. All data survives crashes and is fully SQL-queryable. Write throughput is lower due to WAL fsync overhead.
+
+Use `mise run bench-high-write` (8 workers, batch_size=256) to increase write throughput by spreading connections across more dispatchers.
 
 ## Pub/Sub
 

@@ -508,6 +508,8 @@ unsafe fn write_to_ring(
         msg.pattern[pat_len] = 0;
         msg.pattern_len = pat_len as u16;
 
+        // Payloads longer than PUBSUB_MSG_LEN (128 bytes) are truncated by design;
+        // callers should keep messages short or increase PUBSUB_MSG_LEN at compile time.
         let pay_len = payload.len().min(PUBSUB_MSG_LEN);
         msg.payload[..pay_len].copy_from_slice(&payload[..pay_len]);
         msg.payload_len = pay_len as u32;
@@ -546,7 +548,7 @@ pub unsafe fn pubsub_channels(
 ) -> Vec<Vec<u8>> {
     unsafe {
         spin_acquire(ctl);
-        let mut names: Vec<Vec<u8>> = Vec::with_capacity(MAX_PUBSUB_SLOTS * MAX_SUBS_PER_SLOT);
+        let mut names: Vec<Vec<u8>> = Vec::new();
         for i in 0..MAX_PUBSUB_SLOTS {
             let slot = slots.add(i);
             if (*slot).in_use == 0 {

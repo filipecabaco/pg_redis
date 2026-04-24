@@ -35,14 +35,14 @@ pub(crate) static MEM_MAX_ENTRIES: GucSetting<i32> = GucSetting::<i32>::new(1638
 
 #[derive(Copy, Clone, PartialEq)]
 pub enum StorageMode {
-    Auto,
+    Postgres,
     Memory,
 }
 
 pub fn storage_mode() -> StorageMode {
     match STORAGE_MODE.get().as_deref().and_then(|s| s.to_str().ok()) {
         Some("memory") => StorageMode::Memory,
-        _ => StorageMode::Auto,
+        _ => StorageMode::Postgres,
     }
 }
 
@@ -228,7 +228,7 @@ pub extern "C-unwind" fn _PG_init() {
         c"When set, clients must AUTH before any command.",
         &PASSWORD,
         GucContext::Suset,
-        GucFlags::default(),
+        GucFlags::SUPERUSER_ONLY | GucFlags::NO_SHOW_ALL,
     );
 
     GucRegistry::define_int_guc(
@@ -310,6 +310,9 @@ pub extern "C-unwind" fn pg_redis_worker_main(arg: pg_sys::Datum) {
 /// Dynamic workers will not restart after being terminated.
 #[pg_extern(schema = "redis")]
 fn add_workers(n: i32) -> i32 {
+    if !unsafe { pg_sys::superuser() } {
+        error!("permission denied: superuser required");
+    }
     let schema_exists =
         Spi::get_one::<bool>("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'redis')")
             .ok()
@@ -343,6 +346,9 @@ fn add_workers(n: i32) -> i32 {
 /// pool, lower redis.workers and restart the server.
 #[pg_extern(schema = "redis")]
 fn remove_workers(n: i32) -> i32 {
+    if !unsafe { pg_sys::superuser() } {
+        error!("permission denied: superuser required");
+    }
     match Spi::get_one::<i32>(&format!(
         "SELECT count(pg_terminate_backend(pid))::int \
          FROM (SELECT pid FROM pg_stat_activity \
@@ -373,6 +379,9 @@ fn worker_count() -> i64 {
 /// Call `redis.create_pubsub_table(schema, tbl)` to create a compatible table.
 #[pg_extern(schema = "redis")]
 fn route_publish(channel: &str, schema: &str, tbl: &str) {
+    if !unsafe { pg_sys::superuser() } {
+        error!("permission denied: superuser required");
+    }
     for (name, val) in [("channel", channel), ("schema", schema), ("table", tbl)] {
         if val.len() > 63 {
             error!("{name} must be ≤ 63 bytes");
@@ -401,6 +410,9 @@ fn route_publish(channel: &str, schema: &str, tbl: &str) {
 /// Remove the PUBLISH→table route for `channel`.
 #[pg_extern(schema = "redis")]
 fn unroute_publish(channel: &str) {
+    if !unsafe { pg_sys::superuser() } {
+        error!("permission denied: superuser required");
+    }
     Spi::connect_mut(|client| {
         client
             .update(

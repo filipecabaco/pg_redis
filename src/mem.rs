@@ -1121,11 +1121,12 @@ pub unsafe fn mem_type(db_idx: usize, key: &str) -> &'static str {
             }
         }
         {
-            let htab2 = unsafe { addr_of!((*c).set_htab[db_idx]).read() };
+            let meta_htab2 = unsafe { addr_of!((*c).set_meta_htab[db_idx]).read() };
             let lk2 = unsafe { addr_of!((*c).set_lwlock[db_idx]).read() };
-            if !htab2.is_null() && !lk2.is_null() {
+            if !meta_htab2.is_null() && !lk2.is_null() {
                 unsafe { pg_sys::LWLockAcquire(lk2, pg_sys::LWLockMode::LW_SHARED) };
-                let has_set = unsafe { has_any_set_entry_for_key(htab2, key) };
+                let meta = unsafe { find_set_meta(meta_htab2, key) };
+                let has_set = !meta.is_null() && unsafe { (*meta).count > 0 };
                 unsafe { pg_sys::LWLockRelease(lk2) };
                 if has_set {
                     return "set";
@@ -1133,11 +1134,12 @@ pub unsafe fn mem_type(db_idx: usize, key: &str) -> &'static str {
             }
         }
         {
-            let htab2 = unsafe { addr_of!((*c).zset_htab[db_idx]).read() };
+            let meta_htab2 = unsafe { addr_of!((*c).zset_meta_htab[db_idx]).read() };
             let lk2 = unsafe { addr_of!((*c).zset_lwlock[db_idx]).read() };
-            if !htab2.is_null() && !lk2.is_null() {
+            if !meta_htab2.is_null() && !lk2.is_null() {
                 unsafe { pg_sys::LWLockAcquire(lk2, pg_sys::LWLockMode::LW_SHARED) };
-                let has_zset = unsafe { has_any_zset_entry_for_key(htab2, key) };
+                let meta = unsafe { find_zset_meta(meta_htab2, key) };
+                let has_zset = !meta.is_null() && unsafe { (*meta).count > 0 };
                 unsafe { pg_sys::LWLockRelease(lk2) };
                 if has_zset {
                     return "zset";
@@ -1180,44 +1182,6 @@ unsafe fn has_any_entry_for_key(htab: *mut pg_sys::HTAB, key: &str) -> bool {
     false
 }
 
-unsafe fn has_any_set_entry_for_key(htab: *mut pg_sys::HTAB, key: &str) -> bool {
-    let Some(table) = (unsafe { SharedTable::<SetEntry>::from_raw(htab) }) else {
-        return false;
-    };
-    let key_bytes = key.as_bytes();
-    let mut scan = unsafe { table.scan() };
-    while let Some(entry) = unsafe { scan.next() } {
-        let ek = unsafe { addr_of!((*entry).key) as *const u8 };
-        let ek_slice = unsafe { std::slice::from_raw_parts(ek, MAX_KEY_LEN) };
-        let ek_end = ek_slice.iter().position(|&b| b == 0).unwrap_or(MAX_KEY_LEN);
-        if ek_slice[..ek_end] == key_bytes[..key_bytes.len().min(ek_end)]
-            && key_bytes.len() == ek_end
-        {
-            return true;
-        }
-    }
-    false
-}
-
-unsafe fn has_any_zset_entry_for_key(htab: *mut pg_sys::HTAB, key: &str) -> bool {
-    let Some(table) = (unsafe { SharedTable::<ZsetEntry>::from_raw(htab) }) else {
-        return false;
-    };
-    let key_bytes = key.as_bytes();
-    let mut scan = unsafe { table.scan() };
-    while let Some(entry) = unsafe { scan.next() } {
-        let ek = unsafe { addr_of!((*entry).key) as *const u8 };
-        let ek_slice = unsafe { std::slice::from_raw_parts(ek, MAX_KEY_LEN) };
-        let ek_end = ek_slice.iter().position(|&b| b == 0).unwrap_or(MAX_KEY_LEN);
-        if ek_slice[..ek_end] == key_bytes[..key_bytes.len().min(ek_end)]
-            && key_bytes.len() == ek_end
-        {
-            return true;
-        }
-    }
-    false
-}
-
 unsafe fn has_any_list_entry_for_key(meta_htab: *mut pg_sys::HTAB, key: &str) -> bool {
     let Some(table) = (unsafe { SharedTable::<ListMeta>::from_raw(meta_htab) }) else {
         return false;
@@ -1229,21 +1193,10 @@ unsafe fn has_any_list_entry_for_key(meta_htab: *mut pg_sys::HTAB, key: &str) ->
     }
 }
 
-/// Simple glob pattern matching supporting `*` and `?` wildcards.
+/// Glob pattern matching supporting `*`, `?`, and `[...]` character classes.
+/// Delegates to the iterative implementation in pubsub for consistency with PSUBSCRIBE.
 pub fn glob_matches(pattern: &str, s: &str) -> bool {
-    glob_match_impl(pattern.as_bytes(), s.as_bytes())
-}
-
-fn glob_match_impl(pat: &[u8], s: &[u8]) -> bool {
-    match (pat.first(), s.first()) {
-        (None, None) => true,
-        (Some(&b'*'), _) => {
-            glob_match_impl(&pat[1..], s) || (!s.is_empty() && glob_match_impl(pat, &s[1..]))
-        }
-        (Some(&b'?'), Some(_)) => glob_match_impl(&pat[1..], &s[1..]),
-        (Some(p), Some(c)) if p == c => glob_match_impl(&pat[1..], &s[1..]),
-        _ => false,
-    }
+    crate::pubsub::glob_match(pattern.as_bytes(), s.as_bytes())
 }
 
 /// Shared memory size for the MemControlBlock itself (holds pointers, not HTAB data).
@@ -4707,5 +4660,54 @@ pub unsafe fn mem_del_all_types(db_idx: usize, key: &str) -> i64 {
             + mem_del_zset_key(db_idx, key)
             + mem_del_list_key(db_idx, key);
         sum.min(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::glob_matches;
+
+    #[test]
+    fn glob_star_matches_any() {
+        assert!(glob_matches("*", "anything"));
+        assert!(glob_matches("h*o", "hello"));
+        assert!(!glob_matches("h*o", "world"));
+    }
+
+    #[test]
+    fn glob_question_matches_single_char() {
+        assert!(glob_matches("h?llo", "hello"));
+        assert!(!glob_matches("h?llo", "hllo"));
+    }
+
+    #[test]
+    fn glob_character_class_matches_set() {
+        assert!(glob_matches("[hH]ello", "hello"));
+        assert!(glob_matches("[hH]ello", "Hello"));
+        assert!(!glob_matches("[hH]ello", "xello"));
+    }
+
+    #[test]
+    fn glob_character_class_range() {
+        assert!(glob_matches("[a-z]ello", "hello"));
+        assert!(!glob_matches("[a-z]ello", "Hello"));
+    }
+
+    #[test]
+    fn glob_negated_class() {
+        assert!(glob_matches("[^0-9]ello", "hello"));
+        assert!(!glob_matches("[^0-9]ello", "1ello"));
+    }
+
+    #[test]
+    fn glob_exact_match() {
+        assert!(glob_matches("hello", "hello"));
+        assert!(!glob_matches("hello", "world"));
+    }
+
+    #[test]
+    fn glob_empty_pattern_matches_empty_string_only() {
+        assert!(glob_matches("", ""));
+        assert!(!glob_matches("", "x"));
     }
 }

@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 type VersionMap = Arc<RwLock<HashMap<(u8, String), u64>>>;
 type PendingBatch = Option<(Vec<(Command, u8)>, mpsc::SyncSender<Vec<Response>>)>;
 
+const PUBSUB_NOT_LOADED: &str = "pub/sub requires shared_preload_libraries = 'pg_redis'";
+
 enum DispatchMsg {
     Cmd(Command, u8, mpsc::SyncSender<Response>),
     Batch(Vec<(Command, u8)>, mpsc::SyncSender<Vec<Response>>),
@@ -194,7 +196,7 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
             },
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                std::thread::sleep(Duration::from_millis(250));
+                break;
             }
         }
 
@@ -263,7 +265,7 @@ fn run_dispatch_batch(
             })
         })
     };
-    {
+    if cmds.iter().any(|(cmd, _)| !cmd.write_keys().is_empty()) {
         let mut versions = version_map.write().unwrap();
         for (cmd, db) in cmds {
             for key in cmd.write_keys() {
@@ -329,6 +331,9 @@ fn accept_loop(
                 if let Err(e) = s.set_read_timeout(Some(Duration::from_secs(30))) {
                     eprintln!("pg_redis: set_read_timeout failed: {}", e);
                 }
+                if let Err(e) = s.set_nodelay(true) {
+                    eprintln!("pg_redis: set_nodelay failed: {}", e);
+                }
                 let tx = cmd_tx.clone();
                 let counter = Arc::clone(&conn_count);
                 let pw = password.clone();
@@ -347,13 +352,16 @@ fn accept_loop(
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter()
-        .zip(b.iter())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
+    use subtle::ConstantTimeEq;
+    // Pad both to max length so length difference does not leak via timing.
+    let max_len = a.len().max(b.len());
+    let mut a_padded = vec![0u8; max_len];
+    let mut b_padded = vec![0u8; max_len];
+    a_padded[..a.len()].copy_from_slice(a);
+    b_padded[..b.len()].copy_from_slice(b);
+    let len_ok = subtle::Choice::from((a.len() == b.len()) as u8);
+    let content_ok = a_padded.ct_eq(&b_padded);
+    bool::from(len_ok & content_ok)
 }
 
 fn configured_password() -> Option<Vec<u8>> {
@@ -411,10 +419,14 @@ fn conn_loop(
                         flush(&mut writer);
                         continue;
                     }
+                    let watch_snapshot: Vec<(u8, String, u64)> = watched
+                        .iter()
+                        .map(|((w_db, key), &snap_ver)| (*w_db, key.clone(), snap_ver))
+                        .collect();
                     let watch_dirty = {
                         let versions = version_map.read().unwrap();
-                        watched.iter().any(|((w_db, key), &snap_ver)| {
-                            versions.get(&(*w_db, key.clone())).copied().unwrap_or(0) != snap_ver
+                        watch_snapshot.iter().any(|(w_db, key, snap_ver)| {
+                            versions.get(&(*w_db, key.clone())).copied().unwrap_or(0) != *snap_ver
                         })
                     };
                     let cmds: Vec<(Command, u8)> = queue
@@ -698,9 +710,7 @@ fn conn_loop(
                 reply(&mut writer, |w| write_simple_string(w, "OK"))
             }
             Command::Publish { channel, message } => match crate::pubsub_state() {
-                None => reply(&mut writer, |w| {
-                    write_error(w, "pub/sub requires shared_preload_libraries = 'pg_redis'")
-                }),
+                None => reply(&mut writer, |w| write_error(w, PUBSUB_NOT_LOADED)),
                 Some((ctl, slots)) => {
                     let n = unsafe { crate::pubsub::publish(ctl, slots, channel, message) };
                     if let Some(route_ctl) = crate::route_state()
@@ -721,9 +731,7 @@ fn conn_loop(
                 }
             },
             Command::PubSubChannels { pattern } => match crate::pubsub_state() {
-                None => reply(&mut writer, |w| {
-                    write_error(w, "pub/sub requires shared_preload_libraries = 'pg_redis'")
-                }),
+                None => reply(&mut writer, |w| write_error(w, PUBSUB_NOT_LOADED)),
                 Some((ctl, slots)) => {
                     let channels =
                         unsafe { crate::pubsub::pubsub_channels(ctl, slots, pattern.as_deref()) };
@@ -737,9 +745,7 @@ fn conn_loop(
                 }
             },
             Command::PubSubNumSub { channels } => match crate::pubsub_state() {
-                None => reply(&mut writer, |w| {
-                    write_error(w, "pub/sub requires shared_preload_libraries = 'pg_redis'")
-                }),
+                None => reply(&mut writer, |w| write_error(w, PUBSUB_NOT_LOADED)),
                 Some((ctl, slots)) => {
                     let counts = unsafe { crate::pubsub::pubsub_numsub(ctl, slots, channels) };
                     reply(&mut writer, |w| {
@@ -753,9 +759,7 @@ fn conn_loop(
                 }
             },
             Command::PubSubNumPat => match crate::pubsub_state() {
-                None => reply(&mut writer, |w| {
-                    write_error(w, "pub/sub requires shared_preload_libraries = 'pg_redis'")
-                }),
+                None => reply(&mut writer, |w| write_error(w, PUBSUB_NOT_LOADED)),
                 Some((ctl, slots)) => {
                     let n = unsafe { crate::pubsub::pubsub_numpat(ctl, slots) };
                     reply(&mut writer, |w| write_integer(w, n));
@@ -844,9 +848,7 @@ fn enter_subscribe_mode(
     ) -> Option<(usize, u32)>,
 ) -> bool {
     let Some((ctl, slots)) = crate::pubsub_state() else {
-        reply(writer, |w| {
-            write_error(w, "pub/sub requires shared_preload_libraries = 'pg_redis'")
-        });
+        reply(writer, |w| write_error(w, PUBSUB_NOT_LOADED));
         return true;
     };
     match alloc_fn(ctl, slots, items) {

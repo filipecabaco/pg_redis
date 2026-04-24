@@ -1,14 +1,17 @@
 use pgrx::datum::DatumWithOid;
 use pgrx::spi::SpiClient;
 
+pub const NUM_DBS: usize = 16;
+
 pub mod sql {
+    use super::NUM_DBS;
     use std::sync::LazyLock;
 
-    fn arr<F: Fn(usize) -> String>(f: F) -> [String; 16] {
+    fn arr<F: Fn(usize) -> String>(f: F) -> [String; NUM_DBS] {
         std::array::from_fn(f)
     }
 
-    pub static GET: LazyLock<[String; 16]> = LazyLock::new(|| {
+    pub static GET: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| {
             format!(
                 "SELECT value FROM redis.kv_{db} WHERE key=$1 \
@@ -17,7 +20,7 @@ pub mod sql {
         })
     });
 
-    pub static MGET: LazyLock<[String; 16]> = LazyLock::new(|| {
+    pub static MGET: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| {
             format!(
                 "SELECT key, value FROM redis.kv_{db} \
@@ -26,7 +29,7 @@ pub mod sql {
         })
     });
 
-    pub static STRLEN: LazyLock<[String; 16]> = LazyLock::new(|| {
+    pub static STRLEN: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| {
             format!(
                 "SELECT coalesce(length(value), 0)::bigint FROM redis.kv_{db} \
@@ -35,7 +38,7 @@ pub mod sql {
         })
     });
 
-    pub static TTL: LazyLock<[String; 16]> = LazyLock::new(|| {
+    pub static TTL: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| {
             format!(
                 "SELECT CASE \
@@ -49,7 +52,7 @@ pub mod sql {
         })
     });
 
-    pub static PTTL: LazyLock<[String; 16]> = LazyLock::new(|| {
+    pub static PTTL: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| {
             format!(
                 "SELECT CASE \
@@ -63,7 +66,7 @@ pub mod sql {
         })
     });
 
-    pub static EXPIRETIME: LazyLock<[String; 16]> = LazyLock::new(|| {
+    pub static EXPIRETIME: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| {
             format!(
                 "SELECT CASE \
@@ -77,7 +80,7 @@ pub mod sql {
         })
     });
 
-    pub static PEXPIRETIME: LazyLock<[String; 16]> = LazyLock::new(|| {
+    pub static PEXPIRETIME: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| {
             format!(
                 "SELECT CASE \
@@ -91,7 +94,7 @@ pub mod sql {
         })
     });
 
-    pub static INCR: LazyLock<[String; 16]> = LazyLock::new(|| {
+    pub static INCR: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| {
             format!(
                 "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, '1') \
@@ -103,7 +106,7 @@ pub mod sql {
         })
     });
 
-    pub static DECR: LazyLock<[String; 16]> = LazyLock::new(|| {
+    pub static DECR: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| {
             format!(
                 "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, '-1') \
@@ -115,7 +118,7 @@ pub mod sql {
         })
     });
 
-    pub static INCRBY: LazyLock<[String; 16]> = LazyLock::new(|| {
+    pub static INCRBY: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| {
             format!(
                 "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, $2::text) \
@@ -127,19 +130,19 @@ pub mod sql {
         })
     });
 
-    pub static DECRBY: LazyLock<[String; 16]> = LazyLock::new(|| {
+    pub static DECRBY: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| {
             format!(
-                "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, $2::text) \
+                "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, (-$2::bigint)::text) \
          ON CONFLICT (key) DO UPDATE \
-         SET value = (CAST(redis.kv_{db}.value AS bigint) + $3)::text \
+         SET value = (CAST(redis.kv_{db}.value AS bigint) - $3)::text \
          WHERE redis.kv_{db}.value ~ '^-?[0-9]+$' \
          RETURNING value::bigint"
             )
         })
     });
 
-    pub static INCRBYFLOAT: LazyLock<[String; 16]> = LazyLock::new(|| {
+    pub static INCRBYFLOAT: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| {
             format!(
                 "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, $2::text) \
@@ -151,7 +154,7 @@ pub mod sql {
         })
     });
 
-    pub static PERSIST: LazyLock<[String; 16]> = LazyLock::new(|| {
+    pub static PERSIST: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| {
             format!(
                 "UPDATE redis.kv_{db} SET expires_at = NULL \
@@ -160,7 +163,7 @@ pub mod sql {
         })
     });
 
-    pub static GETDEL: LazyLock<[String; 16]> = LazyLock::new(|| {
+    pub static GETDEL: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| {
             format!(
                 "DELETE FROM redis.kv_{db} WHERE key=$1 \
@@ -170,51 +173,51 @@ pub mod sql {
         })
     });
 
-    pub static HGET: LazyLock<[String; 16]> = LazyLock::new(|| {
+    pub static HGET: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| format!("SELECT value FROM redis.hash_{db} WHERE key=$1 AND field=$2"))
     });
 
-    pub static HGETALL: LazyLock<[String; 16]> = LazyLock::new(|| {
+    pub static HGETALL: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| format!("SELECT field, value FROM redis.hash_{db} WHERE key=$1 ORDER BY field"))
     });
 
-    pub static HKEYS: LazyLock<[String; 16]> = LazyLock::new(|| {
+    pub static HKEYS: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| format!("SELECT field FROM redis.hash_{db} WHERE key=$1 ORDER BY field"))
     });
 
-    pub static HVALS: LazyLock<[String; 16]> = LazyLock::new(|| {
+    pub static HVALS: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| format!("SELECT value FROM redis.hash_{db} WHERE key=$1 ORDER BY field"))
     });
 
-    pub static HLEN: LazyLock<[String; 16]> = LazyLock::new(|| {
+    pub static HLEN: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| format!("SELECT count(*)::bigint FROM redis.hash_{db} WHERE key=$1"))
     });
 
-    pub static HEXISTS: LazyLock<[String; 16]> = LazyLock::new(|| {
+    pub static HEXISTS: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| format!("SELECT 1 FROM redis.hash_{db} WHERE key=$1 AND field=$2"))
     });
 
-    pub static SCARD: LazyLock<[String; 16]> = LazyLock::new(|| {
+    pub static SCARD: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| format!("SELECT count(*)::bigint FROM redis.set_{db} WHERE key=$1"))
     });
 
-    pub static SMEMBERS: LazyLock<[String; 16]> = LazyLock::new(|| {
+    pub static SMEMBERS: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| format!("SELECT member FROM redis.set_{db} WHERE key=$1 ORDER BY member"))
     });
 
-    pub static SISMEMBER: LazyLock<[String; 16]> = LazyLock::new(|| {
+    pub static SISMEMBER: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| format!("SELECT 1 FROM redis.set_{db} WHERE key=$1 AND member=$2"))
     });
 
-    pub static ZCARD: LazyLock<[String; 16]> = LazyLock::new(|| {
+    pub static ZCARD: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| format!("SELECT count(*)::bigint FROM redis.zset_{db} WHERE key=$1"))
     });
 
-    pub static ZSCORE: LazyLock<[String; 16]> = LazyLock::new(|| {
+    pub static ZSCORE: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| format!("SELECT score FROM redis.zset_{db} WHERE key=$1 AND member=$2"))
     });
 
-    pub static LLEN: LazyLock<[String; 16]> = LazyLock::new(|| {
+    pub static LLEN: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| format!("SELECT count(*)::bigint FROM redis.list_{db} WHERE key=$1"))
     });
 }
@@ -800,6 +803,9 @@ impl Command {
                 let db: u8 = str_arg(args, 0, "SELECT")?
                     .parse()
                     .map_err(|_| "SELECT requires integer db".to_string())?;
+                if db > 15 {
+                    return Err("ERR DB index is out of range".to_string());
+                }
                 Ok(Command::Select { db })
             }
             "AUTH" => Ok(Command::Auth {
@@ -2258,8 +2264,7 @@ impl Command {
             }
 
             Command::DecrBy { key, delta } => {
-                let neg_delta = -*delta;
-                match client.update(&sql::DECRBY[db as usize], None, &[key.as_str().into(), neg_delta.into(), neg_delta.into()]) {
+                match client.update(&sql::DECRBY[db as usize], None, &[key.as_str().into(), (*delta).into(), (*delta).into()]) {
                     Ok(tbl) => match tbl.first().get::<i64>(1) {
                         Ok(Some(n)) => Response::Integer(n),
                         _ => Response::Error("ERR value is not an integer or out of range".to_string()),
@@ -4778,6 +4783,18 @@ fn build_inter_sql(db: u8, n_keys: usize, first_param: usize) -> String {
     sql
 }
 
+fn list_key_lock(client: &mut SpiClient<'_>, key: &str) {
+    // Serialize concurrent writers on the same list key to prevent duplicate-pos conflicts.
+    // Namespace 42 is reserved for pg_redis list operations.
+    client
+        .update(
+            "SELECT pg_advisory_xact_lock(42, hashtext($1))",
+            None,
+            &[key.into()],
+        )
+        .ok();
+}
+
 fn list_push(
     client: &mut SpiClient<'_>,
     db: u8,
@@ -4789,6 +4806,7 @@ fn list_push(
     if values.is_empty() {
         return Response::Error("ERR wrong number of arguments".to_string());
     }
+    list_key_lock(client, key);
     let edge_agg = if left { "MIN" } else { "MAX" };
     let pos_op = if left { "-" } else { "+" };
     let values_vec: Vec<Option<String>> = values.iter().map(|v| Some(v.clone())).collect();
@@ -4911,6 +4929,7 @@ fn list_insert(
     pivot: &str,
     value: &str,
 ) -> Response {
+    list_key_lock(client, key);
     let pivot_sql = format!(
         "SELECT pos FROM redis.list_{db} WHERE key = $1 AND value = $2 \
          ORDER BY pos ASC LIMIT 1"
@@ -6350,6 +6369,22 @@ mod tests {
     #[test]
     fn parse_select_invalid() {
         is_err(Command::parse(parts(&["SELECT", "abc"])));
+    }
+
+    #[test]
+    fn parse_select_15_is_max_valid() {
+        let cmd = is_ok(Command::parse(parts(&["SELECT", "15"])));
+        assert!(matches!(cmd, Command::Select { db: 15 }));
+    }
+
+    #[test]
+    fn parse_select_16_is_out_of_range() {
+        is_err(Command::parse(parts(&["SELECT", "16"])));
+    }
+
+    #[test]
+    fn parse_select_255_is_out_of_range() {
+        is_err(Command::parse(parts(&["SELECT", "255"])));
     }
 
     #[test]

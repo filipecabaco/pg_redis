@@ -2,38 +2,38 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
     <url>
          <loc>https://filipecabaco.github.io/pg_redis/</loc>
-         <lastmod>2026-04-22</lastmod>
+         <lastmod>2026-04-24</lastmod>
     </url>
     <url>
          <loc>https://filipecabaco.github.io/pg_redis/benchmarks/</loc>
-         <lastmod>2026-04-22</lastmod>
+         <lastmod>2026-04-24</lastmod>
     </url>
     <url>
          <loc>https://filipecabaco.github.io/pg_redis/command-coverage/</loc>
-         <lastmod>2026-04-22</lastmod>
+         <lastmod>2026-04-24</lastmod>
     </url>
     <url>
          <loc>https://filipecabaco.github.io/pg_redis/commands/</loc>
-         <lastmod>2026-04-22</lastmod>
+         <lastmod>2026-04-24</lastmod>
     </url>
     <url>
          <loc>https://filipecabaco.github.io/pg_redis/configuration/</loc>
-         <lastmod>2026-04-22</lastmod>
+         <lastmod>2026-04-24</lastmod>
     </url>
     <url>
          <loc>https://filipecabaco.github.io/pg_redis/development/</loc>
-         <lastmod>2026-04-22</lastmod>
+         <lastmod>2026-04-24</lastmod>
     </url>
     <url>
          <loc>https://filipecabaco.github.io/pg_redis/installation/</loc>
-         <lastmod>2026-04-22</lastmod>
+         <lastmod>2026-04-24</lastmod>
     </url>
     <url>
          <loc>https://filipecabaco.github.io/pg_redis/pubsub/</loc>
-         <lastmod>2026-04-22</lastmod>
+         <lastmod>2026-04-24</lastmod>
     </url>
     <url>
          <loc>https://filipecabaco.github.io/pg_redis/storage-modes/</loc>
-         <lastmod>2026-04-22</lastmod>
+         <lastmod>2026-04-24</lastmod>
     </url>
 </urlset>

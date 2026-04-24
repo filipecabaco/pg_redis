@@ -929,7 +929,7 @@
 
 
 <h1 id="benchmarks">Benchmarks</h1>
-<p>All figures are requests/second on Docker, Apple M-series. Benchmarks use <a href="https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/benchmarks/"><code>redis-benchmark</code></a> with <code>-n 50000 -c 200</code>.</p>
+<p>All figures are requests/second on Docker, Apple M-series. Benchmarks use <a href="https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/benchmarks/"><code>redis-benchmark</code></a> with <code>-n 50000 -c 200</code>, connecting to the default database (db 0 for memory/unlogged, db 1 for logged).</p>
 <h2 id="commands">Commands</h2>
 <table>
 <thead>
@@ -937,79 +937,80 @@
 <th>Command</th>
 <th>Redis 7</th>
 <th>pg_redis (memory)</th>
-<th>pg_redis (logged)</th>
+<th>pg_redis (SPI/unlogged)</th>
+<th>pg_redis (SPI/logged)</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td>PING</td>
-<td>198,000</td>
-<td>—</td>
-<td>138,000</td>
+<td>234,000</td>
+<td>112,000</td>
+<td>113,000</td>
+<td>103,000</td>
 </tr>
 <tr>
 <td>GET</td>
-<td>185,000</td>
-<td>136,000</td>
-<td>90,000</td>
+<td>243,000</td>
+<td>106,000</td>
+<td>85,000</td>
+<td>92,000</td>
 </tr>
 <tr>
 <td>SET</td>
-<td>175,000</td>
-<td>118,000</td>
-<td>3,004</td>
+<td>224,000</td>
+<td>103,000</td>
+<td>22,000</td>
+<td>12,000</td>
 </tr>
 <tr>
 <td>INCR</td>
-<td>187,000</td>
-<td>123,000</td>
-<td>2,764</td>
+<td>253,000</td>
+<td>116,000</td>
+<td>32,000</td>
+<td>14,000</td>
 </tr>
 <tr>
 <td>HSET</td>
-<td>182,000</td>
-<td>124,000</td>
-<td>15,038</td>
+<td>227,000</td>
+<td>83,000</td>
+<td>26,000</td>
+<td>13,000</td>
 </tr>
 <tr>
 <td>ZADD</td>
 <td>185,000</td>
-<td>127,000</td>
-<td>9,403</td>
+<td>118,000</td>
+<td>15,000</td>
+<td>7,000</td>
 </tr>
 <tr>
 <td>SADD</td>
-<td>190,000</td>
-<td>133,000</td>
-<td>29,412</td>
+<td>194,000</td>
+<td>82,000</td>
+<td>71,000</td>
+<td>66,000</td>
 </tr>
 <tr>
 <td>SPOP</td>
-<td>189,000</td>
-<td>131,000</td>
-<td>22,989</td>
+<td>183,000</td>
+<td>116,000</td>
+<td>51,000</td>
+<td>64,000</td>
 </tr>
 <tr>
 <td>ZPOPMIN</td>
-<td>194,000</td>
-<td>140,000</td>
-<td>17,652</td>
-</tr>
-<tr>
-<td>LPOP</td>
-<td>142,000</td>
-<td>119,000</td>
-<td>5,965</td>
-</tr>
-<tr>
-<td>RPOP</td>
-<td>177,000</td>
-<td>144,000</td>
-<td>11,614</td>
+<td>183,000</td>
+<td>118,000</td>
+<td>48,000</td>
+<td>47,000</td>
 </tr>
 </tbody>
 </table>
-<p>Memory mode (the default) reaches Redis-level throughput for all write commands. Logged databases pay PostgreSQL transaction overhead but survive crashes and are SQL-queryable.</p>
+<p><strong>Memory mode</strong> (even-numbered databases with <code>redis.storage_mode=memory</code>) stores data in shared-memory hash tables with no transaction overhead. Write commands reach near-Redis throughput; reads are close behind.</p>
+<p><strong>SPI/unlogged</strong> (even-numbered databases with <code>redis.storage_mode=auto</code>) uses PostgreSQL UNLOGGED tables. Reads remain fast; writes pay transaction and SPI overhead but survive worker restarts (though not a crash).</p>
+<p><strong>SPI/logged</strong> (odd-numbered databases) uses WAL-logged PostgreSQL tables. All data survives crashes and is fully SQL-queryable. Write throughput is lower due to WAL fsync overhead.</p>
+<p>Use <code>mise run bench-high-write</code> (8 workers, batch_size=256) to increase write throughput by spreading connections across more dispatchers.</p>
 <h2 id="pubsub">Pub/Sub</h2>
 <p>One publisher, varying subscriber counts. <strong>pub/s</strong> = publisher throughput; <strong>recv/s</strong> = total deliveries/s across all subscribers.</p>
 <table>

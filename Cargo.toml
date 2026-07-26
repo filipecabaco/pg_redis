@@ -19,6 +19,7 @@ pg_test = []
 [dependencies]
 pgrx = "=0.18.0"
 socket2 = { version = "0.5", features = ["all"] }
+libc = "0.2"
 subtle = "2"
 
 [dev-dependencies]

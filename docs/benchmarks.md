@@ -1,6 +1,10 @@
 # Benchmarks
 
-All figures are requests/second on Docker, Apple M-series. Benchmarks use [`redis-benchmark`](https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/benchmarks/) with `-n 50000 -c 200`, connecting to the default database (db 0 for memory/unlogged, db 1 for logged).
+All figures are requests/second on Docker, Apple M-series. Benchmarks use [`redis-benchmark`](https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/benchmarks/) with `-n 50000 -c 200`, connecting to the default database (db 0 for memory/unlogged, db 8 for logged).
+
+`redis-benchmark` writes 3-byte values by default, which never leave memory
+mode's 64-byte inline slot — so these figures say nothing about the overflow
+path. `mise run bench-value-sizes` sweeps 3/63/64/65/200/512 bytes for that.
 
 ## Commands
 
@@ -16,11 +20,11 @@ All figures are requests/second on Docker, Apple M-series. Benchmarks use [`redi
 | SPOP    | 183,000 | 116,000           | 51,000                  | 64,000                |
 | ZPOPMIN | 183,000 | 118,000           | 48,000                  | 47,000                |
 
-**Memory mode** (even-numbered databases with `redis.storage_mode=memory`) stores data in shared-memory hash tables with no transaction overhead. Write commands reach near-Redis throughput; reads are close behind.
+**Memory mode** (databases 0–7 with `redis.storage_mode=memory`) stores data in shared-memory hash tables with no transaction overhead. Write commands reach near-Redis throughput; reads are close behind.
 
-**SPI/unlogged** (even-numbered databases with `redis.storage_mode=auto`) uses PostgreSQL UNLOGGED tables. Reads remain fast; writes pay transaction and SPI overhead but survive worker restarts (though not a crash).
+**SPI/unlogged** (databases 0–7 with `redis.storage_mode=auto`) uses PostgreSQL UNLOGGED tables. Reads remain fast; writes pay transaction and SPI overhead but survive worker restarts (though not a crash).
 
-**SPI/logged** (odd-numbered databases) uses WAL-logged PostgreSQL tables. All data survives crashes and is fully SQL-queryable. Write throughput is lower due to WAL fsync overhead.
+**SPI/logged** (databases 8–15) uses WAL-logged PostgreSQL tables. All data survives crashes and is fully SQL-queryable. Write throughput is lower due to WAL fsync overhead.
 
 Use `mise run bench-high-write` (8 workers, batch_size=256) to increase write throughput by spreading connections across more dispatchers.
 

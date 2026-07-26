@@ -19,17 +19,17 @@ OK
 OK
 ```
 
-Switch to a durable, SQL-visible database with an odd-numbered `SELECT`:
+Switch to a durable, SQL-visible database with `SELECT durable`:
 
 ```bash
-127.0.0.1:6379> SELECT 1
+127.0.0.1:6379> SELECT durable
 OK
 127.0.0.1:6379> SET greeting "durable hello"
 OK
 ```
 
 ```sql
-SELECT key, value, expires_at FROM redis.kv_1;
+SELECT key, value, expires_at FROM redis.kv_8;
 ```
 
 ## How it works
@@ -40,8 +40,8 @@ Data is stored across 16 databases (0–15), mirroring Redis's native database m
 
 | DB numbers | Backend | Durability |
 |------------|---------|------------|
-| Even (0, 2 … 14) | Shared-memory hash tables (default) | Lost on restart |
-| Odd (1, 3 … 15) | WAL-logged PostgreSQL tables | Survives crashes |
+| 0–7 (`SELECT cache`) | Shared-memory hash tables (default) | Lost on restart |
+| 8–15 (`SELECT durable`) | WAL-logged PostgreSQL tables | Survives crashes |
 
 See [Storage modes](storage-modes.md) for the full breakdown.
 
@@ -51,3 +51,4 @@ See [Storage modes](storage-modes.md) for the full breakdown.
 - [Configuration](configuration.md) — GUC reference and worker tuning
 - [Commands](commands.md) — supported Redis commands with behaviour notes
 - [Command coverage](command-coverage.md) — full compatibility matrix
+- [Handoff](handoff.md) — in-flight work, how to verify a change, known traps

@@ -921,6 +921,7 @@ dependencies = [
 name = "pg_redis"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "pgrx",
  "pgrx-tests",
  "socket2 0.5.10",

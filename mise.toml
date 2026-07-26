@@ -118,6 +118,30 @@ run_suite 'Redis 7 (reference)' redis
 run_suite 'pg_redis' postgres
 """
 
+[tasks.bench-value-sizes]
+description = "Benchmark SET/GET across the value-size boundaries the default -d 3 never reaches"
+run = """
+set -e
+docker compose -f docker-compose.yml -f docker-compose.noports.yml --profile bench up -d --build --wait
+trap 'docker compose --profile bench down' EXIT INT TERM
+sleep 2
+
+# redis-benchmark defaults to 3-byte values, so the standard suite never leaves
+# the 64-byte inline slot. These sizes straddle every boundary the memory
+# backend has: the inline slot, the overflow table, and the 512-byte cap.
+for d in 3 63 64 65 200 512; do
+  echo ''
+  echo "══ value size ${d} bytes ═══════════════════════════════"
+  for t in set get; do
+    docker compose exec -T redis redis-benchmark \\
+        -h postgres -p 6379 -a testpass -n 20000 -c 50 -d $d -q -t $t 2>/dev/null \\
+      | tr '\\r' '\\n' \\
+      | grep 'requests per second' \\
+      || echo " $t: <connection closed>"
+  done
+done
+"""
+
 [tasks.bench-high-write]
 description = "High-concurrency write benchmark: 8 workers, batch_size=256, 200 clients"
 run = """

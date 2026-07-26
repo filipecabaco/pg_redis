@@ -11,11 +11,103 @@ const redisUrl = `redis://:${REDIS_PASSWORD}@${REDIS_HOST}:${REDIS_PORT}`;
 const sql = new Bun.sql(DATABASE_URL);
 let client: Bun.RedisClient;
 
-beforeAll(() => {
+/**
+ * A minimal RESP client that speaks bytes.
+ *
+ * `Bun.RedisClient` takes command arguments as strings and encodes them as
+ * UTF-8, so it cannot express a value like `0xff` — that arrives as the two
+ * bytes of U+00FF. Anything asserting on exact byte counts or exact byte
+ * content has to bypass it, or it ends up measuring the client's encoder.
+ */
+class RawRedis {
+	private socket!: Awaited<ReturnType<typeof Bun.connect>>;
+	private buffer = Buffer.alloc(0);
+	private waiters: Array<(b: Buffer) => void> = [];
+
+	async connect() {
+		this.socket = await Bun.connect({
+			hostname: REDIS_HOST,
+			port: Number(REDIS_PORT),
+			socket: {
+				data: (_s, chunk) => {
+					this.buffer = Buffer.concat([this.buffer, Buffer.from(chunk)]);
+					this.drain();
+				},
+				error: () => {},
+				close: () => {},
+			},
+		});
+		await this.send("AUTH", REDIS_PASSWORD);
+		return this;
+	}
+
+	/** Resolve waiters as soon as one complete reply is buffered. */
+	private drain() {
+		while (this.waiters.length > 0) {
+			const end = replyEnd(this.buffer);
+			if (end < 0) return;
+			const reply = this.buffer.subarray(0, end);
+			this.buffer = this.buffer.subarray(end);
+			this.waiters.shift()?.(Buffer.from(reply));
+		}
+	}
+
+	send(...args: Array<string | Buffer>): Promise<Buffer> {
+		const parts: Buffer[] = [Buffer.from(`*${args.length}\r\n`)];
+		for (const a of args) {
+			const b = Buffer.isBuffer(a) ? a : Buffer.from(a, "utf8");
+			parts.push(Buffer.from(`$${b.length}\r\n`), b, Buffer.from("\r\n"));
+		}
+		const done = new Promise<Buffer>((resolve) => this.waiters.push(resolve));
+		this.socket.write(Buffer.concat(parts));
+		return done;
+	}
+
+	/** The payload of a bulk-string reply, or null for a nil reply. */
+	async bulk(...args: Array<string | Buffer>): Promise<Buffer | null> {
+		const reply = await this.send(...args);
+		if (reply[0] !== 0x24) return null; // not '$'
+		const head = reply.indexOf("\r\n");
+		const len = Number(reply.subarray(1, head).toString());
+		if (len < 0) return null;
+		return reply.subarray(head + 2, head + 2 + len);
+	}
+
+	close() {
+		this.socket.end();
+	}
+}
+
+/** Offset just past the first complete RESP reply in `buf`, or -1. */
+function replyEnd(buf: Buffer): number {
+	if (buf.length === 0) return -1;
+	const head = buf.indexOf("\r\n");
+	if (head < 0) return -1;
+	// Bulk strings carry a length; every other reply type ends at the newline.
+	if (buf[0] !== 0x24) return head + 2;
+	const len = Number(buf.subarray(1, head).toString());
+	if (len < 0) return head + 2;
+	const end = head + 2 + len + 2;
+	return buf.length >= end ? end : -1;
+}
+
+let raw: RawRedis;
+/** True when databases 0-7 are served from shared memory rather than tables. */
+let memoryMode = false;
+
+beforeAll(async () => {
 	client = new Bun.RedisClient(redisUrl);
+	raw = await new RawRedis().connect();
+	// Aliased: `SHOW redis.storage_mode` names the column "redis.storage_mode",
+	// dot and all, so destructuring by `storage_mode` silently yields undefined
+	// and every memory-mode assertion below takes the wrong branch.
+	const [{ mode }] =
+		await sql`SELECT current_setting('redis.storage_mode') AS mode`;
+	memoryMode = mode === "memory";
 });
 
 afterAll(async () => {
+	raw.close();
 	client.close();
 	await sql.end();
 });
@@ -257,7 +349,7 @@ describe("TTL expiry deletion", () => {
 
 	test("expired key is physically deleted after GET", async () => {
 		const rows =
-			await sql`SELECT count(*)::int AS cnt FROM redis.kv_1 WHERE key = 'expiring_key'`;
+			await sql`SELECT count(*)::int AS cnt FROM redis.kv_8 WHERE key = 'expiring_key'`;
 		expect(rows[0].cnt).toBe(0);
 	});
 
@@ -270,7 +362,7 @@ describe("TTL expiry deletion", () => {
 	test("active scan deletes without GET", async () => {
 		await Bun.sleep(3000);
 		const rows =
-			await sql`SELECT count(*)::int AS cnt FROM redis.kv_1 WHERE key = 'active_scan_key'`;
+			await sql`SELECT count(*)::int AS cnt FROM redis.kv_8 WHERE key = 'active_scan_key'`;
 		expect(rows[0].cnt).toBe(0);
 	});
 
@@ -289,7 +381,7 @@ describe("TTL expiry deletion", () => {
 
 	test("long TTL key row still exists in DB", async () => {
 		const rows =
-			await sql`SELECT count(*)::int AS cnt FROM redis.kv_1 WHERE key = 'long_ttl_key'`;
+			await sql`SELECT count(*)::int AS cnt FROM redis.kv_8 WHERE key = 'long_ttl_key'`;
 		expect(rows[0].cnt).toBe(1);
 	});
 
@@ -346,45 +438,64 @@ describe("Hash", () => {
 });
 
 describe("SELECT isolation", () => {
-	test("DB 0 and DB 1 are isolated", async () => {
-		await client.send("SELECT", ["0"]);
+	test("the cache and durable halves are isolated", async () => {
+		await client.send("SELECT", ["cache"]);
 		await client.del("ulkey");
-		await client.send("SELECT", ["1"]);
+		await client.send("SELECT", ["durable"]);
 		await client.del("ulkey");
 
-		await client.send("SELECT", ["0"]);
+		await client.send("SELECT", ["cache"]);
 		expect(await client.set("ulkey", "ulval")).toBe("OK");
 		expect(await client.get("ulkey")).toBe("ulval");
 
-		await client.send("SELECT", ["1"]);
+		await client.send("SELECT", ["durable"]);
 		expect(await client.get("ulkey")).toBeNull();
 
-		await client.send("SELECT", ["0"]);
+		await client.send("SELECT", ["cache"]);
 	});
 
 	test("full isolation matrix", async () => {
-		await client.send("SELECT", ["0"]);
+		await client.send("SELECT", ["cache"]);
 		await client.del("isolation_ul");
-		await client.send("SELECT", ["1"]);
+		await client.send("SELECT", ["durable"]);
 		await client.del("isolation_ul");
 		await client.del("isolation_lg");
 
-		await client.send("SELECT", ["0"]);
+		await client.send("SELECT", ["cache"]);
 		expect(await client.set("isolation_ul", "isolation_val")).toBe("OK");
 		expect(await client.get("isolation_ul")).toBe("isolation_val");
 
-		await client.send("SELECT", ["1"]);
+		await client.send("SELECT", ["durable"]);
 		expect(await client.get("isolation_ul")).toBeNull();
 		expect(await client.set("isolation_lg", "isolation_val")).toBe("OK");
 		expect(await client.get("isolation_lg")).toBe("isolation_val");
 
-		await client.send("SELECT", ["0"]);
+		await client.send("SELECT", ["cache"]);
 		expect(await client.get("isolation_lg")).toBeNull();
 
-		await client.send("SELECT", ["1"]);
+		await client.send("SELECT", ["durable"]);
 		expect(await client.del("isolation_lg")).toBe(1);
 
+		await client.send("SELECT", ["cache"]);
+	});
+
+	test("the half names are aliases for 0 and 8, not separate databases", async () => {
+		await client.send("SELECT", ["durable"]);
+		expect(await client.set("alias_key", "alias_val")).toBe("OK");
+		await client.send("SELECT", ["8"]);
+		expect(await client.get("alias_key")).toBe("alias_val");
+		expect(await client.del("alias_key")).toBe(1);
+
+		await client.send("SELECT", ["cache"]);
+		expect(await client.set("alias_key", "alias_val")).toBe("OK");
 		await client.send("SELECT", ["0"]);
+		expect(await client.get("alias_key")).toBe("alias_val");
+		expect(await client.del("alias_key")).toBe(1);
+	});
+
+	test("an unknown database name is rejected", async () => {
+		await expect(client.send("SELECT", ["ephemeral"])).rejects.toThrow();
+		await expect(client.send("SELECT", ["16"])).rejects.toThrow();
 	});
 });
 
@@ -634,43 +745,61 @@ describe("List", () => {
 		await expect(client.send("LSET", ["setlist", "99", "x"])).rejects.toThrow();
 	});
 
+	// Driven through the raw client: these ran only against the durable half
+	// before, because `SELECT isolation` leaves the pooled client on db 0 and a
+	// filtered run skips it. Being explicit about the database is what makes
+	// them cover the shared-memory list at all.
 	test("LINSERT BEFORE pivot", async () => {
-		await client.send("DEL", ["inslist"]);
-		await client.send("RPUSH", ["inslist", "a", "c", "e"]);
-		expect(await client.send("LINSERT", ["inslist", "BEFORE", "c", "b"])).toBe(
-			4,
+		await raw.send("SELECT", "cache");
+		await raw.send("DEL", "inslist");
+		await raw.send("RPUSH", "inslist", "a", "c", "e");
+		expect((await raw.send("LINSERT", "inslist", "BEFORE", "c", "b")).toString()).toBe(
+			":4\r\n",
 		);
-		expect(await client.send("LRANGE", ["inslist", "0", "-1"])).toEqual([
-			"a",
-			"b",
-			"c",
-			"e",
-		]);
+		expect(await raw.bulk("LINDEX", "inslist", "1")).toEqual(Buffer.from("b"));
 	});
 
 	test("LINSERT AFTER pivot", async () => {
-		expect(await client.send("LINSERT", ["inslist", "AFTER", "c", "d"])).toBe(
-			5,
+		expect((await raw.send("LINSERT", "inslist", "AFTER", "c", "d")).toString()).toBe(
+			":5\r\n",
 		);
-		expect(await client.send("LRANGE", ["inslist", "0", "-1"])).toEqual([
-			"a",
-			"b",
-			"c",
-			"d",
-			"e",
-		]);
+		// The whole list, in order: a rewrite that renumbers positions has to
+		// leave every element reachable, not just the ones before the splice.
+		for (const [i, want] of ["a", "b", "c", "d", "e"].entries()) {
+			expect(await raw.bulk("LINDEX", "inslist", String(i))).toEqual(
+				Buffer.from(want),
+			);
+		}
 	});
 
 	test("LINSERT missing pivot returns -1", async () => {
-		expect(await client.send("LINSERT", ["inslist", "BEFORE", "Z", "x"])).toBe(
-			-1,
+		expect((await raw.send("LINSERT", "inslist", "BEFORE", "Z", "x")).toString()).toBe(
+			":-1\r\n",
 		);
 	});
 
 	test("LINSERT on missing key returns 0", async () => {
 		expect(
-			await client.send("LINSERT", ["nokey-linsert", "BEFORE", "p", "v"]),
-		).toBe(0);
+			(await raw.send("LINSERT", "nokey-linsert", "BEFORE", "p", "v")).toString(),
+		).toBe(":0\r\n");
+		await raw.send("SELECT", "durable");
+	});
+
+	// LREM removed the right elements but left holes, and readers walk
+	// positions contiguously from min_pos — so the tail became unreachable and
+	// the list silently lost its last element.
+	test("LREM leaves the surviving tail reachable", async () => {
+		await raw.send("SELECT", "cache");
+		await raw.send("DEL", "remraw");
+		await raw.send("RPUSH", "remraw", "a", "x", "a", "x", "a");
+		expect((await raw.send("LREM", "remraw", "2", "a")).toString()).toBe(":2\r\n");
+		expect((await raw.send("LLEN", "remraw")).toString()).toBe(":3\r\n");
+		for (const [i, want] of ["x", "x", "a"].entries()) {
+			expect(await raw.bulk("LINDEX", "remraw", String(i))).toEqual(
+				Buffer.from(want),
+			);
+		}
+		await raw.send("SELECT", "durable");
 	});
 
 	test("LREM positive count removes from head", async () => {
@@ -1550,6 +1679,273 @@ describe("Transactions", () => {
 	});
 });
 
+describe("Binary safety", () => {
+	// Redis keys and values are arbitrary byte strings. These bytes are exactly
+	// what the previous TEXT columns could not store: a NUL, and sequences that
+	// are not valid UTF-8.
+	const BINARY = Buffer.from([0x00, 0xff, 0xfe, 0x61, 0x80, 0x0a, 0x01]);
+
+	test("a value containing NUL and invalid UTF-8 round-trips byte for byte", async () => {
+		const key = "binkey";
+		await raw.send("SET", key, BINARY);
+		expect(await raw.bulk("GET", key)).toEqual(BINARY);
+		// STRLEN counts stored bytes, which is the whole point: a UTF-8 round
+		// trip through the client would report 10 for these 7 bytes.
+		expect((await raw.send("STRLEN", key)).toString()).toBe(
+			`:${BINARY.length}\r\n`,
+		);
+		await raw.send("DEL", key);
+	});
+
+	test("keys differing only after a NUL are distinct keys", async () => {
+		const a = Buffer.concat([BINARY, Buffer.from("one")]);
+		const b = Buffer.concat([BINARY, Buffer.from("two")]);
+		await raw.send("SET", a, "first");
+		await raw.send("SET", b, "second");
+		expect((await raw.bulk("GET", a))?.toString()).toBe("first");
+		expect((await raw.bulk("GET", b))?.toString()).toBe("second");
+		await raw.send("DEL", a);
+		await raw.send("DEL", b);
+	});
+});
+
+describe("Pub/Sub pattern matching", () => {
+	// A pattern whose wildcards run past the end of the channel name used to
+	// panic inside PUBLISH while the pub/sub spinlock was held, wedging pub/sub
+	// for every worker process. The server must stay responsive afterwards.
+	const HOSTILE_PATTERNS = ["*?", "*[a]", "?", "*a", "[abc"];
+
+	test("wildcard patterns past the end of a channel do not wedge the server", async () => {
+		for (const pattern of HOSTILE_PATTERNS) {
+			const subscriber = new Bun.RedisClient(redisUrl);
+			try {
+				await subscriber.send("PSUBSCRIBE", [pattern]);
+				// Empty channel name: nothing is left for the wildcards to consume.
+				await client.send("PUBLISH", ["", "payload"]);
+				await client.send("PUBLISH", ["a", "payload"]);
+			} finally {
+				subscriber.close();
+			}
+			// If the spinlock had leaked, this would hang rather than reply.
+			expect(await client.send("PUBSUB", ["NUMPAT"])).toBeDefined();
+			expect(await client.ping()).toBe("PONG");
+		}
+	});
+
+	test("PSUBSCRIBE delivers only to matching channels", async () => {
+		const subscriber = new Bun.RedisClient(redisUrl);
+		try {
+			await subscriber.send("PSUBSCRIBE", ["news.*"]);
+			await Bun.sleep(100);
+
+			expect(await client.send("PUBLISH", ["news.sports", "hit"])).toBe(1);
+			// `news.*` must not match a channel that merely starts with `news`.
+			expect(await client.send("PUBLISH", ["newsletter", "miss"])).toBe(0);
+			// ...nor one that only ends with the literal part of the pattern.
+			expect(await client.send("PUBLISH", ["other.news", "miss"])).toBe(0);
+		} finally {
+			subscriber.close();
+		}
+	});
+});
+
+describe("Pub/Sub size limits", () => {
+	// Names and payloads live in fixed-size shared-memory slots. Truncating them
+	// would leave a client subscribed to a channel it can never receive on, so
+	// the server rejects them instead.
+	const MAX_CHANNEL = 255;
+	const MAX_PAYLOAD = 512;
+
+	test("a channel name at the limit works end to end", async () => {
+		const channel = "c".repeat(MAX_CHANNEL);
+		const subscriber = new Bun.RedisClient(redisUrl);
+		try {
+			await subscriber.send("SUBSCRIBE", [channel]);
+			await Bun.sleep(100);
+			expect(await client.send("PUBLISH", [channel, "hi"])).toBe(1);
+		} finally {
+			subscriber.close();
+		}
+	});
+
+	test("a payload at the limit is delivered", async () => {
+		const subscriber = new Bun.RedisClient(redisUrl);
+		try {
+			await subscriber.send("SUBSCRIBE", ["limit-chan"]);
+			await Bun.sleep(100);
+			const payload = "p".repeat(MAX_PAYLOAD);
+			expect(await client.send("PUBLISH", ["limit-chan", payload])).toBe(1);
+		} finally {
+			subscriber.close();
+		}
+	});
+
+	test("an over-long channel name is rejected, not truncated", async () => {
+		const tooLong = "c".repeat(MAX_CHANNEL + 1);
+		await expect(client.send("PUBLISH", [tooLong, "hi"])).rejects.toThrow(
+			/limit/,
+		);
+		const subscriber = new Bun.RedisClient(redisUrl);
+		try {
+			await expect(subscriber.send("SUBSCRIBE", [tooLong])).rejects.toThrow(
+				/limit/,
+			);
+		} finally {
+			subscriber.close();
+		}
+	});
+
+	test("an over-long payload is rejected, not truncated", async () => {
+		await expect(
+			client.send("PUBLISH", ["limit-chan", "p".repeat(MAX_PAYLOAD + 1)]),
+		).rejects.toThrow(/limit/);
+	});
+});
+
+// The shared-memory backend stores the first INLINE_VAL_LEN (64) bytes of a
+// value inside the entry and spills the rest into a separate overflow table.
+// `redis-benchmark` writes 3-byte values, so nothing in the benchmark suite has
+// ever crossed that boundary, and the spill/reclaim paths were where two
+// silent-truncation bugs lived.
+const INLINE_VAL_LEN = 64;
+const MAX_TOTAL_VAL_LEN = 512;
+const MAX_MEMBER_LEN = 128;
+const MEM_MAX_KEY = 511;
+
+/** Distinct, position-dependent bytes, so a truncation cannot pass by luck. */
+function payload(n: number): Buffer {
+	const b = Buffer.alloc(n);
+	for (let i = 0; i < n; i++) b[i] = 33 + (i % 90);
+	return b;
+}
+
+/** Sizes either side of every boundary the value path has. */
+const VALUE_SIZES = [
+	1,
+	INLINE_VAL_LEN - 1, // 63  last fully-inline size
+	INLINE_VAL_LEN, // 64  exactly fills the inline slot
+	INLINE_VAL_LEN + 1, // 65  first byte to reach the overflow table
+	200, // comfortably inside overflow
+	MAX_TOTAL_VAL_LEN - 1, // 511
+	MAX_TOTAL_VAL_LEN, // 512 largest the memory backend accepts
+];
+
+describe("Value size limits", () => {
+	// These limits belong to the ephemeral half. On db 8 every value is a
+	// bytea column with no cap, so the whole describe would pass vacuously.
+	beforeAll(async () => {
+		await raw.send("SELECT", "cache");
+	});
+	afterAll(async () => {
+		await raw.send("SELECT", "durable");
+	});
+
+	test("string values round-trip byte for byte at every boundary", async () => {
+		for (const n of VALUE_SIZES) {
+			const v = payload(n);
+			await raw.send("SET", "vs:str", v);
+			expect(await raw.bulk("GET", "vs:str")).toEqual(v);
+			expect((await raw.send("STRLEN", "vs:str")).toString()).toBe(`:${n}\r\n`);
+		}
+		await raw.send("DEL", "vs:str");
+	});
+
+	test("hash values round-trip byte for byte at every boundary", async () => {
+		for (const n of VALUE_SIZES) {
+			const v = payload(n);
+			await raw.send("HSET", "vs:hash", "f", v);
+			expect(await raw.bulk("HGET", "vs:hash", "f")).toEqual(v);
+		}
+		await raw.send("DEL", "vs:hash");
+	});
+
+	test("list values round-trip byte for byte at every boundary", async () => {
+		for (const n of VALUE_SIZES) {
+			const v = payload(n);
+			await raw.send("DEL", "vs:list");
+			await raw.send("RPUSH", "vs:list", v);
+			expect(await raw.bulk("LINDEX", "vs:list", "0")).toEqual(v);
+		}
+		await raw.send("DEL", "vs:list");
+	});
+
+	// Shrinking a value has to release the overflow row it used to own.
+	// Leaving it behind, or leaving has_overflow set, makes the next read
+	// splice a stale tail onto the new value.
+	test("shrinking a value past the inline boundary drops its overflow tail", async () => {
+		const big = payload(300);
+		const small = payload(10);
+		await raw.send("SET", "vs:shrink", big);
+		expect(await raw.bulk("GET", "vs:shrink")).toEqual(big);
+		await raw.send("SET", "vs:shrink", small);
+		expect(await raw.bulk("GET", "vs:shrink")).toEqual(small);
+
+		await raw.send("HSET", "vs:shrinkh", "f", big);
+		await raw.send("HSET", "vs:shrinkh", "f", small);
+		expect(await raw.bulk("HGET", "vs:shrinkh", "f")).toEqual(small);
+
+		await raw.send("DEL", "vs:shrink");
+		await raw.send("DEL", "vs:shrinkh");
+	});
+
+	test("APPEND growing a value across the inline boundary keeps every byte", async () => {
+		await raw.send("DEL", "vs:app");
+		const head = payload(60);
+		const tail = payload(30);
+		await raw.send("SET", "vs:app", head);
+		await raw.send("APPEND", "vs:app", tail);
+		expect(await raw.bulk("GET", "vs:app")).toEqual(
+			Buffer.concat([head, tail]),
+		);
+		await raw.send("DEL", "vs:app");
+	});
+
+	test("a value one byte over the limit is refused in memory mode, stored otherwise", async () => {
+		const over = payload(MAX_TOTAL_VAL_LEN + 1);
+		await raw.send("DEL", "vs:over");
+		const reply = (await raw.send("SET", "vs:over", over)).toString();
+		if (memoryMode) {
+			expect(reply).toMatch(/limit/);
+			// A refusal must not leave a partial value behind.
+			expect(await raw.bulk("GET", "vs:over")).toBeNull();
+		} else {
+			expect(reply).toBe("+OK\r\n");
+			expect(await raw.bulk("GET", "vs:over")).toEqual(over);
+		}
+		await raw.send("DEL", "vs:over");
+	});
+
+	test("hash fields and keys are bounded the same way", async () => {
+		const okField = payload(MAX_MEMBER_LEN);
+		const bigField = payload(MAX_MEMBER_LEN + 1);
+		const okKey = payload(MEM_MAX_KEY);
+		const bigKey = payload(MEM_MAX_KEY + 1);
+
+		await raw.send("HSET", "vs:lim", okField, "v");
+		expect((await raw.bulk("HGET", "vs:lim", okField))?.toString()).toBe("v");
+		await raw.send("SET", okKey, "v");
+		expect((await raw.bulk("GET", okKey))?.toString()).toBe("v");
+
+		const fieldReply = (
+			await raw.send("HSET", "vs:lim", bigField, "v")
+		).toString();
+		const keyReply = (await raw.send("SET", bigKey, "v")).toString();
+		if (memoryMode) {
+			expect(fieldReply).toMatch(/limit/);
+			expect(keyReply).toMatch(/limit/);
+			// The over-long key must not have collided onto its own prefix.
+			expect((await raw.bulk("GET", okKey))?.toString()).toBe("v");
+		} else {
+			expect(fieldReply).toMatch(/^:/);
+			expect(keyReply).toBe("+OK\r\n");
+			await raw.send("DEL", bigKey);
+		}
+
+		await raw.send("DEL", "vs:lim");
+		await raw.send("DEL", okKey);
+	});
+});
+
 describe("Pub/Sub table routing", () => {
 	const ROUTE_TABLE = "pg_redis_e2e_route_test";
 
@@ -1569,7 +1965,7 @@ describe("Pub/Sub table routing", () => {
 		// Give the BGW dispatcher time to process the fire-and-forget INSERT
 		await Bun.sleep(500);
 		const rows =
-			await sql`SELECT channel, payload FROM public.${sql.unsafe(ROUTE_TABLE)} WHERE channel = 'e2e-route-ch'`;
+			await sql`SELECT convert_from(channel, 'UTF8') AS channel, convert_from(payload, 'UTF8') AS payload FROM public.${sql.unsafe(ROUTE_TABLE)} WHERE channel = 'e2e-route-ch'`;
 		expect(rows.length).toBeGreaterThanOrEqual(1);
 		expect(rows[0].payload).toBe("hello-world");
 	});
@@ -1638,9 +2034,9 @@ describe("Pub/Sub multi-channel persistency", () => {
 		await Bun.sleep(500);
 
 		const orderRows =
-			await sql`SELECT channel, payload FROM public.${sql.unsafe(ORDERS_TABLE)}`;
+			await sql`SELECT convert_from(channel, 'UTF8') AS channel, convert_from(payload, 'UTF8') AS payload FROM public.${sql.unsafe(ORDERS_TABLE)}`;
 		const alertRows =
-			await sql`SELECT channel, payload FROM public.${sql.unsafe(ALERTS_TABLE)}`;
+			await sql`SELECT convert_from(channel, 'UTF8') AS channel, convert_from(payload, 'UTF8') AS payload FROM public.${sql.unsafe(ALERTS_TABLE)}`;
 
 		expect(orderRows.length).toBe(1);
 		expect(orderRows[0].channel).toBe("orders");
@@ -1663,7 +2059,7 @@ describe("Pub/Sub multi-channel persistency", () => {
 		await Bun.sleep(500);
 
 		const rows =
-			await sql`SELECT payload FROM public.${sql.unsafe(ORDERS_TABLE)} WHERE channel = 'orders' ORDER BY inserted_at, id`;
+			await sql`SELECT convert_from(payload, 'UTF8') AS payload FROM public.${sql.unsafe(ORDERS_TABLE)} WHERE channel = 'orders' ORDER BY inserted_at, id`;
 		const payloads = rows.map((r: { payload: string }) => r.payload);
 		expect(payloads).toContain("order-A");
 		expect(payloads).toContain("order-B");
@@ -1677,9 +2073,9 @@ describe("Pub/Sub multi-channel persistency", () => {
 		await Bun.sleep(500);
 
 		const createdRows =
-			await sql`SELECT payload FROM public.${sql.unsafe(AUDIT_TABLE)} WHERE channel = 'user.created' ORDER BY inserted_at, id`;
+			await sql`SELECT convert_from(payload, 'UTF8') AS payload FROM public.${sql.unsafe(AUDIT_TABLE)} WHERE channel = 'user.created' ORDER BY inserted_at, id`;
 		const deletedRows =
-			await sql`SELECT payload FROM public.${sql.unsafe(AUDIT_TABLE)} WHERE channel = 'user.deleted' ORDER BY inserted_at, id`;
+			await sql`SELECT convert_from(payload, 'UTF8') AS payload FROM public.${sql.unsafe(AUDIT_TABLE)} WHERE channel = 'user.deleted' ORDER BY inserted_at, id`;
 
 		expect(createdRows.length).toBe(2);
 		expect(createdRows[0].payload).toBe("user-1");

@@ -19,11 +19,41 @@ env:
   SCCACHE_GHA_ENABLED: "true"
   RUSTC_WRAPPER: "sccache"
   CARGO_INCREMENTAL: "0"
-  CARGO_PGRX_VERSION: "0.18.0"
 
 jobs:
-  check:
-    name: Check
+  # Everything that needs neither PostgreSQL nor a compiled crate. Seconds, not
+  # minutes — which is what makes it a sensible gate for the heavy jobs.
+  # A workflow that does not parse is rejected before any job starts, so it
+  # reports as a bare failure with no logs to read. Catch it here instead.
+  workflows:
+    name: Workflows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Validate workflow files
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib, sys, yaml
+          bad = []
+          for path in sorted(pathlib.Path(".github/workflows").glob("*.y*ml")):
+              try:
+                  yaml.safe_load(path.read_text())
+              except yaml.YAMLError as exc:
+                  bad.append(f"{path}: {exc}")
+          if bad:
+              print("\n".join(bad), file=sys.stderr)
+              sys.exit(1)
+          print("all workflow files parse")
+          PY
+
+  # rustfmt parses the source; it needs no PostgreSQL and no build, so this
+  # stays seconds long and is worth gating the expensive jobs on.
+  fmt:
+    name: Format
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -31,11 +61,47 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # Clippy needs pg_config to generate bindings, so it pays the pgrx setup cost.
+  # It no longer gates the test matrix: a lint failure and a test failure are
+  # independent facts, and waiting for one to learn the other doubles the time
+  # to a red build.
+  clippy:
+    name: Clippy
+    needs: [fmt, workflows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # Cargo.toml pins the exact pgrx version; read it from there rather than
+      # keeping a second copy here. A workflow file is the one thing the
+      # auto-update job's token may not rewrite, so a copy in this file is what
+      # made that job fail on every run.
+      - name: Resolve pgrx version
+        run: |
+          set -euo pipefail
+          VERSION=$(sed -nE 's/^pgrx = "=([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p' Cargo.toml)
+          if [[ -z "$VERSION" ]]; then
+            echo "could not read the pgrx version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "CARGO_PGRX_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
         id: rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: stable
-          components: rustfmt, clippy
+          components: clippy
 
       - name: Install system dependencies
         run: |
@@ -54,14 +120,16 @@ jobs:
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
         with:
-          shared-key: "check"
+          shared-key: "pg17"
           cache-on-failure: "true"
 
-      - name: Cache pgrx data dir
+      - name: Cache the built PostgreSQL
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
-          path: ~/.pgrx
-          key: ${{ runner.os }}-pgrx-${{ env.CARGO_PGRX_VERSION }}-pg17
+          path: |
+            ~/.pgrx/config.toml
+            ~/.pgrx/*/pgrx-install
+          key: ${{ runner.os }}-pgrx-install-${{ env.CARGO_PGRX_VERSION }}-pg17
 
       - name: Cache cargo-pgrx binary
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
@@ -73,20 +141,26 @@ jobs:
         run: cargo pgrx --version 2>/dev/null | grep -q "${{ env.CARGO_PGRX_VERSION }}" || cargo install cargo-pgrx --version "=${{ env.CARGO_PGRX_VERSION }}" --locked
 
       - name: Initialize pgrx
-        run: cargo pgrx init --pg17 download
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: |
+          set -euo pipefail
+          # Six minutes of compiling PostgreSQL, and nothing about it changes
+          # between runs. Skip it when the cache already carries the install.
+          if compgen -G "$HOME/.pgrx/17.*/pgrx-install/bin/pg_config" > /dev/null; then
+            echo "reusing the cached PostgreSQL 17 build"
+          else
+            cargo pgrx init --pg17 download
+          fi
 
       - name: Clippy
-        run: cargo clippy --features pg17 --lib --bins -- -D warnings
+        run: cargo clippy --features pg17 --all-targets -- -D warnings
 
       - name: Print sccache stats
+        if: always()
         run: sccache --show-stats
 
   test:
     name: Test (pg${{ matrix.pg }})
-    needs: [check]
+    needs: [fmt, workflows]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -96,6 +170,20 @@ jobs:
         pg: [15, 16, 17]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # Cargo.toml pins the exact pgrx version; read it from there rather than
+      # keeping a second copy here. A workflow file is the one thing the
+      # auto-update job's token may not rewrite, so a copy in this file is what
+      # made that job fail on every run.
+      - name: Resolve pgrx version
+        run: |
+          set -euo pipefail
+          VERSION=$(sed -nE 's/^pgrx = "=([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p' Cargo.toml)
+          if [[ -z "$VERSION" ]]; then
+            echo "could not read the pgrx version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "CARGO_PGRX_VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain
         id: rust
@@ -123,11 +211,13 @@ jobs:
           shared-key: "pg${{ matrix.pg }}"
           cache-on-failure: "true"
 
-      - name: Cache pgrx data dir
+      - name: Cache the built PostgreSQL
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
-          path: ~/.pgrx
-          key: ${{ runner.os }}-pgrx-${{ env.CARGO_PGRX_VERSION }}-pg${{ matrix.pg }}
+          path: |
+            ~/.pgrx/config.toml
+            ~/.pgrx/*/pgrx-install
+          key: ${{ runner.os }}-pgrx-install-${{ env.CARGO_PGRX_VERSION }}-pg${{ matrix.pg }}
 
       - name: Cache cargo-pgrx binary
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
@@ -139,17 +229,34 @@ jobs:
         run: cargo pgrx --version 2>/dev/null | grep -q "${{ env.CARGO_PGRX_VERSION }}" || cargo install cargo-pgrx --version "=${{ env.CARGO_PGRX_VERSION }}" --locked
 
       - name: Initialize pgrx for pg${{ matrix.pg }}
-        run: cargo pgrx init --pg${{ matrix.pg }} download
+        run: |
+          set -euo pipefail
+          # Six minutes of compiling PostgreSQL, and nothing about it changes
+          # between runs. Skip it when the cache already carries the install.
+          if compgen -G "$HOME/.pgrx/${{ matrix.pg }}.*/pgrx-install/bin/pg_config" > /dev/null; then
+            echo "reusing the cached PostgreSQL pg${{ matrix.pg }} build"
+          else
+            cargo pgrx init --pg${{ matrix.pg }} download
+          fi
 
+      # pgrx builds PostgreSQL with --enable-cassert, so this runs against
+      # assertions the distribution packages compile out. That is the point:
+      # misuse of a PostgreSQL internal shows up here and nowhere else.
       - name: Run unit tests
         run: cargo pgrx test pg${{ matrix.pg }}
 
       - name: Print sccache stats
+        if: always()
         run: sccache --show-stats
 
-  e2e:
-    name: E2E
-    needs: [check]
+  # Building the extension image takes longer than everything it is built for.
+  # Both storage-mode legs need the identical image, and when they built it
+  # themselves they started together — so neither could reuse the other's layer
+  # cache and each paid the full cost. Build it once here; the legs below then
+  # restore the warm cache and their build is nearly all hits.
+  image:
+    name: Build image
+    needs: [fmt, workflows]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -175,10 +282,50 @@ jobs:
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
 
+      # actions/cache saves in the post-job phase, so the cache this writes is
+      # in place before any job that `needs` this one starts.
       - name: Move cache
         run: |
           rm -rf /tmp/.buildx-cache
           mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+  # One leg per storage mode, run concurrently. The two modes share almost no
+  # server-side code below the dispatcher — memory mode bypasses SPI entirely —
+  # so both have to run, and running them in sequence doubled this job.
+  e2e:
+    name: E2E (${{ matrix.storage_mode }})
+    needs: [image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        storage_mode: [auto, memory]
+    env:
+      PG_REDIS_STORAGE_MODE: ${{ matrix.storage_mode }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+
+      - name: Restore Docker layers
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ hashFiles('Dockerfile', 'Cargo.toml', 'Cargo.lock', 'src/**', 'sql/**') }}
+          restore-keys: ${{ runner.os }}-buildx-
+
+      # Every layer is already in the cache the `image` job wrote, so this
+      # resolves rather than compiles.
+      - name: Load postgres image from cache
+        uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1 # v6.16.0
+        with:
+          context: .
+          load: true
+          tags: pg_redis:latest
+          cache-from: type=local,src=/tmp/.buildx-cache
 
       - name: Build e2e image
         run: docker compose --profile e2e build e2e

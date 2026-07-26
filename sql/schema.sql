@@ -1,21 +1,31 @@
 CREATE SCHEMA IF NOT EXISTS redis;
 
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.kv_0  (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at TIMESTAMPTZ);
-CREATE         TABLE IF NOT EXISTS redis.kv_1  (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at TIMESTAMPTZ);
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.kv_2  (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at TIMESTAMPTZ);
-CREATE         TABLE IF NOT EXISTS redis.kv_3  (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at TIMESTAMPTZ);
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.kv_4  (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at TIMESTAMPTZ);
-CREATE         TABLE IF NOT EXISTS redis.kv_5  (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at TIMESTAMPTZ);
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.kv_6  (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at TIMESTAMPTZ);
-CREATE         TABLE IF NOT EXISTS redis.kv_7  (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at TIMESTAMPTZ);
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.kv_8  (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at TIMESTAMPTZ);
-CREATE         TABLE IF NOT EXISTS redis.kv_9  (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at TIMESTAMPTZ);
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.kv_10 (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at TIMESTAMPTZ);
-CREATE         TABLE IF NOT EXISTS redis.kv_11 (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at TIMESTAMPTZ);
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.kv_12 (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at TIMESTAMPTZ);
-CREATE         TABLE IF NOT EXISTS redis.kv_13 (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at TIMESTAMPTZ);
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.kv_14 (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at TIMESTAMPTZ);
-CREATE         TABLE IF NOT EXISTS redis.kv_15 (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at TIMESTAMPTZ);
+-- The 16 Redis databases are split into two contiguous halves:
+--
+--   0-7   ephemeral — UNLOGGED tables, or shared memory under
+--                     redis.storage_mode = 'memory' (the default), in which
+--                     case these tables stay empty
+--   8-15  durable   — WAL-logged, replicated, survives restart
+--
+-- `SELECT cache` is an alias for 0 and `SELECT durable` an alias for 8, so a
+-- client never has to remember which half a number lands in.
+
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.kv_0  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.kv_1  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.kv_2  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.kv_3  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.kv_4  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.kv_5  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.kv_6  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.kv_7  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
+CREATE         TABLE IF NOT EXISTS redis.kv_8  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
+CREATE         TABLE IF NOT EXISTS redis.kv_9  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
+CREATE         TABLE IF NOT EXISTS redis.kv_10 (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
+CREATE         TABLE IF NOT EXISTS redis.kv_11 (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
+CREATE         TABLE IF NOT EXISTS redis.kv_12 (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
+CREATE         TABLE IF NOT EXISTS redis.kv_13 (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
+CREATE         TABLE IF NOT EXISTS redis.kv_14 (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
+CREATE         TABLE IF NOT EXISTS redis.kv_15 (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
 
 -- Partial indexes on expires_at: used by the background expiry scan
 -- (DELETE WHERE expires_at <= now()) and TTL lookups. Keys without an expiry
@@ -37,118 +47,118 @@ CREATE INDEX IF NOT EXISTS kv_13_expires_idx ON redis.kv_13 (expires_at) WHERE e
 CREATE INDEX IF NOT EXISTS kv_14_expires_idx ON redis.kv_14 (expires_at) WHERE expires_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS kv_15_expires_idx ON redis.kv_15 (expires_at) WHERE expires_at IS NOT NULL;
 
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.hash_0  (key TEXT NOT NULL, field TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, field));
-CREATE         TABLE IF NOT EXISTS redis.hash_1  (key TEXT NOT NULL, field TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, field));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.hash_2  (key TEXT NOT NULL, field TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, field));
-CREATE         TABLE IF NOT EXISTS redis.hash_3  (key TEXT NOT NULL, field TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, field));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.hash_4  (key TEXT NOT NULL, field TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, field));
-CREATE         TABLE IF NOT EXISTS redis.hash_5  (key TEXT NOT NULL, field TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, field));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.hash_6  (key TEXT NOT NULL, field TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, field));
-CREATE         TABLE IF NOT EXISTS redis.hash_7  (key TEXT NOT NULL, field TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, field));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.hash_8  (key TEXT NOT NULL, field TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, field));
-CREATE         TABLE IF NOT EXISTS redis.hash_9  (key TEXT NOT NULL, field TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, field));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.hash_10 (key TEXT NOT NULL, field TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, field));
-CREATE         TABLE IF NOT EXISTS redis.hash_11 (key TEXT NOT NULL, field TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, field));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.hash_12 (key TEXT NOT NULL, field TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, field));
-CREATE         TABLE IF NOT EXISTS redis.hash_13 (key TEXT NOT NULL, field TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, field));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.hash_14 (key TEXT NOT NULL, field TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, field));
-CREATE         TABLE IF NOT EXISTS redis.hash_15 (key TEXT NOT NULL, field TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, field));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.hash_0  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.hash_1  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.hash_2  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.hash_3  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.hash_4  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.hash_5  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.hash_6  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.hash_7  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_8  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_9  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_10 (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_11 (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_12 (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_13 (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_14 (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_15 (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
 
 -- Lists. `pos` is a signed BIGINT with gaps so LPUSH can decrement below
 -- the current minimum and RPUSH can increment above the current maximum
 -- without renumbering. LINSERT bisects gaps and renumbers when exhausted.
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.list_0  (key TEXT NOT NULL, pos BIGINT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, pos));
-CREATE         TABLE IF NOT EXISTS redis.list_1  (key TEXT NOT NULL, pos BIGINT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, pos));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.list_2  (key TEXT NOT NULL, pos BIGINT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, pos));
-CREATE         TABLE IF NOT EXISTS redis.list_3  (key TEXT NOT NULL, pos BIGINT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, pos));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.list_4  (key TEXT NOT NULL, pos BIGINT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, pos));
-CREATE         TABLE IF NOT EXISTS redis.list_5  (key TEXT NOT NULL, pos BIGINT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, pos));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.list_6  (key TEXT NOT NULL, pos BIGINT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, pos));
-CREATE         TABLE IF NOT EXISTS redis.list_7  (key TEXT NOT NULL, pos BIGINT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, pos));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.list_8  (key TEXT NOT NULL, pos BIGINT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, pos));
-CREATE         TABLE IF NOT EXISTS redis.list_9  (key TEXT NOT NULL, pos BIGINT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, pos));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.list_10 (key TEXT NOT NULL, pos BIGINT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, pos));
-CREATE         TABLE IF NOT EXISTS redis.list_11 (key TEXT NOT NULL, pos BIGINT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, pos));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.list_12 (key TEXT NOT NULL, pos BIGINT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, pos));
-CREATE         TABLE IF NOT EXISTS redis.list_13 (key TEXT NOT NULL, pos BIGINT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, pos));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.list_14 (key TEXT NOT NULL, pos BIGINT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, pos));
-CREATE         TABLE IF NOT EXISTS redis.list_15 (key TEXT NOT NULL, pos BIGINT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (key, pos));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.list_0  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.list_1  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.list_2  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.list_3  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.list_4  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.list_5  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.list_6  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.list_7  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
+CREATE         TABLE IF NOT EXISTS redis.list_8  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
+CREATE         TABLE IF NOT EXISTS redis.list_9  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
+CREATE         TABLE IF NOT EXISTS redis.list_10 (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
+CREATE         TABLE IF NOT EXISTS redis.list_11 (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
+CREATE         TABLE IF NOT EXISTS redis.list_12 (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
+CREATE         TABLE IF NOT EXISTS redis.list_13 (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
+CREATE         TABLE IF NOT EXISTS redis.list_14 (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
+CREATE         TABLE IF NOT EXISTS redis.list_15 (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
 
 
 -- Sets. PRIMARY KEY (key, member) covers both the (key=?) scan path used by
 -- SMEMBERS/SCARD and the (key=?, member=?) membership test used by SISMEMBER,
 -- so no standalone key index is needed.
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.set_0  (key TEXT NOT NULL, member TEXT NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.set_1  (key TEXT NOT NULL, member TEXT NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.set_2  (key TEXT NOT NULL, member TEXT NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.set_3  (key TEXT NOT NULL, member TEXT NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.set_4  (key TEXT NOT NULL, member TEXT NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.set_5  (key TEXT NOT NULL, member TEXT NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.set_6  (key TEXT NOT NULL, member TEXT NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.set_7  (key TEXT NOT NULL, member TEXT NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.set_8  (key TEXT NOT NULL, member TEXT NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.set_9  (key TEXT NOT NULL, member TEXT NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.set_10 (key TEXT NOT NULL, member TEXT NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.set_11 (key TEXT NOT NULL, member TEXT NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.set_12 (key TEXT NOT NULL, member TEXT NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.set_13 (key TEXT NOT NULL, member TEXT NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.set_14 (key TEXT NOT NULL, member TEXT NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.set_15 (key TEXT NOT NULL, member TEXT NOT NULL, PRIMARY KEY (key, member));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.set_0  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.set_1  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.set_2  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.set_3  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.set_4  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.set_5  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.set_6  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.set_7  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_8  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_9  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_10 (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_11 (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_12 (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_13 (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_14 (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_15 (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
 
-CREATE INDEX IF NOT EXISTS hash_0_key_pattern_idx  ON redis.hash_0  (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS hash_1_key_pattern_idx  ON redis.hash_1  (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS hash_2_key_pattern_idx  ON redis.hash_2  (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS hash_3_key_pattern_idx  ON redis.hash_3  (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS hash_4_key_pattern_idx  ON redis.hash_4  (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS hash_5_key_pattern_idx  ON redis.hash_5  (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS hash_6_key_pattern_idx  ON redis.hash_6  (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS hash_7_key_pattern_idx  ON redis.hash_7  (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS hash_8_key_pattern_idx  ON redis.hash_8  (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS hash_9_key_pattern_idx  ON redis.hash_9  (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS hash_10_key_pattern_idx ON redis.hash_10 (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS hash_11_key_pattern_idx ON redis.hash_11 (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS hash_12_key_pattern_idx ON redis.hash_12 (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS hash_13_key_pattern_idx ON redis.hash_13 (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS hash_14_key_pattern_idx ON redis.hash_14 (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS hash_15_key_pattern_idx ON redis.hash_15 (key text_pattern_ops);
+CREATE INDEX IF NOT EXISTS hash_0_key_pattern_idx  ON redis.hash_0  (key);
+CREATE INDEX IF NOT EXISTS hash_1_key_pattern_idx  ON redis.hash_1  (key);
+CREATE INDEX IF NOT EXISTS hash_2_key_pattern_idx  ON redis.hash_2  (key);
+CREATE INDEX IF NOT EXISTS hash_3_key_pattern_idx  ON redis.hash_3  (key);
+CREATE INDEX IF NOT EXISTS hash_4_key_pattern_idx  ON redis.hash_4  (key);
+CREATE INDEX IF NOT EXISTS hash_5_key_pattern_idx  ON redis.hash_5  (key);
+CREATE INDEX IF NOT EXISTS hash_6_key_pattern_idx  ON redis.hash_6  (key);
+CREATE INDEX IF NOT EXISTS hash_7_key_pattern_idx  ON redis.hash_7  (key);
+CREATE INDEX IF NOT EXISTS hash_8_key_pattern_idx  ON redis.hash_8  (key);
+CREATE INDEX IF NOT EXISTS hash_9_key_pattern_idx  ON redis.hash_9  (key);
+CREATE INDEX IF NOT EXISTS hash_10_key_pattern_idx ON redis.hash_10 (key);
+CREATE INDEX IF NOT EXISTS hash_11_key_pattern_idx ON redis.hash_11 (key);
+CREATE INDEX IF NOT EXISTS hash_12_key_pattern_idx ON redis.hash_12 (key);
+CREATE INDEX IF NOT EXISTS hash_13_key_pattern_idx ON redis.hash_13 (key);
+CREATE INDEX IF NOT EXISTS hash_14_key_pattern_idx ON redis.hash_14 (key);
+CREATE INDEX IF NOT EXISTS hash_15_key_pattern_idx ON redis.hash_15 (key);
 
-CREATE INDEX IF NOT EXISTS set_0_key_pattern_idx   ON redis.set_0   (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS set_1_key_pattern_idx   ON redis.set_1   (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS set_2_key_pattern_idx   ON redis.set_2   (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS set_3_key_pattern_idx   ON redis.set_3   (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS set_4_key_pattern_idx   ON redis.set_4   (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS set_5_key_pattern_idx   ON redis.set_5   (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS set_6_key_pattern_idx   ON redis.set_6   (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS set_7_key_pattern_idx   ON redis.set_7   (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS set_8_key_pattern_idx   ON redis.set_8   (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS set_9_key_pattern_idx   ON redis.set_9   (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS set_10_key_pattern_idx  ON redis.set_10  (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS set_11_key_pattern_idx  ON redis.set_11  (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS set_12_key_pattern_idx  ON redis.set_12  (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS set_13_key_pattern_idx  ON redis.set_13  (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS set_14_key_pattern_idx  ON redis.set_14  (key text_pattern_ops);
-CREATE INDEX IF NOT EXISTS set_15_key_pattern_idx  ON redis.set_15  (key text_pattern_ops);
+CREATE INDEX IF NOT EXISTS set_0_key_pattern_idx   ON redis.set_0   (key);
+CREATE INDEX IF NOT EXISTS set_1_key_pattern_idx   ON redis.set_1   (key);
+CREATE INDEX IF NOT EXISTS set_2_key_pattern_idx   ON redis.set_2   (key);
+CREATE INDEX IF NOT EXISTS set_3_key_pattern_idx   ON redis.set_3   (key);
+CREATE INDEX IF NOT EXISTS set_4_key_pattern_idx   ON redis.set_4   (key);
+CREATE INDEX IF NOT EXISTS set_5_key_pattern_idx   ON redis.set_5   (key);
+CREATE INDEX IF NOT EXISTS set_6_key_pattern_idx   ON redis.set_6   (key);
+CREATE INDEX IF NOT EXISTS set_7_key_pattern_idx   ON redis.set_7   (key);
+CREATE INDEX IF NOT EXISTS set_8_key_pattern_idx   ON redis.set_8   (key);
+CREATE INDEX IF NOT EXISTS set_9_key_pattern_idx   ON redis.set_9   (key);
+CREATE INDEX IF NOT EXISTS set_10_key_pattern_idx  ON redis.set_10  (key);
+CREATE INDEX IF NOT EXISTS set_11_key_pattern_idx  ON redis.set_11  (key);
+CREATE INDEX IF NOT EXISTS set_12_key_pattern_idx  ON redis.set_12  (key);
+CREATE INDEX IF NOT EXISTS set_13_key_pattern_idx  ON redis.set_13  (key);
+CREATE INDEX IF NOT EXISTS set_14_key_pattern_idx  ON redis.set_14  (key);
+CREATE INDEX IF NOT EXISTS set_15_key_pattern_idx  ON redis.set_15  (key);
 
 -- Sorted sets. Scores are DOUBLE PRECISION to match Redis float64 semantics
 -- (native +Infinity/-Infinity handling). The composite index on
 -- (key, score, member) covers ZRANGE BYSCORE, ZRANGE BYLEX, ZRANK, ZCOUNT,
 -- and ZLEXCOUNT; the PK (key, member) covers ZSCORE/ZREM membership lookup.
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.zset_0  (key TEXT NOT NULL, member TEXT NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.zset_1  (key TEXT NOT NULL, member TEXT NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.zset_2  (key TEXT NOT NULL, member TEXT NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.zset_3  (key TEXT NOT NULL, member TEXT NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.zset_4  (key TEXT NOT NULL, member TEXT NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.zset_5  (key TEXT NOT NULL, member TEXT NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.zset_6  (key TEXT NOT NULL, member TEXT NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.zset_7  (key TEXT NOT NULL, member TEXT NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.zset_8  (key TEXT NOT NULL, member TEXT NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.zset_9  (key TEXT NOT NULL, member TEXT NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.zset_10 (key TEXT NOT NULL, member TEXT NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.zset_11 (key TEXT NOT NULL, member TEXT NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.zset_12 (key TEXT NOT NULL, member TEXT NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.zset_13 (key TEXT NOT NULL, member TEXT NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.zset_14 (key TEXT NOT NULL, member TEXT NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.zset_15 (key TEXT NOT NULL, member TEXT NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.zset_0  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.zset_1  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.zset_2  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.zset_3  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.zset_4  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.zset_5  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.zset_6  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.zset_7  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.zset_8  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.zset_9  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.zset_10 (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.zset_11 (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.zset_12 (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.zset_13 (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.zset_14 (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.zset_15 (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
 
 CREATE INDEX IF NOT EXISTS zset_0_key_score_member  ON redis.zset_0  (key, score, member);
 CREATE INDEX IF NOT EXISTS zset_1_key_score_member  ON redis.zset_1  (key, score, member);
@@ -176,7 +186,7 @@ CREATE TABLE IF NOT EXISTS redis.pubsub_routes (
 );
 
 -- Helper to create a target table for pub/sub routing.
--- The table must have `channel TEXT` and `payload TEXT` columns to receive routed messages.
+-- The table must have `channel BYTEA` and `payload BYTEA` columns to receive routed messages.
 CREATE OR REPLACE FUNCTION redis.create_pubsub_table(p_schema text, p_tbl text)
 RETURNS void
 LANGUAGE plpgsql
@@ -185,8 +195,8 @@ BEGIN
     EXECUTE format(
         'CREATE TABLE IF NOT EXISTS %I.%I (
             id          BIGSERIAL PRIMARY KEY,
-            channel     TEXT NOT NULL,
-            payload     TEXT NOT NULL,
+            channel     BYTEA NOT NULL,
+            payload     BYTEA NOT NULL,
             inserted_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )',
         p_schema, p_tbl

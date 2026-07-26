@@ -5,36 +5,66 @@
 | GUC | Default | Description |
 |-----|---------|-------------|
 | `redis.port` | `6379` | TCP port the Redis listener binds to |
-| `redis.listen_address` | `0.0.0.0` | IP address to bind on |
-| `redis.use_logged` | `false` | Default database for new connections (`true` = db 1, `false` = db 0) |
+| `redis.listen_address` | `127.0.0.1` | IP address to bind on. See [Exposing the listener](#exposing-the-listener) before widening this. |
+| `redis.default_db` | `0` | Database new connections start on (0–15). `0` is ephemeral, matching Redis; set `8` to start durable. |
 | `redis.workers` | `4` | Number of background worker processes (requires restart) |
 | `redis.max_connections` | `128` | Max simultaneous Redis clients per worker |
 | `redis.batch_size` | `64` | Max commands coalesced into one transaction; `1` disables batching |
 | `redis.password` | _(none)_ | When set, clients must `AUTH <password>` before any command |
-| `redis.storage_mode` | `memory` | Storage backend for even-numbered databases. `memory` = shared-memory hash tables (default); `auto` = UNLOGGED tables. Requires restart. See [Storage modes](./storage-modes.md). |
-| `redis.mem_max_entries` | `16384` | Maximum keys per data type per even-db in memory mode. Requires restart. |
+| `redis.storage_mode` | `memory` | Storage backend for the ephemeral databases (0–7). `memory` = shared-memory hash tables (default); `auto` = UNLOGGED tables. Requires restart. See [Storage modes](./storage-modes.md). |
+| `redis.mem_max_entries` | `8192` | Maximum keys per data type per ephemeral database in memory mode. Requires restart. |
+| `redis.maxmemory_policy` | `noeviction` | What memory mode does when a table fills: `noeviction` (refuse the write, as in Redis), `allkeys-random`, or `volatile-ttl`. See [Storage modes](./storage-modes.md#when-a-table-fills). |
 
 Apply at runtime (no restart needed unless noted):
 
 ```sql
 ALTER SYSTEM SET redis.port = 6380;
-ALTER SYSTEM SET redis.listen_address = '127.0.0.1';
-ALTER SYSTEM SET redis.use_logged = false;
+ALTER SYSTEM SET redis.listen_address = '0.0.0.0';
+ALTER SYSTEM SET redis.default_db = 0;
 ALTER SYSTEM SET redis.workers = 8;
 ALTER SYSTEM SET redis.password = 'mysecret';
 SELECT pg_reload_conf();
 ```
 
+## Exposing the listener
+
+The Redis port does not go through PostgreSQL authentication. Anything that can
+reach it can read and write every `redis.*` table with the background worker's
+privileges, regardless of PostgreSQL roles or `pg_hba.conf`.
+
+`redis.listen_address` therefore defaults to `127.0.0.1`. To accept connections
+from other hosts — including publishing the port out of a container — widen it
+deliberately **and** set a password:
+
+```sql
+ALTER SYSTEM SET redis.listen_address = '0.0.0.0';
+ALTER SYSTEM SET redis.password = 'mysecret';
+SELECT pg_reload_conf();
+```
+
+Binding a non-loopback address with no password logs a warning at startup.
+
 ## Selecting a database per connection
 
-There are 16 databases (0–15). Even databases use unlogged tables; odd databases use WAL-logged tables. Switch with `SELECT <db>`:
+There are 16 databases, split into two contiguous halves:
+
+| Databases | Storage | Durability |
+|-----------|---------|------------|
+| **0–7** | Shared memory, or UNLOGGED tables under `storage_mode = 'auto'` | Lost on restart |
+| **8–15** | WAL-logged PostgreSQL tables | Survives crashes, replicated |
+
+`SELECT` also accepts the name of each half, so you do not have to remember
+where the boundary is — `cache` is database 0 and `durable` is database 8:
 
 ```bash
-redis-cli> SELECT 0   # unlogged — fast, no WAL
+redis-cli> SELECT cache     # same as SELECT 0
 redis-cli> SET cache:key value
-redis-cli> SELECT 1   # logged — durable
+redis-cli> SELECT durable   # same as SELECT 8
 redis-cli> SET user:42 '{"name":"Alice"}'
 ```
+
+Plain numbers work exactly as in Redis, and `redis.default_db` picks the one new
+connections start on.
 
 ## Managing workers at runtime
 

@@ -7,15 +7,26 @@ use socket2::{Domain, Socket, Type};
 use std::collections::HashMap;
 use std::io::{self, BufWriter, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-type VersionMap = Arc<RwLock<HashMap<(u8, String), u64>>>;
 type PendingBatch = Option<(Vec<(Command, u8)>, mpsc::SyncSender<Vec<Response>>)>;
 
 const PUBSUB_NOT_LOADED: &str = "pub/sub requires shared_preload_libraries = 'pg_redis'";
+const WATCH_NOT_LOADED: &str = "WATCH requires shared_preload_libraries = 'pg_redis'";
+
+/// Channel names and payloads live in fixed-size shared-memory slots. Silently
+/// truncating either is worse than refusing: a truncated subscription never
+/// matches a publish to the same name, so the client waits forever on a channel
+/// it believes it is subscribed to.
+fn pubsub_len_error(items: &[Vec<u8>], limit: usize, what: &str) -> Option<String> {
+    items
+        .iter()
+        .find(|i| i.len() > limit)
+        .map(|_| format!("{what} exceeds the pub/sub limit of {limit} bytes"))
+}
 
 enum DispatchMsg {
     Cmd(Command, u8, mpsc::SyncSender<Response>),
@@ -24,6 +35,18 @@ enum DispatchMsg {
 }
 
 const QUEUE_LIMIT: usize = 10_000;
+
+/// How long a subscribed connection blocks on the socket each time round the
+/// loop before going back to waiting for published messages.
+const SUBSCRIBE_POLL: Duration = Duration::from_millis(5);
+/// Bounds on how long a subscriber sleeps between socket polls. This is not
+/// message-delivery latency — a publish wakes the sleeper immediately — only how
+/// long a *command* sent by an already-quiet subscriber can sit unread. It backs
+/// off from the first to the second while the connection stays silent, so an
+/// interactive client keeps millisecond acks and a parked one costs ~4 wakeups
+/// per second instead of 200.
+const SUBSCRIBE_WAIT_MIN: Duration = Duration::from_millis(5);
+const SUBSCRIBE_WAIT_MAX: Duration = Duration::from_millis(250);
 
 pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
@@ -111,7 +134,7 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
     }
 
     let port = crate::PORT.get() as u16;
-    let default_db: u8 = if crate::USE_LOGGED.get() { 1 } else { 0 };
+    let default_db: u8 = crate::DEFAULT_DB.get().clamp(0, 15) as u8;
     let listen_addr = crate::LISTEN_ADDRESS
         .get()
         .as_deref()
@@ -123,19 +146,9 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
     let batch_size = crate::BATCH_SIZE.get().max(1) as usize;
 
     let (cmd_tx, cmd_rx) = mpsc::sync_channel::<DispatchMsg>(256);
-    let version_map: VersionMap = Arc::new(RwLock::new(HashMap::new()));
-    let version_map_accept = Arc::clone(&version_map);
 
     std::thread::spawn(move || {
-        accept_loop(
-            port,
-            cmd_tx,
-            default_db,
-            listen_addr,
-            max_conn,
-            password,
-            version_map_accept,
-        )
+        accept_loop(port, cmd_tx, default_db, listen_addr, max_conn, password)
     });
 
     let mut last_expiry_scan = Instant::now();
@@ -147,10 +160,10 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
         match cmd_rx.recv_timeout(Duration::from_millis(250)) {
             Ok(first) => match first {
                 DispatchMsg::FireAndForget(cmd, db) => {
-                    run_dispatch_batch(&[(cmd, db)], mem_mode, &version_map);
+                    run_dispatch_batch(&[(cmd, db)], mem_mode);
                 }
                 DispatchMsg::Batch(cmds, resp_tx) => {
-                    let responses = run_dispatch_batch(&cmds, mem_mode, &version_map);
+                    let responses = run_dispatch_batch(&cmds, mem_mode);
                     resp_tx.send(responses).ok();
                 }
                 DispatchMsg::Cmd(first_cmd, first_db, first_resp_tx) => {
@@ -179,17 +192,17 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                         }
                     }
 
-                    let responses = run_dispatch_batch(&cmds, mem_mode, &version_map);
+                    let responses = run_dispatch_batch(&cmds, mem_mode);
                     for (tx, resp) in txs.into_iter().zip(responses) {
                         tx.send(resp).ok();
                     }
 
                     if !faf_cmds.is_empty() {
-                        run_dispatch_batch(&faf_cmds, mem_mode, &version_map);
+                        run_dispatch_batch(&faf_cmds, mem_mode);
                     }
 
                     if let Some((batch_cmds, batch_tx)) = pending_batch {
-                        let responses = run_dispatch_batch(&batch_cmds, mem_mode, &version_map);
+                        let responses = run_dispatch_batch(&batch_cmds, mem_mode);
                         batch_tx.send(responses).ok();
                     }
                 }
@@ -202,13 +215,20 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
 
         if last_expiry_scan.elapsed() >= Duration::from_secs(1) {
             last_expiry_scan = Instant::now();
+            // The SQL sweep targets redis.kv_*, which only exist once someone has
+            // run CREATE EXTENSION in *this* database. Under
+            // shared_preload_libraries the worker connects to redis.database —
+            // commonly 'postgres', where the extension is usually absent — and a
+            // missing relation raises an error that kills the worker. It then
+            // restarts and dies again a second later, forever. Check first.
+            let sql_tables_exist = kv_tables_exist();
             for db in 0u8..16 {
-                if mem_mode && db % 2 == 0 {
+                if mem_mode && crate::commands::is_ephemeral(db) {
                     unsafe {
                         pg_sys::CurrentMemoryContext = pg_sys::TopMemoryContext;
-                        crate::mem::mem_sweep_expired((db / 2) as usize);
+                        crate::mem::mem_sweep_expired(db as usize);
                     }
-                } else {
+                } else if sql_tables_exist {
                     BackgroundWorker::transaction(|| {
                         Spi::connect_mut(|client| {
                             client
@@ -229,47 +249,124 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
     }
 }
 
-fn run_dispatch_batch(
-    cmds: &[(Command, u8)],
-    mem_mode: bool,
-    version_map: &VersionMap,
-) -> Vec<Response> {
+/// Whether this database has the `redis.kv_*` tables the SQL expiry sweep needs.
+///
+/// Re-checked each tick rather than cached, so a worker that started before
+/// `CREATE EXTENSION` begins sweeping once the tables appear, without a restart.
+fn kv_tables_exist() -> bool {
+    BackgroundWorker::transaction(kv_tables_present)
+}
+
+/// The catalog probe behind [`kv_tables_exist`], without the surrounding
+/// transaction — callable from an ordinary backend, which is what lets a test
+/// exercise it.
+pub(crate) fn kv_tables_present() -> bool {
+    Spi::get_one::<bool>("SELECT to_regclass('redis.kv_1') IS NOT NULL")
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+}
+
+/// Run `body` in its own subtransaction, keeping its writes only if it succeeded.
+///
+/// A batch coalesces commands from unrelated connections into one transaction,
+/// so one client's failing command must not roll back another's write. That
+/// isolation used to come from `SAVEPOINT` / `ROLLBACK TO` / `RELEASE` issued as
+/// SQL: three statements parsed, planned and executed through SPI for every
+/// command in the batch, which for a plain SET cost more than the SET. These are
+/// the same subtransaction primitives without the SQL layer — the guarantee is
+/// unchanged, the per-command overhead is not.
+///
+/// Mirrors the save/restore dance PL/pgSQL performs around its EXCEPTION blocks.
+///
+/// # Safety
+/// Must run on the background worker's main thread, inside a transaction.
+pub(crate) unsafe fn in_subtransaction<F: FnOnce() -> Response>(body: F) -> Response {
+    unsafe {
+        let outer_context = pg_sys::CurrentMemoryContext;
+        let outer_owner = pg_sys::CurrentResourceOwner;
+
+        pg_sys::BeginInternalSubTransaction(std::ptr::null());
+        // BeginInternalSubTransaction switches to the subtransaction's context;
+        // run the command in the caller's so its allocations outlive the release.
+        pg_sys::MemoryContextSwitchTo(outer_context);
+
+        // Give this command its own snapshot, the way a new statement gets one.
+        //
+        // A batch runs many commands inside one transaction, and SPI reads run
+        // read-only — they reuse whatever snapshot is already active instead of
+        // taking a fresh one. So without this, a GET queued after a SET in the
+        // same MULTI still sees the pre-SET world.
+        //
+        // Deliberately push/pop rather than `UpdateActiveSnapshotCommandId`,
+        // which is the other way to do it: that function asserts the active
+        // snapshot has `active_count == 1` and `regd_count == 0`, and the
+        // snapshot SPI has already pushed satisfies neither. Distribution
+        // builds compile assertions out and it appears to work; pgrx builds
+        // PostgreSQL with --enable-cassert, so it fails there and only there.
+        let pushed = pg_sys::ActiveSnapshotSet();
+        if pushed {
+            pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
+        }
+
+        let response = body();
+
+        if pushed {
+            pg_sys::PopActiveSnapshot();
+        }
+        if matches!(response, Response::Error(_)) {
+            pg_sys::RollbackAndReleaseCurrentSubTransaction();
+        } else {
+            pg_sys::ReleaseCurrentSubTransaction();
+        }
+        pg_sys::MemoryContextSwitchTo(outer_context);
+        pg_sys::CurrentResourceOwner = outer_owner;
+
+        // Advance the command counter so the *next* command's snapshot sees
+        // what this one wrote.
+        pg_sys::CommandCounterIncrement();
+
+        response
+    }
+}
+
+fn run_dispatch_batch(cmds: &[(Command, u8)], mem_mode: bool) -> Vec<Response> {
     let all_mem = mem_mode
-        && cmds
-            .iter()
-            .all(|(cmd, db)| db % 2 == 0 && !matches!(cmd, Command::TablePublish { .. }));
+        && cmds.iter().all(|(cmd, db)| {
+            crate::commands::is_ephemeral(*db) && !matches!(cmd, Command::TablePublish { .. })
+        });
     let responses: Vec<Response> = if all_mem {
         unsafe {
             pg_sys::CurrentMemoryContext = pg_sys::TopMemoryContext;
         }
         cmds.iter().map(|(cmd, db)| cmd.execute_mem(*db)).collect()
     } else if cmds.len() == 1 {
+        // Still a subtransaction, even though there is no sibling command to
+        // protect. An SPI error inside `execute` unwinds by longjmp, straight
+        // past the `Err` arms that look like they handle it, and kills the
+        // worker — which takes the listener down for every connection. The
+        // routed-table INSERT reaches user-created tables whose columns this
+        // extension never validated, so that is a reachable path, not a
+        // theoretical one.
         let (cmd, db) = &cmds[0];
         vec![BackgroundWorker::transaction(|| {
-            Spi::connect_mut(|client| cmd.execute(client, *db))
+            Spi::connect_mut(|client| unsafe { in_subtransaction(|| cmd.execute(client, *db)) })
         })]
     } else {
         BackgroundWorker::transaction(|| {
             Spi::connect_mut(|client| {
                 cmds.iter()
-                    .map(|(cmd, db)| {
-                        client.update("SAVEPOINT pgr", None, &[]).ok();
-                        let resp = cmd.execute(client, *db);
-                        if matches!(resp, Response::Error(_)) {
-                            client.update("ROLLBACK TO SAVEPOINT pgr", None, &[]).ok();
-                        }
-                        client.update("RELEASE SAVEPOINT pgr", None, &[]).ok();
-                        resp
-                    })
+                    .map(|(cmd, db)| unsafe { in_subtransaction(|| cmd.execute(client, *db)) })
                     .collect()
             })
         })
     };
-    if cmds.iter().any(|(cmd, _)| !cmd.write_keys().is_empty()) {
-        let mut versions = version_map.write().unwrap();
+    // Publish the writes so a WATCH on any worker sees them. One `write_keys()`
+    // pass, not two — it allocates a Vec per command.
+    if let Some(watch_ctl) = crate::watch_state() {
         for (cmd, db) in cmds {
             for key in cmd.write_keys() {
-                *versions.entry((*db, key.to_string())).or_insert(0) += 1;
+                unsafe { crate::watch::bump(watch_ctl, *db, key) };
             }
         }
     }
@@ -283,7 +380,6 @@ fn accept_loop(
     listen_addr: String,
     max_conn: usize,
     password: Option<Vec<u8>>,
-    version_map: VersionMap,
 ) {
     let addr: SocketAddr = match format!("{}:{}", listen_addr, port).parse() {
         Ok(a) => a,
@@ -295,6 +391,16 @@ fn accept_loop(
             return;
         }
     };
+    // The Redis port bypasses PostgreSQL authentication entirely: whoever reaches
+    // it gets read/write access to every redis.* table through the worker's own
+    // privileges. Binding it off-host without a password is almost never intended.
+    if password.is_none() && !addr.ip().is_loopback() {
+        eprintln!(
+            "pg_redis: WARNING listening on {} with no redis.password set — \
+             any host that can reach this port has full access to redis.* data",
+            addr
+        );
+    }
     let socket = match Socket::new(Domain::IPV4, Type::STREAM, None) {
         Ok(s) => s,
         Err(e) => {
@@ -337,10 +443,9 @@ fn accept_loop(
                 let tx = cmd_tx.clone();
                 let counter = Arc::clone(&conn_count);
                 let pw = password.clone();
-                let vm = Arc::clone(&version_map);
                 counter.fetch_add(1, Ordering::Relaxed);
                 std::thread::spawn(move || {
-                    conn_loop(s, tx, default_db, pw, vm);
+                    conn_loop(s, tx, default_db, pw);
                     counter.fetch_sub(1, Ordering::Relaxed);
                 });
             }
@@ -353,15 +458,17 @@ fn accept_loop(
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
-    // Pad both to max length so length difference does not leak via timing.
-    let max_len = a.len().max(b.len());
-    let mut a_padded = vec![0u8; max_len];
-    let mut b_padded = vec![0u8; max_len];
-    a_padded[..a.len()].copy_from_slice(a);
-    b_padded[..b.len()].copy_from_slice(b);
-    let len_ok = subtle::Choice::from((a.len() == b.len()) as u8);
-    let content_ok = a_padded.ct_eq(&b_padded);
-    bool::from(len_ok & content_ok)
+    // Compare across max(len), reading past-the-end bytes as 0, so a length
+    // difference does not short-circuit the loop and leak via timing. Done
+    // without padding buffers: `a` is attacker-supplied and may be megabytes,
+    // and AUTH must not hand an unauthenticated client an allocation lever.
+    let mut equal = ((a.len() ^ b.len()) as u64).ct_eq(&0);
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        equal &= x.ct_eq(&y);
+    }
+    bool::from(equal)
 }
 
 fn configured_password() -> Option<Vec<u8>> {
@@ -376,7 +483,6 @@ fn conn_loop(
     cmd_tx: mpsc::SyncSender<DispatchMsg>,
     default_db: u8,
     required_password: Option<Vec<u8>>,
-    version_map: VersionMap,
 ) {
     let write_stream = match stream.try_clone() {
         Ok(s) => s,
@@ -389,7 +495,7 @@ fn conn_loop(
     let mut authenticated = required_password.is_none();
     let mut multi = false;
     let mut queue: Vec<Result<Command, String>> = Vec::new();
-    let mut watched: HashMap<(u8, String), u64> = HashMap::new();
+    let mut watched: HashMap<(u8, Vec<u8>), u64> = HashMap::new();
 
     loop {
         let parts = match parser.read_command() {
@@ -419,15 +525,16 @@ fn conn_loop(
                         flush(&mut writer);
                         continue;
                     }
-                    let watch_snapshot: Vec<(u8, String, u64)> = watched
-                        .iter()
-                        .map(|((w_db, key), &snap_ver)| (*w_db, key.clone(), snap_ver))
-                        .collect();
-                    let watch_dirty = {
-                        let versions = version_map.read().unwrap();
-                        watch_snapshot.iter().any(|(w_db, key, snap_ver)| {
-                            versions.get(&(*w_db, key.clone())).copied().unwrap_or(0) != *snap_ver
-                        })
+                    // Re-read the shared counters: any worker may have written
+                    // one of these keys since WATCH snapshotted it.
+                    let watch_dirty = match crate::watch_state() {
+                        Some(ctl) => watched.iter().any(|((w_db, key), &snapshot)| {
+                            let now = unsafe { crate::watch::version(ctl, *w_db, key) };
+                            now != snapshot
+                        }),
+                        // Without shared memory there is nothing to compare against.
+                        // WATCH already refused, so nothing can be watched here.
+                        None => false,
                     };
                     let cmds: Vec<(Command, u8)> = queue
                         .drain(..)
@@ -688,15 +795,19 @@ fn conn_loop(
                 write_error(&mut writer, "DISCARD without MULTI").ok();
                 flush(&mut writer);
             }
-            Command::Watch { keys } => {
-                let versions = version_map.read().unwrap();
-                for key in keys {
-                    let ver = versions.get(&(db, key.clone())).copied().unwrap_or(0);
-                    watched.insert((db, key.clone()), ver);
+            Command::Watch { keys } => match crate::watch_state() {
+                // Refuse rather than accept a WATCH that cannot detect anything:
+                // silently returning OK here would let EXEC commit over a
+                // conflicting write.
+                None => reply(&mut writer, |w| write_error(w, WATCH_NOT_LOADED)),
+                Some(ctl) => {
+                    for key in keys {
+                        let version = unsafe { crate::watch::version(ctl, db, key) };
+                        watched.insert((db, key.clone()), version);
+                    }
+                    reply(&mut writer, |w| write_simple_string(w, "OK"));
                 }
-                drop(versions);
-                reply(&mut writer, |w| write_simple_string(w, "OK"));
-            }
+            },
             Command::Unwatch => {
                 watched.clear();
                 reply(&mut writer, |w| write_simple_string(w, "OK"));
@@ -708,6 +819,23 @@ fn conn_loop(
             Command::ConfigGet { .. } => reply(&mut writer, |w| write_array_header(w, 0)),
             Command::ConfigSet | Command::ConfigOther => {
                 reply(&mut writer, |w| write_simple_string(w, "OK"))
+            }
+            Command::Publish { channel, message }
+                if channel.len() > crate::pubsub::MAX_CHANNEL_LEN
+                    || message.len() > crate::pubsub::PUBSUB_MSG_LEN =>
+            {
+                let err = if channel.len() > crate::pubsub::MAX_CHANNEL_LEN {
+                    format!(
+                        "channel name exceeds the pub/sub limit of {} bytes",
+                        crate::pubsub::MAX_CHANNEL_LEN
+                    )
+                } else {
+                    format!(
+                        "message exceeds the pub/sub limit of {} bytes",
+                        crate::pubsub::PUBSUB_MSG_LEN
+                    )
+                };
+                reply(&mut writer, |w| write_error(w, &err));
             }
             Command::Publish { channel, message } => match crate::pubsub_state() {
                 None => reply(&mut writer, |w| write_error(w, PUBSUB_NOT_LOADED)),
@@ -781,6 +909,12 @@ fn conn_loop(
                 });
             }
             Command::Subscribe { channels } => {
+                if let Some(err) =
+                    pubsub_len_error(channels, crate::pubsub::MAX_CHANNEL_LEN, "channel name")
+                {
+                    reply(&mut writer, |w| write_error(w, &err));
+                    continue;
+                }
                 let cont = enter_subscribe_mode(
                     &mut writer,
                     &mut parser,
@@ -796,6 +930,12 @@ fn conn_loop(
                 }
             }
             Command::PSubscribe { patterns } => {
+                if let Some(err) =
+                    pubsub_len_error(patterns, crate::pubsub::MAX_CHANNEL_LEN, "pattern")
+                {
+                    reply(&mut writer, |w| write_error(w, &err));
+                    continue;
+                }
                 let cont = enter_subscribe_mode(
                     &mut writer,
                     &mut parser,
@@ -881,11 +1021,20 @@ fn subscribe_loop(
     let Some((ctl, slots)) = crate::pubsub_state() else {
         return true;
     };
-    parser.set_read_timeout(Some(Duration::from_millis(5))).ok();
+    // Short enough that a command sent by a subscribed client is noticed
+    // promptly, long enough that an idle subscriber is not spinning on it.
+    // Message delivery does not depend on this: the wait below is woken by the
+    // publisher.
+    parser.set_read_timeout(Some(SUBSCRIBE_POLL)).ok();
     let mut keep_conn = true;
     let mut slot_freed = false;
+    let mut idle_wait = SUBSCRIBE_WAIT_MIN;
 
     'outer: loop {
+        // Snapshot before draining, so a publish that lands between the drain
+        // and the wait makes the wait return immediately instead of sleeping.
+        let seen_tail = unsafe { crate::pubsub::current_tail(slots, slot_idx) };
+
         // Drain ring buffer — lock-free, safe from any thread (AtomicU32, no pg_sys)
         loop {
             match unsafe { crate::pubsub::poll_message(slots, slot_idx) } {
@@ -912,6 +1061,10 @@ fn subscribe_loop(
             Err(e)
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
             {
+                // No client command pending. Sleep until the publisher wakes us
+                // rather than immediately polling the socket again.
+                unsafe { crate::pubsub::wait_for_message(slots, slot_idx, seen_tail, idle_wait) };
+                idle_wait = (idle_wait * 2).min(SUBSCRIBE_WAIT_MAX);
                 continue;
             }
             Err(_) => {
@@ -921,6 +1074,8 @@ fn subscribe_loop(
             Ok(p) if p.is_empty() => continue,
             Ok(p) => p,
         };
+        // The client is talking; go back to acknowledging quickly.
+        idle_wait = SUBSCRIBE_WAIT_MIN;
 
         let cmd_name = parts
             .first()
@@ -1143,6 +1298,8 @@ mod tests {
     use std::net::TcpListener;
     use std::time::Duration;
 
+    /// Stands in for the SPI dispatcher: answers every command with +OK and
+    /// reports which db each single command was routed to.
     fn fake_dispatcher(cmd_rx: mpsc::Receiver<DispatchMsg>) -> mpsc::Receiver<u8> {
         let (db_tx, db_rx) = mpsc::sync_channel(16);
         std::thread::spawn(move || {
@@ -1153,8 +1310,9 @@ mod tests {
                         resp_tx.send(Response::Ok).ok();
                     }
                     DispatchMsg::Batch(cmds, resp_tx) => {
-                        let responses = cmds.iter().map(|_| Response::Ok).collect();
-                        resp_tx.send(responses).ok();
+                        resp_tx
+                            .send(cmds.iter().map(|_| Response::Ok).collect())
+                            .ok();
                     }
                     DispatchMsg::FireAndForget(..) => {}
                 }
@@ -1163,351 +1321,221 @@ mod tests {
         db_rx
     }
 
-    fn connect_conn_loop(default_db: u8) -> (TcpStream, mpsc::Receiver<u8>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (cmd_tx, cmd_rx) = mpsc::sync_channel::<DispatchMsg>(256);
-        let db_rx = fake_dispatcher(cmd_rx);
-        let version_map: VersionMap = Arc::new(RwLock::new(HashMap::new()));
-        std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            conn_loop(stream, cmd_tx, default_db, None, version_map);
-        });
-        let client = TcpStream::connect(addr).unwrap();
-        client
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        (client, db_rx)
+    struct Conn {
+        client: TcpStream,
+        dispatched: mpsc::Receiver<u8>,
     }
 
-    fn send_cmd(client: &mut TcpStream, parts: &[&str]) {
-        let mut buf = format!("*{}\r\n", parts.len());
-        for p in parts {
-            buf.push_str(&format!("${}\r\n{}\r\n", p.len(), p));
+    impl Conn {
+        fn open(default_db: u8) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (cmd_tx, cmd_rx) = mpsc::sync_channel::<DispatchMsg>(256);
+            let dispatched = fake_dispatcher(cmd_rx);
+            std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                conn_loop(stream, cmd_tx, default_db, None);
+            });
+            let client = TcpStream::connect(addr).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            Conn { client, dispatched }
         }
-        client.write_all(buf.as_bytes()).unwrap();
-    }
 
-    fn read_line(client: &mut TcpStream) -> String {
-        let mut out = String::new();
-        let mut byte = [0u8; 1];
-        loop {
-            client.read_exact(&mut byte).unwrap();
-            if byte[0] == b'\n' {
-                break;
+        fn send(&mut self, parts: &[&str]) -> &mut Self {
+            let mut buf = format!("*{}\r\n", parts.len());
+            for p in parts {
+                buf.push_str(&format!("${}\r\n{}\r\n", p.len(), p));
             }
-            if byte[0] != b'\r' {
-                out.push(byte[0] as char);
+            self.client.write_all(buf.as_bytes()).unwrap();
+            self
+        }
+
+        /// Read one RESP line, stripping the CRLF.
+        fn line(&mut self) -> String {
+            let mut out = String::new();
+            let mut byte = [0u8; 1];
+            loop {
+                self.client.read_exact(&mut byte).unwrap();
+                match byte[0] {
+                    b'\n' => return out,
+                    b'\r' => {}
+                    c => out.push(c as char),
+                }
             }
         }
-        out
+
+        fn reply_to(&mut self, parts: &[&str]) -> String {
+            self.send(parts).line()
+        }
+
+        /// The db a dispatched command was routed to, or None if nothing was dispatched.
+        fn routed_db(&mut self) -> Option<u8> {
+            self.dispatched.recv_timeout(Duration::from_secs(2)).ok()
+        }
+
+        fn dispatched_nothing(&mut self) -> bool {
+            self.dispatched
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        }
+    }
+
+    // ─────────────────────────── db selection ────────────────────────────────
+
+    #[test]
+    fn commands_route_to_the_connection_default_db() {
+        for default_db in [0u8, 1] {
+            let mut c = Conn::open(default_db);
+            c.send(&["SET", "k", "v"]);
+            assert_eq!(c.routed_db(), Some(default_db));
+        }
     }
 
     #[test]
-    fn conn_loop_uses_default_db_1_for_first_command() {
-        let (mut client, db_rx) = connect_conn_loop(1);
-        send_cmd(&mut client, &["SET", "k", "v"]);
-        let db = db_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert_eq!(db, 1, "expected db=1 (default logged), got {}", db);
+    fn select_switches_the_db_for_subsequent_commands() {
+        let mut c = Conn::open(1);
+        assert_eq!(c.reply_to(&["SELECT", "0"]), "+OK");
+        c.send(&["SET", "k", "v"]);
+        assert_eq!(c.routed_db(), Some(0));
+
+        assert_eq!(c.reply_to(&["SELECT", "1"]), "+OK");
+        c.send(&["SET", "k", "v"]);
+        assert_eq!(c.routed_db(), Some(1));
     }
 
     #[test]
-    fn conn_loop_uses_default_db_0_for_first_command() {
-        let (mut client, db_rx) = connect_conn_loop(0);
-        send_cmd(&mut client, &["SET", "k", "v"]);
-        let db = db_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert_eq!(db, 0, "expected db=0 (default unlogged), got {}", db);
+    fn selected_db_is_per_connection() {
+        let (mut a, mut b) = (Conn::open(1), Conn::open(0));
+        a.reply_to(&["SELECT", "2"]);
+        b.reply_to(&["SELECT", "3"]);
+        a.send(&["SET", "k", "v"]);
+        b.send(&["SET", "k", "v"]);
+        assert_eq!(a.routed_db(), Some(2), "connection A kept its own db");
+        assert_eq!(b.routed_db(), Some(3), "connection B kept its own db");
+    }
+
+    // ───────────────────────────── dispatch ──────────────────────────────────
+
+    #[test]
+    fn data_commands_reach_the_dispatcher() {
+        for cmd in [&["SET", "k", "v"][..], &["GET", "k"], &["DEL", "k"]] {
+            let mut c = Conn::open(1);
+            c.send(cmd);
+            assert!(c.routed_db().is_some(), "{cmd:?} must reach the dispatcher");
+        }
     }
 
     #[test]
-    fn select_0_routes_to_db_0_unlogged() {
-        let (mut client, db_rx) = connect_conn_loop(1);
-        send_cmd(&mut client, &["SELECT", "0"]);
-        let resp = read_line(&mut client);
-        assert_eq!(resp, "+OK", "SELECT 0 should return OK");
-        send_cmd(&mut client, &["SET", "k", "v"]);
-        let db = db_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert_eq!(db, 0, "after SELECT 0, db should be 0 (unlogged)");
+    fn connection_local_commands_never_reach_the_dispatcher() {
+        for cmd in [&["PING"][..], &["SELECT", "0"], &["MULTI"], &["UNWATCH"]] {
+            let mut c = Conn::open(1);
+            c.reply_to(cmd);
+            assert!(c.dispatched_nothing(), "{cmd:?} must be answered locally");
+        }
     }
 
     #[test]
-    fn select_1_routes_to_db_1_logged() {
-        let (mut client, db_rx) = connect_conn_loop(0);
-        send_cmd(&mut client, &["SELECT", "1"]);
-        let resp = read_line(&mut client);
-        assert_eq!(resp, "+OK", "SELECT 1 should return OK");
-        send_cmd(&mut client, &["SET", "k", "v"]);
-        let db = db_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert_eq!(db, 1, "after SELECT 1, db should be 1 (logged)");
+    fn dispatcher_reply_is_forwarded_to_the_client() {
+        let mut c = Conn::open(1);
+        assert_eq!(c.reply_to(&["SET", "k", "v"]), "+OK");
     }
 
+    // ─────────────────────────── MULTI / WATCH ───────────────────────────────
+
     #[test]
-    fn select_db_is_independent_per_connection() {
-        let (mut client_a, db_rx_a) = connect_conn_loop(1);
-        let (mut client_b, db_rx_b) = connect_conn_loop(0);
-
-        send_cmd(&mut client_a, &["SELECT", "2"]);
-        read_line(&mut client_a);
-
-        send_cmd(&mut client_b, &["SELECT", "3"]);
-        read_line(&mut client_b);
-
-        send_cmd(&mut client_a, &["SET", "k", "v"]);
-        send_cmd(&mut client_b, &["SET", "k", "v"]);
-
-        let a_db = db_rx_a.recv_timeout(Duration::from_secs(2)).unwrap();
-        let b_db = db_rx_b.recv_timeout(Duration::from_secs(2)).unwrap();
-
-        assert_eq!(
-            a_db, 2,
-            "connection A: after SELECT 2 should use db 2 (unlogged)"
-        );
-        assert_eq!(
-            b_db, 3,
-            "connection B: after SELECT 3 should use db 3 (logged)"
-        );
+    fn simple_commands_get_their_documented_replies() {
+        let cases: &[(&[&str], &str)] = &[
+            (&["PING"], "+PONG"),
+            (&["MULTI"], "+OK"),
+            (&["UNWATCH"], "+OK"),
+            // Both are allowed before AUTH when no password is configured.
+            (&["AUTH", "anything"], "+OK"),
+        ];
+        for (cmd, expected) in cases {
+            let mut c = Conn::open(1);
+            assert_eq!(&c.reply_to(cmd), expected, "for {cmd:?}");
+        }
     }
 
+    /// WATCH needs the shared-memory counters, which only exist when the
+    /// extension is in shared_preload_libraries. Refusing is the safe answer:
+    /// replying +OK would let the following EXEC commit over a conflicting
+    /// write it had no way to observe. These tests run outside Postgres, so
+    /// the counters are absent and the refusal is what we should see.
     #[test]
-    fn ping_is_handled_without_hitting_dispatcher() {
-        let (mut client, logged_rx) = connect_conn_loop(1);
-        send_cmd(&mut client, &["PING"]);
-        let resp = read_line(&mut client);
-        assert_eq!(resp, "+PONG");
+    fn watch_refuses_when_shared_memory_is_unavailable() {
+        let mut c = Conn::open(1);
+        let resp = c.reply_to(&["WATCH", "mykey"]);
         assert!(
-            logged_rx.recv_timeout(Duration::from_millis(100)).is_err(),
-            "PING should not reach the SPI dispatcher"
+            resp.starts_with("-ERR") && resp.contains("shared_preload_libraries"),
+            "WATCH should refuse without shared memory, got {resp}"
         );
     }
 
     #[test]
-    fn select_does_not_reach_dispatcher() {
-        let (mut client, logged_rx) = connect_conn_loop(1);
-        send_cmd(&mut client, &["SELECT", "0"]);
-        read_line(&mut client);
+    fn transaction_commands_out_of_context_return_errors() {
+        // (setup, command that should error)
+        let cases: &[(&[&[&str]], &[&str])] = &[
+            (&[], &["EXEC"]),
+            (&[], &["DISCARD"]),
+            (&[&["MULTI"]], &["MULTI"]),
+            (&[&["MULTI"]], &["WATCH", "k"]),
+        ];
+        for (setup, cmd) in cases {
+            let mut c = Conn::open(1);
+            for s in *setup {
+                c.reply_to(s);
+            }
+            let resp = c.reply_to(cmd);
+            assert!(resp.starts_with("-ERR"), "{cmd:?} should error, got {resp}");
+        }
+    }
+
+    #[test]
+    fn queued_commands_execute_on_exec() {
+        let mut c = Conn::open(1);
+        assert_eq!(c.reply_to(&["MULTI"]), "+OK");
+        assert_eq!(c.reply_to(&["SET", "k", "v"]), "+QUEUED");
+        c.send(&["EXEC"]);
+        assert_eq!(c.line(), "*1", "EXEC returns one reply per queued command");
+        assert_eq!(c.line(), "+OK");
+    }
+
+    #[test]
+    fn discard_drops_the_queue_without_executing_it() {
+        let mut c = Conn::open(1);
+        c.reply_to(&["MULTI"]);
+        c.reply_to(&["SET", "k", "v"]);
+        assert_eq!(c.reply_to(&["DISCARD"]), "+OK");
         assert!(
-            logged_rx.recv_timeout(Duration::from_millis(100)).is_err(),
-            "SELECT should not reach the SPI dispatcher"
+            c.dispatched_nothing(),
+            "discarded commands must not be executed"
         );
     }
 
-    #[test]
-    fn set_reaches_dispatcher() {
-        let (mut client, logged_rx) = connect_conn_loop(1);
-        send_cmd(&mut client, &["SET", "k", "v"]);
-        assert!(
-            logged_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
-            "SET must reach the SPI dispatcher"
-        );
-    }
+    // ───────────────────────────────  AUTH  ──────────────────────────────────
 
     #[test]
-    fn get_reaches_dispatcher() {
-        let (mut client, logged_rx) = connect_conn_loop(1);
-        send_cmd(&mut client, &["GET", "k"]);
-        assert!(
-            logged_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
-            "GET must reach the SPI dispatcher"
-        );
-    }
-
-    #[test]
-    fn del_reaches_dispatcher() {
-        let (mut client, logged_rx) = connect_conn_loop(1);
-        send_cmd(&mut client, &["DEL", "k"]);
-        assert!(
-            logged_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
-            "DEL must reach the SPI dispatcher"
-        );
-    }
-
-    #[test]
-    fn dispatcher_reply_is_forwarded_to_client() {
-        let (mut client, _logged_rx) = connect_conn_loop(1);
-        send_cmd(&mut client, &["SET", "k", "v"]);
-        let resp = read_line(&mut client);
-        assert_eq!(
-            resp, "+OK",
-            "dispatcher response must be forwarded to the client"
-        );
-    }
-
-    #[test]
-    fn constant_time_eq_matches_equal_slices() {
-        assert!(constant_time_eq(b"secret", b"secret"));
-    }
-
-    #[test]
-    fn constant_time_eq_rejects_different_slices() {
-        assert!(!constant_time_eq(b"secret", b"wroong"));
-    }
-
-    #[test]
-    fn constant_time_eq_rejects_different_lengths() {
-        assert!(!constant_time_eq(b"short", b"longer"));
-    }
-
-    #[test]
-    fn constant_time_eq_empty_matches_empty() {
-        assert!(constant_time_eq(b"", b""));
-    }
-
-    #[test]
-    fn ping_is_allowed_without_auth() {
-        let (mut client, _) = connect_conn_loop(1);
-        send_cmd(&mut client, &["PING"]);
-        let resp = read_line(&mut client);
-        assert_eq!(resp, "+PONG", "PING must respond without authentication");
-    }
-
-    #[test]
-    fn auth_with_no_password_configured_always_succeeds() {
-        let (mut client, _) = connect_conn_loop(1);
-        send_cmd(&mut client, &["AUTH", "anything"]);
-        let resp = read_line(&mut client);
-        assert_eq!(
-            resp, "+OK",
-            "AUTH must return OK when no password is configured"
-        );
-    }
-
-    #[test]
-    fn connection_counter_increments_and_decrements() {
-        let counter = Arc::new(AtomicUsize::new(0));
-        assert_eq!(counter.load(Ordering::Relaxed), 0);
-
-        counter.fetch_add(1, Ordering::Relaxed);
-        assert_eq!(counter.load(Ordering::Relaxed), 1);
-
-        counter.fetch_sub(1, Ordering::Relaxed);
-        assert_eq!(counter.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn multi_returns_ok() {
-        let (mut client, _) = connect_conn_loop(1);
-        send_cmd(&mut client, &["MULTI"]);
-        let resp = read_line(&mut client);
-        assert_eq!(resp, "+OK", "MULTI must return OK");
-    }
-
-    #[test]
-    fn multi_nested_returns_error() {
-        let (mut client, _) = connect_conn_loop(1);
-        send_cmd(&mut client, &["MULTI"]);
-        read_line(&mut client);
-        send_cmd(&mut client, &["MULTI"]);
-        let resp = read_line(&mut client);
-        assert!(
-            resp.starts_with("-ERR"),
-            "nested MULTI must return error, got: {}",
-            resp
-        );
-    }
-
-    #[test]
-    fn discard_outside_multi_returns_error() {
-        let (mut client, _) = connect_conn_loop(1);
-        send_cmd(&mut client, &["DISCARD"]);
-        let resp = read_line(&mut client);
-        assert!(
-            resp.starts_with("-ERR"),
-            "DISCARD without MULTI must return error, got: {}",
-            resp
-        );
-    }
-
-    #[test]
-    fn exec_outside_multi_returns_error() {
-        let (mut client, _) = connect_conn_loop(1);
-        send_cmd(&mut client, &["EXEC"]);
-        let resp = read_line(&mut client);
-        assert!(
-            resp.starts_with("-ERR"),
-            "EXEC without MULTI must return error, got: {}",
-            resp
-        );
-    }
-
-    #[test]
-    fn commands_inside_multi_return_queued() {
-        let (mut client, _) = connect_conn_loop(1);
-        send_cmd(&mut client, &["MULTI"]);
-        read_line(&mut client);
-        send_cmd(&mut client, &["SET", "k", "v"]);
-        let resp = read_line(&mut client);
-        assert_eq!(
-            resp, "+QUEUED",
-            "commands inside MULTI must return QUEUED, got: {}",
-            resp
-        );
-    }
-
-    #[test]
-    fn discard_inside_multi_returns_ok_and_clears_queue() {
-        let (mut client, logged_rx) = connect_conn_loop(1);
-        send_cmd(&mut client, &["MULTI"]);
-        read_line(&mut client);
-        send_cmd(&mut client, &["SET", "k", "v"]);
-        read_line(&mut client);
-        send_cmd(&mut client, &["DISCARD"]);
-        let resp = read_line(&mut client);
-        assert_eq!(resp, "+OK", "DISCARD must return OK, got: {}", resp);
-        assert!(
-            logged_rx.recv_timeout(Duration::from_millis(100)).is_err(),
-            "queued commands must not reach dispatcher after DISCARD"
-        );
-    }
-
-    #[test]
-    fn exec_inside_multi_dispatches_batch_and_returns_array() {
-        let (mut client, _) = connect_conn_loop(1);
-        send_cmd(&mut client, &["MULTI"]);
-        read_line(&mut client);
-        send_cmd(&mut client, &["SET", "k", "v"]);
-        read_line(&mut client);
-        send_cmd(&mut client, &["EXEC"]);
-        let array_header = read_line(&mut client);
-        assert_eq!(
-            array_header, "*1",
-            "EXEC must return array with one element, got: {}",
-            array_header
-        );
-        let item_resp = read_line(&mut client);
-        assert_eq!(
-            item_resp, "+OK",
-            "SET response in EXEC array must be OK, got: {}",
-            item_resp
-        );
-    }
-
-    #[test]
-    fn watch_returns_ok() {
-        let (mut client, _) = connect_conn_loop(1);
-        send_cmd(&mut client, &["WATCH", "mykey"]);
-        let resp = read_line(&mut client);
-        assert_eq!(resp, "+OK", "WATCH must return OK, got: {}", resp);
-    }
-
-    #[test]
-    fn unwatch_returns_ok() {
-        let (mut client, _) = connect_conn_loop(1);
-        send_cmd(&mut client, &["UNWATCH"]);
-        let resp = read_line(&mut client);
-        assert_eq!(resp, "+OK", "UNWATCH must return OK, got: {}", resp);
-    }
-
-    #[test]
-    fn watch_inside_multi_returns_error() {
-        let (mut client, _) = connect_conn_loop(1);
-        send_cmd(&mut client, &["MULTI"]);
-        read_line(&mut client);
-        send_cmd(&mut client, &["WATCH", "k"]);
-        let resp = read_line(&mut client);
-        assert!(
-            resp.starts_with("-ERR"),
-            "WATCH inside MULTI must return error, got: {}",
-            resp
-        );
+    fn constant_time_eq_compares_by_value() {
+        let cases: &[(&[u8], &[u8], bool)] = &[
+            (b"secret", b"secret", true),
+            (b"secret", b"wroong", false),
+            (b"short", b"longer", false),
+            (b"", b"", true),
+            (b"", b"x", false),
+            // Differs only in the final byte — must not be reported equal.
+            (b"secreta", b"secretb", false),
+        ];
+        for &(a, b, expected) in cases {
+            assert_eq!(
+                constant_time_eq(a, b),
+                expected,
+                "{:?} vs {:?}",
+                String::from_utf8_lossy(a),
+                String::from_utf8_lossy(b)
+            );
+        }
     }
 }

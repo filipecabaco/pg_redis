@@ -27,9 +27,9 @@ jobs:
         id: current
         run: |
           set -euo pipefail
-          VERSION=$(grep '^  CARGO_PGRX_VERSION:' .github/workflows/ci.yml | sed 's/.*: "//' | tr -d '"')
+          VERSION=$(sed -nE 's/^pgrx = "=([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p' Cargo.toml)
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "ERROR: could not parse current pgrx version from ci.yml (got: '$VERSION')" >&2
+            echo "ERROR: could not parse current pgrx version from Cargo.toml (got: '$VERSION')" >&2
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -77,7 +77,6 @@ jobs:
           set -euo pipefail
 
           # Use | as sed delimiter to avoid conflicts with version dots
-          sed -i "s|CARGO_PGRX_VERSION: \"${OLD}\"|CARGO_PGRX_VERSION: \"${NEW}\"|" .github/workflows/ci.yml
           sed -i "s|pgrx = \"=${OLD}\"|pgrx = \"=${NEW}\"|" Cargo.toml
           sed -i "s|pgrx-tests = \"=${OLD}\"|pgrx-tests = \"=${NEW}\"|" Cargo.toml
 
@@ -97,22 +96,44 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
-          git add .github/workflows/ci.yml Cargo.toml Cargo.lock
+          git add Cargo.toml Cargo.lock
           git commit -m "chore: update pgrx ${OLD} -> ${NEW}"
-          git push origin "$BRANCH"
+          # Recreated from main on every run, and named for the version it
+          # targets, so the remote copy is only ever a previous attempt at the
+          # same bump. A plain push fails the moment one of those is left behind
+          # — which is what happens whenever the PR step could not complete.
+          git push --force origin "$BRANCH"
 
-          gh pr create \
-            --title "chore: update pgrx ${OLD} -> ${NEW}" \
-            --body "Automated update of pgrx from \`${OLD}\` to \`${NEW}\`.
+          # Build the body in a heredoc. Writing it inline would need blank and
+          # unindented lines, which end the enclosing YAML block scalar and make
+          # the whole workflow file unparseable.
+          cat > /tmp/pr-body.md <<BODY
+          Automated update of pgrx from \`${OLD}\` to \`${NEW}\`.
 
-Changes:
-- \`.github/workflows/ci.yml\`: \`CARGO_PGRX_VERSION\`
-- \`Cargo.toml\`: \`pgrx\` and \`pgrx-tests\` dependencies
-- \`Cargo.lock\`: updated lock entries
+          Changes:
+          - \`Cargo.toml\`: \`pgrx\` and \`pgrx-tests\` dependencies
+          - \`Cargo.lock\`: updated lock entries
 
-CI will run the full test matrix (pg15, pg16, pg17) automatically." \
-            --base main \
-            --head "$BRANCH"
+          CI will run the full test matrix (pg15, pg16, pg17) automatically.
+          BODY
+
+          # Opening the PR needs "Allow GitHub Actions to create and approve pull
+          # requests" (Settings > Actions > General). That is a repository
+          # setting, not a token permission a workflow can ask for, so treat it
+          # as optional: the branch is pushed either way, and the useful work —
+          # the dependency bump, committed and ready — is already done.
+          if gh pr create \
+              --title "chore: update pgrx ${OLD} -> ${NEW}" \
+              --body-file /tmp/pr-body.md \
+              --base main \
+              --head "$BRANCH"; then
+            exit 0
+          fi
+
+          echo "::notice::Pushed ${BRANCH}, but could not open the pull request." \
+               "Enable 'Allow GitHub Actions to create and approve pull requests'" \
+               "in Settings > Actions > General to automate this step."
+          echo "Open it manually: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${BRANCH}?expand=1"
 
       - name: Already up to date
         if: steps.latest.outputs.version == steps.current.outputs.version

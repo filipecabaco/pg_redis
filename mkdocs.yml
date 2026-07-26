@@ -62,3 +62,4 @@ nav:
       - Benchmarks: benchmarks.md
   - Contributing:
       - Development: development.md
+      - Handoff: handoff.md

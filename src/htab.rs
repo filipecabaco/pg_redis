@@ -43,17 +43,26 @@ impl<E> SharedTable<E> {
         }
     }
 
-    /// HASH_ENTER: returns (entry_ptr, was_already_present).
-    pub unsafe fn enter(&self, key_ptr: *const c_void) -> (*mut E, bool) {
+    /// HASH_ENTER_NULL: returns (entry_ptr, was_already_present), or `None` when
+    /// the table is full.
+    ///
+    /// Deliberately not `HASH_ENTER`. These tables are created `HASH_FIXED_SIZE`,
+    /// and dynahash answers a full fixed-size table by raising
+    /// `out of shared memory` — an `ereport(ERROR)`, which unwinds by longjmp.
+    /// The shared-memory command path exists precisely to avoid opening a
+    /// transaction, so there is no subtransaction in scope to catch it. Getting
+    /// a null back and reporting it is the difference between a full cache and
+    /// a worker that dies.
+    pub unsafe fn enter(&self, key_ptr: *const c_void) -> Option<(*mut E, bool)> {
         unsafe {
             let mut found = false;
             let entry = pg_sys::hash_search(
                 self.htab,
                 key_ptr,
-                pg_sys::HASHACTION::HASH_ENTER,
+                pg_sys::HASHACTION::HASH_ENTER_NULL,
                 &mut found,
             ) as *mut E;
-            (entry, found)
+            (!entry.is_null()).then_some((entry, found))
         }
     }
 

@@ -3,8 +3,13 @@ use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 pub const MAX_PUBSUB_SLOTS: usize = 256;
 pub const PUBSUB_RING_CAP: usize = 256;
 pub const MAX_SUBS_PER_SLOT: usize = 16;
-pub const PUBSUB_MSG_LEN: usize = 128;
-pub const CHAN_LEN: usize = 64;
+/// Maximum PUBLISH payload. Matches `mem::MAX_TOTAL_VAL_LEN` so a value that
+/// fits in memory mode also fits through pub/sub.
+pub const PUBSUB_MSG_LEN: usize = 512;
+/// Maximum channel or pattern name. One byte is reserved for the NUL
+/// terminator, so `MAX_CHANNEL_LEN` is what callers may actually use.
+pub const CHAN_LEN: usize = 256;
+pub const MAX_CHANNEL_LEN: usize = CHAN_LEN - 1;
 
 pub const MAX_ROUTES: usize = 64;
 pub const ROUTE_SCHEMA_LEN: usize = 64;
@@ -35,23 +40,30 @@ pub fn route_ctl_size() -> usize {
     std::mem::size_of::<RouteCtl>()
 }
 
-// Works on any *mut T where T has a `lock: AtomicU8` field.
-macro_rules! acquire_lock {
-    ($ctl:expr) => {
-        while (*$ctl)
-            .lock
+/// RAII guard for the cross-process `AtomicU8` spinlocks in this module.
+///
+/// Releasing in `Drop` rather than at each exit point matters for more than
+/// tidiness: these locks are plain shared-memory bytes with no owner tracking,
+/// so a thread that unwound while holding one would wedge every pub/sub
+/// operation in every worker process, permanently, at 100% CPU.
+struct SpinGuard<'a>(&'a AtomicU8);
+
+impl<'a> SpinGuard<'a> {
+    fn acquire(lock: &'a AtomicU8) -> Self {
+        while lock
             .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             std::hint::spin_loop();
         }
-    };
+        Self(lock)
+    }
 }
 
-macro_rules! release_lock {
-    ($ctl:expr) => {
-        (*$ctl).lock.store(0, Ordering::Release);
-    };
+impl Drop for SpinGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(0, Ordering::Release);
+    }
 }
 
 /// Header block: global spinlock protecting subscription map changes and PUBLISH scans.
@@ -95,20 +107,11 @@ pub fn pubsub_ctl_size() -> usize {
     std::mem::size_of::<PubsubCtl>()
 }
 
+/// Shared memory the slot table occupies — ~66 MiB at the current constants,
+/// requested whether or not pub/sub is used. Raising `CHAN_LEN`,
+/// `PUBSUB_MSG_LEN` or `PUBSUB_RING_CAP` is a real cost to every deployment.
 pub fn pubsub_slots_size() -> usize {
     std::mem::size_of::<PubsubSlot>() * MAX_PUBSUB_SLOTS
-}
-
-unsafe fn spin_acquire(ctl: *mut PubsubCtl) {
-    unsafe {
-        acquire_lock!(ctl);
-    }
-}
-
-unsafe fn spin_release(ctl: *mut PubsubCtl) {
-    unsafe {
-        release_lock!(ctl);
-    }
 }
 
 pub unsafe fn route_add(ctl: *mut RouteCtl, channel: &[u8], schema: &[u8], table: &[u8]) -> bool {
@@ -117,7 +120,7 @@ pub unsafe fn route_add(ctl: *mut RouteCtl, channel: &[u8], schema: &[u8], table
         let sc_len = schema.len().min(ROUTE_SCHEMA_LEN - 1);
         let tb_len = table.len().min(ROUTE_TABLE_LEN - 1);
 
-        acquire_lock!(ctl);
+        let _guard = SpinGuard::acquire(&(*ctl).lock);
         let mut free_idx = None;
         for i in 0..MAX_ROUTES {
             let e = &mut (*ctl).entries[i];
@@ -132,45 +135,35 @@ pub unsafe fn route_add(ctl: *mut RouteCtl, channel: &[u8], schema: &[u8], table
                 e.schema_len = sc_len as u16;
                 e.table[..tb_len].copy_from_slice(&table[..tb_len]);
                 e.table_len = tb_len as u16;
-                release_lock!(ctl);
                 return true;
             }
         }
-        if let Some(idx) = free_idx {
-            let e = &mut (*ctl).entries[idx];
-            e.channel[..ch_len].copy_from_slice(&channel[..ch_len]);
-            e.channel_len = ch_len as u16;
-            e.schema[..sc_len].copy_from_slice(&schema[..sc_len]);
-            e.schema_len = sc_len as u16;
-            e.table[..tb_len].copy_from_slice(&table[..tb_len]);
-            e.table_len = tb_len as u16;
-            e.active = 1;
-            (*ctl).route_count.fetch_add(1, Ordering::Relaxed);
-            release_lock!(ctl);
-            return true;
-        }
-        release_lock!(ctl);
-        false
+        let Some(idx) = free_idx else { return false };
+        let e = &mut (*ctl).entries[idx];
+        e.channel[..ch_len].copy_from_slice(&channel[..ch_len]);
+        e.channel_len = ch_len as u16;
+        e.schema[..sc_len].copy_from_slice(&schema[..sc_len]);
+        e.schema_len = sc_len as u16;
+        e.table[..tb_len].copy_from_slice(&table[..tb_len]);
+        e.table_len = tb_len as u16;
+        e.active = 1;
+        (*ctl).route_count.fetch_add(1, Ordering::Relaxed);
+        true
     }
 }
 
 pub unsafe fn route_remove(ctl: *mut RouteCtl, channel: &[u8]) -> bool {
     unsafe {
-        acquire_lock!(ctl);
+        let _guard = SpinGuard::acquire(&(*ctl).lock);
         for i in 0..MAX_ROUTES {
             let e = &mut (*ctl).entries[i];
-            if e.active == 0 {
-                continue;
-            }
             let ch_len = e.channel_len as usize;
-            if ch_len == channel.len() && e.channel[..ch_len] == *channel {
+            if e.active != 0 && ch_len == channel.len() && e.channel[..ch_len] == *channel {
                 e.active = 0;
                 (*ctl).route_count.fetch_sub(1, Ordering::Relaxed);
-                release_lock!(ctl);
                 return true;
             }
         }
-        release_lock!(ctl);
         false
     }
 }
@@ -180,24 +173,19 @@ pub unsafe fn route_lookup(ctl: *mut RouteCtl, channel: &[u8]) -> Option<(Vec<u8
         if (*ctl).route_count.load(Ordering::Relaxed) == 0 {
             return None;
         }
-        acquire_lock!(ctl);
-        let mut result = None;
-        for i in 0..MAX_ROUTES {
+        let _guard = SpinGuard::acquire(&(*ctl).lock);
+        (0..MAX_ROUTES).find_map(|i| {
             let e = &(*ctl).entries[i];
-            if e.active == 0 {
-                continue;
-            }
             let ch_len = e.channel_len as usize;
-            if ch_len == channel.len() && e.channel[..ch_len] == *channel {
-                result = Some((
-                    e.schema[..e.schema_len as usize].to_vec(),
-                    e.table[..e.table_len as usize].to_vec(),
-                ));
-                break;
-            }
-        }
-        release_lock!(ctl);
-        result
+            (e.active != 0 && ch_len == channel.len() && e.channel[..ch_len] == *channel).then(
+                || {
+                    (
+                        e.schema[..e.schema_len as usize].to_vec(),
+                        e.table[..e.table_len as usize].to_vec(),
+                    )
+                },
+            )
+        })
     }
 }
 
@@ -211,17 +199,28 @@ unsafe fn slot_reset(slot: *mut PubsubSlot) {
     }
 }
 
+/// Length of a NUL-terminated fixed-size slot entry.
+fn entry_len(entry: &[u8; CHAN_LEN]) -> usize {
+    entry.iter().position(|&b| b == 0).unwrap_or(CHAN_LEN)
+}
+
+/// Compare a NUL-terminated slot entry against `value`.
+///
+/// Deliberately avoids locating the terminator first: PUBLISH runs this against
+/// every subscription of every slot, and the overwhelmingly common case
+/// mismatches on the first byte.
+fn entry_eq(entry: &[u8; CHAN_LEN], value: &[u8]) -> bool {
+    value.len() < CHAN_LEN && entry[..value.len()] == *value && entry[value.len()] == 0
+}
+
 unsafe fn slot_add(
     arr: &mut [[u8; CHAN_LEN]; MAX_SUBS_PER_SLOT],
     count: &mut u32,
     value: &[u8],
 ) -> bool {
     let n = *count as usize;
-    for entry in arr[..n].iter() {
-        let len = entry.iter().position(|&b| b == 0).unwrap_or(CHAN_LEN);
-        if len == value.len() && entry[..len] == *value {
-            return false;
-        }
+    if arr[..n].iter().any(|entry| entry_eq(entry, value)) {
+        return false;
     }
     if n >= MAX_SUBS_PER_SLOT {
         return false;
@@ -239,25 +238,16 @@ unsafe fn slot_remove(
     value: &[u8],
 ) {
     let n = *count as usize;
-    for (i, entry) in arr[..n].iter().enumerate() {
-        let len = entry.iter().position(|&b| b == 0).unwrap_or(CHAN_LEN);
-        if len == value.len() && entry[..len] == *value {
-            if i < n - 1 {
-                arr[i] = arr[n - 1];
-            }
-            *count -= 1;
-            return;
-        }
+    if let Some(i) = arr[..n].iter().position(|entry| entry_eq(entry, value)) {
+        arr[i] = arr[n - 1];
+        *count -= 1;
     }
 }
 
 unsafe fn slot_names(arr: &[[u8; CHAN_LEN]; MAX_SUBS_PER_SLOT], count: u32) -> Vec<Vec<u8>> {
     arr[..count as usize]
         .iter()
-        .map(|entry| {
-            let len = entry.iter().position(|&b| b == 0).unwrap_or(CHAN_LEN);
-            entry[..len].to_vec()
-        })
+        .map(|entry| entry[..entry_len(entry)].to_vec())
         .collect()
 }
 
@@ -272,14 +262,13 @@ where
     F: FnOnce(&mut PubsubSlot),
 {
     unsafe {
-        spin_acquire(ctl);
+        let _guard = SpinGuard::acquire(&(*ctl).lock);
         let slot = &mut *slots.add(idx);
         mutate(slot);
         let counts = (slot.channel_count, slot.pattern_count);
         if counts == (0, 0) {
             slot_reset(slot as *mut _);
         }
-        spin_release(ctl);
         counts
     }
 }
@@ -302,23 +291,19 @@ where
     ),
 {
     unsafe {
-        spin_acquire(ctl);
-        let mut result = None;
-        for i in 0..MAX_PUBSUB_SLOTS {
+        let _guard = SpinGuard::acquire(&(*ctl).lock);
+        (0..MAX_PUBSUB_SLOTS).find_map(|i| {
             let slot = slots.add(i);
-            if (*slot).in_use == 0 {
+            ((*slot).in_use == 0).then(|| {
                 slot_reset(slot);
                 (*slot).in_use = 1;
                 let (arr, count) = field_fn(slot);
                 for item in items {
                     slot_add(arr, count, item);
                 }
-                result = Some((i, *count));
-                break;
-            }
-        }
-        spin_release(ctl);
-        result
+                (i, *count)
+            })
+        })
     }
 }
 
@@ -348,12 +333,11 @@ pub unsafe fn slot_alloc_and_psubscribe(
 
 pub unsafe fn slot_free(ctl: *mut PubsubCtl, slots: *mut PubsubSlot, idx: usize) {
     unsafe {
-        spin_acquire(ctl);
+        let _guard = SpinGuard::acquire(&(*ctl).lock);
         let slot = slots.add(idx);
         if (*slot).in_use != 0 {
             slot_reset(slot);
         }
-        spin_release(ctl);
     }
 }
 
@@ -423,11 +407,9 @@ pub unsafe fn channel_names(
     idx: usize,
 ) -> Vec<Vec<u8>> {
     unsafe {
-        spin_acquire(ctl);
+        let _guard = SpinGuard::acquire(&(*ctl).lock);
         let slot = slots.add(idx);
-        let names = slot_names(&(*slot).channels, (*slot).channel_count);
-        spin_release(ctl);
-        names
+        slot_names(&(*slot).channels, (*slot).channel_count)
     }
 }
 
@@ -437,11 +419,9 @@ pub unsafe fn pattern_names(
     idx: usize,
 ) -> Vec<Vec<u8>> {
     unsafe {
-        spin_acquire(ctl);
+        let _guard = SpinGuard::acquire(&(*ctl).lock);
         let slot = slots.add(idx);
-        let names = slot_names(&(*slot).patterns, (*slot).pattern_count);
-        spin_release(ctl);
-        names
+        slot_names(&(*slot).patterns, (*slot).pattern_count)
     }
 }
 
@@ -452,7 +432,7 @@ pub unsafe fn publish(
     message: &[u8],
 ) -> i64 {
     unsafe {
-        spin_acquire(ctl);
+        let _guard = SpinGuard::acquire(&(*ctl).lock);
         let mut count: i64 = 0;
         for i in 0..MAX_PUBSUB_SLOTS {
             let slot = slots.add(i);
@@ -460,26 +440,21 @@ pub unsafe fn publish(
                 continue;
             }
             let ch_count = (*slot).channel_count as usize;
-            'ch: for entry in (&(*slot).channels)[..ch_count].iter() {
-                let len = entry.iter().position(|&b| b == 0).unwrap_or(CHAN_LEN);
-                if len == channel.len() && entry[..len] == *channel {
-                    if write_to_ring(slot, channel, b"", message) {
-                        count += 1;
-                    }
-                    break 'ch;
-                }
+            if (&(*slot).channels)[..ch_count]
+                .iter()
+                .any(|entry| entry_eq(entry, channel))
+                && write_to_ring(slot, channel, b"", message)
+            {
+                count += 1;
             }
             let pat_count = (*slot).pattern_count as usize;
             for entry in (&(*slot).patterns)[..pat_count].iter() {
-                let len = entry.iter().position(|&b| b == 0).unwrap_or(CHAN_LEN);
-                if glob_match(&entry[..len], channel)
-                    && write_to_ring(slot, channel, &entry[..len], message)
-                {
+                let pat = &entry[..entry_len(entry)];
+                if glob_match(pat, channel) && write_to_ring(slot, channel, pat, message) {
                     count += 1;
                 }
             }
         }
-        spin_release(ctl);
         count
     }
 }
@@ -508,16 +483,81 @@ unsafe fn write_to_ring(
         msg.pattern[pat_len] = 0;
         msg.pattern_len = pat_len as u16;
 
-        // Payloads longer than PUBSUB_MSG_LEN (128 bytes) are truncated by design;
-        // callers should keep messages short or increase PUBSUB_MSG_LEN at compile time.
+        // Callers reject oversized payloads before reaching here; the clamp is a
+        // belt-and-braces bound on the memcpy, not the enforcement point.
         let pay_len = payload.len().min(PUBSUB_MSG_LEN);
         msg.payload[..pay_len].copy_from_slice(&payload[..pay_len]);
         msg.payload_len = pay_len as u32;
 
         (*slot).tail.store(tail + 1, Ordering::Release);
+        wake_subscriber(slot);
         true
     }
 }
+
+/// Current ring position, for a subscriber to pass to [`wait_for_message`].
+pub unsafe fn current_tail(slots: *mut PubsubSlot, idx: usize) -> u32 {
+    unsafe { (*slots.add(idx)).tail.load(Ordering::Acquire) }
+}
+
+/// Block until this slot's ring advances past `seen_tail`, or `timeout` elapses.
+///
+/// Subscribers used to discover messages by letting a 5 ms socket read time out,
+/// which cost ~200 wakeups per second per idle subscriber and still delayed
+/// delivery by up to 5 ms. Waiting on the tail counter instead makes delivery
+/// immediate and leaves the timeout doing nothing but bounding how long a client
+/// command sits unread.
+///
+/// The futex lives in PostgreSQL's shared memory segment, so the shared (not
+/// `PRIVATE`) operations are required: the waiter and the waker are different
+/// processes. A missed wakeup only costs one `timeout`, never a hang.
+///
+/// # Safety
+/// `slots` must point at the initialised slot array and `idx` be in range.
+#[cfg(target_os = "linux")]
+pub unsafe fn wait_for_message(
+    slots: *mut PubsubSlot,
+    idx: usize,
+    seen_tail: u32,
+    timeout: std::time::Duration,
+) {
+    const FUTEX_WAIT: libc::c_int = 0;
+    unsafe {
+        let addr = std::ptr::addr_of!((*slots.add(idx)).tail) as *const u32;
+        let deadline = libc::timespec {
+            tv_sec: timeout.as_secs() as libc::time_t,
+            tv_nsec: timeout.subsec_nanos() as libc::c_long,
+        };
+        // Returns EAGAIN immediately if tail already moved — exactly the race we
+        // need handled, since a publish between the drain and this call must not
+        // be slept through.
+        libc::syscall(libc::SYS_futex, addr, FUTEX_WAIT, seen_tail, &deadline);
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn wake_subscriber(slot: *mut PubsubSlot) {
+    const FUTEX_WAKE: libc::c_int = 1;
+    unsafe {
+        let addr = std::ptr::addr_of!((*slot).tail) as *const u32;
+        libc::syscall(libc::SYS_futex, addr, FUTEX_WAKE, 1i32);
+    }
+}
+
+/// Fallback for platforms without futex: sleep briefly and let the caller
+/// re-check, i.e. the polling behaviour this replaces on Linux.
+#[cfg(not(target_os = "linux"))]
+pub unsafe fn wait_for_message(
+    _slots: *mut PubsubSlot,
+    _idx: usize,
+    _seen_tail: u32,
+    timeout: std::time::Duration,
+) {
+    std::thread::sleep(timeout.min(std::time::Duration::from_millis(5)));
+}
+
+#[cfg(not(target_os = "linux"))]
+unsafe fn wake_subscriber(_slot: *mut PubsubSlot) {}
 
 /// Lock-free ring poll — safe from any thread, no spinlock needed.
 pub unsafe fn poll_message(
@@ -547,23 +587,23 @@ pub unsafe fn pubsub_channels(
     pattern: Option<&[u8]>,
 ) -> Vec<Vec<u8>> {
     unsafe {
-        spin_acquire(ctl);
         let mut names: Vec<Vec<u8>> = Vec::new();
-        for i in 0..MAX_PUBSUB_SLOTS {
-            let slot = slots.add(i);
-            if (*slot).in_use == 0 {
-                continue;
-            }
-            let ch_count = (*slot).channel_count as usize;
-            for entry in (&(*slot).channels)[..ch_count].iter() {
-                let len = entry.iter().position(|&b| b == 0).unwrap_or(CHAN_LEN);
-                let name = entry[..len].to_vec();
-                if pattern.is_none_or(|p| glob_match(p, &name)) {
-                    names.push(name);
+        {
+            let _guard = SpinGuard::acquire(&(*ctl).lock);
+            for i in 0..MAX_PUBSUB_SLOTS {
+                let slot = slots.add(i);
+                if (*slot).in_use == 0 {
+                    continue;
+                }
+                let ch_count = (*slot).channel_count as usize;
+                for entry in (&(*slot).channels)[..ch_count].iter() {
+                    let name = &entry[..entry_len(entry)];
+                    if pattern.is_none_or(|p| glob_match(p, name)) {
+                        names.push(name.to_vec());
+                    }
                 }
             }
         }
-        spin_release(ctl);
         // Dedup outside the lock so sort cost doesn't extend the critical section
         names.sort_unstable();
         names.dedup();
@@ -578,7 +618,7 @@ pub unsafe fn pubsub_numsub(
     channels: &[Vec<u8>],
 ) -> Vec<i64> {
     unsafe {
-        spin_acquire(ctl);
+        let _guard = SpinGuard::acquire(&(*ctl).lock);
         let mut counts = vec![0i64; channels.len()];
         for i in 0..MAX_PUBSUB_SLOTS {
             let slot = slots.add(i);
@@ -587,15 +627,13 @@ pub unsafe fn pubsub_numsub(
             }
             let ch_count = (*slot).channel_count as usize;
             for entry in (&(*slot).channels)[..ch_count].iter() {
-                let len = entry.iter().position(|&b| b == 0).unwrap_or(CHAN_LEN);
                 for (k, target) in channels.iter().enumerate() {
-                    if len == target.len() && entry[..len] == **target {
+                    if entry_eq(entry, target) {
                         counts[k] += 1;
                     }
                 }
             }
         }
-        spin_release(ctl);
         counts
     }
 }
@@ -603,8 +641,8 @@ pub unsafe fn pubsub_numsub(
 /// PUBSUB NUMPAT
 pub unsafe fn pubsub_numpat(ctl: *mut PubsubCtl, slots: *mut PubsubSlot) -> i64 {
     unsafe {
-        spin_acquire(ctl);
-        let count: i64 = (0..MAX_PUBSUB_SLOTS)
+        let _guard = SpinGuard::acquire(&(*ctl).lock);
+        (0..MAX_PUBSUB_SLOTS)
             .map(|i| {
                 let slot = slots.add(i);
                 if (*slot).in_use != 0 {
@@ -613,151 +651,268 @@ pub unsafe fn pubsub_numpat(ctl: *mut PubsubCtl, slots: *mut PubsubSlot) -> i64 
                     0
                 }
             })
-            .sum();
-        spin_release(ctl);
-        count
+            .sum()
     }
 }
 
-/// Redis-compatible glob match. Iterative O(n×m) — no stack growth for multiple `*` wildcards.
+/// Redis-compatible glob match over `*`, `?` and `[...]` classes.
+///
+/// Iterative O(n×m) backtracking — no recursion, and indices rather than
+/// reslicing so no input can drive a slice out of bounds. A panic here would be
+/// fatal: `publish` calls this while holding the pub/sub spinlock.
 pub fn glob_match(pattern: &[u8], string: &[u8]) -> bool {
-    let mut pat = pattern;
-    let mut s = string;
-    let mut star_pat: &[u8] = b"";
-    let mut star_s: &[u8] = b"";
-    let mut has_star = false;
+    let (mut p, mut s) = (0usize, 0usize);
+    // Position of the last `*` seen, and how much of `string` it currently absorbs.
+    let (mut star_p, mut star_s) = (usize::MAX, 0usize);
 
-    loop {
-        match pat.first() {
-            Some(&b'*') => {
-                has_star = true;
-                star_pat = &pat[1..];
+    while s < string.len() {
+        let consumed = match pattern.get(p) {
+            Some(b'*') => {
+                star_p = p;
                 star_s = s;
-                pat = &pat[1..];
+                p += 1;
+                continue;
             }
-            Some(&b'?') => {
-                if s.is_empty() {
-                    if has_star {
-                        pat = star_pat;
-                        s = &star_s[1..];
-                        star_s = s;
-                        continue;
-                    }
-                    return false;
-                }
-                pat = &pat[1..];
-                s = &s[1..];
+            Some(b'?') => {
+                p += 1;
+                s += 1;
+                continue;
             }
-            Some(&b'[') => {
-                if s.is_empty() {
-                    if has_star {
-                        pat = star_pat;
-                        s = &star_s[1..];
-                        star_s = s;
-                        continue;
-                    }
-                    return false;
+            Some(b'[') => match match_class(&pattern[p + 1..], string[s]) {
+                (true, len) => {
+                    p += 1 + len;
+                    s += 1;
+                    continue;
                 }
-                let (matched, rest) = match_class(&pat[1..], s[0]);
-                if matched {
-                    pat = rest;
-                    s = &s[1..];
-                } else if has_star && !star_s.is_empty() {
-                    star_s = &star_s[1..];
-                    s = star_s;
-                    pat = star_pat;
-                } else {
-                    return false;
-                }
-            }
-            Some(&c) => {
-                if s.first() == Some(&c) {
-                    pat = &pat[1..];
-                    s = &s[1..];
-                } else if has_star && !star_s.is_empty() {
-                    star_s = &star_s[1..];
-                    s = star_s;
-                    pat = star_pat;
-                } else {
-                    return false;
-                }
-            }
-            None => return s.is_empty() || (has_star && pat.is_empty()),
+                (false, _) => false,
+            },
+            Some(&c) => c == string[s],
+            None => false,
+        };
+        if consumed {
+            p += 1;
+            s += 1;
+            continue;
         }
+        // Mismatch: give the last `*` one more character, or fail outright.
+        if star_p == usize::MAX {
+            return false;
+        }
+        star_s += 1;
+        s = star_s;
+        p = star_p + 1;
     }
+
+    // The string is exhausted; the rest of the pattern must be trailing `*`s.
+    while pattern.get(p) == Some(&b'*') {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
-fn match_class(pat: &[u8], ch: u8) -> (bool, &[u8]) {
+/// Match one `[...]` class body (everything after the `[`) against `ch`.
+/// Returns whether it matched and how many bytes the class body occupies,
+/// including its closing `]` when present.
+fn match_class(pat: &[u8], ch: u8) -> (bool, usize) {
     let negate = pat.first() == Some(&b'^');
-    let mut p = if negate { &pat[1..] } else { pat };
+    let mut i = usize::from(negate);
     let mut matched = false;
-    loop {
-        match p.first() {
-            None | Some(&b']') => {
-                return (matched != negate, &p[p.first().map_or(0, |_| 1)..]);
-            }
-            Some(&c) if p.len() > 2 && p[1] == b'-' => {
-                if ch >= c && ch <= p[2] {
-                    matched = true;
-                }
-                p = &p[3..];
-            }
-            Some(&c) => {
-                if ch == c {
-                    matched = true;
-                }
-                p = &p[1..];
-            }
+    while let Some(&c) = pat.get(i) {
+        if c == b']' {
+            return (matched != negate, i + 1);
+        }
+        if pat.len() - i > 2 && pat[i + 1] == b'-' {
+            matched |= ch >= c && ch <= pat[i + 2];
+            i += 3;
+        } else {
+            matched |= ch == c;
+            i += 1;
         }
     }
+    // Unterminated class — consume the remainder, as the original scan did.
+    (matched != negate, i)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// One table drives every wildcard form PSUBSCRIBE accepts. Cases are
+    /// `(pattern, channel, should_match)`.
+    const GLOB_CASES: &[(&[u8], &[u8], bool)] = &[
+        // exact
+        (b"hello", b"hello", true),
+        (b"hello", b"world", false),
+        (b"", b"", true),
+        (b"", b"x", false),
+        // `*`
+        (b"*", b"anything", true),
+        (b"*", b"", true),
+        (b"h*o", b"hello", true),
+        (b"news.*", b"news.sports", true),
+        (b"news.*", b"sports", false),
+        (b"*a*b*", b"xaxb", true),
+        (b"*a*b*", b"xbxa", false),
+        // A `*` must not swallow a trailing literal that never matches.
+        (b"*a", b"aab", false),
+        (b"*a", b"aba", true),
+        // `?`
+        (b"h?llo", b"hello", true),
+        (b"h?llo", b"hllo", false),
+        // classes
+        (b"[hH]ello", b"hello", true),
+        (b"[hH]ello", b"Hello", true),
+        (b"[hH]ello", b"xello", false),
+        (b"[a-z]ello", b"hello", true),
+        (b"[a-z]ello", b"Hello", false),
+        (b"[^0-9]ello", b"hello", true),
+        (b"[^0-9]ello", b"1ello", false),
+        // Wildcards that run past the end of an empty channel. These used to
+        // panic inside `publish`, wedging the pub/sub spinlock for every worker.
+        (b"*?", b"", false),
+        (b"*[a]", b"", false),
+        (b"?", b"", false),
+        (b"*a", b"", false),
+        // Unterminated class must not run off the end either.
+        (b"[abc", b"a", true),
+        (b"[abc", b"z", false),
+    ];
+
     #[test]
-    fn glob_exact() {
-        assert!(glob_match(b"hello", b"hello"));
-        assert!(!glob_match(b"hello", b"world"));
+    fn glob_match_table() {
+        for &(pattern, string, expected) in GLOB_CASES {
+            assert_eq!(
+                glob_match(pattern, string),
+                expected,
+                "pattern {:?} vs {:?}",
+                String::from_utf8_lossy(pattern),
+                String::from_utf8_lossy(string),
+            );
+        }
+    }
+
+    /// The slot table is requested from shared memory at postmaster start
+    /// whether or not anyone uses pub/sub, so these constants are a cost every
+    /// deployment pays. Changing one should be a deliberate act.
+    #[test]
+    fn slot_table_stays_within_its_shared_memory_budget() {
+        let bytes = pubsub_slots_size();
+        assert!(
+            bytes <= 80 * 1024 * 1024,
+            "pub/sub slots would request {} MiB of shared memory",
+            bytes / 1024 / 1024
+        );
+        // A payload that fits in memory mode must also fit through pub/sub.
+        const {
+            assert!(PUBSUB_MSG_LEN >= crate::mem::MAX_TOTAL_VAL_LEN);
+        }
+        // One byte of every channel slot is reserved for the terminator.
+        assert_eq!(MAX_CHANNEL_LEN, CHAN_LEN - 1);
     }
 
     #[test]
-    fn glob_star() {
-        assert!(glob_match(b"h*o", b"hello"));
-        assert!(glob_match(b"*", b"anything"));
-        assert!(glob_match(b"news.*", b"news.sports"));
-        assert!(!glob_match(b"news.*", b"sports"));
+    fn a_channel_name_at_the_limit_round_trips() {
+        let mut arr = [[0u8; CHAN_LEN]; MAX_SUBS_PER_SLOT];
+        let mut count = 0u32;
+        let name = vec![b'c'; MAX_CHANNEL_LEN];
+
+        assert!(unsafe { slot_add(&mut arr, &mut count, &name) });
+        assert_eq!(count, 1);
+        assert!(entry_eq(&arr[0], &name), "a stored name must match itself");
+        assert_eq!(unsafe { slot_names(&arr, count) }, vec![name.clone()]);
+
+        // Subscribing twice to the same channel is a no-op, not a second entry.
+        assert!(!unsafe { slot_add(&mut arr, &mut count, &name) });
+        assert_eq!(count, 1);
+    }
+
+    /// Backing store for a slot, aligned for the atomics inside it.
+    struct SlotBuf(#[allow(dead_code)] Vec<u64>, *mut PubsubSlot);
+    // The pointer addresses a heap buffer owned by the test and is only ever
+    // touched while that buffer is alive.
+    unsafe impl Send for SlotBuf {}
+
+    fn slot_buf() -> SlotBuf {
+        let words = std::mem::size_of::<PubsubSlot>().div_ceil(8);
+        let mut buf = vec![0u64; words];
+        let ptr = buf.as_mut_ptr() as *mut PubsubSlot;
+        unsafe { (*ptr).in_use = 1 };
+        SlotBuf(buf, ptr)
+    }
+
+    /// A publish must wake a waiting subscriber rather than leaving it to
+    /// discover the message on the next timeout.
+    #[test]
+    fn a_publish_wakes_a_waiting_subscriber() {
+        let slot = slot_buf();
+        let ptr = slot.1;
+
+        let publisher = std::thread::spawn(move || {
+            let slot = slot;
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            unsafe { write_to_ring(slot.1, b"chan", b"", b"payload") };
+            slot
+        });
+
+        let start = std::time::Instant::now();
+        // A ten-second timeout that we expect to return in ~100 ms: if the
+        // wakeup were lost this test would take the full timeout.
+        unsafe { wait_for_message(ptr, 0, 0, std::time::Duration::from_secs(10)) };
+        let waited = start.elapsed();
+        let slot = publisher.join().unwrap();
+
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "waited {waited:?}; the publish should have woken the subscriber"
+        );
+        let message = unsafe { poll_message(slot.1, 0) };
+        assert_eq!(
+            message,
+            Some((b"chan".to_vec(), Vec::new(), b"payload".to_vec()))
+        );
+    }
+
+    /// A publish that lands before the wait starts must not be slept through.
+    #[test]
+    fn a_publish_already_in_the_ring_does_not_block() {
+        let slot = slot_buf();
+        unsafe { write_to_ring(slot.1, b"chan", b"", b"payload") };
+
+        let start = std::time::Instant::now();
+        // seen_tail = 0, but the publish already moved it to 1.
+        unsafe { wait_for_message(slot.1, 0, 0, std::time::Duration::from_secs(10)) };
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "a stale snapshot must return at once, not sleep"
+        );
+    }
+
+    /// With no publisher at all the wait is bounded by its timeout, so a lost
+    /// wakeup can only ever cost latency — never a hung subscriber.
+    #[test]
+    fn a_missed_wakeup_degrades_to_the_timeout() {
+        let slot = slot_buf();
+        let start = std::time::Instant::now();
+        unsafe { wait_for_message(slot.1, 0, 0, std::time::Duration::from_millis(150)) };
+        let waited = start.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_millis(100),
+            "returned after {waited:?}, expected to wait out the timeout"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(2),
+            "waited {waited:?}"
+        );
     }
 
     #[test]
-    fn glob_question() {
-        assert!(glob_match(b"h?llo", b"hello"));
-        assert!(!glob_match(b"h?llo", b"hllo"));
-    }
-
-    #[test]
-    fn glob_class() {
-        assert!(glob_match(b"[hH]ello", b"hello"));
-        assert!(glob_match(b"[hH]ello", b"Hello"));
-        assert!(!glob_match(b"[hH]ello", b"xello"));
-    }
-
-    #[test]
-    fn glob_range() {
-        assert!(glob_match(b"[a-z]ello", b"hello"));
-        assert!(!glob_match(b"[a-z]ello", b"Hello"));
-    }
-
-    #[test]
-    fn glob_negated() {
-        assert!(glob_match(b"[^0-9]ello", b"hello"));
-        assert!(!glob_match(b"[^0-9]ello", b"1ello"));
-    }
-
-    #[test]
-    fn glob_star_multi() {
-        assert!(glob_match(b"*a*b*", b"xaxb"));
-        assert!(!glob_match(b"*a*b*", b"xbxa"));
+    fn entry_eq_matches_nul_terminated_entry() {
+        let mut entry = [0u8; CHAN_LEN];
+        entry[..5].copy_from_slice(b"news.");
+        assert!(entry_eq(&entry, b"news."));
+        assert!(!entry_eq(&entry, b"news"));
+        assert!(!entry_eq(&entry, b"news.x"));
+        // A name too long to have been stored can never match.
+        assert!(!entry_eq(&entry, &[b'a'; CHAN_LEN]));
     }
 }

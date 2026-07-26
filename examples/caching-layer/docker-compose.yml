@@ -14,7 +14,8 @@ services:
       postgres
         -c shared_preload_libraries=pg_redis
         -c redis.port=6379
-        -c redis.use_logged=true
+        -c redis.listen_address=0.0.0.0
+        -c redis.default_db=8
         -c redis.workers=4
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]

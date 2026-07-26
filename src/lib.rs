@@ -3,7 +3,8 @@ pub(crate) mod htab;
 pub(crate) mod mem;
 pub(crate) mod pubsub;
 mod resp;
-mod worker;
+pub(crate) mod watch;
+pub(crate) mod worker;
 
 use pgrx::bgworkers::*;
 use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
@@ -17,10 +18,14 @@ use pgrx::prelude::*;
 mod redis {}
 
 pub(crate) static PORT: GucSetting<i32> = GucSetting::<i32>::new(6379);
-pub(crate) static USE_LOGGED: GucSetting<bool> = GucSetting::<bool>::new(false);
+/// Database new connections start on. 0 is Redis's own default and lands in the
+/// ephemeral half; set it to 8 (or use `SELECT durable`) for WAL-backed storage.
+pub(crate) static DEFAULT_DB: GucSetting<i32> = GucSetting::<i32>::new(0);
 pub(crate) static NUM_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(4);
+/// Loopback by default: the Redis port bypasses PostgreSQL authentication, so
+/// exposing it beyond the host must be a deliberate act.
 pub(crate) static LISTEN_ADDRESS: GucSetting<Option<std::ffi::CString>> =
-    GucSetting::<Option<std::ffi::CString>>::new(Some(c"0.0.0.0"));
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"127.0.0.1"));
 pub(crate) static MAX_CONNECTIONS: GucSetting<i32> = GucSetting::<i32>::new(128);
 pub(crate) static PASSWORD: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
@@ -31,7 +36,16 @@ pub(crate) static DATABASE: GucSetting<Option<std::ffi::CString>> =
 pub(crate) static STORAGE_MODE: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(Some(c"memory"));
 
-pub(crate) static MEM_MAX_ENTRIES: GucSetting<i32> = GucSetting::<i32>::new(16384);
+/// What memory mode does when a shared-memory table fills. Defaults to
+/// `noeviction`, as Redis's own `maxmemory-policy` does.
+pub(crate) static MAXMEMORY_POLICY: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"noeviction"));
+
+/// Halved from 16384 when MAX_KEY_LEN grew to 512, to hold the shared-memory
+/// request steady. Hashing the key out of the composite tables has since taken
+/// that request from ~376 MiB to ~202 MiB, so there is now room to raise this
+/// again if you need the key capacity more than the memory.
+pub(crate) static MEM_MAX_ENTRIES: GucSetting<i32> = GucSetting::<i32>::new(8192);
 
 #[derive(Copy, Clone, PartialEq)]
 pub enum StorageMode {
@@ -50,6 +64,7 @@ static mut SHMEM_CTL: *mut mem::MemControlBlock = std::ptr::null_mut();
 static mut PUBSUB_CTL: *mut pubsub::PubsubCtl = std::ptr::null_mut();
 static mut PUBSUB_SLOTS: *mut pubsub::PubsubSlot = std::ptr::null_mut();
 static mut ROUTE_CTL: *mut pubsub::RouteCtl = std::ptr::null_mut();
+static mut WATCH_CTL: *mut watch::WatchCtl = std::ptr::null_mut();
 static mut PREV_SHMEM_REQUEST_HOOK: pg_sys::shmem_request_hook_type = None;
 static mut PREV_SHMEM_STARTUP_HOOK: pg_sys::shmem_startup_hook_type = None;
 
@@ -63,6 +78,8 @@ unsafe extern "C-unwind" fn pg_redis_shmem_request() {
         pg_sys::RequestAddinShmemSpace(pubsub::pubsub_ctl_size());
         pg_sys::RequestAddinShmemSpace(pubsub::pubsub_slots_size());
         pg_sys::RequestAddinShmemSpace(pubsub::route_ctl_size());
+        // WATCH version counters — needed in both storage modes.
+        pg_sys::RequestAddinShmemSpace(watch::watch_ctl_size());
 
         // Memory-mode shared memory — only when storage_mode = 'memory'.
         if storage_mode() == StorageMode::Memory {
@@ -117,6 +134,17 @@ unsafe extern "C-unwind" fn pg_redis_shmem_startup() {
             std::ptr::write_bytes(ROUTE_CTL, 0, 1);
         }
 
+        let mut watch_found = false;
+        WATCH_CTL = pg_sys::ShmemInitStruct(
+            c"pg_redis_watch_ctl".as_ptr(),
+            watch::watch_ctl_size(),
+            &mut watch_found,
+        )
+        .cast();
+        if !watch_found {
+            std::ptr::write_bytes(WATCH_CTL, 0, 1);
+        }
+
         // Memory-mode init — conditional.
         if storage_mode() == StorageMode::Memory {
             let mut mem_found = false;
@@ -169,6 +197,13 @@ pub(crate) fn route_state() -> Option<*mut pubsub::RouteCtl> {
     if ctl.is_null() { None } else { Some(ctl) }
 }
 
+/// `Some(ctl)` once WATCH's shared-memory counters exist, `None` when the
+/// extension was not loaded via `shared_preload_libraries`.
+pub(crate) fn watch_state() -> Option<*mut watch::WatchCtl> {
+    let ctl = unsafe { WATCH_CTL };
+    if ctl.is_null() { None } else { Some(ctl) }
+}
+
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_int_guc(
@@ -182,11 +217,16 @@ pub extern "C-unwind" fn _PG_init() {
         GucFlags::default(),
     );
 
-    GucRegistry::define_bool_guc(
-        c"redis.use_logged",
-        c"Use WAL-logged tables",
-        c"Default DB on new connections (0-15). Even DBs use UNLOGGED tables, odd DBs use WAL-logged tables. Clients can override per-connection with SELECT <db>.",
-        &USE_LOGGED,
+    GucRegistry::define_int_guc(
+        c"redis.default_db",
+        c"Database new connections start on",
+        c"Databases 0-7 are ephemeral (shared memory, or UNLOGGED tables when \
+          redis.storage_mode = 'auto'); 8-15 are WAL-logged and survive restart. \
+          Default: 0, matching Redis. Clients override per-connection with SELECT, \
+          which also accepts the names 'cache' (0) and 'durable' (8).",
+        &DEFAULT_DB,
+        0,
+        15,
         GucContext::Suset,
         GucFlags::default(),
     );
@@ -205,7 +245,9 @@ pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_string_guc(
         c"redis.listen_address",
         c"TCP bind address for the Redis listener",
-        c"IP address pg_redis binds on (default: 0.0.0.0).",
+        c"IP address pg_redis binds on (default: 127.0.0.1). The Redis port does not \
+          go through PostgreSQL authentication, so widening this exposes every redis.* \
+          table to anything that can reach the port. Set redis.password as well.",
         &LISTEN_ADDRESS,
         GucContext::Suset,
         GucFlags::default(),
@@ -258,8 +300,8 @@ pub extern "C-unwind" fn _PG_init() {
 
     GucRegistry::define_string_guc(
         c"redis.storage_mode",
-        c"Storage backend for even-numbered databases",
-        c"'auto' (default): use UNLOGGED PostgreSQL tables. 'memory': use shared-memory \
+        c"Storage backend for the ephemeral databases (0-7)",
+        c"'auto': use UNLOGGED PostgreSQL tables. 'memory' (default): use shared-memory \
           hash tables, bypassing SPI and transactions entirely. Data is lost on server \
           restart. Requires restart to take effect.",
         &STORAGE_MODE,
@@ -267,11 +309,23 @@ pub extern "C-unwind" fn _PG_init() {
         GucFlags::default(),
     );
 
+    GucRegistry::define_string_guc(
+        c"redis.maxmemory_policy",
+        c"What memory mode does when a shared-memory table is full",
+        c"'noeviction' (default, as in Redis): refuse the write with an OOM error. \
+          'allkeys-random': evict entries to make room, collections whole. \
+          'volatile-ttl': evict only keys that carry an expiry, soonest first. \
+          Expired keys are always reclaimed first, whatever the policy.",
+        &MAXMEMORY_POLICY,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
     GucRegistry::define_int_guc(
         c"redis.mem_max_entries",
-        c"Maximum keys per data type per even-numbered database in memory mode",
+        c"Maximum keys per data type per ephemeral database in memory mode",
         c"Controls the size of each shared-memory hash table. Larger values use more RAM \
-          (proportional). Default 16384. Requires server restart.",
+          (proportional). Default 8192. Requires server restart.",
         &MEM_MAX_ENTRIES,
         256,
         1048576,
@@ -382,9 +436,15 @@ fn route_publish(channel: &str, schema: &str, tbl: &str) {
     if !unsafe { pg_sys::superuser() } {
         error!("permission denied: superuser required");
     }
-    for (name, val) in [("channel", channel), ("schema", schema), ("table", tbl)] {
-        if val.len() > 63 {
-            error!("{name} must be ≤ 63 bytes");
+    // Schema and table are PostgreSQL identifiers (NAMEDATALEN - 1); the channel
+    // is bounded by the pub/sub slot layout instead.
+    for (name, val, limit) in [
+        ("channel", channel, pubsub::MAX_CHANNEL_LEN),
+        ("schema", schema, 63),
+        ("table", tbl, 63),
+    ] {
+        if val.len() > limit {
+            error!("{name} must be ≤ {limit} bytes");
         }
         if val.contains('\0') {
             error!("{name} must not contain NUL bytes");
@@ -432,462 +492,520 @@ fn unroute_publish(channel: &str) {
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
+    use crate::commands::NUM_DBS;
+    use crate::commands::sql;
     use pgrx::prelude::*;
 
-    fn clean_kv(db: u8) {
-        Spi::run(&format!("DELETE FROM redis.kv_{}", db)).unwrap();
+    /// Run one of the cached statements and return its first column, collapsing
+    /// "no rows" to `None` exactly as `Command::execute` does.
+    fn query_one<T: pgrx::datum::FromDatum + pgrx::datum::IntoDatum>(
+        stmt: &str,
+        args: &[&[u8]],
+    ) -> Option<T> {
+        Spi::connect(|c| {
+            // Keys, fields and members are bytea now, so bind them as bytes.
+            let args: Vec<pgrx::datum::DatumWithOid> = args.iter().map(|a| (*a).into()).collect();
+            c.select(stmt, None, &args)
+                .unwrap()
+                .first()
+                .get::<T>(1)
+                .ok()
+                .flatten()
+        })
     }
 
-    fn clean_hash(db: u8) {
-        Spi::run(&format!("DELETE FROM redis.hash_{}", db)).unwrap();
+    /// Clear a database's string and hash tables between assertions.
+    ///
+    /// DELETE rather than TRUNCATE on purpose: pgrx runs these tests against one
+    /// shared server, and TRUNCATE's ACCESS EXCLUSIVE lock deadlocks against
+    /// whichever other test is reading the same table.
+    fn truncate(db: usize) {
+        for tbl in ["kv", "hash"] {
+            Spi::run(&format!("DELETE FROM redis.{tbl}_{db}")).unwrap();
+        }
     }
 
-    // ──────────────────────────────── Schema ────────────────────────────────
+    // ─────────────────────────── Schema contract ────────────────────────────
 
+    /// Every db must exist with the columns and constraints the generated SQL
+    /// assumes — including the UNLOGGED/logged split on even/odd databases.
     #[pg_test]
-    fn test_kv_db1_logged_schema() {
-        Spi::run("INSERT INTO redis.kv_1 (key, value) VALUES ('k', 'v')").unwrap();
-        let v = Spi::get_one::<String>("SELECT value FROM redis.kv_1 WHERE key = 'k'").unwrap();
-        assert_eq!(v, Some("v".to_string()));
-        clean_kv(1);
+    fn every_database_has_the_expected_tables() {
+        for db in 0..NUM_DBS {
+            Spi::run(&format!(
+                "INSERT INTO redis.kv_{db} (key, value) VALUES ('k', 'v') \
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+            ))
+            .unwrap();
+            Spi::run(&format!(
+                "INSERT INTO redis.hash_{db} (key, field, value) VALUES ('h', 'f', 'v') \
+                 ON CONFLICT (key, field) DO UPDATE SET value = EXCLUDED.value"
+            ))
+            .unwrap();
+
+            let persistence = Spi::get_one::<String>(&format!(
+                "SELECT relpersistence::text FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = 'redis' AND c.relname = 'kv_{db}'"
+            ))
+            .unwrap();
+            let ephemeral = crate::commands::is_ephemeral(db as u8);
+            assert_eq!(
+                persistence.as_deref(),
+                Some(if ephemeral { "u" } else { "p" }),
+                "redis.kv_{db} should be {}",
+                if ephemeral { "UNLOGGED" } else { "logged" }
+            );
+
+            truncate(db);
+        }
     }
 
+    /// The background expiry sweep does a `WHERE expires_at <= now()` delete on
+    /// every kv table; without this index that is a sequential scan per second.
     #[pg_test]
-    fn test_kv_db0_unlogged_schema() {
-        Spi::run("INSERT INTO redis.kv_0 (key, value) VALUES ('k', 'v')").unwrap();
-        let v = Spi::get_one::<String>("SELECT value FROM redis.kv_0 WHERE key = 'k'").unwrap();
-        assert_eq!(v, Some("v".to_string()));
-        clean_kv(0);
+    fn every_kv_table_has_a_partial_expiry_index() {
+        for db in 0..NUM_DBS {
+            let exists = Spi::get_one::<bool>(&format!(
+                "SELECT EXISTS (SELECT 1 FROM pg_indexes \
+                 WHERE schemaname = 'redis' AND tablename = 'kv_{db}' \
+                   AND indexdef LIKE '%expires_at%')"
+            ))
+            .unwrap();
+            assert_eq!(exists, Some(true), "redis.kv_{db} is missing the index");
+        }
     }
 
+    // ──────────────────── Cached statements against the schema ───────────────
+
+    /// Runs the statements `Command::execute` actually issues, for every db, so
+    /// a schema drift breaks here rather than on a live connection.
     #[pg_test]
-    fn test_hash_db1_logged_schema() {
-        Spi::run("INSERT INTO redis.hash_1 (key, field, value) VALUES ('h', 'f', 'v')").unwrap();
-        let v = Spi::get_one::<String>(
-            "SELECT value FROM redis.hash_1 WHERE key = 'h' AND field = 'f'",
+    fn cached_statements_match_the_schema() {
+        for db in 0..NUM_DBS {
+            Spi::run(&format!(
+                "INSERT INTO redis.kv_{db} (key, value) VALUES ('k', 'v')"
+            ))
+            .unwrap();
+            Spi::run(&format!(
+                "INSERT INTO redis.hash_{db} (key, field, value) VALUES ('h', 'f', 'hv')"
+            ))
+            .unwrap();
+
+            assert_eq!(
+                query_one::<Vec<u8>>(&sql::GET[db], &[b"k"]).as_deref(),
+                Some(&b"v"[..]),
+                "GET on db {db}"
+            );
+            assert_eq!(
+                query_one::<i64>(&sql::STRLEN[db], &[b"k"]),
+                Some(1),
+                "STRLEN on db {db}"
+            );
+            // No expiry set, so TTL/PTTL report -1 and a missing key reports -2.
+            assert_eq!(query_one::<i64>(&sql::TTL[db], &[b"k"]), Some(-1));
+            assert_eq!(query_one::<i64>(&sql::PTTL[db], &[b"k"]), Some(-1));
+            assert_eq!(query_one::<i64>(&sql::TTL[db], &[b"absent"]), Some(-2));
+            assert_eq!(query_one::<i64>(&sql::EXPIRETIME[db], &[b"k"]), Some(-1));
+            assert_eq!(query_one::<i64>(&sql::PEXPIRETIME[db], &[b"k"]), Some(-1));
+
+            assert_eq!(
+                query_one::<Vec<u8>>(&sql::HGET[db], &[b"h", b"f"]).as_deref(),
+                Some(&b"hv"[..]),
+                "HGET on db {db}"
+            );
+            assert_eq!(query_one::<i64>(&sql::HLEN[db], &[b"h"]), Some(1));
+            assert_eq!(
+                query_one::<Vec<u8>>(&sql::HKEYS[db], &[b"h"]).as_deref(),
+                Some(&b"f"[..])
+            );
+            assert_eq!(
+                query_one::<Vec<u8>>(&sql::HVALS[db], &[b"h"]).as_deref(),
+                Some(&b"hv"[..])
+            );
+            assert_eq!(query_one::<i64>(&sql::SCARD[db], &[b"nosuchset"]), Some(0));
+            assert_eq!(query_one::<i64>(&sql::ZCARD[db], &[b"nosuchzset"]), Some(0));
+            assert_eq!(query_one::<i64>(&sql::LLEN[db], &[b"nosuchlist"]), Some(0));
+
+            // INCR upserts and returns the new value; a second call increments.
+            assert_eq!(query_one::<i64>(&sql::INCR[db], &[b"n"]), Some(1));
+            assert_eq!(query_one::<i64>(&sql::INCR[db], &[b"n"]), Some(2));
+            assert_eq!(query_one::<i64>(&sql::DECR[db], &[b"n"]), Some(1));
+
+            // GETDEL returns the value and removes the row in one statement.
+            assert_eq!(
+                query_one::<Vec<u8>>(&sql::GETDEL[db], &[b"k"]).as_deref(),
+                Some(&b"v"[..])
+            );
+            assert_eq!(query_one::<Vec<u8>>(&sql::GET[db], &[b"k"]), None);
+
+            truncate(db);
+        }
+    }
+
+    /// An expired row must be invisible to reads even before the sweep removes it.
+    #[pg_test]
+    fn cached_reads_hide_expired_keys() {
+        Spi::run(
+            "INSERT INTO redis.kv_1 (key, value, expires_at) \
+             VALUES ('gone', 'v', now() - interval '1 second'), \
+                    ('live', 'v', now() + interval '1 hour')",
         )
         .unwrap();
-        assert_eq!(v, Some("v".to_string()));
-        clean_hash(1);
-    }
 
-    #[pg_test]
-    fn test_hash_db0_unlogged_schema() {
-        Spi::run("INSERT INTO redis.hash_0 (key, field, value) VALUES ('h', 'f', 'v')").unwrap();
-        let v = Spi::get_one::<String>(
-            "SELECT value FROM redis.hash_0 WHERE key = 'h' AND field = 'f'",
-        )
-        .unwrap();
-        assert_eq!(v, Some("v".to_string()));
-        clean_hash(0);
-    }
-
-    // ──────────────────────────── Key-value ops ──────────────────────────────
-
-    #[pg_test]
-    fn test_kv_upsert() {
-        Spi::run("INSERT INTO redis.kv_1 (key, value) VALUES ('x', 'first') ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value").unwrap();
-        Spi::run("INSERT INTO redis.kv_1 (key, value) VALUES ('x', 'second') ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value").unwrap();
-        let v = Spi::get_one::<String>("SELECT value FROM redis.kv_1 WHERE key = 'x'").unwrap();
-        assert_eq!(v, Some("second".to_string()));
-        clean_kv(1);
-    }
-
-    #[pg_test]
-    fn test_kv_expiry_filters_expired() {
-        Spi::run("INSERT INTO redis.kv_1 (key, value, expires_at) VALUES ('exp', 'v', now() - interval '1 second')").unwrap();
-        let v = Spi::get_one::<String>(
-            "SELECT value FROM redis.kv_1 WHERE key = 'exp' AND (expires_at IS NULL OR expires_at > now())",
-        )
-        .ok()
-        .flatten();
-        assert_eq!(v, None);
-        clean_kv(1);
-    }
-
-    #[pg_test]
-    fn test_kv_expiry_passes_future() {
-        Spi::run("INSERT INTO redis.kv_1 (key, value, expires_at) VALUES ('live', 'v', now() + interval '1 hour')").unwrap();
-        let v = Spi::get_one::<String>(
-            "SELECT value FROM redis.kv_1 WHERE key = 'live' AND (expires_at IS NULL OR expires_at > now())",
-        )
-        .unwrap();
-        assert_eq!(v, Some("v".to_string()));
-        clean_kv(1);
-    }
-
-    #[pg_test]
-    fn test_kv_delete_returns_count() {
-        Spi::run("INSERT INTO redis.kv_1 (key, value) VALUES ('d1', 'v'), ('d2', 'v')").unwrap();
-        let n = Spi::get_one::<i64>(
-            "WITH del AS (DELETE FROM redis.kv_1 WHERE key = ANY(ARRAY['d1','d2','missing']) RETURNING 1) SELECT count(*) FROM del",
-        )
-        .unwrap();
-        assert_eq!(n, Some(2));
-        clean_kv(1);
-    }
-
-    #[pg_test]
-    fn test_kv_exists_count() {
-        Spi::run("INSERT INTO redis.kv_1 (key, value) VALUES ('e1', 'v'), ('e2', 'v')").unwrap();
-        let n = Spi::get_one::<i64>(
-            "SELECT count(*)::bigint FROM redis.kv_1 WHERE key = ANY(ARRAY['e1','e2','nope']) AND (expires_at IS NULL OR expires_at > now())",
-        )
-        .unwrap();
-        assert_eq!(n, Some(2));
-        clean_kv(1);
-    }
-
-    // ──────────────────────────────── TTL ops ────────────────────────────────
-
-    #[pg_test]
-    fn test_ttl_single_lookup_for_missing_key() {
-        let ttl = Spi::get_one::<i64>(
-            "SELECT CASE \
-               WHEN r.key IS NULL THEN -2::bigint \
-               WHEN r.expires_at IS NULL THEN -1::bigint \
-               ELSE GREATEST(-1, EXTRACT(EPOCH FROM (r.expires_at - now()))::bigint) \
-             END \
-             FROM (VALUES ('ghost'::text)) AS dummy(k) \
-             LEFT JOIN redis.kv_1 r ON r.key = dummy.k",
-        )
-        .unwrap();
-        assert_eq!(ttl, Some(-2));
-    }
-
-    #[pg_test]
-    fn test_ttl_single_lookup_for_no_expiry() {
-        Spi::run("INSERT INTO redis.kv_1 (key, value) VALUES ('nottle', 'v')").unwrap();
-        let ttl = Spi::get_one::<i64>(
-            "SELECT CASE \
-               WHEN r.key IS NULL THEN -2::bigint \
-               WHEN r.expires_at IS NULL THEN -1::bigint \
-               ELSE GREATEST(-1, EXTRACT(EPOCH FROM (r.expires_at - now()))::bigint) \
-             END \
-             FROM (VALUES ('nottle'::text)) AS dummy(k) \
-             LEFT JOIN redis.kv_1 r ON r.key = dummy.k",
-        )
-        .unwrap();
-        assert_eq!(ttl, Some(-1));
-        clean_kv(1);
-    }
-
-    #[pg_test]
-    fn test_ttl_single_lookup_for_expiring_key() {
-        Spi::run("INSERT INTO redis.kv_1 (key, value, expires_at) VALUES ('ttlkey', 'v', now() + interval '60 seconds')").unwrap();
-        let ttl = Spi::get_one::<i64>(
-            "SELECT CASE \
-               WHEN r.key IS NULL THEN -2::bigint \
-               WHEN r.expires_at IS NULL THEN -1::bigint \
-               ELSE GREATEST(-1, EXTRACT(EPOCH FROM (r.expires_at - now()))::bigint) \
-             END \
-             FROM (VALUES ('ttlkey'::text)) AS dummy(k) \
-             LEFT JOIN redis.kv_1 r ON r.key = dummy.k",
-        )
-        .unwrap();
+        assert_eq!(query_one::<Vec<u8>>(&sql::GET[1], &[b"gone"]), None);
+        assert_eq!(
+            query_one::<Vec<u8>>(&sql::GET[1], &[b"live"]).as_deref(),
+            Some(&b"v"[..])
+        );
         assert!(
-            ttl.unwrap_or(-999) >= 59,
-            "TTL for a 60s key should be at least 59, got {:?}",
-            ttl
+            query_one::<i64>(&sql::TTL[1], &[b"live"]).unwrap_or(0) >= 3599,
+            "TTL should report the remaining hour"
         );
-        clean_kv(1);
-    }
 
-    #[pg_test]
-    fn test_persist_removes_expiry() {
-        Spi::run("INSERT INTO redis.kv_1 (key, value, expires_at) VALUES ('pk', 'v', now() + interval '1 hour')").unwrap();
-        Spi::run(
-            "UPDATE redis.kv_1 SET expires_at = NULL WHERE key = 'pk' AND expires_at IS NOT NULL",
-        )
-        .unwrap();
-        let exp =
-            Spi::get_one::<bool>("SELECT expires_at IS NULL FROM redis.kv_1 WHERE key = 'pk'")
+        // The sweep the worker runs every second removes the expired row.
+        Spi::run("DELETE FROM redis.kv_1 WHERE expires_at IS NOT NULL AND expires_at <= now()")
+            .unwrap();
+        let remaining =
+            Spi::get_one::<i64>("SELECT count(*)::bigint FROM redis.kv_1 WHERE key = 'gone'")
                 .unwrap();
-        assert_eq!(exp, Some(true));
-        clean_kv(1);
-    }
+        assert_eq!(remaining, Some(0), "expiry sweep must delete the row");
 
-    // ───────────────────────── Expiry deletion (Redis parity) ────────────────
-
-    #[pg_test]
-    fn test_lazy_delete_removes_expired_row() {
-        Spi::run("INSERT INTO redis.kv_1 (key, value, expires_at) VALUES ('ex_del', 'v', now() - interval '1 second')").unwrap();
-        Spi::run("DELETE FROM redis.kv_1 WHERE key = 'ex_del' AND expires_at <= now()").unwrap();
-        let count =
-            Spi::get_one::<i64>("SELECT count(*)::bigint FROM redis.kv_1 WHERE key = 'ex_del'")
+        // PERSIST clears the expiry so the key stops being a sweep candidate.
+        Spi::connect_mut(|c| {
+            c.update(&sql::PERSIST[1], None, &[b"live".as_slice().into()])
                 .unwrap();
-        assert_eq!(
-            count,
-            Some(0),
-            "expired key must be deleted from the table, not just filtered"
-        );
-    }
-
-    #[pg_test]
-    fn test_active_expiry_deletes_rows() {
-        Spi::run("INSERT INTO redis.kv_1 (key, value, expires_at) VALUES ('active_exp', 'v', now() - interval '1 second')").unwrap();
-        Spi::run("DELETE FROM redis.kv_1 WHERE expires_at <= now()").unwrap();
-        let count =
-            Spi::get_one::<i64>("SELECT count(*)::bigint FROM redis.kv_1 WHERE key = 'active_exp'")
-                .unwrap();
-        assert_eq!(
-            count,
-            Some(0),
-            "active expiry scan must delete expired rows"
-        );
-    }
-
-    #[pg_test]
-    fn test_non_expired_key_survives_active_scan() {
-        Spi::run("INSERT INTO redis.kv_1 (key, value, expires_at) VALUES ('live_key', 'v', now() + interval '1 hour')").unwrap();
-        Spi::run("DELETE FROM redis.kv_1 WHERE expires_at <= now()").unwrap();
-        let count =
-            Spi::get_one::<i64>("SELECT count(*)::bigint FROM redis.kv_1 WHERE key = 'live_key'")
-                .unwrap();
-        assert_eq!(
-            count,
-            Some(1),
-            "non-expired key must not be deleted by expiry scan"
-        );
-        clean_kv(1);
-    }
-
-    #[pg_test]
-    fn test_get_returns_null_and_deletes_expired_key() {
-        Spi::run("INSERT INTO redis.kv_1 (key, value, expires_at) VALUES ('lazy', 'v', now() - interval '1 second')").unwrap();
-        Spi::run("DELETE FROM redis.kv_1 WHERE key = 'lazy' AND expires_at <= now()").unwrap();
-        let v = Spi::get_one::<String>(
-            "SELECT value FROM redis.kv_1 WHERE key = 'lazy' AND (expires_at IS NULL OR expires_at > now())",
-        )
-        .ok()
-        .flatten();
-        assert_eq!(v, None, "GET must return null for expired key");
-        let exists =
-            Spi::get_one::<bool>("SELECT EXISTS (SELECT 1 FROM redis.kv_1 WHERE key = 'lazy')")
-                .unwrap();
-        assert_eq!(
-            exists,
-            Some(false),
-            "expired key must be removed from table after GET"
-        );
-    }
-
-    // ──────────────────────────────── Hash ops ────────────────────────────────
-
-    #[pg_test]
-    fn test_hset_upsert() {
-        Spi::run("INSERT INTO redis.hash_1 (key, field, value) VALUES ('h', 'f', 'v1') ON CONFLICT (key, field) DO UPDATE SET value = EXCLUDED.value").unwrap();
-        Spi::run("INSERT INTO redis.hash_1 (key, field, value) VALUES ('h', 'f', 'v2') ON CONFLICT (key, field) DO UPDATE SET value = EXCLUDED.value").unwrap();
-        let v = Spi::get_one::<String>(
-            "SELECT value FROM redis.hash_1 WHERE key = 'h' AND field = 'f'",
-        )
-        .unwrap();
-        assert_eq!(v, Some("v2".to_string()));
-        clean_hash(1);
-    }
-
-    #[pg_test]
-    fn test_hgetall_order() {
-        Spi::run("INSERT INTO redis.hash_1 (key, field, value) VALUES ('h', 'b', 'vb'), ('h', 'a', 'va')").unwrap();
-        let fields: Vec<Option<String>> = Spi::connect(|c| {
-            c.select(
-                "SELECT field FROM redis.hash_1 WHERE key = 'h' ORDER BY field",
-                None,
-                &[],
-            )
-            .unwrap()
-            .map(|r| r.get::<String>(1).unwrap())
-            .collect()
         });
-        assert_eq!(fields, vec![Some("a".to_string()), Some("b".to_string())]);
-        clean_hash(1);
-    }
-
-    #[pg_test]
-    fn test_hdel_count() {
-        Spi::run("INSERT INTO redis.hash_1 (key, field, value) VALUES ('h', 'f1', 'v'), ('h', 'f2', 'v')").unwrap();
-        let n = Spi::get_one::<i64>(
-            "WITH del AS (DELETE FROM redis.hash_1 WHERE key = 'h' AND field = ANY(ARRAY['f1','f2','gone']) RETURNING 1) SELECT count(*) FROM del",
-        )
-        .unwrap();
-        assert_eq!(n, Some(2));
-        clean_hash(1);
-    }
-
-    // ──────────────────────────── MSET / MGET ────────────────────────────────
-
-    #[pg_test]
-    fn test_mset_batch_upsert() {
-        Spi::run("INSERT INTO redis.kv_1 (key, value, expires_at) SELECT unnest(ARRAY['k1','k2']::text[]), unnest(ARRAY['v1','v2']::text[]), NULL ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, expires_at = EXCLUDED.expires_at").unwrap();
-        let v1 = Spi::get_one::<String>("SELECT value FROM redis.kv_1 WHERE key = 'k1'").unwrap();
-        let v2 = Spi::get_one::<String>("SELECT value FROM redis.kv_1 WHERE key = 'k2'").unwrap();
-        assert_eq!(v1, Some("v1".to_string()));
-        assert_eq!(v2, Some("v2".to_string()));
-        clean_kv(1);
-    }
-
-    #[pg_test]
-    fn test_mget_preserves_null_for_missing() {
-        Spi::run("INSERT INTO redis.kv_1 (key, value) VALUES ('present', 'yes')").unwrap();
-        let rows: Vec<Option<String>> = Spi::connect(|c| {
-            c.select(
-                "SELECT value FROM redis.kv_1 WHERE key = ANY(ARRAY['present','missing']) AND (expires_at IS NULL OR expires_at > now())",
-                None,
-                &[],
-            )
-            .unwrap()
-            .map(|r| r.get::<String>(1).unwrap())
-            .collect()
-        });
-        assert!(rows.contains(&Some("yes".to_string())));
-        assert_eq!(rows.len(), 1);
-        clean_kv(1);
-    }
-
-    #[pg_test]
-    fn test_mget_lazy_deletes_expired_keys() {
-        Spi::run("INSERT INTO redis.kv_1 (key, value, expires_at) VALUES ('ex1', 'v', now() - interval '1 second'), ('ex2', 'v', now() - interval '1 second')").unwrap();
-        Spi::run(
-            "DELETE FROM redis.kv_1 WHERE key = ANY(ARRAY['ex1','ex2']) AND expires_at <= now()",
-        )
-        .unwrap();
-        let count = Spi::get_one::<i64>(
-            "SELECT count(*)::bigint FROM redis.kv_1 WHERE key = ANY(ARRAY['ex1','ex2'])",
-        )
-        .unwrap();
-        assert_eq!(
-            count,
-            Some(0),
-            "mget lazy delete must remove expired keys from storage"
-        );
-        clean_kv(1);
+        let cleared =
+            Spi::get_one::<bool>("SELECT expires_at IS NULL FROM redis.kv_1 WHERE key = 'live'")
+                .unwrap();
+        assert_eq!(cleared, Some(true));
+        truncate(1);
     }
 
     // ──────────────────────────── Worker management ──────────────────────────
 
     #[pg_test]
-    fn test_worker_count_is_positive() {
+    fn workers_can_be_added_and_removed_at_runtime() {
         Spi::run("SELECT pg_sleep(1)").unwrap();
-        let count = Spi::get_one::<i64>("SELECT redis.worker_count()")
+        let before = Spi::get_one::<i64>("SELECT redis.worker_count()")
             .unwrap()
             .unwrap_or(0);
         assert!(
-            count > 0,
-            "expected at least one worker running, got {}",
-            count
+            before > 0,
+            "startup workers should be running, got {before}"
         );
-    }
 
-    #[pg_test]
-    fn test_add_workers_returns_requested_count() {
         let added = Spi::get_one::<i32>("SELECT redis.add_workers(2)")
             .unwrap()
             .unwrap_or(0);
-        assert_eq!(added, 2, "add_workers(2) should return 2");
-        Spi::run("SELECT redis.remove_workers(2)").unwrap();
-    }
-
-    #[pg_test]
-    fn test_remove_workers_returns_terminated_count() {
-        Spi::run("SELECT redis.add_workers(2)").unwrap();
+        assert_eq!(added, 2, "add_workers(2) should report 2");
         Spi::run("SELECT pg_sleep(1)").unwrap();
+
         let removed = Spi::get_one::<i32>("SELECT redis.remove_workers(2)")
             .unwrap()
             .unwrap_or(0);
-        assert_eq!(removed, 2, "remove_workers(2) should terminate 2 workers");
+        assert_eq!(removed, 2, "remove_workers(2) should terminate 2");
     }
 
-    // ─────────────────────── expires_at partial index ────────────────────────
+    // ──────────────────────────── Binary safety ──────────────────────────────
+
+    /// The point of the bytea columns: Redis keys and values are arbitrary byte
+    /// strings. TEXT could not store a NUL at all and mangled anything that was
+    /// not valid UTF-8, so these bytes are exactly what the old schema lost.
+    const HOSTILE: &[u8] = &[0x00, 0xff, 0xfe, b'a', 0x80, b'\n', 0x01, 0xc3, 0x28];
 
     #[pg_test]
-    fn test_expires_at_partial_index_exists_for_kv_tables() {
-        for db in 0u8..16 {
-            let table = format!("kv_{}", db);
-            let exists = Spi::get_one::<bool>(&format!(
-                "SELECT EXISTS (
-                    SELECT 1 FROM pg_indexes
-                    WHERE schemaname = 'redis'
-                      AND tablename = '{table}'
-                      AND indexdef LIKE '%expires_at%'
-                )"
-            ))
+    fn keys_and_values_survive_arbitrary_bytes() {
+        Spi::connect_mut(|c| {
+            c.update(
+                "INSERT INTO redis.kv_1 (key, value) VALUES ($1, $2)",
+                None,
+                &[HOSTILE.into(), HOSTILE.into()],
+            )
             .unwrap();
-            assert_eq!(
-                exists,
-                Some(true),
-                "partial index on expires_at must exist for redis.{table}"
-            );
-        }
+        });
+
+        // Read back through the statement GET actually issues.
+        let got = query_one::<Vec<u8>>(&sql::GET[1], &[HOSTILE]);
+        assert_eq!(
+            got.as_deref(),
+            Some(HOSTILE),
+            "the key round-tripped only if it matched byte for byte, NUL included"
+        );
+        assert_eq!(
+            query_one::<i64>(&sql::STRLEN[1], &[HOSTILE]),
+            Some(HOSTILE.len() as i64),
+            "STRLEN counts bytes, not characters"
+        );
+
+        // A key differing only after a NUL must be a different key. Under TEXT
+        // this insert could not even be stored.
+        let mut sibling = HOSTILE.to_vec();
+        sibling.push(b'!');
+        Spi::connect_mut(|c| {
+            c.update(
+                "INSERT INTO redis.kv_1 (key, value) VALUES ($1, $2)",
+                None,
+                &[sibling.as_slice().into(), b"other".as_slice().into()],
+            )
+            .unwrap();
+        });
+        assert_eq!(
+            query_one::<Vec<u8>>(&sql::GET[1], &[HOSTILE]).as_deref(),
+            Some(HOSTILE),
+            "the sibling key must not have overwritten the original"
+        );
+
+        // Delete just these rows. TRUNCATE takes ACCESS EXCLUSIVE and deadlocks
+        // against the other tests sharing this database.
+        Spi::connect_mut(|c| {
+            c.update(
+                "DELETE FROM redis.kv_1 WHERE key IN ($1, $2)",
+                None,
+                &[HOSTILE.into(), sibling.as_slice().into()],
+            )
+            .unwrap();
+        });
+    }
+
+    /// Hash fields and sorted-set members are equally binary, and bytea sorts
+    /// bytewise — which is what Redis lexicographic ordering means.
+    #[pg_test]
+    fn fields_and_members_are_binary_and_sort_bytewise() {
+        Spi::connect_mut(|c| {
+            c.update(
+                "INSERT INTO redis.hash_1 (key, field, value) VALUES ($1, $2, $3)",
+                None,
+                &[b"h".as_slice().into(), HOSTILE.into(), HOSTILE.into()],
+            )
+            .unwrap();
+        });
+        assert_eq!(
+            query_one::<Vec<u8>>(&sql::HGET[1], &[b"h", HOSTILE]).as_deref(),
+            Some(HOSTILE)
+        );
+
+        // 0x80 sorts after 'z' by byte value; a text collation would not
+        // necessarily agree, and could not hold these bytes anyway.
+        Spi::connect_mut(|c| {
+            c.update(
+                "INSERT INTO redis.zset_1 (key, member, score) \
+                 VALUES ($1, $2, 1), ($1, $3, 1)",
+                None,
+                &[
+                    b"z".as_slice().into(),
+                    b"\x80".as_slice().into(),
+                    b"z".as_slice().into(),
+                ],
+            )
+            .unwrap();
+        });
+        let first = Spi::connect(|c| {
+            c.select(
+                "SELECT member FROM redis.zset_1 WHERE key = 'z' ORDER BY member LIMIT 1",
+                None,
+                &[],
+            )
+            .unwrap()
+            .first()
+            .get::<Vec<u8>>(1)
+            .unwrap()
+        });
+        assert_eq!(
+            first.as_deref(),
+            Some(&b"z"[..]),
+            "0x80 must sort after 'z'"
+        );
+
+        Spi::run("TRUNCATE redis.hash_1, redis.zset_1").unwrap();
+    }
+
+    // ─────────────────────────── Worker resilience ───────────────────────────
+
+    /// Under `shared_preload_libraries` a worker connects to `redis.database`,
+    /// which usually has no `CREATE EXTENSION` and therefore no `redis.kv_*`.
+    /// The expiry sweep must notice that instead of raising `relation does not
+    /// exist`, which killed the worker and left it restarting once a second
+    /// forever. The guard also has to re-enable itself once the tables appear.
+    #[pg_test]
+    fn expiry_sweep_tolerates_a_database_without_the_extension() {
+        assert!(
+            crate::worker::kv_tables_present(),
+            "this test database has the extension, so the sweep should be enabled"
+        );
+
+        let missing = Spi::get_one::<bool>("SELECT to_regclass('redis.no_such_table') IS NULL")
+            .unwrap()
+            .unwrap_or(false);
+        assert!(missing, "to_regclass must report absent relations as NULL");
+    }
+
+    // ──────────────────────── Batch command isolation ────────────────────────
+
+    /// A batch coalesces commands from unrelated connections into one
+    /// transaction, so a failing command must roll back its own writes and
+    /// nothing else. This is the guarantee the per-command SAVEPOINT statements
+    /// used to provide and that `in_subtransaction` now provides directly.
+    #[pg_test]
+    fn a_failed_command_in_a_batch_rolls_back_only_itself() {
+        use crate::commands::Response;
+
+        Spi::run("CREATE TEMP TABLE batch_iso (n int)").unwrap();
+
+        // Committed: the command reported success.
+        let ok = unsafe {
+            crate::worker::in_subtransaction(|| {
+                Spi::run("INSERT INTO batch_iso VALUES (1)").unwrap();
+                Response::Ok
+            })
+        };
+        assert!(matches!(ok, Response::Ok));
+
+        // Rolled back: the command reported an error, so its write is discarded.
+        let failed = unsafe {
+            crate::worker::in_subtransaction(|| {
+                Spi::run("INSERT INTO batch_iso VALUES (2)").unwrap();
+                Response::Error("boom".to_string())
+            })
+        };
+        assert!(matches!(failed, Response::Error(_)));
+
+        // Committed again: the surrounding transaction survived the rollback.
+        unsafe {
+            crate::worker::in_subtransaction(|| {
+                Spi::run("INSERT INTO batch_iso VALUES (3)").unwrap();
+                Response::Ok
+            })
+        };
+
+        let rows: Vec<Option<i32>> = Spi::connect(|c| {
+            c.select("SELECT n FROM batch_iso ORDER BY n", None, &[])
+                .unwrap()
+                .map(|r| r.get::<i32>(1).unwrap())
+                .collect()
+        });
+        assert_eq!(
+            rows,
+            vec![Some(1), Some(3)],
+            "only the failing command's write should have been discarded"
+        );
+
+        Spi::run("DROP TABLE batch_iso").unwrap();
+    }
+
+    // ──────────────────────────── WATCH counters ─────────────────────────────
+
+    /// The counters live in shared memory precisely so a WATCH taken on one
+    /// worker sees a write dispatched through another. Exercising them directly
+    /// is the closest a pg_test can get to that cross-process guarantee.
+    #[pg_test]
+    fn watch_counters_are_visible_through_shared_memory() {
+        let ctl = crate::watch_state().expect("watch shmem must be initialised");
+
+        let before = unsafe { crate::watch::version(ctl, 0, b"k") };
+        unsafe { crate::watch::bump(ctl, 0, b"k") };
+        let after = unsafe { crate::watch::version(ctl, 0, b"k") };
+        assert_ne!(before, after, "a write must invalidate a prior WATCH");
+
+        // An unrelated key must not be disturbed by that write. Slot collisions
+        // are possible by design, so this asserts on a key known not to collide.
+        let other = (0..64u32)
+            .map(|i| format!("other-{i}"))
+            .find(|k| {
+                let v = unsafe { crate::watch::version(ctl, 0, k.as_bytes()) };
+                unsafe { crate::watch::bump(ctl, 0, b"k") };
+                v == unsafe { crate::watch::version(ctl, 0, k.as_bytes()) }
+            })
+            .expect("some key must not share a slot with \"k\"");
+        let untouched = unsafe { crate::watch::version(ctl, 0, other.as_bytes()) };
+        unsafe { crate::watch::bump(ctl, 0, b"k") };
+        assert_eq!(
+            untouched,
+            unsafe { crate::watch::version(ctl, 0, other.as_bytes()) },
+            "writing one key must not invalidate a WATCH on an unrelated key"
+        );
+
+        // Same key name, different database: tracked independently.
+        let db1 = unsafe { crate::watch::version(ctl, 1, b"k") };
+        unsafe { crate::watch::bump(ctl, 0, b"k") };
+        assert_eq!(db1, unsafe { crate::watch::version(ctl, 1, b"k") });
     }
 
     // ──────────────────────────── Pub/sub routing ────────────────────────────
 
     #[pg_test]
-    fn test_route_publish_inserts_row() {
-        Spi::run("DELETE FROM redis.pubsub_routes WHERE channel = 'test-route'").unwrap();
-        Spi::run("SELECT redis.route_publish('test-route', 'public', 'nonexistent_table')")
-            .unwrap();
-        let count = Spi::get_one::<i64>(
-            "SELECT count(*) FROM redis.pubsub_routes WHERE channel = 'test-route'",
-        )
-        .unwrap();
-        assert_eq!(count, Some(1));
-        Spi::run("DELETE FROM redis.pubsub_routes WHERE channel = 'test-route'").unwrap();
-    }
+    fn route_publish_upserts_and_unroute_removes() {
+        Spi::run("DELETE FROM redis.pubsub_routes WHERE channel = 'ch'").unwrap();
 
-    #[pg_test]
-    fn test_route_publish_upserts() {
-        Spi::run("DELETE FROM redis.pubsub_routes WHERE channel = 'upsert-ch'").unwrap();
-        Spi::run("SELECT redis.route_publish('upsert-ch', 'public', 'tbl1')").unwrap();
-        Spi::run("SELECT redis.route_publish('upsert-ch', 'public', 'tbl2')").unwrap();
-        let tbl = Spi::get_one::<String>(
-            "SELECT tbl FROM redis.pubsub_routes WHERE channel = 'upsert-ch'",
-        )
-        .unwrap();
-        assert_eq!(tbl, Some("tbl2".to_string()));
-        Spi::run("DELETE FROM redis.pubsub_routes WHERE channel = 'upsert-ch'").unwrap();
-    }
+        Spi::run("SELECT redis.route_publish('ch', 'public', 'tbl1')").unwrap();
+        Spi::run("SELECT redis.route_publish('ch', 'public', 'tbl2')").unwrap();
+        let tbl =
+            Spi::get_one::<String>("SELECT tbl FROM redis.pubsub_routes WHERE channel = 'ch'")
+                .unwrap();
+        assert_eq!(
+            tbl.as_deref(),
+            Some("tbl2"),
+            "re-routing a channel should replace the target, not duplicate it"
+        );
 
-    #[pg_test]
-    fn test_unroute_publish_removes_row() {
-        Spi::run("DELETE FROM redis.pubsub_routes WHERE channel = 'rm-route'").unwrap();
-        Spi::run("SELECT redis.route_publish('rm-route', 'public', 'some_tbl')").unwrap();
-        Spi::run("SELECT redis.unroute_publish('rm-route')").unwrap();
-        let count = Spi::get_one::<i64>(
-            "SELECT count(*) FROM redis.pubsub_routes WHERE channel = 'rm-route'",
-        )
-        .unwrap();
+        Spi::run("SELECT redis.unroute_publish('ch')").unwrap();
+        let count =
+            Spi::get_one::<i64>("SELECT count(*) FROM redis.pubsub_routes WHERE channel = 'ch'")
+                .unwrap();
         assert_eq!(count, Some(0));
     }
 
     #[pg_test]
-    fn test_create_pubsub_table_creates_table() {
-        Spi::run("DROP TABLE IF EXISTS public.pg_redis_test_route_tbl").unwrap();
-        Spi::run("SELECT redis.create_pubsub_table('public', 'pg_redis_test_route_tbl')").unwrap();
-        let exists = Spi::get_one::<bool>(
-            "SELECT EXISTS (SELECT 1 FROM pg_tables \
-             WHERE schemaname = 'public' AND tablename = 'pg_redis_test_route_tbl')",
-        )
-        .unwrap();
-        assert_eq!(exists, Some(true));
-        Spi::run("DROP TABLE IF EXISTS public.pg_redis_test_route_tbl").unwrap();
-    }
+    fn create_pubsub_table_accepts_the_routed_insert() {
+        Spi::run("DROP TABLE IF EXISTS public.pg_redis_route_tbl").unwrap();
+        Spi::run("SELECT redis.create_pubsub_table('public', 'pg_redis_route_tbl')").unwrap();
 
-    #[pg_test]
-    fn test_create_pubsub_table_accepts_channel_payload_insert() {
-        Spi::run("DROP TABLE IF EXISTS public.pg_redis_route_spi_test").unwrap();
-        Spi::run("SELECT redis.create_pubsub_table('public', 'pg_redis_route_spi_test')").unwrap();
-        // Insert via the exact column set that TablePublish::execute() uses
+        // Exactly the column set Command::TablePublish writes.
         Spi::run(
-            "INSERT INTO public.pg_redis_route_spi_test (channel, payload) VALUES ('mychan', 'hello')",
+            "INSERT INTO public.pg_redis_route_tbl (channel, payload) VALUES ('mychan', 'hello')",
         )
         .unwrap();
         let count = Spi::get_one::<i64>(
-            "SELECT count(*) FROM public.pg_redis_route_spi_test WHERE channel = 'mychan'",
+            "SELECT count(*) FROM public.pg_redis_route_tbl WHERE channel = 'mychan'",
         )
         .unwrap();
         assert_eq!(count, Some(1));
-        Spi::run("DROP TABLE IF EXISTS public.pg_redis_route_spi_test").unwrap();
+
+        Spi::run("DROP TABLE IF EXISTS public.pg_redis_route_tbl").unwrap();
+    }
+
+    /// Identifiers are interpolated into the CREATE TABLE, so a quoted name
+    /// must be handled as a name and not as SQL.
+    #[pg_test]
+    fn create_pubsub_table_quotes_identifiers() {
+        let odd = r#"pg redis "odd" tbl"#;
+        Spi::connect_mut(|c| {
+            c.update(
+                "SELECT redis.create_pubsub_table('public', $1)",
+                None,
+                &[odd.into()],
+            )
+            .unwrap();
+        });
+        let exists = Spi::connect(|c| {
+            c.select(
+                "SELECT EXISTS (SELECT 1 FROM pg_tables \
+                 WHERE schemaname = 'public' AND tablename = $1)",
+                None,
+                &[odd.into()],
+            )
+            .unwrap()
+            .first()
+            .get::<bool>(1)
+            .unwrap()
+        });
+        assert_eq!(exists, Some(true));
+        Spi::run(&format!(
+            r#"DROP TABLE IF EXISTS public."{}""#,
+            odd.replace('"', "\"\"")
+        ))
+        .unwrap();
     }
 }
 

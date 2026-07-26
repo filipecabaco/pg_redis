@@ -1,181 +1,199 @@
 # Command coverage
 
-Status of Redis commands against pg_redis. Commands not listed are not implemented.
+Every command pg_redis accepts, grouped by family. Anything absent is not
+implemented and replies with an error.
 
-Legend: **Yes** = fully supported · **Partial** = supported with caveats · **No** = not implemented
+This page is checked against the parser by a test, so a command cannot be
+implemented without appearing here, or listed here without existing.
 
-## String / Key–value
+Behaviour is identical in both storage modes unless a note says otherwise. The
+limits that apply only to `storage_mode = 'memory'` are described in
+[Storage modes](storage-modes.md#where-this-differs-from-redis) rather than
+repeated per command.
 
-| Command | Status | Notes |
-|---------|--------|-------|
-| `GET` | Yes | |
-| `SET` | Yes | NX, XX, GET, EX, PX, EXAT, PXAT, KEEPTTL flags |
-| `SETEX` | Yes | |
-| `PSETEX` | Yes | |
-| `MGET` | Yes | |
-| `MSET` | Yes | |
-| `DEL` | Yes | |
-| `EXISTS` | Yes | Multi-key |
-| `GETSET` | No | Use `SET … GET` instead |
-| `GETEX` | No | |
-| `GETDEL` | No | |
-| `SETNX` | No | Use `SET … NX` instead |
-| `MSETNX` | No | |
-| `APPEND` | No | |
-| `STRLEN` | No | |
-| `INCR` | No | |
-| `INCRBY` | No | |
-| `INCRBYFLOAT` | No | |
-| `DECR` | No | |
-| `DECRBY` | No | |
-| `SUBSTR` / `GETRANGE` | No | |
-| `SETRANGE` | No | |
+
+## Connection
+
+| Command | Notes |
+|---------|-------|
+| `PING` |  |
+| `ECHO` |  |
+| `SELECT` | Also accepts the names `cache` (db 0) and `durable` (db 8) |
+| `AUTH` | Validated against `redis.password`; a no-op when that is unset |
+| `HELLO` | RESP3 handshake; push frames are used for pub/sub when negotiated |
+| `RESET` |  |
+| `QUIT` |  |
+| `CLIENT` | Accepted and answered, but connection state is not tracked |
+| `COMMAND` | Returns an empty array, enough for client handshakes |
+| `CONFIG` | `GET` returns nothing; `SET` is accepted and ignored |
+| `INFO` |  |
+
+## Strings
+
+| Command | Notes |
+|---------|-------|
+| `GET` |  |
+| `SET` | NX, XX, GET, EX, PX, EXAT, PXAT and KEEPTTL |
+| `SETEX` |  |
+| `PSETEX` |  |
+| `SETNX` |  |
+| `MSETNX` |  |
+| `MGET` |  |
+| `MSET` |  |
+| `APPEND` |  |
+| `STRLEN` |  |
+| `GETSET` |  |
+| `GETDEL` |  |
+| `INCR` |  |
+| `DECR` |  |
+| `INCRBY` |  |
+| `DECRBY` |  |
+| `INCRBYFLOAT` |  |
+
+## Keys
+
+| Command | Notes |
+|---------|-------|
+| `DEL` |  |
+| `UNLINK` |  |
+| `EXISTS` |  |
+| `TYPE` |  |
+| `KEYS` | Full scan, as in Redis. Glob matching is done in-process, not in SQL |
+| `SCAN` | Cursor is always 0 — one full pass, no incremental guarantee |
+| `RANDOMKEY` |  |
+| `RENAME` |  |
+| `DBSIZE` |  |
 
 ## Expiry
 
-| Command | Status | Notes |
-|---------|--------|-------|
-| `EXPIRE` | Yes | Seconds |
-| `PEXPIRE` | Yes | Milliseconds |
-| `EXPIREAT` | Yes | Unix timestamp (seconds) |
-| `PEXPIREAT` | Yes | Unix timestamp (milliseconds) |
-| `TTL` | Yes | |
-| `PTTL` | Yes | |
-| `PERSIST` | Yes | |
-| `EXPIRETIME` | Yes | |
-| `PEXPIRETIME` | Yes | |
+| Command | Notes |
+|---------|-------|
+| `EXPIRE` | Expiry applies to string keys only, as in Redis before `HEXPIRE` |
+| `PEXPIRE` |  |
+| `EXPIREAT` |  |
+| `PEXPIREAT` |  |
+| `TTL` |  |
+| `PTTL` |  |
+| `PERSIST` |  |
+| `EXPIRETIME` |  |
+| `PEXPIRETIME` |  |
 
 ## Hashes
 
-| Command | Status | Notes |
-|---------|--------|-------|
-| `HGET` | Yes | |
-| `HSET` | Yes | Multi-field |
-| `HDEL` | Yes | Multi-field |
-| `HGETALL` | Yes | |
-| `HMGET` | No | |
-| `HMSET` | No | Use `HSET` with multiple fields |
-| `HKEYS` | No | |
-| `HVALS` | No | |
-| `HLEN` | No | |
-| `HEXISTS` | No | |
-| `HINCRBY` | No | |
-| `HINCRBYFLOAT` | No | |
-| `HSCAN` | No | |
-| `HRANDFIELD` | No | |
-| `HEXPIRE` | No | Hash field TTL not supported |
+| Command | Notes |
+|---------|-------|
+| `HGET` |  |
+| `HSET` |  |
+| `HSETNX` |  |
+| `HDEL` |  |
+| `HGETALL` |  |
+| `HMGET` |  |
+| `HMSET` |  |
+| `HKEYS` |  |
+| `HVALS` |  |
+| `HLEN` |  |
+| `HEXISTS` |  |
+| `HINCRBY` |  |
 
 ## Lists
 
-| Command | Status | Notes |
-|---------|--------|-------|
-| `LPUSH` | No | |
-| `RPUSH` | No | |
-| `LPOP` | No | |
-| `RPOP` | No | |
-| `LRANGE` | No | |
-| `LLEN` | No | |
-| `LINDEX` | No | |
-| `LSET` | No | |
-| `LREM` | No | |
-| `LTRIM` | No | |
-| `LINSERT` | No | |
-| `LMOVE` | No | |
-| `BLPOP` | No | |
-| `BRPOP` | No | |
+| Command | Notes |
+|---------|-------|
+| `LPUSH` |  |
+| `RPUSH` |  |
+| `LPUSHX` |  |
+| `RPUSHX` |  |
+| `LPOP` |  |
+| `RPOP` |  |
+| `LLEN` |  |
+| `LRANGE` |  |
+| `LINDEX` |  |
+| `LSET` |  |
+| `LINSERT` | Rewrites the list to keep positions contiguous, so it is O(n) |
+| `LREM` | Same rewrite as LINSERT |
+| `LTRIM` |  |
+| `LPOS` | RANK and COUNT supported, including negative RANK |
+| `LMOVE` |  |
 
 ## Sets
 
-| Command | Status | Notes |
-|---------|--------|-------|
-| `SADD` | No | |
-| `SREM` | No | |
-| `SMEMBERS` | No | |
-| `SISMEMBER` | No | |
-| `SCARD` | No | |
-| `SUNION` | No | |
-| `SINTER` | No | |
-| `SDIFF` | No | |
-| `SSCAN` | No | |
-| `SRANDMEMBER` | No | |
-| `SPOP` | No | |
+| Command | Notes |
+|---------|-------|
+| `SADD` |  |
+| `SREM` |  |
+| `SMEMBERS` |  |
+| `SCARD` |  |
+| `SISMEMBER` |  |
+| `SMISMEMBER` |  |
+| `SPOP` |  |
+| `SRANDMEMBER` |  |
+| `SMOVE` |  |
+| `SUNION` |  |
+| `SINTER` |  |
+| `SDIFF` |  |
+| `SUNIONSTORE` |  |
+| `SINTERSTORE` |  |
+| `SDIFFSTORE` |  |
 
 ## Sorted sets
 
-| Command | Status | Notes |
-|---------|--------|-------|
-| `ZADD` | No | |
-| `ZREM` | No | |
-| `ZSCORE` | No | |
-| `ZRANK` | No | |
-| `ZRANGE` | No | |
-| `ZRANGEBYSCORE` | No | |
-| `ZCARD` | No | |
-| `ZINCRBY` | No | |
-| `ZCOUNT` | No | |
-| `ZSCAN` | No | |
+| Command | Notes |
+|---------|-------|
+| `ZADD` |  |
+| `ZREM` |  |
+| `ZSCORE` |  |
+| `ZMSCORE` |  |
+| `ZINCRBY` |  |
+| `ZCARD` |  |
+| `ZCOUNT` |  |
+| `ZLEXCOUNT` |  |
+| `ZRANK` |  |
+| `ZREVRANK` |  |
+| `ZRANGE` |  |
+| `ZREVRANGE` |  |
+| `ZRANGEBYSCORE` |  |
+| `ZREVRANGEBYSCORE` |  |
+| `ZRANGEBYLEX` |  |
+| `ZREVRANGEBYLEX` |  |
+| `ZPOPMIN` |  |
+| `ZPOPMAX` |  |
+| `ZRANDMEMBER` |  |
+| `ZREMRANGEBYRANK` |  |
+| `ZREMRANGEBYSCORE` |  |
+| `ZREMRANGEBYLEX` |  |
+| `ZUNION` |  |
+| `ZINTER` |  |
+| `ZDIFF` |  |
+| `ZUNIONSTORE` |  |
+| `ZINTERSTORE` |  |
+| `ZDIFFSTORE` |  |
 
 ## Pub/Sub
 
-| Command | Status | Notes |
-|---------|--------|-------|
-| `PUBLISH` | Yes | Routes to PostgreSQL tables via pattern matching — see [Pub/Sub routing](pubsub.md) |
-| `SUBSCRIBE` | No | |
-| `UNSUBSCRIBE` | No | |
-| `PSUBSCRIBE` | No | |
-| `PUNSUBSCRIBE` | No | |
+| Command | Notes |
+|---------|-------|
+| `SUBSCRIBE` |  |
+| `UNSUBSCRIBE` |  |
+| `PSUBSCRIBE` |  |
+| `PUNSUBSCRIBE` |  |
+| `PUBLISH` | Optionally also inserts into a table — see Pub/Sub routing |
+| `PUBSUB` | CHANNELS, NUMSUB, NUMPAT |
 
 ## Transactions
 
-| Command | Status | Notes |
-|---------|--------|-------|
-| `MULTI` | Yes | |
-| `EXEC` | Yes | |
-| `DISCARD` | Yes | |
-| `WATCH` | Yes | |
-| `UNWATCH` | Yes | |
+| Command | Notes |
+|---------|-------|
+| `MULTI` |  |
+| `EXEC` | Each queued command runs in its own subtransaction |
+| `DISCARD` |  |
+| `WATCH` | Requires `shared_preload_libraries`; see Transactions in Commands |
+| `UNWATCH` |  |
 
-## Server / Connection
+## Not implemented
 
-| Command | Status | Notes |
-|---------|--------|-------|
-| `PING` | Yes | Optional message |
-| `ECHO` | Yes | |
-| `SELECT` | Yes | Databases 0–15 |
-| `AUTH` | Yes | Validates against `redis.password` GUC |
-| `INFO` | Yes | Returns server info string |
-| `COMMAND` | Yes | Returns empty array (client compatibility) |
-| `CLIENT` | Partial | No-op, returns OK |
-| `QUIT` | No | |
-| `RESET` | No | |
-| `KEYS` | No | |
-| `SCAN` | No | |
-| `TYPE` | No | |
-| `RENAME` | No | |
-| `RENAMENX` | No | |
-| `COPY` | No | |
-| `MOVE` | No | |
-| `RANDOMKEY` | No | |
-| `OBJECT` | No | |
-| `DEBUG` | No | |
-| `FLUSHDB` | No | |
-| `FLUSHALL` | No | |
-| `DBSIZE` | No | |
-| `SAVE` | No | |
-| `BGSAVE` | No | |
-| `LASTSAVE` | No | |
-| `SHUTDOWN` | No | |
-| `SLAVEOF` | No | |
-| `REPLICAOF` | No | |
-| `CONFIG` | No | Use PostgreSQL GUCs instead — see [Configuration](configuration.md) |
+Notable absences, so you do not have to infer them from silence: `GETRANGE`,
+`SETRANGE`, `SETBIT`/`GETBIT` and the other bit operations, `HRANDFIELD`,
+`HSCAN`/`SSCAN`/`ZSCAN`, `SINTERCARD`, `OBJECT`, `SORT`, `DUMP`/`RESTORE`,
+`MIGRATE`, `BLPOP` and the other blocking list commands, `EVAL` and scripting,
+streams (`XADD` and friends), and cluster commands.
 
-## Compatibility matrix
-
-| Postgres version | pgrx version | Status |
-|-----------------|--------------|--------|
-| 17 | 0.18.0 | Tested |
-| 16 | 0.18.0 | Tested |
-| 15 | 0.18.0 | Tested |
-| 18 | 0.18.0 | Tested |
-
-Tested against `redis-cli` (Redis 7.x) and standard RESP2 clients.

@@ -10,11 +10,18 @@ Built with [pgrx](https://github.com/pgcentralfoundation/pgrx) in Rust.
 
 `pg_redis` starts a pool of TCP background workers inside PostgreSQL that listen for Redis clients on port 6379. Incoming RESP2 commands are parsed and dispatched to one of three storage backends:
 
-- **Memory** (default, even-numbered databases) — shared-memory hash tables, no transaction overhead, near-Redis throughput
-- **SPI/unlogged** (even-numbered databases, `storage_mode=auto`) — PostgreSQL UNLOGGED tables via SPI, survives worker restarts
-- **SPI/logged** (odd-numbered databases) — WAL-logged PostgreSQL tables, full crash durability and SQL visibility
+- **Memory** (default, databases 0–7) — shared-memory hash tables, no transaction overhead, near-Redis throughput
+- **SPI/unlogged** (databases 0–7 with `storage_mode=auto`) — PostgreSQL UNLOGGED tables via SPI, survives worker restarts
+- **SPI/logged** (databases 8–15) — WAL-logged PostgreSQL tables, full crash durability and SQL visibility
 
-Data is stored across 16 databases (0–15), mirroring Redis's native database model.
+Data is stored across 16 databases (0–15), mirroring Redis's native database model, split into an ephemeral half (0–7) and a durable half (8–15). `SELECT` accepts `cache` and `durable` as names for the two.
+
+Memory mode buys its speed with a fixed-size shared-memory region, reserved at
+server start, and that has consequences worth knowing before you rely on it:
+keys are capped at 511 bytes, values at 512, and hash fields and set members at
+128; a full table either evicts or refuses the write depending on
+`redis.maxmemory_policy`. Nothing is ever silently truncated. The durable half
+has none of these limits. See [Storage modes](./docs/storage-modes.md).
 
 ## Performance
 
@@ -45,17 +52,17 @@ OK
 OK
 ```
 
-To use a durable, SQL-visible database, switch to an odd-numbered db:
+To use a durable, SQL-visible database, switch to the durable half:
 
 ```bash
-127.0.0.1:6379> SELECT 1
+127.0.0.1:6379> SELECT durable
 OK
 127.0.0.1:6379> SET greeting "hello from postgres"
 OK
 ```
 
 ```sql
-SELECT key, value, expires_at FROM redis.kv_1;
+SELECT key, value, expires_at FROM redis.kv_8;
 ```
 
 ## Documentation

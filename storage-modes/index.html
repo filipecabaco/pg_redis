@@ -23,7 +23,7 @@
       
       
       <link rel="icon" href="../assets/favicon.svg">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
     
     
       
@@ -31,7 +31,7 @@
       
     
     
-      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
       
         
         <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
@@ -605,6 +605,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#binary-safety" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Binary safety
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#comparison" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -613,13 +624,52 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Comparison">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#where-this-differs-from-redis" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Where this differs from Redis
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
-  <a href="#logged-tables-odd-numbered-databases" class="md-nav__link">
+  <a href="#when-a-table-fills" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Logged tables (odd-numbered databases)
+        When a table fills
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#how-keys-are-stored-in-memory-mode" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How keys are stored in memory mode
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#logged-tables-databases-815" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Logged tables (databases 8–15)
       
     </span>
   </a>
@@ -859,6 +909,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../handoff/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Handoff
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -926,6 +1004,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#binary-safety" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Binary safety
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#comparison" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -934,13 +1023,52 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Comparison">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#where-this-differs-from-redis" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Where this differs from Redis
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
-  <a href="#logged-tables-odd-numbered-databases" class="md-nav__link">
+  <a href="#when-a-table-fills" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Logged tables (odd-numbered databases)
+        When a table fills
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#how-keys-are-stored-in-memory-mode" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How keys are stored in memory mode
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#logged-tables-databases-815" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Logged tables (databases 8–15)
       
     </span>
   </a>
@@ -996,7 +1124,8 @@
 
 <h1 id="storage-modes">Storage modes</h1>
 <h2 id="overview">Overview</h2>
-<p>Data is stored across 16 databases (0–15), mirroring Redis's native database model:</p>
+<p>Data is stored across 16 databases (0–15), mirroring Redis's native database
+model. They are split into two contiguous halves:</p>
 <table>
 <thead>
 <tr>
@@ -1007,27 +1136,47 @@
 </thead>
 <tbody>
 <tr>
-<td><strong>Odd</strong> (1, 3, 5 … 15)</td>
-<td><code>redis.kv_1</code>, <code>redis.hash_1</code>, …</td>
-<td>WAL-backed, survives crashes</td>
+<td><strong>0–7</strong> — <em>ephemeral</em></td>
+<td><code>redis.kv_0</code> … <code>redis.kv_7</code></td>
+<td>Configurable — see below</td>
 </tr>
 <tr>
-<td><strong>Even</strong> (0, 2, 4 … 14)</td>
-<td><code>redis.kv_0</code>, <code>redis.hash_0</code>, …</td>
-<td>Configurable — see below</td>
+<td><strong>8–15</strong> — <em>durable</em></td>
+<td><code>redis.kv_8</code> … <code>redis.kv_15</code></td>
+<td>WAL-backed, survives crashes</td>
 </tr>
 </tbody>
 </table>
-<p>Even-numbered databases have two storage backends controlled by <code>redis.storage_mode</code>.</p>
+<p><code>SELECT</code> accepts <code>cache</code> for 0 and <code>durable</code> for 8, so neither half needs to be
+memorised as a number. <code>redis.default_db</code> (default <code>0</code>, as in Redis) chooses
+where new connections start.</p>
+<p>The ephemeral half has two storage backends controlled by <code>redis.storage_mode</code>.</p>
 <h2 id="memory-default">memory (default)</h2>
-<p>Even-numbered databases bypass PostgreSQL's SPI layer entirely. Commands are served from shared-memory hash tables (<code>ShmemInitHash</code>) with no transaction overhead, no WAL, and no buffer pool involvement. This is the default because it gives the closest performance profile to Redis.</p>
+<p>Databases 0–7 bypass PostgreSQL's SPI layer entirely. Commands are served from shared-memory hash tables (<code>ShmemInitHash</code>) with no transaction overhead, no WAL, and no buffer pool involvement. This is the default because it gives the closest performance profile to Redis.</p>
 <p><code>redis.storage_mode</code> is a <code>postmaster</code>-scope GUC — a PostgreSQL restart is required to change it.</p>
 <h2 id="auto">auto</h2>
-<p>Even-numbered databases use UNLOGGED PostgreSQL tables — same SPI/transaction path as odd databases but without WAL writes. Use this when you need even-db data to be SQL-visible or when values exceed the memory mode size limits.</p>
+<p>Databases 0–7 use UNLOGGED PostgreSQL tables — the same SPI/transaction path as the durable half but without WAL writes. Use this when you need ephemeral data to be SQL-visible, or when values exceed the memory-mode size limits.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="c1"># postgresql.conf</span>
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="na">redis.storage_mode</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">&#39;auto&#39;</span>
-<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="na">redis.use_logged</span><span class="w">   </span><span class="o">=</span><span class="w"> </span><span class="s">false</span><span class="w">    </span><span class="c1"># keep db 0 as the default</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="na">redis.default_db</span><span class="w">   </span><span class="o">=</span><span class="w"> </span><span class="s">0</span><span class="w">        </span><span class="c1"># keep db 0 as the default</span>
 </code></pre></div>
+<h2 id="binary-safety">Binary safety</h2>
+<p>Redis keys, values, hash fields and set members are arbitrary byte strings, and
+both storage modes preserve them exactly — including NUL bytes and sequences
+that are not valid UTF-8. The PostgreSQL tables use <code>BYTEA</code> columns rather than
+<code>TEXT</code>, which cannot hold a NUL at all.</p>
+<p>Two consequences when querying the tables directly from SQL:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="c1">-- Keys and values come back as bytea, so cast when you want to read them.</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">convert_from</span><span class="p">(</span><span class="k">key</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;UTF8&#39;</span><span class="p">),</span><span class="w"> </span><span class="n">convert_from</span><span class="p">(</span><span class="n">value</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;UTF8&#39;</span><span class="p">)</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">kv_8</span><span class="p">;</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="c1">-- ...and cast the other way when comparing against a literal.</span>
+<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">kv_8</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="k">key</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">convert_to</span><span class="p">(</span><span class="s1">&#39;mykey&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;UTF8&#39;</span><span class="p">);</span>
+<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="c1">-- A plain literal also works, since it is coerced to bytea:</span>
+<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">kv_8</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="k">key</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;mykey&#39;</span><span class="p">;</span>
+</code></pre></div>
+<p>Ordering is bytewise, which is what Redis means by lexicographic — so
+<code>ZRANGEBYLEX</code> and <code>ORDER BY member</code> agree with Redis rather than with a
+database collation.</p>
 <h2 id="comparison">Comparison</h2>
 <table>
 <thead>
@@ -1039,7 +1188,7 @@
 </thead>
 <tbody>
 <tr>
-<td>Even-db storage</td>
+<td>Storage for db 0–7</td>
 <td>Shared-memory HTAB per data type</td>
 <td>UNLOGGED PostgreSQL tables</td>
 </tr>
@@ -1065,8 +1214,13 @@
 </tr>
 <tr>
 <td>Max keys</td>
-<td><code>redis.mem_max_entries</code> per KV db (default 16,384)</td>
+<td><code>redis.mem_max_entries</code> per KV db (default 8,192)</td>
 <td>Unlimited (disk)</td>
+</tr>
+<tr>
+<td>Shared memory at the default</td>
+<td>~202 MiB, reserved at server start</td>
+<td>None</td>
 </tr>
 <tr>
 <td>Max value size</td>
@@ -1074,20 +1228,90 @@
 <td>Unlimited (TOAST)</td>
 </tr>
 <tr>
-<td>Key size limit</td>
-<td>127 bytes</td>
+<td>Max key size</td>
+<td>511 bytes</td>
+<td>Unlimited</td>
+</tr>
+<tr>
+<td>Max hash field / set member</td>
+<td>128 bytes</td>
 <td>Unlimited</td>
 </tr>
 </tbody>
 </table>
-<h2 id="logged-tables-odd-numbered-databases">Logged tables (odd-numbered databases)</h2>
-<p>Odd-numbered databases (1, 3, 5 … 15) always use WAL-logged tables regardless of <code>storage_mode</code>.</p>
+<h3 id="where-this-differs-from-redis">Where this differs from Redis</h3>
+<p>Redis caps a string at 512 MiB (<code>proto-max-bulk-len</code>) and places no limit at all
+on key or field length. pg_redis honours the 512 MiB protocol limit at the
+parser, so <strong>the durable half (8–15) matches Redis</strong>: values there are bounded
+only by PostgreSQL's ~1 GB per-field TOAST limit.</p>
+<p>The memory-mode limits above are far lower because shared memory is a
+fixed-size region allocated at postmaster start — every slot has to be sized up
+front, so an entry cannot grow to 512 MiB on demand. This is a property of the
+backend, not of the protocol.</p>
+<p>Anything over a limit is <strong>rejected, never truncated</strong>. A truncated key is worse
+than an error: two keys sharing a 511-byte prefix would collapse onto one entry,
+so a <code>GET</code> returns another key's value and a <code>DEL</code> removes it. The reply names
+both the limit and the way past it:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>ERR key exceeds redis.storage_mode=&#39;memory&#39; limit of 511 bytes (use SELECT durable for unbounded values)
+</code></pre></div>
+<p>The check runs before the command executes, so a refusal never leaves a partial
+write behind — no half-stored value, no entry under a truncated key. Switch the
+database to <code>auto</code>, or use <code>SELECT durable</code>, and the same command is stored
+exactly as Redis would store it.</p>
+<h2 id="when-a-table-fills">When a table fills</h2>
+<p><code>redis.mem_max_entries</code> (default 8192) bounds each data type in each ephemeral
+database. What happens at the boundary is <code>redis.maxmemory_policy</code>, named after
+Redis's setting of the same name:</p>
+<table>
+<thead>
+<tr>
+<th>Policy</th>
+<th>Behaviour</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>noeviction</code> (default, as in Redis)</td>
+<td>The write is refused with <code>OOM command not allowed when used memory &gt; 'maxmemory'</code>. Nothing already stored is lost.</td>
+</tr>
+<tr>
+<td><code>allkeys-random</code></td>
+<td>Entries are evicted to make room. Hashes, sets, sorted sets and lists are evicted <strong>whole</strong> — a collection is never left half-present, and the key currently being written is never chosen, so a single key larger than its table still reports OOM.</td>
+</tr>
+<tr>
+<td><code>volatile-ttl</code></td>
+<td>Only keys that carry an expiry are evicted, soonest expiry first. Falls back to refusing the write if none do.</td>
+</tr>
+</tbody>
+</table>
+<p>Expired keys are reclaimed before any live key is considered, under every
+policy. A background sweep also removes them once a second.</p>
+<p>A full table has never been able to take the server down: <code>HASH_ENTER_NULL</code>
+returns a null the command turns into the error above, rather than the
+<code>out of shared memory</code> that dynahash raises for <code>HASH_ENTER</code>.</p>
+<p>The durable half has no such limit — it is bounded by disk.</p>
+<h2 id="how-keys-are-stored-in-memory-mode">How keys are stored in memory mode</h2>
+<p>A hash, a set, a sorted set or a list holds one shared-memory entry per member,
+and each entry has to identify the key it belongs to. Storing the key itself
+cost 512 bytes in every one of them — 512 of a set member's 640 bytes, repeated
+for every member of every set.</p>
+<p>They instead store a 128-bit SipHash of the key, keyed with random material
+drawn once per server start. Nothing needs the key bytes back: every access to
+these tables compares against a key the caller already holds, and the commands
+that hand a key to a client (<code>KEYS</code>, <code>SCAN</code>, <code>RANDOMKEY</code>) read the string table,
+which still stores keys verbatim. The hash is keyed rather than plain so that a
+client cannot construct two keys that collide and merge their contents.</p>
+<p>At the default <code>redis.mem_max_entries</code> this takes the extension's shared-memory
+reservation from <strong>376 MiB to 202 MiB</strong> — measured as a drop in
+<code>shared_memory_size</code> from 587 MB to 413 MB.</p>
+<h2 id="logged-tables-databases-815">Logged tables (databases 8–15)</h2>
+<p>The durable half always uses WAL-logged tables regardless of <code>storage_mode</code>.</p>
 <table>
 <thead>
 <tr>
 <th></th>
-<th>Logged (odd)</th>
-<th>memory (even, default)</th>
+<th>Durable (8–15)</th>
+<th>memory (0–7, default)</th>
 </tr>
 </thead>
 <tbody>
@@ -1118,11 +1342,11 @@
 </tr>
 </tbody>
 </table>
-<p>Use odd-numbered databases (<code>SELECT 1</code>) for data that must survive a PostgreSQL restart or needs to be queryable via SQL.</p>
+<p>Use the durable half (<code>SELECT durable</code>, or any db from 8 to 15) for data that must survive a PostgreSQL restart or needs to be queryable via SQL.</p>
 <h2 id="when-to-use-each-mode">When to use each mode</h2>
 <p><strong>Default (<code>memory</code>)</strong> — ephemeral caches, session tokens, rate-limit counters. Closest to Redis behaviour.</p>
-<p><strong><code>auto</code></strong> — even-db data you want queryable via SQL joins, or keys/values exceeding the inline limits.</p>
-<p><strong>Odd databases</strong> — data that must survive crashes and participate in replication.</p>
+<p><strong><code>auto</code></strong> — ephemeral data you want queryable via SQL joins, or keys/values exceeding the inline limits.</p>
+<p><strong>Databases 8–15</strong> — data that must survive crashes and participate in replication.</p>
 <h2 id="notes-on-memory-mode">Notes on memory mode</h2>
 <ul>
 <li>Data is <strong>lost on PostgreSQL restart</strong>, crash, or <code>DROP EXTENSION</code>.</li>
@@ -1219,7 +1443,7 @@
       <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.sections", "navigation.top", "content.code.copy", "content.action.edit"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
       
     
   </body>

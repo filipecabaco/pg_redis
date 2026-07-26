@@ -23,7 +23,7 @@
       
       
       <link rel="icon" href="../assets/favicon.svg">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
     
     
       
@@ -31,7 +31,7 @@
       
     
     
-      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
       
         
         <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
@@ -560,6 +560,28 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#lists" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Lists
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#errors-and-limits" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Errors and limits
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#transactions" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -837,6 +859,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../handoff/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Handoff
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -915,6 +965,28 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#lists" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Lists
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#errors-and-limits" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Errors and limits
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#transactions" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -970,7 +1042,7 @@
 </tr>
 <tr>
 <td><code>SELECT db</code></td>
-<td>0–15; even = unlogged, odd = logged</td>
+<td>0–15, or the names <code>cache</code> (0) and <code>durable</code> (8). Databases 0–7 are ephemeral, 8–15 WAL-logged — see <a href="../storage-modes/">Storage modes</a></td>
 </tr>
 <tr>
 <td><code>AUTH [password]</code></td>
@@ -1110,6 +1182,73 @@
 <blockquote>
 <p>Expiry is not supported on hash keys (same behaviour as Redis hash TTLs without <code>HEXPIRE</code>).</p>
 </blockquote>
+<h2 id="lists">Lists</h2>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Behaviour</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>LPUSH</code>/<code>RPUSH key value [value ...]</code></td>
+<td>Prepend/append, returns the new length</td>
+</tr>
+<tr>
+<td><code>LPOP</code>/<code>RPOP key [count]</code></td>
+<td>Pop from either end</td>
+</tr>
+<tr>
+<td><code>LRANGE key start stop</code></td>
+<td>Inclusive range, negative indices count from the tail</td>
+</tr>
+<tr>
+<td><code>LINSERT key BEFORE\|AFTER pivot value</code></td>
+<td>Returns the new length, <code>-1</code> if the pivot is absent, <code>0</code> if the key is</td>
+</tr>
+<tr>
+<td><code>LREM key count value</code></td>
+<td><code>count &gt; 0</code> from the head, <code>&lt; 0</code> from the tail, <code>0</code> removes every match</td>
+</tr>
+<tr>
+<td><code>LPOS key element [RANK r] [COUNT n]</code></td>
+<td>Negative <code>RANK</code> searches from the tail; <code>COUNT 0</code> returns every match</td>
+</tr>
+</tbody>
+</table>
+<p><code>LINSERT</code> and <code>LREM</code> rewrite the list so its positions stay contiguous, which
+makes them O(n). Removing in place would leave a gap, and every reader walks
+positions in order — the list would silently end at the first gap.</p>
+<h2 id="errors-and-limits">Errors and limits</h2>
+<p>Errors carry a Redis error code, so client-side handling that matches on one
+works unchanged:</p>
+<table>
+<thead>
+<tr>
+<th>Reply</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>-ERR ...</code></td>
+<td>The general case</td>
+</tr>
+<tr>
+<td><code>-OOM command not allowed when used memory &gt; 'maxmemory'</code></td>
+<td>A shared-memory table is full and <code>redis.maxmemory_policy</code> is <code>noeviction</code>. See <a href="../storage-modes/#when-a-table-fills">When a table fills</a></td>
+</tr>
+<tr>
+<td><code>-ERR key exceeds redis.storage_mode='memory' limit of 511 bytes ...</code></td>
+<td>The key, hash field, set member or value is larger than a shared-memory slot</td>
+</tr>
+</tbody>
+</table>
+<p>Both of those are specific to <code>storage_mode = 'memory'</code>; the durable half is
+bounded only by disk. Size limits are checked before the command runs, so a
+refusal never leaves a partial write — no half-stored value and no entry under
+a truncated key.</p>
 <h2 id="transactions">Transactions</h2>
 <table>
 <thead>
@@ -1141,7 +1280,12 @@
 </tr>
 </tbody>
 </table>
-<p>Commands queued inside <code>MULTI</code> receive <code>QUEUED</code> responses. Runtime errors inside <code>EXEC</code> (e.g. <code>INCR</code> on a non-integer) are returned as per-command errors without aborting the remaining commands.</p>
+<p>Commands queued inside <code>MULTI</code> receive <code>QUEUED</code> responses. Runtime errors inside <code>EXEC</code> (e.g. <code>INCR</code> on a non-integer) are returned as per-command errors without aborting the remaining commands: each command runs in its own subtransaction, so a failure rolls back that command only.</p>
+<p><code>WATCH</code> tracks writes through counters in shared memory, so it detects a conflicting write no matter which worker served it. Two consequences:</p>
+<ul>
+<li>It requires the extension in <code>shared_preload_libraries</code>; otherwise <code>WATCH</code> returns an error rather than silently failing to detect anything.</li>
+<li>Keys are hashed into a fixed table of counters, so unrelated keys can occasionally share one. That can abort an <code>EXEC</code> that did not strictly conflict; it can never let a conflicting one through. Retry on a nil <code>EXEC</code>, as with Redis.</li>
+</ul>
 
 
 
@@ -1231,7 +1375,7 @@
       <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.sections", "navigation.top", "content.code.copy", "content.action.edit"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
       
     
   </body>

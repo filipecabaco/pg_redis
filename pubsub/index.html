@@ -23,7 +23,7 @@
       
       
       <link rel="icon" href="../assets/favicon.svg">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
     
     
       
@@ -31,7 +31,7 @@
       
     
     
-      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
       
         
         <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
@@ -643,6 +643,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#size-limits" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Size limits
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -826,6 +837,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../handoff/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Handoff
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -903,6 +942,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#size-limits" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Size limits
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -967,12 +1017,17 @@
 </tbody>
 </table>
 <h2 id="bring-your-own-table">Bring your own table</h2>
-<p>The target table must have <code>channel TEXT</code> and <code>payload TEXT</code> columns:</p>
+<p>The target table must have <code>channel BYTEA</code> and <code>payload BYTEA</code> columns:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">your_table</span><span class="w"> </span><span class="p">(</span>
-<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">    </span><span class="n">channel</span><span class="w"> </span><span class="nb">TEXT</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span><span class="p">,</span>
-<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">    </span><span class="n">payload</span><span class="w"> </span><span class="nb">TEXT</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">    </span><span class="n">channel</span><span class="w"> </span><span class="n">BYTEA</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span><span class="p">,</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">    </span><span class="n">payload</span><span class="w"> </span><span class="n">BYTEA</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span>
 <a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="p">);</span>
 </code></pre></div>
+<p><code>BYTEA</code> is required, not merely recommended: channels and payloads are arbitrary
+byte strings and <code>TEXT</code> cannot hold a NUL. A routed insert into a table whose
+columns are the wrong type fails, and because the insert is fire-and-forget the
+<code>PUBLISH</code> still succeeds — the failure is reported in the PostgreSQL log, not to
+the publishing client. Check there if routed rows stop appearing.</p>
 <h2 id="how-it-works">How it works</h2>
 <ul>
 <li>Routes are stored in <code>redis.pubsub_routes</code> and loaded into shared memory on startup. Lookups are lock-free when no routes are configured (atomic counter short-circuit).</li>
@@ -980,6 +1035,51 @@
 <li>Routes survive server restart (persisted in <code>redis.pubsub_routes</code>).</li>
 <li>Up to 64 routes can be active simultaneously.</li>
 </ul>
+<h2 id="size-limits">Size limits</h2>
+<p>Pub/sub runs entirely through fixed-size shared-memory slots, so the following
+are hard caps:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Limit</th>
+<th>Over the limit</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Channel / pattern name</td>
+<td>255 bytes</td>
+<td><code>SUBSCRIBE</code>, <code>PSUBSCRIBE</code> and <code>PUBLISH</code> return an error</td>
+</tr>
+<tr>
+<td>Message payload</td>
+<td>512 bytes</td>
+<td><code>PUBLISH</code> returns an error</td>
+</tr>
+<tr>
+<td>Concurrent subscriber connections</td>
+<td>256</td>
+<td><code>SUBSCRIBE</code> returns "max pub/sub subscribers reached"</td>
+</tr>
+<tr>
+<td>Channels + patterns per connection</td>
+<td>16 each</td>
+<td>Further subscriptions are ignored</td>
+</tr>
+<tr>
+<td>Undelivered messages queued per subscriber</td>
+<td>256</td>
+<td>Further messages are dropped for that subscriber</td>
+</tr>
+</tbody>
+</table>
+<p>Names and payloads over the limit are <strong>rejected, not truncated</strong>. A truncated
+subscription would never match a publish to the same name, leaving the client
+waiting on a channel it believed it was subscribed to.</p>
+<p>Use the table routing above when payloads exceed 512 bytes.</p>
+<p>The slot table costs roughly 66 MiB of shared memory and is allocated at server
+start whether or not pub/sub is used.</p>
 
 
 
@@ -1069,7 +1169,7 @@
       <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.sections", "navigation.top", "content.code.copy", "content.action.edit"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
       
     
   </body>

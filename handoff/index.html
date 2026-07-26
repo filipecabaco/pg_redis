@@ -10,13 +10,11 @@
       
       
       
-        <link rel="canonical" href="https://filipecabaco.github.io/pg_redis/development/">
+        <link rel="canonical" href="https://filipecabaco.github.io/pg_redis/handoff/">
       
       
-        <link rel="prev" href="../benchmarks/">
+        <link rel="prev" href="../development/">
       
-      
-        <link rel="next" href="../handoff/">
       
       
         
@@ -27,7 +25,7 @@
     
     
       
-        <title>Development - pg_redis</title>
+        <title>Handoff - pg_redis</title>
       
     
     
@@ -80,7 +78,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#development" class="md-skip">
+        <a href="#handoff" class="md-skip">
           Skip to content
         </a>
       
@@ -115,7 +113,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Development
+              Handoff
             
           </span>
         </div>
@@ -711,6 +709,34 @@
                 
   
   
+  
+  
+    <li class="md-nav__item">
+      <a href="../development/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Development
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
     
   
   
@@ -730,7 +756,7 @@
   <span class="md-ellipsis">
     
   
-    Development
+    Handoff
   
 
     
@@ -748,7 +774,7 @@
   <span class="md-ellipsis">
     
   
-    Development
+    Handoff
   
 
     
@@ -774,22 +800,33 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#running-tests" class="md-nav__link">
+  <a href="#state" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Running tests
+        State
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="Running tests">
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#verifying-a-change" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Verifying a change
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Verifying a change">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#assertions" class="md-nav__link">
+  <a href="#running-the-e2e-suite-without-docker" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Assertions
+        Running the e2e suite without Docker
       
     </span>
   </a>
@@ -797,10 +834,21 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#byte-exact-assertions" class="md-nav__link">
+  <a href="#ci-runs-against-an-assert-enabled-postgresql" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Byte-exact assertions
+        CI runs against an assert-enabled PostgreSQL
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#traps" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Traps
       
     </span>
   </a>
@@ -813,10 +861,60 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#continuous-integration" class="md-nav__link">
+  <a href="#open-work" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Continuous integration
+        Open work
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Open work">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#1-the-dispatch-handoff-throughput" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. The dispatch handoff (throughput)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2-chunked-value-pool-memory-and-the-value-cap" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Chunked value pool (memory, and the value cap)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#3-smaller-items" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Smaller items
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#design-notes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Design notes
       
     </span>
   </a>
@@ -824,21 +922,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#local-development" class="md-nav__link">
+  <a href="#benchmarking" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Local development
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#schema" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Schema
+        Benchmarking
       
     </span>
   </a>
@@ -849,34 +936,6 @@
   
 </nav>
       
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../handoff/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Handoff
-  
-
-    
-  </span>
-  
-  
-
-      </a>
     </li>
   
 
@@ -916,22 +975,33 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#running-tests" class="md-nav__link">
+  <a href="#state" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Running tests
+        State
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="Running tests">
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#verifying-a-change" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Verifying a change
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Verifying a change">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#assertions" class="md-nav__link">
+  <a href="#running-the-e2e-suite-without-docker" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Assertions
+        Running the e2e suite without Docker
       
     </span>
   </a>
@@ -939,10 +1009,21 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#byte-exact-assertions" class="md-nav__link">
+  <a href="#ci-runs-against-an-assert-enabled-postgresql" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Byte-exact assertions
+        CI runs against an assert-enabled PostgreSQL
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#traps" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Traps
       
     </span>
   </a>
@@ -955,10 +1036,60 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#continuous-integration" class="md-nav__link">
+  <a href="#open-work" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Continuous integration
+        Open work
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Open work">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#1-the-dispatch-handoff-throughput" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. The dispatch handoff (throughput)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2-chunked-value-pool-memory-and-the-value-cap" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Chunked value pool (memory, and the value cap)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#3-smaller-items" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Smaller items
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#design-notes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Design notes
       
     </span>
   </a>
@@ -966,21 +1097,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#local-development" class="md-nav__link">
+  <a href="#benchmarking" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Local development
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#schema" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Schema
+        Benchmarking
       
     </span>
   </a>
@@ -1004,7 +1124,7 @@
 
 
   
-    <a href="https://github.com/filipecabaco/pg_redis/edit/main/docs/development.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
+    <a href="https://github.com/filipecabaco/pg_redis/edit/main/docs/handoff.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
       
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M10 20H6V4h7v5h5v3.1l2-2V8l-6-6H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h4zm10.2-7c.1 0 .3.1.4.2l1.3 1.3c.2.2.2.6 0 .8l-1 1-2.1-2.1 1-1c.1-.1.2-.2.4-.2m0 3.9L14.1 23H12v-2.1l6.1-6.1z"/></svg>
     </a>
@@ -1012,102 +1132,237 @@
   
 
 
-<h1 id="development">Development</h1>
-<h2 id="running-tests">Running tests</h2>
-<p>There are three layers and they cover different code. Running one is not
-running the others:</p>
+<h1 id="handoff">Handoff</h1>
+<p>Working notes for picking up the in-flight work: what is done, what is open,
+how to verify a change, and which traps have already cost someone a day.</p>
+<h2 id="state">State</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Rust tests</td>
+<td>111/111 on pg15, pg16, pg17</td>
+</tr>
+<tr>
+<td>E2E</td>
+<td>205/205 under <strong>both</strong> <code>storage_mode=memory</code> and <code>storage_mode=auto</code></td>
+</tr>
+<tr>
+<td>Lint</td>
+<td>clippy clean at <code>-D warnings</code>, <code>cargo fmt --check</code> clean</td>
+</tr>
+<tr>
+<td>Shared memory</td>
+<td>413 MB <code>shared_memory_size</code> at the defaults, down from 587 MB</td>
+</tr>
+</tbody>
+</table>
+<h2 id="verifying-a-change">Verifying a change</h2>
+<p>There are three test layers and they cover different code. Running one is not
+running the others.</p>
 <table>
 <thead>
 <tr>
 <th>Layer</th>
 <th>Command</th>
-<th>What it covers</th>
+<th>What it actually covers</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td>Unit</td>
-<td><code>mise run test-unit</code></td>
-<td>Parsing, key layout, size limits, the hash — no PostgreSQL</td>
+<td><code>cargo test --lib</code></td>
+<td>Pure functions: parsing, key layout, limits, SipHash, and that <code>docs/command-coverage.md</code> still matches the parser</td>
 </tr>
 <tr>
 <td>pgrx</td>
-<td><code>mise run test-pg</code></td>
-<td>The SPI path, against a PostgreSQL pgrx builds itself</td>
+<td><code>cargo pgrx test pg17</code></td>
+<td><strong>The SPI path only</strong> — never the shared-memory backend</td>
 </tr>
 <tr>
-<td>End-to-end</td>
-<td><code>mise run e2e</code></td>
-<td>A live server over the Redis protocol, in one storage mode</td>
+<td>E2E</td>
+<td><code>bun test</code> against a live server</td>
+<td>Everything, in whichever storage mode the server runs</td>
 </tr>
 </tbody>
 </table>
-<p>The gap between the second and third is the one to know about. <code>cargo pgrx
-test</code> starts a throwaway cluster <strong>without</strong> <code>shared_preload_libraries</code>, so
-memory mode — the default storage mode, and the whole of <code>src/mem.rs</code> — is
-invisible to it. Only the end-to-end suite reaches that code, and only when the
-server it runs against is configured for it:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>mise<span class="w"> </span>run<span class="w"> </span>e2e<span class="w">                              </span><span class="c1"># storage_mode=auto</span>
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="nv">PG_REDIS_STORAGE_MODE</span><span class="o">=</span>memory<span class="w"> </span>mise<span class="w"> </span>run<span class="w"> </span>e2e<span class="w"> </span><span class="c1"># the shared-memory backend</span>
+<p>The gap in the middle is the important one. <code>cargo pgrx test</code> starts its own
+throwaway cluster without <code>shared_preload_libraries</code>, so memory mode — the
+default storage mode, and all of <code>mem.rs</code> — is invisible to it. Four bugs
+reached the branch that way. CI now runs the e2e suite in both storage modes
+for exactly this reason.</p>
+<h3 id="running-the-e2e-suite-without-docker">Running the e2e suite without Docker</h3>
+<p><code>docker compose --profile e2e up</code> is the supported path, but it is not the only
+one, and in a dev container without a working Docker daemon it is not an option.
+<code>bun</code> runs the same suite directly against any live server:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="c1"># 1. A cluster with the extension preloaded. Run as an unprivileged user —</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="c1">#    initdb refuses to run as root, and a long $HOME breaks the socket path.</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>initdb<span class="w"> </span>-D<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PGDATA</span><span class="s2">&quot;</span><span class="w"> </span>-U<span class="w"> </span>postgres<span class="w"> </span>-A<span class="w"> </span>trust
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>cat<span class="w"> </span>&gt;&gt;<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PGDATA</span><span class="s2">/postgresql.conf&quot;</span><span class="w"> </span><span class="s">&lt;&lt;&#39;CONF&#39;</span>
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="s">listen_addresses = &#39;localhost&#39;</span>
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="s">shared_preload_libraries = &#39;pg_redis&#39;</span>
+<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="s">redis.storage_mode = &#39;memory&#39;      # or &#39;auto&#39; — run both</span>
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="s">redis.port = 6379</span>
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="s">redis.database = &#39;postgres&#39;</span>
+<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="s">redis.default_db = 8</span>
+<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="s">redis.password = &#39;testpass&#39;</span>
+<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="s">CONF</span>
+<a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>
+<a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a><span class="c1"># 2. Install the extension into that PostgreSQL, then start it.</span>
+<a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a>cargo<span class="w"> </span>pgrx<span class="w"> </span>install<span class="w"> </span>--release<span class="w"> </span>--pg-config<span class="w"> </span>/usr/lib/postgresql/17/bin/pg_config
+<a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a>pg_ctl<span class="w"> </span>-D<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PGDATA</span><span class="s2">&quot;</span><span class="w"> </span>-o<span class="w"> </span><span class="s1">&#39;-k /tmp&#39;</span><span class="w"> </span>start
+<a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a>psql<span class="w"> </span>-h<span class="w"> </span><span class="m">127</span>.0.0.1<span class="w"> </span>-U<span class="w"> </span>postgres<span class="w"> </span>-c<span class="w"> </span><span class="s1">&#39;CREATE EXTENSION pg_redis;&#39;</span>
+<a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a>
+<a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a><span class="c1"># 3. The suite.</span>
+<a id="__codelineno-0-20" name="__codelineno-0-20" href="#__codelineno-0-20"></a><span class="nb">cd</span><span class="w"> </span>docker/e2e<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>bun<span class="w"> </span>install
+<a id="__codelineno-0-21" name="__codelineno-0-21" href="#__codelineno-0-21"></a><span class="nv">DATABASE_URL</span><span class="o">=</span><span class="s2">&quot;postgres://postgres@localhost:5432/postgres&quot;</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-0-22" name="__codelineno-0-22" href="#__codelineno-0-22"></a><span class="nv">REDIS_HOST</span><span class="o">=</span>localhost<span class="w"> </span><span class="nv">REDIS_PORT</span><span class="o">=</span><span class="m">6379</span><span class="w"> </span><span class="nv">REDIS_PASSWORD</span><span class="o">=</span>testpass<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-0-23" name="__codelineno-0-23" href="#__codelineno-0-23"></a><span class="w">  </span>bun<span class="w"> </span><span class="nb">test</span><span class="w"> </span>index.test.ts
 </code></pre></div>
-<p>CI runs both. Please do the same for anything touching <code>mem.rs</code>.</p>
-<h3 id="assertions">Assertions</h3>
-<p><code>cargo pgrx init --pgN download</code> builds PostgreSQL with <code>--enable-cassert</code>,
-which distribution packages do not. Misuse of a PostgreSQL internal can pass
-against a system package and fail only under pgrx, and an assertion failure
-takes the backend down with it, so unrelated tests fail alongside the real one.
-If a test fails in CI and passes locally, suspect this first —
-<a href="../handoff/#ci-runs-against-an-assert-enabled-postgresql">Handoff</a> has a recipe
-for reproducing it.</p>
-<h3 id="byte-exact-assertions">Byte-exact assertions</h3>
-<p><code>Bun.RedisClient</code> encodes command arguments as UTF-8, so it cannot send a
-<code>0xff</code> byte and reports 10 bytes for a 7-byte value. Anything asserting on
-exact bytes or lengths has to go through the <code>RawRedis</code> helper at the top of
-<code>docker/e2e/index.test.ts</code>.</p>
-<h2 id="continuous-integration">Continuous integration</h2>
-<p><code>.github/workflows/ci.yml</code> is six jobs. Two are trivial and gate the rest, so a
-formatting mistake costs seconds rather than a full matrix:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>Workflows ─┐
-<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>Format    ─┴─&gt; Clippy
-<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>               Test (pg15, pg16, pg17)
-<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>               Build image ──&gt; E2E (auto), E2E (memory)
+<p>Re-run step 2 after every code change — the running server holds the old
+<code>.so</code> until it restarts.</p>
+<h3 id="ci-runs-against-an-assert-enabled-postgresql">CI runs against an assert-enabled PostgreSQL</h3>
+<p><code>cargo pgrx init --pgN download</code> configures PostgreSQL with <code>--enable-cassert</code>,
+which the distribution packages do not. Code that misuses a PostgreSQL internal
+can pass against system packages and fail only in CI, with an assertion crash
+that also takes down the backend and cascades into unrelated tests.</p>
+<p>That is not hypothetical: <code>UpdateActiveSnapshotCommandId</code> asserts the active
+snapshot has <code>active_count == 1</code> and <code>regd_count == 0</code>, which the snapshot SPI
+has already pushed satisfies neither. It passed locally and failed every CI leg.</p>
+<p>To reproduce that locally, build one and point pgrx at it:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="c1"># ftp.postgresql.org may be unreachable; the Debian source package works.</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;deb-src [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="s2">  https://apt.postgresql.org/pub/repos/apt noble-pgdg main&quot;</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="w">  </span>&gt;<span class="w"> </span>/etc/apt/sources.list.d/pgdg-src.list
+<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>apt-get<span class="w"> </span>update<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>apt-get<span class="w"> </span>install<span class="w"> </span>-y<span class="w"> </span>flex<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>apt-get<span class="w"> </span><span class="nb">source</span><span class="w"> </span>postgresql-17
+<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>
+<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="nb">cd</span><span class="w"> </span>postgresql-17-*/
+<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a>./configure<span class="w"> </span>--prefix<span class="o">=</span><span class="nv">$HOME</span>/pgassert<span class="w"> </span>--enable-cassert<span class="w"> </span>--enable-debug<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="w">  </span>--without-icu<span class="w"> </span>--without-readline<span class="w"> </span>--without-zlib<span class="w"> </span>--with-openssl
+<a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a>make<span class="w"> </span>-j<span class="s2">&quot;</span><span class="k">$(</span>nproc<span class="k">)</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>make<span class="w"> </span>install
+<a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a>
+<a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a><span class="nv">PGRX_HOME</span><span class="o">=</span><span class="nv">$HOME</span>/pgrxassert<span class="w"> </span>cargo<span class="w"> </span>pgrx<span class="w"> </span>init<span class="w"> </span>--pg17<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$HOME</span><span class="s2">/pgassert/bin/pg_config&quot;</span>
+<a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a><span class="nv">PGRX_HOME</span><span class="o">=</span><span class="nv">$HOME</span>/pgrxassert<span class="w"> </span>cargo<span class="w"> </span>pgrx<span class="w"> </span><span class="nb">test</span><span class="w"> </span>pg17
 </code></pre></div>
-<p><code>Build image</code> exists because both end-to-end legs need the same container. When
-they each built it they started together, so neither could reuse the other's
-layer cache and both paid full price; now it is built once and the legs restore
-the warm cache.</p>
-<p>The pgrx version comes from <code>Cargo.toml</code> — CI reads it from there rather than
-keeping its own copy, because the auto-update workflow's token is not allowed
-to rewrite a workflow file.</p>
-<h2 id="local-development">Local development</h2>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="c1"># Start a local postgres with the extension hot-reloaded</span>
-<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>mise<span class="w"> </span>run<span class="w"> </span>run
-<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="c1"># equivalent to:</span>
-<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>cargo<span class="w"> </span>pgrx<span class="w"> </span>run<span class="w"> </span>pg17
-<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>
-<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="c1"># Inside the psql session:</span>
-<a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>CREATE<span class="w"> </span>EXTENSION<span class="w"> </span>pg_redis<span class="p">;</span>
-<a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>
-<a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="c1"># In another terminal:</span>
-<a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>redis-cli<span class="w"> </span>-p<span class="w"> </span><span class="m">6379</span><span class="w"> </span>ping
-</code></pre></div>
-<p>Format and lint:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>mise<span class="w"> </span>run<span class="w"> </span>fmt<span class="w">    </span><span class="c1"># cargo fmt</span>
-<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>mise<span class="w"> </span>run<span class="w"> </span>lint<span class="w">   </span><span class="c1"># cargo clippy -D warnings</span>
-</code></pre></div>
-<h2 id="schema">Schema</h2>
-<p>All tables live in the <code>redis</code> schema. Slots 0–7 use <code>UNLOGGED</code> tables; slots 8–15 use WAL-logged tables:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">SCHEMA</span><span class="w"> </span><span class="n">redis</span><span class="p">;</span>
-<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>
-<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="c1">-- Key-value (pattern repeats for db 0–15)</span>
-<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="k">CREATE</span><span class="w"> </span><span class="n">UNLOGGED</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">kv_0</span><span class="w"> </span><span class="p">(</span><span class="k">key</span><span class="w"> </span><span class="n">BYTEA</span><span class="w"> </span><span class="k">PRIMARY</span><span class="w"> </span><span class="k">KEY</span><span class="p">,</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="n">BYTEA</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">expires_at</span><span class="w"> </span><span class="n">TIMESTAMPTZ</span><span class="p">);</span>
-<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="k">CREATE</span><span class="w">         </span><span class="k">TABLE</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">kv_8</span><span class="w"> </span><span class="p">(</span><span class="k">key</span><span class="w"> </span><span class="n">BYTEA</span><span class="w"> </span><span class="k">PRIMARY</span><span class="w"> </span><span class="k">KEY</span><span class="p">,</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="n">BYTEA</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">expires_at</span><span class="w"> </span><span class="n">TIMESTAMPTZ</span><span class="p">);</span>
-<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a>
-<a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="c1">-- Hash (same pattern)</span>
-<a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a><span class="k">CREATE</span><span class="w"> </span><span class="n">UNLOGGED</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">hash_0</span><span class="w"> </span><span class="p">(</span><span class="k">key</span><span class="w"> </span><span class="n">BYTEA</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">field</span><span class="w"> </span><span class="n">BYTEA</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="n">BYTEA</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span><span class="p">,</span><span class="w"> </span><span class="k">PRIMARY</span><span class="w"> </span><span class="k">KEY</span><span class="w"> </span><span class="p">(</span><span class="k">key</span><span class="p">,</span><span class="w"> </span><span class="n">field</span><span class="p">));</span>
-<a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a><span class="k">CREATE</span><span class="w">         </span><span class="k">TABLE</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">hash_8</span><span class="w"> </span><span class="p">(</span><span class="k">key</span><span class="w"> </span><span class="n">BYTEA</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">field</span><span class="w"> </span><span class="n">BYTEA</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="n">BYTEA</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span><span class="p">,</span><span class="w"> </span><span class="k">PRIMARY</span><span class="w"> </span><span class="k">KEY</span><span class="w"> </span><span class="p">(</span><span class="k">key</span><span class="p">,</span><span class="w"> </span><span class="n">field</span><span class="p">));</span>
-</code></pre></div>
-<p>All tables are queryable with standard SQL, joinable with your application data, and subject to normal PostgreSQL access control.</p>
+<p>Keep it under its own <code>PGRX_HOME</code> so the fast system-PostgreSQL config stays
+intact for everyday runs.</p>
+<h3 id="traps">Traps</h3>
+<ul>
+<li><strong><code>bun test -t "&lt;filter&gt;"</code> changes which database the tests run against.</strong>
+  The <code>SELECT isolation</code> describe is what leaves the pooled client on db 0; a
+  filtered run skips it, so the connection stays on db 8 and the test silently
+  exercises the durable half instead of shared memory. A list bug was
+  misdiagnosed twice this way. Prefer a full run when a failure looks
+  order-dependent.</li>
+<li><strong><code>Bun.RedisClient</code> encodes arguments as UTF-8.</strong> It cannot express a <code>0xff</code>
+  byte, and reports 10 for a 7-byte value. Anything asserting on exact bytes or
+  exact lengths must go through the <code>RawRedis</code> helper at the top of
+  <code>index.test.ts</code>, or it measures the client's encoder rather than the server.</li>
+<li><strong>A rejected <code>client.send()</code> leaves the pooled client's replies out of step</strong>
+  for later tests. Where an error reply is the expected outcome, use <code>RawRedis</code>,
+  which returns the frame as data.</li>
+<li><strong><code>SHOW redis.foo</code> names the result column <code>redis.foo</code></strong>, dot included.
+  Destructuring by <code>foo</code> yields <code>undefined</code> with no error. Use
+  <code>SELECT current_setting('redis.foo') AS mode</code>.</li>
+</ul>
+<h2 id="open-work">Open work</h2>
+<h3 id="1-the-dispatch-handoff-throughput">1. The dispatch handoff (throughput)</h3>
+<p><strong>Sharding the shared-memory LWLocks is not worth doing.</strong> That was measured,
+not assumed:</p>
+<table>
+<thead>
+<tr>
+<th>Measurement</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Throughput at 1 / 2 / 4 workers</td>
+<td>55k / 48k / 55k — no scaling at all</td>
+</tr>
+<tr>
+<td>Worker wait events, 120 samples under <code>SET</code> load</td>
+<td>100% <code>RUNNING/cpu</code>, zero LWLock waits</td>
+</tr>
+<tr>
+<td><code>SET</code> (exclusive lock) vs <code>GET</code> (shared lock)</td>
+<td>52k vs 54k — indistinguishable</td>
+</tr>
+<tr>
+<td>Pipelining <code>-P 1</code> → <code>-P 32</code></td>
+<td>47.5k → 151k (3.2×)</td>
+</tr>
+</tbody>
+</table>
+<p>One worker matches four, and pipelining triples throughput without touching the
+lock. The ceiling is the <strong>two mpsc thread hops per command</strong> between a
+connection thread and its worker's dispatcher (<code>DispatchMsg</code> in <code>worker.rs</code>).</p>
+<p>Memory-mode commands need no SPI and no transaction, so a connection thread
+could in principle execute them inline and skip both hops. The blocker is that
+PostgreSQL LWLocks require a valid <code>MyProc</code>, which non-backend threads do not
+have — which is why everything funnels through the bgworker main thread today.
+Closing this needs a design, not a patch. Lock sharding only becomes
+interesting afterwards.</p>
+<h3 id="2-chunked-value-pool-memory-and-the-value-cap">2. Chunked value pool (memory, and the value cap)</h3>
+<p>Roughly <strong>155 MiB of the 202 MiB</strong> the extension reserves is overflow tables —
+<code>kv_overflow</code> 75 MiB, <code>hash_overflow</code> 42.5 MiB, <code>list_overflow</code> 37.8 MiB — all
+preallocated as though every value exceeded the 64-byte inline slot. Almost
+none do.</p>
+<p>Replacing the fixed 448-byte overflow entry with a shared slab of fixed-size
+chunks on a free list, chained by index, reclaims most of that. It also turns
+<code>MAX_TOTAL_VAL_LEN</code> from a compile-time constant into a function of pool
+capacity, which makes the 512-byte value limit a sizing question rather than a
+Redis-parity gap.</p>
+<h3 id="3-smaller-items">3. Smaller items</h3>
+<ul>
+<li><strong>Multi-key writes are not atomic under OOM.</strong> An <code>MSET</code> or multi-member
+  <code>SADD</code> that fills a table part-way through stores the earlier keys and then
+  errors, where Redis rejects the command whole. Whether there is room is only
+  knowable at the insert, so this needs a capacity pre-check against the
+  command's key count. Commented at the check site in <code>execute_mem</code>.</li>
+<li><strong><code>MAX_MEMBER_LEN</code> is still 128 bytes.</strong> Redis has no limit on hash fields or
+  set members. Hashing the key out of the composite tables freed 174 MiB, so
+  there is headroom to raise it now.</li>
+<li><strong><code>redis.mem_max_entries</code> is still 8192</strong>, halved when <code>MAX_KEY_LEN</code> grew to</li>
+<li>The same headroom applies.</li>
+</ul>
+<h2 id="design-notes">Design notes</h2>
+<p>Things that are easy to get wrong without knowing why they are the way they are.</p>
+<ul>
+<li><strong>Databases split into contiguous halves</strong>, not by parity: 0–7 ephemeral,
+  8–15 durable. <code>SELECT</code> also accepts <code>cache</code> (0) and <code>durable</code> (8).</li>
+<li><strong>Composite tables key on a 128-bit keyed SipHash of the Redis key</strong>, not the
+  key bytes. Every access to those tables is a comparison against a key the
+  caller already holds; only <code>KEYS</code>, <code>SCAN</code> and <code>RANDOMKEY</code> need real key bytes,
+  and they read the string table. The hash is keyed from <code>pg_strong_random</code> per
+  postmaster so a client cannot craft a collision and merge two keys' contents.</li>
+<li><strong>Every insert uses <code>HASH_ENTER_NULL</code>, never <code>HASH_ENTER</code>.</strong> On a
+  <code>HASH_FIXED_SIZE</code> table dynahash answers a full table by raising
+  <code>out of shared memory</code>, which unwinds by longjmp — past the Rust error
+  handling that looks like it covers it — and kills the worker.</li>
+<li><strong>Lists renumber on removal.</strong> Readers walk positions as
+  <code>min_pos + i * LIST_POS_STEP</code>, so an in-place delete leaves a hole that
+  truncates the list at the first gap. <code>LREM</code> and <code>LINSERT</code> go through a
+  read-modify-write that renumbers from a fresh base.</li>
+<li><strong>Size limits are checked before execution</strong>, in <code>Command::mem_too_long_error</code>,
+  so a refusal never leaves a partial write. <code>debug_assert</code>s in <code>make_key</code>,
+  <code>make_composite_key</code>, <code>make_list_key</code> and the three value writers catch
+  anything that reaches the backend over-long.</li>
+<li><strong>Error replies carry their own code when they have one.</strong> <code>write_error</code>
+  prefixes <code>ERR</code> only for messages that do not already start with a code from
+  <code>ERROR_CODES</code>, so an OOM reply goes out as <code>-OOM ...</code> — which is what clients
+  match on.</li>
+</ul>
+<h2 id="benchmarking">Benchmarking</h2>
+<p><code>redis-benchmark</code> defaults to 3-byte values, so the standard suite never leaves
+the 64-byte inline slot. <code>mise run bench-value-sizes</code> sweeps 3/63/64/65/200/512
+bytes to make the inline-to-overflow boundary visible.</p>
 
 
 

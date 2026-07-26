@@ -23,7 +23,7 @@
       
       
       <link rel="icon" href="../assets/favicon.svg">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
     
     
       
@@ -31,7 +31,7 @@
       
     
     
-      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
       
         
         <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
@@ -440,6 +440,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#exposing-the-listener" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Exposing the listener
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#selecting-a-database-per-connection" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -815,6 +826,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../handoff/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Handoff
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -853,6 +892,17 @@
     <span class="md-ellipsis">
       
         GUC reference
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#exposing-the-listener" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Exposing the listener
       
     </span>
   </a>
@@ -924,13 +974,13 @@
 </tr>
 <tr>
 <td><code>redis.listen_address</code></td>
-<td><code>0.0.0.0</code></td>
-<td>IP address to bind on</td>
+<td><code>127.0.0.1</code></td>
+<td>IP address to bind on. See <a href="#exposing-the-listener">Exposing the listener</a> before widening this.</td>
 </tr>
 <tr>
-<td><code>redis.use_logged</code></td>
-<td><code>false</code></td>
-<td>Default database for new connections (<code>true</code> = db 1, <code>false</code> = db 0)</td>
+<td><code>redis.default_db</code></td>
+<td><code>0</code></td>
+<td>Database new connections start on (0–15). <code>0</code> is ephemeral, matching Redis; set <code>8</code> to start durable.</td>
 </tr>
 <tr>
 <td><code>redis.workers</code></td>
@@ -955,35 +1005,77 @@
 <tr>
 <td><code>redis.storage_mode</code></td>
 <td><code>memory</code></td>
-<td>Storage backend for even-numbered databases. <code>memory</code> = shared-memory hash tables (default); <code>auto</code> = UNLOGGED tables. Requires restart. See <a href="../storage-modes/">Storage modes</a>.</td>
+<td>Storage backend for the ephemeral databases (0–7). <code>memory</code> = shared-memory hash tables (default); <code>auto</code> = UNLOGGED tables. Requires restart. See <a href="../storage-modes/">Storage modes</a>.</td>
 </tr>
 <tr>
 <td><code>redis.mem_max_entries</code></td>
-<td><code>16384</code></td>
-<td>Maximum keys per data type per even-db in memory mode. Requires restart.</td>
+<td><code>8192</code></td>
+<td>Maximum keys per data type per ephemeral database in memory mode. Requires restart.</td>
+</tr>
+<tr>
+<td><code>redis.maxmemory_policy</code></td>
+<td><code>noeviction</code></td>
+<td>What memory mode does when a table fills: <code>noeviction</code> (refuse the write, as in Redis), <code>allkeys-random</code>, or <code>volatile-ttl</code>. See <a href="../storage-modes/#when-a-table-fills">Storage modes</a>.</td>
 </tr>
 </tbody>
 </table>
 <p>Apply at runtime (no restart needed unless noted):</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">SYSTEM</span><span class="w"> </span><span class="k">SET</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">port</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">6380</span><span class="p">;</span>
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">SYSTEM</span><span class="w"> </span><span class="k">SET</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">listen_address</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;127.0.0.1&#39;</span><span class="p">;</span>
-<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">SYSTEM</span><span class="w"> </span><span class="k">SET</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">use_logged</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">false</span><span class="p">;</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">SYSTEM</span><span class="w"> </span><span class="k">SET</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">listen_address</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;0.0.0.0&#39;</span><span class="p">;</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">SYSTEM</span><span class="w"> </span><span class="k">SET</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">default_db</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
 <a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">SYSTEM</span><span class="w"> </span><span class="k">SET</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">workers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="p">;</span>
 <a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">SYSTEM</span><span class="w"> </span><span class="k">SET</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">password</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;mysecret&#39;</span><span class="p">;</span>
 <a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">pg_reload_conf</span><span class="p">();</span>
 </code></pre></div>
-<h2 id="selecting-a-database-per-connection">Selecting a database per connection</h2>
-<p>There are 16 databases (0–15). Even databases use unlogged tables; odd databases use WAL-logged tables. Switch with <code>SELECT &lt;db&gt;</code>:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>redis-cli&gt;<span class="w"> </span>SELECT<span class="w"> </span><span class="m">0</span><span class="w">   </span><span class="c1"># unlogged — fast, no WAL</span>
-<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>redis-cli&gt;<span class="w"> </span>SET<span class="w"> </span>cache:key<span class="w"> </span>value
-<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>redis-cli&gt;<span class="w"> </span>SELECT<span class="w"> </span><span class="m">1</span><span class="w">   </span><span class="c1"># logged — durable</span>
-<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>redis-cli&gt;<span class="w"> </span>SET<span class="w"> </span>user:42<span class="w"> </span><span class="s1">&#39;{&quot;name&quot;:&quot;Alice&quot;}&#39;</span>
+<h2 id="exposing-the-listener">Exposing the listener</h2>
+<p>The Redis port does not go through PostgreSQL authentication. Anything that can
+reach it can read and write every <code>redis.*</code> table with the background worker's
+privileges, regardless of PostgreSQL roles or <code>pg_hba.conf</code>.</p>
+<p><code>redis.listen_address</code> therefore defaults to <code>127.0.0.1</code>. To accept connections
+from other hosts — including publishing the port out of a container — widen it
+deliberately <strong>and</strong> set a password:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">SYSTEM</span><span class="w"> </span><span class="k">SET</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">listen_address</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;0.0.0.0&#39;</span><span class="p">;</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">SYSTEM</span><span class="w"> </span><span class="k">SET</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">password</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;mysecret&#39;</span><span class="p">;</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">pg_reload_conf</span><span class="p">();</span>
 </code></pre></div>
+<p>Binding a non-loopback address with no password logs a warning at startup.</p>
+<h2 id="selecting-a-database-per-connection">Selecting a database per connection</h2>
+<p>There are 16 databases, split into two contiguous halves:</p>
+<table>
+<thead>
+<tr>
+<th>Databases</th>
+<th>Storage</th>
+<th>Durability</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>0–7</strong></td>
+<td>Shared memory, or UNLOGGED tables under <code>storage_mode = 'auto'</code></td>
+<td>Lost on restart</td>
+</tr>
+<tr>
+<td><strong>8–15</strong></td>
+<td>WAL-logged PostgreSQL tables</td>
+<td>Survives crashes, replicated</td>
+</tr>
+</tbody>
+</table>
+<p><code>SELECT</code> also accepts the name of each half, so you do not have to remember
+where the boundary is — <code>cache</code> is database 0 and <code>durable</code> is database 8:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>redis-cli&gt;<span class="w"> </span>SELECT<span class="w"> </span>cache<span class="w">     </span><span class="c1"># same as SELECT 0</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>redis-cli&gt;<span class="w"> </span>SET<span class="w"> </span>cache:key<span class="w"> </span>value
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>redis-cli&gt;<span class="w"> </span>SELECT<span class="w"> </span>durable<span class="w">   </span><span class="c1"># same as SELECT 8</span>
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>redis-cli&gt;<span class="w"> </span>SET<span class="w"> </span>user:42<span class="w"> </span><span class="s1">&#39;{&quot;name&quot;:&quot;Alice&quot;}&#39;</span>
+</code></pre></div>
+<p>Plain numbers work exactly as in Redis, and <code>redis.default_db</code> picks the one new
+connections start on.</p>
 <h2 id="managing-workers-at-runtime">Managing workers at runtime</h2>
 <p>Workers can be added or removed without a server restart. Dynamically added workers are not restarted if terminated; startup workers (configured via <code>redis.workers</code>) restart automatically after ~5 seconds.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">worker_count</span><span class="p">();</span><span class="w">   </span><span class="c1">-- how many are running</span>
-<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">add_workers</span><span class="p">(</span><span class="mi">2</span><span class="p">);</span><span class="w">   </span><span class="c1">-- add 2 more dynamically</span>
-<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">remove_workers</span><span class="p">(</span><span class="mi">2</span><span class="p">);</span><span class="w"> </span><span class="c1">-- remove 2 (newest first)</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">worker_count</span><span class="p">();</span><span class="w">   </span><span class="c1">-- how many are running</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">add_workers</span><span class="p">(</span><span class="mi">2</span><span class="p">);</span><span class="w">   </span><span class="c1">-- add 2 more dynamically</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">remove_workers</span><span class="p">(</span><span class="mi">2</span><span class="p">);</span><span class="w"> </span><span class="c1">-- remove 2 (newest first)</span>
 </code></pre></div>
 <table>
 <thead>
@@ -1101,7 +1193,7 @@
       <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.sections", "navigation.top", "content.code.copy", "content.action.edit"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
       
     
   </body>

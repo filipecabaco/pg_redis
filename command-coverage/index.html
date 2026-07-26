@@ -23,7 +23,7 @@
       
       
       <link rel="icon" href="../assets/favicon.svg">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
     
     
       
@@ -31,7 +31,7 @@
       
     
     
-      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
       
         
         <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
@@ -544,10 +544,32 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#string-keyvalue" class="md-nav__link">
+  <a href="#connection" class="md-nav__link">
     <span class="md-ellipsis">
       
-        String / Key–value
+        Connection
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#strings" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Strings
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#keys" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Keys
       
     </span>
   </a>
@@ -632,21 +654,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#server-connection" class="md-nav__link">
+  <a href="#not-implemented" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Server / Connection
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#compatibility-matrix" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Compatibility matrix
+        Not implemented
       
     </span>
   </a>
@@ -892,6 +903,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../handoff/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Handoff
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -926,10 +965,32 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#string-keyvalue" class="md-nav__link">
+  <a href="#connection" class="md-nav__link">
     <span class="md-ellipsis">
       
-        String / Key–value
+        Connection
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#strings" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Strings
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#keys" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Keys
       
     </span>
   </a>
@@ -1014,21 +1075,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#server-connection" class="md-nav__link">
+  <a href="#not-implemented" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Server / Connection
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#compatibility-matrix" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Compatibility matrix
+        Not implemented
       
     </span>
   </a>
@@ -1061,126 +1111,191 @@
 
 
 <h1 id="command-coverage">Command coverage</h1>
-<p>Status of Redis commands against pg_redis. Commands not listed are not implemented.</p>
-<p>Legend: <strong>Yes</strong> = fully supported · <strong>Partial</strong> = supported with caveats · <strong>No</strong> = not implemented</p>
-<h2 id="string-keyvalue">String / Key–value</h2>
+<p>Every command pg_redis accepts, grouped by family. Anything absent is not
+implemented and replies with an error.</p>
+<p>This page is checked against the parser by a test, so a command cannot be
+implemented without appearing here, or listed here without existing.</p>
+<p>Behaviour is identical in both storage modes unless a note says otherwise. The
+limits that apply only to <code>storage_mode = 'memory'</code> are described in
+<a href="../storage-modes/#where-this-differs-from-redis">Storage modes</a> rather than
+repeated per command.</p>
+<h2 id="connection">Connection</h2>
 <table>
 <thead>
 <tr>
 <th>Command</th>
-<th>Status</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>PING</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>ECHO</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>SELECT</code></td>
+<td>Also accepts the names <code>cache</code> (db 0) and <code>durable</code> (db 8)</td>
+</tr>
+<tr>
+<td><code>AUTH</code></td>
+<td>Validated against <code>redis.password</code>; a no-op when that is unset</td>
+</tr>
+<tr>
+<td><code>HELLO</code></td>
+<td>RESP3 handshake; push frames are used for pub/sub when negotiated</td>
+</tr>
+<tr>
+<td><code>RESET</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>QUIT</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>CLIENT</code></td>
+<td>Accepted and answered, but connection state is not tracked</td>
+</tr>
+<tr>
+<td><code>COMMAND</code></td>
+<td>Returns an empty array, enough for client handshakes</td>
+</tr>
+<tr>
+<td><code>CONFIG</code></td>
+<td><code>GET</code> returns nothing; <code>SET</code> is accepted and ignored</td>
+</tr>
+<tr>
+<td><code>INFO</code></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h2 id="strings">Strings</h2>
+<table>
+<thead>
+<tr>
+<th>Command</th>
 <th>Notes</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td><code>GET</code></td>
-<td>Yes</td>
 <td></td>
 </tr>
 <tr>
 <td><code>SET</code></td>
-<td>Yes</td>
-<td>NX, XX, GET, EX, PX, EXAT, PXAT, KEEPTTL flags</td>
+<td>NX, XX, GET, EX, PX, EXAT, PXAT and KEEPTTL</td>
 </tr>
 <tr>
 <td><code>SETEX</code></td>
-<td>Yes</td>
 <td></td>
 </tr>
 <tr>
 <td><code>PSETEX</code></td>
-<td>Yes</td>
-<td></td>
-</tr>
-<tr>
-<td><code>MGET</code></td>
-<td>Yes</td>
-<td></td>
-</tr>
-<tr>
-<td><code>MSET</code></td>
-<td>Yes</td>
-<td></td>
-</tr>
-<tr>
-<td><code>DEL</code></td>
-<td>Yes</td>
-<td></td>
-</tr>
-<tr>
-<td><code>EXISTS</code></td>
-<td>Yes</td>
-<td>Multi-key</td>
-</tr>
-<tr>
-<td><code>GETSET</code></td>
-<td>No</td>
-<td>Use <code>SET … GET</code> instead</td>
-</tr>
-<tr>
-<td><code>GETEX</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>GETDEL</code></td>
-<td>No</td>
 <td></td>
 </tr>
 <tr>
 <td><code>SETNX</code></td>
-<td>No</td>
-<td>Use <code>SET … NX</code> instead</td>
+<td></td>
 </tr>
 <tr>
 <td><code>MSETNX</code></td>
-<td>No</td>
+<td></td>
+</tr>
+<tr>
+<td><code>MGET</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>MSET</code></td>
 <td></td>
 </tr>
 <tr>
 <td><code>APPEND</code></td>
-<td>No</td>
 <td></td>
 </tr>
 <tr>
 <td><code>STRLEN</code></td>
-<td>No</td>
+<td></td>
+</tr>
+<tr>
+<td><code>GETSET</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>GETDEL</code></td>
 <td></td>
 </tr>
 <tr>
 <td><code>INCR</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>INCRBY</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>INCRBYFLOAT</code></td>
-<td>No</td>
 <td></td>
 </tr>
 <tr>
 <td><code>DECR</code></td>
-<td>No</td>
+<td></td>
+</tr>
+<tr>
+<td><code>INCRBY</code></td>
 <td></td>
 </tr>
 <tr>
 <td><code>DECRBY</code></td>
-<td>No</td>
 <td></td>
 </tr>
 <tr>
-<td><code>SUBSTR</code> / <code>GETRANGE</code></td>
-<td>No</td>
+<td><code>INCRBYFLOAT</code></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h2 id="keys">Keys</h2>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>DEL</code></td>
 <td></td>
 </tr>
 <tr>
-<td><code>SETRANGE</code></td>
-<td>No</td>
+<td><code>UNLINK</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>EXISTS</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>TYPE</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>KEYS</code></td>
+<td>Full scan, as in Redis. Glob matching is done in-process, not in SQL</td>
+</tr>
+<tr>
+<td><code>SCAN</code></td>
+<td>Cursor is always 0 — one full pass, no incremental guarantee</td>
+</tr>
+<tr>
+<td><code>RANDOMKEY</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>RENAME</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>DBSIZE</code></td>
 <td></td>
 </tr>
 </tbody>
@@ -1190,54 +1305,44 @@
 <thead>
 <tr>
 <th>Command</th>
-<th>Status</th>
 <th>Notes</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td><code>EXPIRE</code></td>
-<td>Yes</td>
-<td>Seconds</td>
+<td>Expiry applies to string keys only, as in Redis before <code>HEXPIRE</code></td>
 </tr>
 <tr>
 <td><code>PEXPIRE</code></td>
-<td>Yes</td>
-<td>Milliseconds</td>
+<td></td>
 </tr>
 <tr>
 <td><code>EXPIREAT</code></td>
-<td>Yes</td>
-<td>Unix timestamp (seconds)</td>
+<td></td>
 </tr>
 <tr>
 <td><code>PEXPIREAT</code></td>
-<td>Yes</td>
-<td>Unix timestamp (milliseconds)</td>
+<td></td>
 </tr>
 <tr>
 <td><code>TTL</code></td>
-<td>Yes</td>
 <td></td>
 </tr>
 <tr>
 <td><code>PTTL</code></td>
-<td>Yes</td>
 <td></td>
 </tr>
 <tr>
 <td><code>PERSIST</code></td>
-<td>Yes</td>
 <td></td>
 </tr>
 <tr>
 <td><code>EXPIRETIME</code></td>
-<td>Yes</td>
 <td></td>
 </tr>
 <tr>
 <td><code>PEXPIRETIME</code></td>
-<td>Yes</td>
 <td></td>
 </tr>
 </tbody>
@@ -1247,85 +1352,57 @@
 <thead>
 <tr>
 <th>Command</th>
-<th>Status</th>
 <th>Notes</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td><code>HGET</code></td>
-<td>Yes</td>
 <td></td>
 </tr>
 <tr>
 <td><code>HSET</code></td>
-<td>Yes</td>
-<td>Multi-field</td>
+<td></td>
+</tr>
+<tr>
+<td><code>HSETNX</code></td>
+<td></td>
 </tr>
 <tr>
 <td><code>HDEL</code></td>
-<td>Yes</td>
-<td>Multi-field</td>
+<td></td>
 </tr>
 <tr>
 <td><code>HGETALL</code></td>
-<td>Yes</td>
 <td></td>
 </tr>
 <tr>
 <td><code>HMGET</code></td>
-<td>No</td>
 <td></td>
 </tr>
 <tr>
 <td><code>HMSET</code></td>
-<td>No</td>
-<td>Use <code>HSET</code> with multiple fields</td>
+<td></td>
 </tr>
 <tr>
 <td><code>HKEYS</code></td>
-<td>No</td>
 <td></td>
 </tr>
 <tr>
 <td><code>HVALS</code></td>
-<td>No</td>
 <td></td>
 </tr>
 <tr>
 <td><code>HLEN</code></td>
-<td>No</td>
 <td></td>
 </tr>
 <tr>
 <td><code>HEXISTS</code></td>
-<td>No</td>
 <td></td>
 </tr>
 <tr>
 <td><code>HINCRBY</code></td>
-<td>No</td>
 <td></td>
-</tr>
-<tr>
-<td><code>HINCRBYFLOAT</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>HSCAN</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>HRANDFIELD</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>HEXPIRE</code></td>
-<td>No</td>
-<td>Hash field TTL not supported</td>
 </tr>
 </tbody>
 </table>
@@ -1334,79 +1411,68 @@
 <thead>
 <tr>
 <th>Command</th>
-<th>Status</th>
 <th>Notes</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td><code>LPUSH</code></td>
-<td>No</td>
 <td></td>
 </tr>
 <tr>
 <td><code>RPUSH</code></td>
-<td>No</td>
+<td></td>
+</tr>
+<tr>
+<td><code>LPUSHX</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>RPUSHX</code></td>
 <td></td>
 </tr>
 <tr>
 <td><code>LPOP</code></td>
-<td>No</td>
 <td></td>
 </tr>
 <tr>
 <td><code>RPOP</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>LRANGE</code></td>
-<td>No</td>
 <td></td>
 </tr>
 <tr>
 <td><code>LLEN</code></td>
-<td>No</td>
+<td></td>
+</tr>
+<tr>
+<td><code>LRANGE</code></td>
 <td></td>
 </tr>
 <tr>
 <td><code>LINDEX</code></td>
-<td>No</td>
 <td></td>
 </tr>
 <tr>
 <td><code>LSET</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>LREM</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>LTRIM</code></td>
-<td>No</td>
 <td></td>
 </tr>
 <tr>
 <td><code>LINSERT</code></td>
-<td>No</td>
+<td>Rewrites the list to keep positions contiguous, so it is O(n)</td>
+</tr>
+<tr>
+<td><code>LREM</code></td>
+<td>Same rewrite as LINSERT</td>
+</tr>
+<tr>
+<td><code>LTRIM</code></td>
 <td></td>
+</tr>
+<tr>
+<td><code>LPOS</code></td>
+<td>RANK and COUNT supported, including negative RANK</td>
 </tr>
 <tr>
 <td><code>LMOVE</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>BLPOP</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>BRPOP</code></td>
-<td>No</td>
 <td></td>
 </tr>
 </tbody>
@@ -1416,64 +1482,68 @@
 <thead>
 <tr>
 <th>Command</th>
-<th>Status</th>
 <th>Notes</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td><code>SADD</code></td>
-<td>No</td>
 <td></td>
 </tr>
 <tr>
 <td><code>SREM</code></td>
-<td>No</td>
 <td></td>
 </tr>
 <tr>
 <td><code>SMEMBERS</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>SISMEMBER</code></td>
-<td>No</td>
 <td></td>
 </tr>
 <tr>
 <td><code>SCARD</code></td>
-<td>No</td>
 <td></td>
 </tr>
 <tr>
-<td><code>SUNION</code></td>
-<td>No</td>
+<td><code>SISMEMBER</code></td>
 <td></td>
 </tr>
 <tr>
-<td><code>SINTER</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>SDIFF</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>SSCAN</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>SRANDMEMBER</code></td>
-<td>No</td>
+<td><code>SMISMEMBER</code></td>
 <td></td>
 </tr>
 <tr>
 <td><code>SPOP</code></td>
-<td>No</td>
+<td></td>
+</tr>
+<tr>
+<td><code>SRANDMEMBER</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>SMOVE</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>SUNION</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>SINTER</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>SDIFF</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>SUNIONSTORE</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>SINTERSTORE</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>SDIFFSTORE</code></td>
 <td></td>
 </tr>
 </tbody>
@@ -1483,59 +1553,120 @@
 <thead>
 <tr>
 <th>Command</th>
-<th>Status</th>
 <th>Notes</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td><code>ZADD</code></td>
-<td>No</td>
 <td></td>
 </tr>
 <tr>
 <td><code>ZREM</code></td>
-<td>No</td>
 <td></td>
 </tr>
 <tr>
 <td><code>ZSCORE</code></td>
-<td>No</td>
 <td></td>
 </tr>
 <tr>
-<td><code>ZRANK</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>ZRANGE</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>ZRANGEBYSCORE</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>ZCARD</code></td>
-<td>No</td>
+<td><code>ZMSCORE</code></td>
 <td></td>
 </tr>
 <tr>
 <td><code>ZINCRBY</code></td>
-<td>No</td>
+<td></td>
+</tr>
+<tr>
+<td><code>ZCARD</code></td>
 <td></td>
 </tr>
 <tr>
 <td><code>ZCOUNT</code></td>
-<td>No</td>
 <td></td>
 </tr>
 <tr>
-<td><code>ZSCAN</code></td>
-<td>No</td>
+<td><code>ZLEXCOUNT</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>ZRANK</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>ZREVRANK</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>ZRANGE</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>ZREVRANGE</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>ZRANGEBYSCORE</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>ZREVRANGEBYSCORE</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>ZRANGEBYLEX</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>ZREVRANGEBYLEX</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>ZPOPMIN</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>ZPOPMAX</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>ZRANDMEMBER</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>ZREMRANGEBYRANK</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>ZREMRANGEBYSCORE</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>ZREMRANGEBYLEX</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>ZUNION</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>ZINTER</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>ZDIFF</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>ZUNIONSTORE</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>ZINTERSTORE</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>ZDIFFSTORE</code></td>
 <td></td>
 </tr>
 </tbody>
@@ -1545,35 +1676,33 @@
 <thead>
 <tr>
 <th>Command</th>
-<th>Status</th>
 <th>Notes</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><code>PUBLISH</code></td>
-<td>Yes</td>
-<td>Routes to PostgreSQL tables via pattern matching — see <a href="../pubsub/">Pub/Sub routing</a></td>
-</tr>
-<tr>
 <td><code>SUBSCRIBE</code></td>
-<td>No</td>
 <td></td>
 </tr>
 <tr>
 <td><code>UNSUBSCRIBE</code></td>
-<td>No</td>
 <td></td>
 </tr>
 <tr>
 <td><code>PSUBSCRIBE</code></td>
-<td>No</td>
 <td></td>
 </tr>
 <tr>
 <td><code>PUNSUBSCRIBE</code></td>
-<td>No</td>
 <td></td>
+</tr>
+<tr>
+<td><code>PUBLISH</code></td>
+<td>Optionally also inserts into a table — see Pub/Sub routing</td>
+</tr>
+<tr>
+<td><code>PUBSUB</code></td>
+<td>CHANNELS, NUMSUB, NUMPAT</td>
 </tr>
 </tbody>
 </table>
@@ -1582,228 +1711,38 @@
 <thead>
 <tr>
 <th>Command</th>
-<th>Status</th>
 <th>Notes</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td><code>MULTI</code></td>
-<td>Yes</td>
 <td></td>
 </tr>
 <tr>
 <td><code>EXEC</code></td>
-<td>Yes</td>
-<td></td>
+<td>Each queued command runs in its own subtransaction</td>
 </tr>
 <tr>
 <td><code>DISCARD</code></td>
-<td>Yes</td>
 <td></td>
 </tr>
 <tr>
 <td><code>WATCH</code></td>
-<td>Yes</td>
-<td></td>
+<td>Requires <code>shared_preload_libraries</code>; see Transactions in Commands</td>
 </tr>
 <tr>
 <td><code>UNWATCH</code></td>
-<td>Yes</td>
 <td></td>
 </tr>
 </tbody>
 </table>
-<h2 id="server-connection">Server / Connection</h2>
-<table>
-<thead>
-<tr>
-<th>Command</th>
-<th>Status</th>
-<th>Notes</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>PING</code></td>
-<td>Yes</td>
-<td>Optional message</td>
-</tr>
-<tr>
-<td><code>ECHO</code></td>
-<td>Yes</td>
-<td></td>
-</tr>
-<tr>
-<td><code>SELECT</code></td>
-<td>Yes</td>
-<td>Databases 0–15</td>
-</tr>
-<tr>
-<td><code>AUTH</code></td>
-<td>Yes</td>
-<td>Validates against <code>redis.password</code> GUC</td>
-</tr>
-<tr>
-<td><code>INFO</code></td>
-<td>Yes</td>
-<td>Returns server info string</td>
-</tr>
-<tr>
-<td><code>COMMAND</code></td>
-<td>Yes</td>
-<td>Returns empty array (client compatibility)</td>
-</tr>
-<tr>
-<td><code>CLIENT</code></td>
-<td>Partial</td>
-<td>No-op, returns OK</td>
-</tr>
-<tr>
-<td><code>QUIT</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>RESET</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>KEYS</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>SCAN</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>TYPE</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>RENAME</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>RENAMENX</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>COPY</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>MOVE</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>RANDOMKEY</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>OBJECT</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>DEBUG</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>FLUSHDB</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>FLUSHALL</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>DBSIZE</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>SAVE</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>BGSAVE</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>LASTSAVE</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>SHUTDOWN</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>SLAVEOF</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>REPLICAOF</code></td>
-<td>No</td>
-<td></td>
-</tr>
-<tr>
-<td><code>CONFIG</code></td>
-<td>No</td>
-<td>Use PostgreSQL GUCs instead — see <a href="../configuration/">Configuration</a></td>
-</tr>
-</tbody>
-</table>
-<h2 id="compatibility-matrix">Compatibility matrix</h2>
-<table>
-<thead>
-<tr>
-<th>Postgres version</th>
-<th>pgrx version</th>
-<th>Status</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>17</td>
-<td>0.18.0</td>
-<td>Tested</td>
-</tr>
-<tr>
-<td>16</td>
-<td>0.18.0</td>
-<td>Tested</td>
-</tr>
-<tr>
-<td>15</td>
-<td>0.18.0</td>
-<td>Tested</td>
-</tr>
-<tr>
-<td>18</td>
-<td>0.18.0</td>
-<td>Tested</td>
-</tr>
-</tbody>
-</table>
-<p>Tested against <code>redis-cli</code> (Redis 7.x) and standard RESP2 clients.</p>
+<h2 id="not-implemented">Not implemented</h2>
+<p>Notable absences, so you do not have to infer them from silence: <code>GETRANGE</code>,
+<code>SETRANGE</code>, <code>SETBIT</code>/<code>GETBIT</code> and the other bit operations, <code>HRANDFIELD</code>,
+<code>HSCAN</code>/<code>SSCAN</code>/<code>ZSCAN</code>, <code>SINTERCARD</code>, <code>OBJECT</code>, <code>SORT</code>, <code>DUMP</code>/<code>RESTORE</code>,
+<code>MIGRATE</code>, <code>BLPOP</code> and the other blocking list commands, <code>EVAL</code> and scripting,
+streams (<code>XADD</code> and friends), and cluster commands.</p>
 
 
 
@@ -1893,7 +1832,7 @@
       <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.sections", "navigation.top", "content.code.copy", "content.action.edit"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
       
     
   </body>

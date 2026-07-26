@@ -23,7 +23,7 @@
       
       
       <link rel="icon" href="../assets/favicon.svg">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
     
     
       
@@ -31,7 +31,7 @@
       
     
     
-      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
       
         
         <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
@@ -826,6 +826,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../handoff/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Handoff
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -929,7 +957,10 @@
 
 
 <h1 id="benchmarks">Benchmarks</h1>
-<p>All figures are requests/second on Docker, Apple M-series. Benchmarks use <a href="https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/benchmarks/"><code>redis-benchmark</code></a> with <code>-n 50000 -c 200</code>, connecting to the default database (db 0 for memory/unlogged, db 1 for logged).</p>
+<p>All figures are requests/second on Docker, Apple M-series. Benchmarks use <a href="https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/benchmarks/"><code>redis-benchmark</code></a> with <code>-n 50000 -c 200</code>, connecting to the default database (db 0 for memory/unlogged, db 8 for logged).</p>
+<p><code>redis-benchmark</code> writes 3-byte values by default, which never leave memory
+mode's 64-byte inline slot — so these figures say nothing about the overflow
+path. <code>mise run bench-value-sizes</code> sweeps 3/63/64/65/200/512 bytes for that.</p>
 <h2 id="commands">Commands</h2>
 <table>
 <thead>
@@ -1007,9 +1038,9 @@
 </tr>
 </tbody>
 </table>
-<p><strong>Memory mode</strong> (even-numbered databases with <code>redis.storage_mode=memory</code>) stores data in shared-memory hash tables with no transaction overhead. Write commands reach near-Redis throughput; reads are close behind.</p>
-<p><strong>SPI/unlogged</strong> (even-numbered databases with <code>redis.storage_mode=auto</code>) uses PostgreSQL UNLOGGED tables. Reads remain fast; writes pay transaction and SPI overhead but survive worker restarts (though not a crash).</p>
-<p><strong>SPI/logged</strong> (odd-numbered databases) uses WAL-logged PostgreSQL tables. All data survives crashes and is fully SQL-queryable. Write throughput is lower due to WAL fsync overhead.</p>
+<p><strong>Memory mode</strong> (databases 0–7 with <code>redis.storage_mode=memory</code>) stores data in shared-memory hash tables with no transaction overhead. Write commands reach near-Redis throughput; reads are close behind.</p>
+<p><strong>SPI/unlogged</strong> (databases 0–7 with <code>redis.storage_mode=auto</code>) uses PostgreSQL UNLOGGED tables. Reads remain fast; writes pay transaction and SPI overhead but survive worker restarts (though not a crash).</p>
+<p><strong>SPI/logged</strong> (databases 8–15) uses WAL-logged PostgreSQL tables. All data survives crashes and is fully SQL-queryable. Write throughput is lower due to WAL fsync overhead.</p>
 <p>Use <code>mise run bench-high-write</code> (8 workers, batch_size=256) to increase write throughput by spreading connections across more dispatchers.</p>
 <h2 id="pubsub">Pub/Sub</h2>
 <p>One publisher, varying subscriber counts. <strong>pub/s</strong> = publisher throughput; <strong>recv/s</strong> = total deliveries/s across all subscribers.</p>
@@ -1177,7 +1208,7 @@
       <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.sections", "navigation.top", "content.code.copy", "content.action.edit"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
       
     
   </body>

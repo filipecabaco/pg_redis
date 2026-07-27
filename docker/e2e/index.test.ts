@@ -1292,6 +1292,62 @@ describe("Sorted Set", () => {
 		expect(await client.send("ZINCRBY", ["zincrby-z", "-2", "a"])).toBe("6");
 	});
 
+	// ZINCRBY's return value alone says nothing about the metadata. A member
+	// that reaches the entry table and not the meta is listed by ZRANGE, counted
+	// 0 by ZCARD, invisible to ZPOPMIN, and leaves the count wrong for the life
+	// of the key — so assert through all three.
+	test("a member ZINCRBY creates is counted and can be popped", async () => {
+		await client.send("DEL", ["zincrby-meta"]);
+		expect(await client.send("ZINCRBY", ["zincrby-meta", "5", "alice"])).toBe(
+			"5",
+		);
+		expect(await client.send("ZCARD", ["zincrby-meta"])).toBe(1);
+		expect(await client.send("ZRANGE", ["zincrby-meta", "0", "-1"])).toEqual([
+			"alice",
+		]);
+		expect(await client.send("ZPOPMIN", ["zincrby-meta"])).toEqual([
+			"alice",
+			"5",
+		]);
+		expect(await client.send("ZCARD", ["zincrby-meta"])).toBe(0);
+
+		// A member added afterwards must not inherit a count the pop left wrong.
+		await client.send("ZADD", ["zincrby-meta", "1", "bob"]);
+		expect(await client.send("ZCARD", ["zincrby-meta"])).toBe(1);
+		await client.send("DEL", ["zincrby-meta"]);
+	});
+
+	// ZINCRBY has to move the extremes too, not just create members. ZPOPMIN
+	// and ZPOPMAX read them straight out of the metadata.
+	test("ZINCRBY moves the min and max the metadata reports", async () => {
+		await client.send("DEL", ["zincrby-ext"]);
+		await client.send("ZADD", ["zincrby-ext", "1", "a", "2", "b", "3", "c"]);
+		// `a` overtakes `c`: the max moves to a member that was neither.
+		expect(await client.send("ZINCRBY", ["zincrby-ext", "10", "a"])).toBe("11");
+		expect(await client.send("ZPOPMAX", ["zincrby-ext"])).toEqual(["a", "11"]);
+		// `b` is now the min; drop it below and the min has to follow.
+		expect(await client.send("ZINCRBY", ["zincrby-ext", "-5", "b"])).toBe("-3");
+		expect(await client.send("ZPOPMIN", ["zincrby-ext"])).toEqual(["b", "-3"]);
+		// And the min moving *off* a member re-derives from the entries.
+		expect(await client.send("ZCARD", ["zincrby-ext"])).toBe(1);
+		expect(await client.send("ZPOPMIN", ["zincrby-ext"])).toEqual(["c", "3"]);
+		await client.send("DEL", ["zincrby-ext"]);
+	});
+
+	// ZADD ... INCR reaches the same code path and needs the same guard.
+	test("a member ZADD INCR creates is counted", async () => {
+		await client.send("DEL", ["zaddincr-meta"]);
+		expect(
+			await client.send("ZADD", ["zaddincr-meta", "INCR", "7", "solo"]),
+		).toBe("7");
+		expect(await client.send("ZCARD", ["zaddincr-meta"])).toBe(1);
+		expect(await client.send("ZPOPMAX", ["zaddincr-meta"])).toEqual([
+			"solo",
+			"7",
+		]);
+		await client.send("DEL", ["zaddincr-meta"]);
+	});
+
 	test("ZCARD on missing key returns 0", async () => {
 		expect(await client.send("ZCARD", ["zcard-z"])).toBe(0);
 		await client.send("ZADD", ["zcard-z", "1", "a"]);
@@ -1715,6 +1771,20 @@ describe("Binary safety", () => {
 	// what the previous TEXT columns could not store: a NUL, and sequences that
 	// are not valid UTF-8.
 	const BINARY = Buffer.from([0x00, 0xff, 0xfe, 0x61, 0x80, 0x0a, 0x01]);
+	const star = Buffer.from("*");
+	/** Sorted hex of a key list, so binary keys compare readably. */
+	const hexes = (ks: Array<Buffer | null>) =>
+		ks.map((k) => k?.toString("hex") ?? "").sort();
+
+	// Must run on `cache`. On db 8 a key is a bytea column, binary-safe for
+	// free, so every assertion below passes without saying anything about the
+	// shared-memory backend — which is where binary keys are actually hard.
+	beforeAll(async () => {
+		await raw.send("SELECT", "cache");
+	});
+	afterAll(async () => {
+		await raw.send("SELECT", "durable");
+	});
 
 	test("a value containing NUL and invalid UTF-8 round-trips byte for byte", async () => {
 		const key = "binkey";
@@ -1735,8 +1805,57 @@ describe("Binary safety", () => {
 		await raw.send("SET", b, "second");
 		expect((await raw.bulk("GET", a))?.toString()).toBe("first");
 		expect((await raw.bulk("GET", b))?.toString()).toBe("second");
+		// Both, not one collapsed onto the other and truncated at the NUL.
+		const listed = await raw.array("KEYS", Buffer.concat([BINARY, star]));
+		expect(hexes(listed)).toEqual(hexes([a, b]));
 		await raw.send("DEL", a);
 		await raw.send("DEL", b);
+	});
+
+	// KEYS, SCAN and RANDOMKEY read the key bytes back out of the entry. A key
+	// past the 128-byte inline prefix is assembled from the chunk pool: the one
+	// a truncated read would mangle, and the one a lookup cannot settle by
+	// comparing the prefix alone.
+	test("keys of every length round-trip through KEYS, SCAN and RANDOMKEY", async () => {
+		const prefix = Buffer.from("binlen:");
+		const lengths = [8, 63, 64, 65, 128, 200, 511, 512];
+		const keys = lengths.map((n) => {
+			const k = Buffer.concat([prefix, payload(n - prefix.length)]);
+			// A NUL every 32 bytes, so no key is a prefix of another only past
+			// its terminator either.
+			for (let i = 31; i < n; i += 32) k[i] = 0;
+			k[n - 1] = n & 0xff;
+			return k;
+		});
+		for (const [i, k] of keys.entries()) {
+			await raw.send("SET", k, `v${lengths[i]}`);
+		}
+		for (const [i, k] of keys.entries()) {
+			expect((await raw.bulk("GET", k))?.toString()).toBe(`v${lengths[i]}`);
+			expect((await raw.send("STRLEN", k)).toString()).toBe(
+				`:${`v${lengths[i]}`.length}\r\n`,
+			);
+		}
+
+		const pattern = Buffer.concat([prefix, star]);
+		expect(hexes(await raw.array("KEYS", pattern))).toEqual(hexes(keys));
+		// SCAN's second element is the key array; cursor is always 0 here.
+		const scanned = await raw.array("SCAN", "0", "MATCH", pattern);
+		expect(scanned[1]).not.toBeNull();
+
+		// RANDOMKEY reads a key out of an entry through the same call. Whatever
+		// it names has to be a whole key: a truncating read would hand back a
+		// byte string that is not a key in the database at all. (It cannot be
+		// asked for one of ours — on the shared-memory half it returns the
+		// first entry the scan reaches, not a uniform draw.)
+		const random = await raw.bulk("RANDOMKEY");
+		expect(random).not.toBeNull();
+		expect((await raw.send("EXISTS", random as Buffer)).toString()).toBe(
+			":1\r\n",
+		);
+
+		for (const k of keys) await raw.send("DEL", k);
+		expect(await raw.array("KEYS", pattern)).toEqual([]);
 	});
 });
 
@@ -1842,10 +1961,12 @@ describe("Pub/Sub size limits", () => {
 const INLINE_VAL_LEN = 64;
 const CHUNK_LEN = 64;
 // An eighth of a pool of `redis.mem_max_entries` chunks, capped at 64 KiB —
-// which is where the default 8192 lands. See docs/storage-modes.md.
+// which is where the default 8192 lands. See docs/IMPLEMENTATION.md.
 const MAX_TOTAL_VAL_LEN = 64 * 1024;
 const MAX_MEMBER_LEN = 128;
-const MEM_MAX_KEY = 511;
+// Keys are length-prefixed in the shared-memory entry, so the whole 512 is
+// usable — none of it goes to a terminator. See docs/IMPLEMENTATION.md.
+const MEM_MAX_KEY = 512;
 
 /** Distinct, position-dependent bytes, so a truncation cannot pass by luck. */
 function payload(n: number): Buffer {
@@ -2065,6 +2186,33 @@ describe("Value size limits", () => {
 		}
 		expect(await raw.bulk("GET", "vs:swept:7")).toEqual(big);
 		for (let i = 0; i < 8; i++) await raw.send("DEL", `vs:swept:${i}`);
+	});
+
+	// A KV entry owns two chains: its value's and its key's. Both have to come
+	// back when the entry goes. A leaked key chain is invisible until the pool
+	// is dry, so the only way to see it is to churn enough keys to empty one —
+	// 512-byte keys are 6 chunks each, so 4,000 of them is three pools' worth.
+	test("churning long keys does not exhaust the chunk pool", async () => {
+		const longKey = (i: number) => {
+			const k = Buffer.alloc(MEM_MAX_KEY, 0x6b);
+			k.write(`churnkey:${i}:`, 0);
+			return k;
+		};
+		for (let i = 0; i < 4000; i++) {
+			await raw.send("SET", longKey(i), "v");
+			await raw.send("DEL", longKey(i));
+		}
+		// If either chain leaked, the pool is empty by now and this is an OOM.
+		await raw.send("SET", longKey(0), payload(MAX_TOTAL_VAL_LEN / 8));
+		expect(await raw.bulk("GET", longKey(0))).toEqual(
+			payload(MAX_TOTAL_VAL_LEN / 8),
+		);
+		// ...and the key still reads back whole, 512 bytes of it.
+		const listed = await raw.array("KEYS", Buffer.from("churnkey:0:*"));
+		expect(listed.map((k) => k?.toString("hex"))).toEqual([
+			longKey(0).toString("hex"),
+		]);
+		await raw.send("DEL", longKey(0));
 	});
 
 	test("a value one byte over the limit is refused in memory mode, stored otherwise", async () => {

@@ -270,12 +270,11 @@ pub(crate) fn kv_tables_present() -> bool {
 /// Run `body` in its own subtransaction, keeping its writes only if it succeeded.
 ///
 /// A batch coalesces commands from unrelated connections into one transaction,
-/// so one client's failing command must not roll back another's write. That
-/// isolation used to come from `SAVEPOINT` / `ROLLBACK TO` / `RELEASE` issued as
-/// SQL: three statements parsed, planned and executed through SPI for every
-/// command in the batch, which for a plain SET cost more than the SET. These are
-/// the same subtransaction primitives without the SQL layer — the guarantee is
-/// unchanged, the per-command overhead is not.
+/// so one client's failing command must not roll back another's write. These
+/// are the subtransaction primitives `SAVEPOINT` / `ROLLBACK TO` / `RELEASE`
+/// reach through SQL, called directly: the same guarantee without three
+/// statements parsed, planned and executed through SPI for every command in the
+/// batch, which for a plain SET costs more than the SET.
 ///
 /// Mirrors the save/restore dance PL/pgSQL performs around its EXCEPTION blocks.
 ///
@@ -1463,7 +1462,7 @@ mod tests {
     /// extension is in shared_preload_libraries. Refusing is the safe answer:
     /// replying +OK would let the following EXEC commit over a conflicting
     /// write it had no way to observe. These tests run outside Postgres, so
-    /// the counters are absent and the refusal is what we should see.
+    /// the counters are absent and the refusal is the expected reply.
     #[test]
     fn watch_refuses_when_shared_memory_is_unavailable() {
         let mut c = Conn::open(1);

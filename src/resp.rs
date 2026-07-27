@@ -195,7 +195,7 @@ pub fn write_map_header(w: &mut impl Write, count: usize) -> io::Result<()> {
     write!(w, "%{}\r\n", count)
 }
 
-pub fn write_push_header(w: &mut impl Write, count: usize) -> io::Result<()> {
+fn write_push_header(w: &mut impl Write, count: usize) -> io::Result<()> {
     write!(w, ">{}\r\n", count)
 }
 

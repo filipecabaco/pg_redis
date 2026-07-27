@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Counter table size. At 8 bytes each this is 512 KiB of shared memory, and
 /// the spurious-abort rate is roughly `writes_during_the_watch / WATCH_SLOTS`.
-pub const WATCH_SLOTS: usize = 65_536;
+const WATCH_SLOTS: usize = 65_536;
 
 #[repr(C)]
 pub struct WatchCtl {

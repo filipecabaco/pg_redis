@@ -44,12 +44,12 @@ pub(crate) static MAXMEMORY_POLICY: GucSetting<Option<std::ffi::CString>> =
 /// Boot value of `redis.mem_max_entries`, and the sizing memory mode assumes
 /// when it is asked about its limits without shared memory attached.
 ///
-/// Halved from 16384 when MAX_KEY_LEN grew to 512, to hold the shared-memory
-/// request steady. Hashing the key out of the composite tables took that
-/// request from ~376 MiB to ~202 MiB, and the chunked value pool took it to
-/// ~72 MiB, so there is room to raise this again if you need the key capacity
-/// more than the memory. It also sets the size of each pool, and with it the
-/// largest value memory mode accepts — see `mem::max_total_val_len`.
+/// This one number scales the whole shared-memory request, so it is the only
+/// knob that decides how much the extension reserves. Doubling it costs about
+/// 69 MB of `shared_memory_size`; `docs/IMPLEMENTATION.md` prices each step.
+///
+/// It also sets the size of each chunk pool, and with it the largest value
+/// memory mode accepts — see `mem::max_total_val_len`.
 pub(crate) const MEM_MAX_ENTRIES_DEFAULT: i32 = 8192;
 pub(crate) static MEM_MAX_ENTRIES: GucSetting<i32> =
     GucSetting::<i32>::new(MEM_MAX_ENTRIES_DEFAULT);
@@ -850,8 +850,7 @@ mod tests {
 
     /// A batch coalesces commands from unrelated connections into one
     /// transaction, so a failing command must roll back its own writes and
-    /// nothing else. This is the guarantee the per-command SAVEPOINT statements
-    /// used to provide and that `in_subtransaction` now provides directly.
+    /// nothing else. `in_subtransaction` is what provides that guarantee.
     #[pg_test]
     fn a_failed_command_in_a_batch_rolls_back_only_itself() {
         use crate::commands::Response;

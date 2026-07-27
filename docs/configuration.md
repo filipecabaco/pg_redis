@@ -11,9 +11,9 @@
 | `redis.max_connections` | `128` | Max simultaneous Redis clients per worker |
 | `redis.batch_size` | `64` | Max commands coalesced into one transaction; `1` disables batching |
 | `redis.password` | _(none)_ | When set, clients must `AUTH <password>` before any command |
-| `redis.storage_mode` | `memory` | Storage backend for the ephemeral databases (0–7). `memory` = shared-memory hash tables (default); `auto` = UNLOGGED tables. Requires restart. See [Storage modes](./storage-modes.md). |
+| `redis.storage_mode` | `memory` | Storage backend for the ephemeral databases (0–7). `memory` = shared-memory hash tables (default); `auto` = UNLOGGED tables. Requires restart. See [Storage modes](./IMPLEMENTATION.md). |
 | `redis.mem_max_entries` | `8192` | Maximum keys per data type per ephemeral database in memory mode. Requires restart. |
-| `redis.maxmemory_policy` | `noeviction` | What memory mode does when a table fills: `noeviction` (refuse the write, as in Redis), `allkeys-random`, or `volatile-ttl`. See [Storage modes](./storage-modes.md#when-a-table-fills). |
+| `redis.maxmemory_policy` | `noeviction` | What memory mode does when a table fills: `noeviction` (refuse the write, as in Redis), `allkeys-random`, or `volatile-ttl`. See [Storage modes](./IMPLEMENTATION.md#when-a-table-fills). |
 
 Apply at runtime (no restart needed unless noted):
 

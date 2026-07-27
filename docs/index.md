@@ -43,7 +43,7 @@ Data is stored across 16 databases (0–15), mirroring Redis's native database m
 | 0–7 (`SELECT cache`) | Shared-memory hash tables (default) | Lost on restart |
 | 8–15 (`SELECT durable`) | WAL-logged PostgreSQL tables | Survives crashes |
 
-See [Storage modes](storage-modes.md) for the full breakdown.
+See [Implementation](IMPLEMENTATION.md#2-storage-backends) for the full breakdown.
 
 ## Next steps
 
@@ -51,4 +51,4 @@ See [Storage modes](storage-modes.md) for the full breakdown.
 - [Configuration](configuration.md) — GUC reference and worker tuning
 - [Commands](commands.md) — supported Redis commands with behaviour notes
 - [Command coverage](command-coverage.md) — full compatibility matrix
-- [Handoff](handoff.md) — in-flight work, how to verify a change, known traps
+- [Implementation](IMPLEMENTATION.md) — architecture, the shared-memory backend, limits, testing, open work

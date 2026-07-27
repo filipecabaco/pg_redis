@@ -629,62 +629,6 @@
 
               
             
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../storage-modes/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Storage modes
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../pubsub/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Pub/Sub routing
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
           </ul>
         </nav>
       
@@ -698,67 +642,15 @@
   
   
   
-    
-    
-    
-    
-      
-        
-        
-      
-    
-    
-    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
-      
-        
-        
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
-        
-          
-          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="">
-            
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Performance
-  
-
-    
-  </span>
-  
-  
-
-            <span class="md-nav__icon md-icon"></span>
-          </label>
-        
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_4">
-            <span class="md-nav__icon md-icon"></span>
-            
-  
-    Performance
-  
-
-          </label>
-          <ul class="md-nav__list" data-md-scrollfix>
-            
-              
-                
-  
-  
-  
-  
     <li class="md-nav__item">
-      <a href="../benchmarks/" class="md-nav__link">
+      <a href="../IMPLEMENTATION/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Benchmarks
+    Implementation
   
 
     
@@ -767,129 +659,6 @@
   
 
       </a>
-    </li>
-  
-
-              
-            
-          </ul>
-        </nav>
-      
-    </li>
-  
-
-    
-      
-      
-  
-  
-  
-  
-    
-    
-    
-    
-      
-        
-        
-      
-    
-    
-    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
-      
-        
-        
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
-        
-          
-          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
-            
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Contributing
-  
-
-    
-  </span>
-  
-  
-
-            <span class="md-nav__icon md-icon"></span>
-          </label>
-        
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_5">
-            <span class="md-nav__icon md-icon"></span>
-            
-  
-    Contributing
-  
-
-          </label>
-          <ul class="md-nav__list" data-md-scrollfix>
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../development/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Development
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../handoff/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Handoff
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-          </ul>
-        </nav>
-      
     </li>
   
 
@@ -1042,7 +811,7 @@
 </tr>
 <tr>
 <td><code>SELECT db</code></td>
-<td>0–15, or the names <code>cache</code> (0) and <code>durable</code> (8). Databases 0–7 are ephemeral, 8–15 WAL-logged — see <a href="../storage-modes/">Storage modes</a></td>
+<td>0–15, or the names <code>cache</code> (0) and <code>durable</code> (8). Databases 0–7 are ephemeral, 8–15 WAL-logged — see <a href="../IMPLEMENTATION/">Storage modes</a></td>
 </tr>
 <tr>
 <td><code>AUTH [password]</code></td>
@@ -1237,15 +1006,19 @@ works unchanged:</p>
 </tr>
 <tr>
 <td><code>-OOM command not allowed when used memory &gt; 'maxmemory'</code></td>
-<td>A shared-memory table is full and <code>redis.maxmemory_policy</code> is <code>noeviction</code>. See <a href="../storage-modes/#when-a-table-fills">When a table fills</a></td>
+<td>A shared-memory table is full and <code>redis.maxmemory_policy</code> is <code>noeviction</code>. See <a href="../IMPLEMENTATION/#when-a-table-fills">When a table fills</a></td>
 </tr>
 <tr>
-<td><code>-ERR key exceeds redis.storage_mode='memory' limit of 511 bytes ...</code></td>
-<td>The key, hash field, set member or value is larger than a shared-memory slot</td>
+<td><code>-ERR key exceeds redis.storage_mode='memory' limit of 512 bytes ...</code></td>
+<td>The key, hash field, set member or value is larger than memory mode accepts</td>
+</tr>
+<tr>
+<td><code>-ERR key hash collides with a different key already stored ...</code></td>
+<td>Two keys shared a 128-bit keyed hash. Refused rather than merged — see <a href="../IMPLEMENTATION/#lookups-verify-the-key">how keys are stored</a></td>
 </tr>
 </tbody>
 </table>
-<p>Both of those are specific to <code>storage_mode = 'memory'</code>; the durable half is
+<p>All of those are specific to <code>storage_mode = 'memory'</code>; the durable half is
 bounded only by disk. Size limits are checked before the command runs, so a
 refusal never leaves a partial write — no half-stored value and no entry under
 a truncated key.</p>

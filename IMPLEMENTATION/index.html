@@ -1,0 +1,2933 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Redis protocol support for PostgreSQL — backed by real SQL tables">
+      
+      
+      
+        <link rel="canonical" href="https://filipecabaco.github.io/pg_redis/IMPLEMENTATION/">
+      
+      
+        <link rel="prev" href="../command-coverage/">
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/favicon.svg">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Implementation - pg_redis</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../stylesheets/supabase.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="slate" data-md-color-primary="custom" data-md-color-accent="custom">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#implementation" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="pg_redis" class="md-header__button md-logo" aria-label="pg_redis" data-md-component="logo">
+      
+  <img src="../assets/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            pg_redis
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Implementation
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="slate" data-md-color-primary="custom" data-md-color-accent="custom"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="default" data-md-color-primary="custom" data-md-color-accent="custom"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/filipecabaco/pg_redis" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    filipecabaco/pg_redis
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="pg_redis" class="md-nav__button md-logo" aria-label="pg_redis" data-md-component="logo">
+      
+  <img src="../assets/logo.svg" alt="logo">
+
+    </a>
+    pg_redis
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/filipecabaco/pg_redis" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    filipecabaco/pg_redis
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting started
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Getting started
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../installation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Installation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../configuration/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reference
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Reference
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../commands/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Commands
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../command-coverage/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Command coverage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Implementation
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Implementation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#1-architecture" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Architecture
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="1. Architecture">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#process-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Process model
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#command-path" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Command path
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#the-16-databases" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The 16 databases
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#batching-and-transaction-isolation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Batching and transaction isolation
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-storage-backends" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Storage backends
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2. Storage backends">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#sql-schema" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        SQL schema
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-the-shared-memory-backend" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. The shared-memory backend
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="3. The shared-memory backend">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#tables-and-entry-layouts" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tables and entry layouts
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#key-hashing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Key hashing
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#how-a-kv-entry-stores-its-key" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How a KV entry stores its key
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#lookups-verify-the-key" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Lookups verify the key
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#the-chunk-pool" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The chunk pool
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#value-and-key-size-limits" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Value and key size limits
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#when-a-table-fills" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When a table fills
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#expiry" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Expiry
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#lists" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Lists
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#sizing-redismem_max_entries" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sizing redis.mem_max_entries
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#how-the-reservation-got-here" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How the reservation got here
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-pubsub" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Pub/Sub
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="4. Pub/Sub">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#size-limits" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Size limits
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#table-routing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Table routing
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-watch" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. WATCH
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-the-resp-layer" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. The RESP layer
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-limits" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        7. Limits
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#8-performance" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        8. Performance
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="8. Performance">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#pubsub" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Pub/Sub
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#where-the-ceiling-is" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Where the ceiling is
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#benchmarking-without-fooling-yourself" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Benchmarking without fooling yourself
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#9-testing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        9. Testing
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="9. Testing">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#running-the-e2e-suite-without-docker" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Running the e2e suite without Docker
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#against-an-assert-enabled-postgresql" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Against an assert-enabled PostgreSQL
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#cargo-pgrx-test-has-to-run-as-a-non-root-user" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        cargo pgrx test has to run as a non-root user
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#traps" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Traps
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#10-continuous-integration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        10. Continuous integration
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#11-local-development" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        11. Local development
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#12-open-work" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        12. Open work
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="12. Open work">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#the-dispatch-handoff" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The dispatch handoff
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#max_member_len-is-still-128-bytes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        MAX_MEMBER_LEN is still 128 bytes
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#multi-key-writes-are-not-atomic-under-oom" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Multi-key writes are not atomic under OOM
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#settled-so-not-on-this-list" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Settled, so not on this list
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#1-architecture" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Architecture
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="1. Architecture">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#process-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Process model
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#command-path" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Command path
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#the-16-databases" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The 16 databases
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#batching-and-transaction-isolation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Batching and transaction isolation
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-storage-backends" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Storage backends
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2. Storage backends">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#sql-schema" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        SQL schema
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-the-shared-memory-backend" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. The shared-memory backend
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="3. The shared-memory backend">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#tables-and-entry-layouts" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tables and entry layouts
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#key-hashing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Key hashing
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#how-a-kv-entry-stores-its-key" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How a KV entry stores its key
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#lookups-verify-the-key" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Lookups verify the key
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#the-chunk-pool" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The chunk pool
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#value-and-key-size-limits" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Value and key size limits
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#when-a-table-fills" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When a table fills
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#expiry" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Expiry
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#lists" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Lists
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#sizing-redismem_max_entries" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sizing redis.mem_max_entries
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#how-the-reservation-got-here" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How the reservation got here
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-pubsub" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Pub/Sub
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="4. Pub/Sub">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#size-limits" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Size limits
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#table-routing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Table routing
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-watch" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. WATCH
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-the-resp-layer" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. The RESP layer
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-limits" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        7. Limits
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#8-performance" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        8. Performance
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="8. Performance">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#pubsub" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Pub/Sub
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#where-the-ceiling-is" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Where the ceiling is
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#benchmarking-without-fooling-yourself" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Benchmarking without fooling yourself
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#9-testing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        9. Testing
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="9. Testing">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#running-the-e2e-suite-without-docker" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Running the e2e suite without Docker
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#against-an-assert-enabled-postgresql" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Against an assert-enabled PostgreSQL
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#cargo-pgrx-test-has-to-run-as-a-non-root-user" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        cargo pgrx test has to run as a non-root user
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#traps" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Traps
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#10-continuous-integration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        10. Continuous integration
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#11-local-development" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        11. Local development
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#12-open-work" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        12. Open work
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="12. Open work">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#the-dispatch-handoff" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The dispatch handoff
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#max_member_len-is-still-128-bytes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        MAX_MEMBER_LEN is still 128 bytes
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#multi-key-writes-are-not-atomic-under-oom" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Multi-key writes are not atomic under OOM
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#settled-so-not-on-this-list" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Settled, so not on this list
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+    <a href="https://github.com/filipecabaco/pg_redis/edit/main/docs/IMPLEMENTATION.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M10 20H6V4h7v5h5v3.1l2-2V8l-6-6H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h4zm10.2-7c.1 0 .3.1.4.2l1.3 1.3c.2.2.2.6 0 .8l-1 1-2.1-2.1 1-1c.1-.1.2-.2.4-.2m0 3.9L14.1 23H12v-2.1l6.1-6.1z"/></svg>
+    </a>
+  
+  
+
+
+<h1 id="implementation">Implementation</h1>
+<p>How pg_redis works, end to end: the process model, the three storage backends,
+the shared-memory layout, pub/sub, WATCH, the limits every one of those imposes,
+and how to test and benchmark a change to any of it.</p>
+<p>This is the single reference for internals. The pages beside it are for using
+the extension rather than changing it — <a href="../installation/">Installation</a>,
+<a href="../configuration/">Configuration</a>, <a href="../commands/">Commands</a> and the
+<a href="../command-coverage/">Command coverage</a> matrix, which is machine-checked
+against the parser by a unit test and so has to stay a page of its own.</p>
+<hr />
+<h2 id="1-architecture">1. Architecture</h2>
+<h3 id="process-model">Process model</h3>
+<p><code>shared_preload_libraries = 'pg_redis'</code> registers a pool of PostgreSQL
+background workers (<code>redis.workers</code>, default 4). Each one opens the Redis port
+(<code>redis.port</code>, default 6379) with <code>SO_REUSEPORT</code>, so the kernel spreads incoming
+connections across the pool and no worker is a listener bottleneck.</p>
+<p>A worker is two things at once:</p>
+<ul>
+<li><strong>Connection threads.</strong> One per client. They own the socket, parse RESP2, and
+  write replies. They are ordinary OS threads, not PostgreSQL backends.</li>
+<li><strong>A dispatcher</strong> on the worker's main thread — the only thread with a valid
+  <code>MyProc</code>, and therefore the only one allowed to touch PostgreSQL LWLocks or
+  SPI.</li>
+</ul>
+<p>Every data command crosses between them twice: connection thread → dispatcher
+(<code>DispatchMsg</code>), dispatcher → connection thread (the reply). Those two mpsc hops
+are the throughput ceiling; see <a href="#8-performance">Performance</a>.</p>
+<p>Connection-local commands — <code>PING</code>, <code>SELECT</code>, <code>AUTH</code>, <code>MULTI</code>/<code>EXEC</code> queueing —
+never reach the dispatcher and cost nothing but the parse.</p>
+<h3 id="command-path">Command path</h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>socket ─&gt; resp::parse ─&gt; Command::parse ─┬─&gt; execute_mem   (shared memory, db 0–7 in memory mode)
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>                                         └─&gt; execute_spi   (SPI + SQL, everything else)
+</code></pre></div>
+<p><code>Command</code> is a single enum covering every supported command. Parsing is
+separated from execution so the parser can be unit-tested without a PostgreSQL
+instance, and so size limits can be checked <em>before</em> anything is written — see
+<a href="#7-limits">Limits</a>.</p>
+<h3 id="the-16-databases">The 16 databases</h3>
+<p>Databases mirror Redis's model and split into two contiguous halves.</p>
+<table>
+<thead>
+<tr>
+<th>DB</th>
+<th>Name</th>
+<th>Backend</th>
+<th>Durability</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0–7</td>
+<td><code>cache</code> (0)</td>
+<td>shared memory, or UNLOGGED tables</td>
+<td>Lost on restart</td>
+</tr>
+<tr>
+<td>8–15</td>
+<td><code>durable</code> (8)</td>
+<td>WAL-logged tables</td>
+<td>Survives crashes</td>
+</tr>
+</tbody>
+</table>
+<p><code>SELECT</code> accepts the numbers and the two names. <code>redis.default_db</code> (default 0)
+chooses where new connections start. The halves are contiguous rather than
+odd/even because <code>execute_mem</code> indexes the shared-memory tables with the raw
+database number; a unit test pins that correspondence.</p>
+<h3 id="batching-and-transaction-isolation">Batching and transaction isolation</h3>
+<p>The dispatcher coalesces up to <code>redis.batch_size</code> (default 64) commands from
+<em>unrelated</em> connections into one SPI transaction, which is what makes the SPI
+path bearable at all. That creates a hazard: one client's failing command must
+not roll back another client's write.</p>
+<p>Each command therefore runs in its own subtransaction. <code>worker.rs</code> calls
+PostgreSQL's subtransaction primitives directly rather than issuing <code>SAVEPOINT</code>
+/ <code>ROLLBACK TO</code> / <code>RELEASE</code> as SQL — three statements parsed, planned and
+executed through SPI per command, which for a plain <code>SET</code> cost more than the
+<code>SET</code>. It mirrors the save/restore dance PL/pgSQL performs around its
+<code>EXCEPTION</code> blocks.</p>
+<hr />
+<h2 id="2-storage-backends">2. Storage backends</h2>
+<p>The ephemeral half has two, chosen by <code>redis.storage_mode</code> (a <code>postmaster</code>-scope
+GUC — changing it needs a restart). The durable half is always WAL-logged.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th><code>memory</code> (default)</th>
+<th><code>auto</code></th>
+<th>durable (8–15)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Storage for db 0–7</td>
+<td>Shared-memory HTAB per data type</td>
+<td>UNLOGGED tables</td>
+<td>—</td>
+</tr>
+<tr>
+<td>Transaction</td>
+<td>None</td>
+<td><code>BEGIN</code>/<code>COMMIT</code> per batch</td>
+<td>per batch</td>
+</tr>
+<tr>
+<td>SPI overhead</td>
+<td>None</td>
+<td>Yes</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>WAL</td>
+<td>No</td>
+<td>No</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Survives crash</td>
+<td>No</td>
+<td>No (UNLOGGED, truncated)</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Replication</td>
+<td>No</td>
+<td>No</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>SQL-visible</td>
+<td>No — <code>SELECT * FROM redis.kv_0</code> returns nothing</td>
+<td>Yes</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Max keys</td>
+<td><code>redis.mem_max_entries</code> per type per db</td>
+<td>Unlimited (disk)</td>
+<td>Unlimited</td>
+</tr>
+<tr>
+<td>Shared memory at the default</td>
+<td>~70 MiB, reserved at start</td>
+<td>None</td>
+<td>None</td>
+</tr>
+<tr>
+<td>Max value</td>
+<td>64 KiB</td>
+<td>Unlimited (TOAST)</td>
+<td>Unlimited</td>
+</tr>
+<tr>
+<td>Max key</td>
+<td>512 bytes</td>
+<td>Unlimited</td>
+<td>Unlimited</td>
+</tr>
+<tr>
+<td>Max hash field / set member</td>
+<td>128 bytes</td>
+<td>Unlimited</td>
+<td>Unlimited</td>
+</tr>
+</tbody>
+</table>
+<h3 id="sql-schema">SQL schema</h3>
+<p>Both SPI backends use the same shape in the <code>redis</code> schema, one table per data
+type per database; 0–7 <code>UNLOGGED</code>, 8–15 logged.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">SCHEMA</span><span class="w"> </span><span class="n">redis</span><span class="p">;</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="c1">-- Key-value (pattern repeats for db 0–15)</span>
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="k">CREATE</span><span class="w"> </span><span class="n">UNLOGGED</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">kv_0</span><span class="w"> </span><span class="p">(</span><span class="k">key</span><span class="w"> </span><span class="n">BYTEA</span><span class="w"> </span><span class="k">PRIMARY</span><span class="w"> </span><span class="k">KEY</span><span class="p">,</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="n">BYTEA</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">expires_at</span><span class="w"> </span><span class="n">TIMESTAMPTZ</span><span class="p">);</span>
+<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="k">CREATE</span><span class="w">         </span><span class="k">TABLE</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">kv_8</span><span class="w"> </span><span class="p">(</span><span class="k">key</span><span class="w"> </span><span class="n">BYTEA</span><span class="w"> </span><span class="k">PRIMARY</span><span class="w"> </span><span class="k">KEY</span><span class="p">,</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="n">BYTEA</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">expires_at</span><span class="w"> </span><span class="n">TIMESTAMPTZ</span><span class="p">);</span>
+<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>
+<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="c1">-- Hash (same pattern)</span>
+<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="k">CREATE</span><span class="w"> </span><span class="n">UNLOGGED</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">hash_0</span><span class="w"> </span><span class="p">(</span><span class="k">key</span><span class="w"> </span><span class="n">BYTEA</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">field</span><span class="w"> </span><span class="n">BYTEA</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="n">BYTEA</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span><span class="p">,</span><span class="w"> </span><span class="k">PRIMARY</span><span class="w"> </span><span class="k">KEY</span><span class="w"> </span><span class="p">(</span><span class="k">key</span><span class="p">,</span><span class="w"> </span><span class="n">field</span><span class="p">));</span>
+<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="k">CREATE</span><span class="w">         </span><span class="k">TABLE</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">hash_8</span><span class="w"> </span><span class="p">(</span><span class="k">key</span><span class="w"> </span><span class="n">BYTEA</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">field</span><span class="w"> </span><span class="n">BYTEA</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="n">BYTEA</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span><span class="p">,</span><span class="w"> </span><span class="k">PRIMARY</span><span class="w"> </span><span class="k">KEY</span><span class="w"> </span><span class="p">(</span><span class="k">key</span><span class="p">,</span><span class="w"> </span><span class="n">field</span><span class="p">));</span>
+</code></pre></div>
+<p>Every column is <code>BYTEA</code>, never <code>TEXT</code>. Redis keys, values, fields and members
+are arbitrary byte strings, and <code>TEXT</code> cannot hold a NUL at all. Two
+consequences when querying directly:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="c1">-- Cast to read.</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">convert_from</span><span class="p">(</span><span class="k">key</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;UTF8&#39;</span><span class="p">),</span><span class="w"> </span><span class="n">convert_from</span><span class="p">(</span><span class="n">value</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;UTF8&#39;</span><span class="p">)</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">kv_8</span><span class="p">;</span>
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="c1">-- Cast the other way to compare (a plain literal is coerced, so it also works).</span>
+<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">kv_8</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="k">key</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">convert_to</span><span class="p">(</span><span class="s1">&#39;mykey&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;UTF8&#39;</span><span class="p">);</span>
+</code></pre></div>
+<p>Ordering is bytewise, which is what Redis means by lexicographic — <code>ZRANGEBYLEX</code>
+and <code>ORDER BY member</code> agree with Redis rather than with a database collation.</p>
+<p>Every <code>kv_*</code> table carries a partial index on <code>expires_at</code> for the SQL expiry
+sweep; a unit test asserts it exists on all sixteen.</p>
+<hr />
+<h2 id="3-the-shared-memory-backend">3. The shared-memory backend</h2>
+<p>All of <code>src/mem.rs</code>. Eight databases, eight tables each, and five LWLocks per
+database — one per data type, with each meta table covered by its type's lock.
+So a write to db 0 never blocks a write to db 2, and the hash table never blocks
+the list table.</p>
+<h3 id="tables-and-entry-layouts">Tables and entry layouts</h3>
+<p>Eight HTABs per database, created with <code>ShmemInitHash</code> during
+<code>shmem_startup_hook</code>, all <code>HASH_BLOBS</code> and <code>HASH_FIXED_SIZE</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Table</th>
+<th>Entries</th>
+<th style="text-align: right;">Entry</th>
+<th>HTAB key</th>
+<th style="text-align: right;">Size at the default</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>KV</td>
+<td><code>mem_max_entries</code></td>
+<td style="text-align: right;"><code>KvEntry</code> 232 B</td>
+<td>16 B key hash</td>
+<td style="text-align: right;">18.19 MiB</td>
+</tr>
+<tr>
+<td>Hash</td>
+<td>half</td>
+<td style="text-align: right;"><code>HashEntry</code> 216 B</td>
+<td>16 B hash + 128 B field</td>
+<td style="text-align: right;">8.50 MiB</td>
+</tr>
+<tr>
+<td>Zset</td>
+<td>half</td>
+<td style="text-align: right;"><code>ZsetEntry</code> 152 B</td>
+<td>16 B hash + 128 B member</td>
+<td style="text-align: right;">6.00 MiB</td>
+</tr>
+<tr>
+<td>Set</td>
+<td>half</td>
+<td style="text-align: right;"><code>SetEntry</code> 144 B</td>
+<td>16 B hash + 128 B member</td>
+<td style="text-align: right;">5.69 MiB</td>
+</tr>
+<tr>
+<td>List</td>
+<td>half</td>
+<td style="text-align: right;"><code>ListEntry</code> 96 B</td>
+<td>16 B hash + 8 B position</td>
+<td style="text-align: right;">3.81 MiB</td>
+</tr>
+<tr>
+<td>Zset meta</td>
+<td>half</td>
+<td style="text-align: right;"><code>ZsetMeta</code> 304 B</td>
+<td>16 B key hash</td>
+<td style="text-align: right;">11.94 MiB</td>
+</tr>
+<tr>
+<td>List meta</td>
+<td>half</td>
+<td style="text-align: right;"><code>ListMeta</code> 40 B</td>
+<td>16 B key hash</td>
+<td style="text-align: right;">1.62 MiB</td>
+</tr>
+<tr>
+<td>Set meta</td>
+<td>half</td>
+<td style="text-align: right;"><code>SetMeta</code> 24 B</td>
+<td>16 B key hash</td>
+<td style="text-align: right;">1.00 MiB</td>
+</tr>
+</tbody>
+</table>
+<p>"half" is <code>mem_max_entries / 2</code>, floored at 256. Sizes include dynahash's 5/4
+bucket overhead and are multiplied across eight databases. A unit test pins
+every entry size, because each one is multiplied by <code>mem_max_entries</code> across
+eight databases and requested <em>before</em> the postmaster starts — growing one
+carelessly turns "slower" into "does not boot".</p>
+<p>The meta tables exist so <code>ZCARD</code>, <code>SCARD</code>, <code>LLEN</code>, <code>ZPOPMIN</code>/<code>ZPOPMAX</code> and
+<code>LPUSH</code>/<code>RPUSH</code> are O(1) rather than a scan of the entry table.</p>
+<h3 id="key-hashing">Key hashing</h3>
+<p><strong>Every table indexes on a 128-bit keyed SipHash-2-4 of the Redis key</strong>, not on
+the key bytes. The key material is drawn from <code>pg_strong_random</code> once per
+postmaster, so a client cannot craft two keys that collide and merge their
+contents. Shared memory does not survive a restart, so neither does the key, and
+it never has to match anything on disk.</p>
+<p>The collection tables (hash, set, zset, list) keep <em>only</em> the hash. They store
+one entry per member, so a full copy of the key in each would dominate the entry
+— 512 bytes against a <code>SetEntry</code>'s 144, repeated for every member — and they
+never need the bytes: every access is a comparison against a key the caller
+already holds.</p>
+<p>The KV table is the exception, because <code>KEYS</code>, <code>SCAN</code> and <code>RANDOMKEY</code> hand real
+keys back to clients.</p>
+<p>No table is <code>HASH_STRINGS</code>, and none may become one: dynahash compares string
+keys with <code>strncmp</code>, which makes two keys agreeing up to their first NUL byte
+the same key.</p>
+<h3 id="how-a-kv-entry-stores-its-key">How a KV entry stores its key</h3>
+<p><code>KvEntry</code> keys on the hash and keeps the key bytes alongside it, laid out the
+way a value is — an inline prefix with the tail chained through the same chunk
+pool:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>KvEntry  = key hash 16 | key_inline 128 | value_inline 64 | expires_at 8
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>                       | key_len 4 | key_overflow 4 | value_len 4 | overflow 4
+</code></pre></div>
+<p><code>INLINE_KEY_LEN</code> is 128, and the reason is the pool rather than the entry. Eight
+bytes of <code>KvEntry</code> is 640 KiB of shared memory (8192 entries × 8 databases ×
+5/4), so the prefix costs 10 MiB. At 64 it would cost 5 MiB — but a key of
+65–128 bytes would then take a chunk, and <code>myapp:prod:session:&lt;uuid&gt;</code> is 60 to
+90 bytes, so a full table of entirely ordinary keys would claim every chunk in
+the pool and leave nothing for any value past its own 64-byte inline slot. At
+128 the same cliff sits at 129 bytes, which conventional keys do not reach.</p>
+<p>A longer key still works, at one chunk per 64 bytes over:</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">Key length</th>
+<th style="text-align: right;">Chunks per key</th>
+<th style="text-align: right;">Keys before the pool is empty</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">≤ 128 bytes</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">8,192 (the table's own limit)</td>
+</tr>
+<tr>
+<td style="text-align: right;">129–192</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">8,192, with no pool left for values</td>
+</tr>
+<tr>
+<td style="text-align: right;">193–256</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">4,096</td>
+</tr>
+<tr>
+<td style="text-align: right;">449–512</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">1,365</td>
+</tr>
+</tbody>
+</table>
+<h3 id="lookups-verify-the-key">Lookups verify the key</h3>
+<p>Because the KV entry holds the key bytes, <code>kv_find</code> and <code>kv_enter</code> compare the
+stored key against the one asked for. A mismatch reads as "absent" and refuses
+the write, so a hash collision cannot return or overwrite another key's value.
+It has its own error rather than an OOM, because raising <code>mem_max_entries</code> is
+the obvious response to an OOM and does nothing for a collision:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>ERR key hash collides with a different key already stored; rename the key, or use SELECT durable.
+</code></pre></div>
+<p>The cost is a length test plus, at most, a compare of the inline prefix against
+bytes the lookup has already pulled into cache; only a key over 128 bytes
+matching on both goes as far as walking the pool. Unreachable in practice at
+<code>mem_max_entries</code> keys per database — it exists because the alternative is to
+write over the key already there, silently. <strong>The collection tables cannot do
+this</strong>: they have nowhere to put the loser of a collision.</p>
+<h3 id="the-chunk-pool">The chunk pool</h3>
+<p>One slab per KV, hash and list table per database — 24 in all — carved out of a
+single <code>ShmemInitStruct</code> allocation and indexed by stride.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>[ValPool header][next: u32 × capacity][data: u8 × capacity × 64]
+</code></pre></div>
+<p><code>capacity</code> is <code>mem_max_entries</code> chunks of <code>CHUNK_LEN</code> = 64 bytes. The <code>next</code>
+array doubles as the free list <em>and</em> as the chain of a stored value, so a chunk
+is on exactly one of the two at any moment and no separate bitmap has to be kept
+in step. Allocating <em>n</em> chunks takes a prefix of the free list — one pointer
+moved, not <em>n</em>. Freeing returns a chain in one splice.</p>
+<p>A byte string of length <em>n</em> occupies <code>ceil((n - inline) / 64)</code> chunks, where
+<code>inline</code> is 64 for a value and 128 for a KV key. Anything shorter than its
+inline slot costs no chunk at all — which covers most of what a cache holds;
+<code>redis-benchmark</code> writes 3-byte values.</p>
+<p><strong>Chunk lifecycle is the easiest thing here to get wrong.</strong> The chain head lives
+in the entry, so the release must happen while the entry is still there. Every
+removal goes through <code>remove_valued</code> (or <code>list_remove_at</code>, its bare-HTAB twin).
+A <code>KvEntry</code> owns <em>two</em> chains, so its <code>kv_free</code> releases the value chain and the
+key chain. A path that calls <code>hash_search(HASH_REMOVE)</code> on the KV, hash or list
+table directly leaks silently until the pool runs dry.</p>
+<h3 id="value-and-key-size-limits">Value and key size limits</h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>max value = min(64 KiB, 64 + (redis.mem_max_entries / 8) × 64 bytes)
+</code></pre></div>
+<p>which is <strong>65,536 bytes</strong> at the default, where the two bounds meet:</p>
+<ul>
+<li><strong>An eighth of the pool.</strong> A pool is shared by every value in its table, so one
+  value must not be able to take all of it.</li>
+<li><strong>64 KiB outright.</strong> Every read copies the value out of shared memory while the
+  table's LWLock is held, so an unbounded value would hold a whole database still
+  for the length of one memcpy. That ceiling holds however large the pool is
+  configured, so raising <code>mem_max_entries</code> buys capacity, not longer values.</li>
+</ul>
+<p>Keys are capped at 512 bytes for the same kind of reason — how much of the
+shared pool one key may take — and hash fields and set members at 128 because
+those still live in fixed-size arrays.</p>
+<p>Anything over a limit is <strong>rejected, never truncated</strong>, and the check runs
+before the command executes so a refusal never leaves a partial write behind:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>ERR key exceeds redis.storage_mode=&#39;memory&#39; limit of 512 bytes (use SELECT durable for unbounded values)
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>ERR value exceeds redis.storage_mode=&#39;memory&#39; limit of 65536 bytes (use SELECT durable for unbounded values)
+</code></pre></div>
+<p>Truncation is the one failure mode worse than an error: two members sharing a
+128-byte prefix would collapse onto one entry, so an <code>HGET</code> returns another
+field's value and an <code>HDEL</code> removes it.</p>
+<h3 id="when-a-table-fills">When a table fills</h3>
+<p><code>redis.maxmemory_policy</code>, named after Redis's setting:</p>
+<table>
+<thead>
+<tr>
+<th>Policy</th>
+<th>Behaviour</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>noeviction</code> (default, as in Redis)</td>
+<td>The write is refused with <code>OOM command not allowed when used memory &gt; 'maxmemory'</code>. Nothing already stored is lost.</td>
+</tr>
+<tr>
+<td><code>allkeys-random</code></td>
+<td>Entries are evicted to make room. Collections go <strong>whole</strong> — never half-present — and the key being written is never chosen, so a single key larger than its own table still reports OOM.</td>
+</tr>
+<tr>
+<td><code>volatile-ttl</code></td>
+<td>Only keys carrying an expiry, soonest first. Falls back to refusing if none do.</td>
+</tr>
+</tbody>
+</table>
+<p>Expired entries are reclaimed before any live key is considered, under every
+policy. Eviction costs one <code>hash_seq_search</code>, so it frees <code>EVICT_BATCH</code> = 64
+entries at a time and amortises the scan over the next 64 inserts. Under
+<code>noeviction</code> it returns immediately without scanning anything.</p>
+<p>A full table has never been able to take the server down: every insert uses
+<code>HASH_ENTER_NULL</code>, never <code>HASH_ENTER</code>. On a <code>HASH_FIXED_SIZE</code> table dynahash
+answers a full table by raising <code>out of shared memory</code>, which unwinds by
+longjmp — past the Rust error handling that looks like it covers it — and kills
+the worker.</p>
+<p>The <strong>pool</strong> can run dry before the entries do. That is reported as the same
+OOM, and <code>reserve_chunks</code> (<code>kv_reserve</code> for the KV table, which must budget for
+the key as well as the value) asks eviction for room the same way. It has to run
+<em>before</em> the entry exists, because eviction may remove any entry in the table
+including the one about to be written.</p>
+<p>A refused write records <em>why</em> in a single thread-local <code>Refusal</code>, read once per
+command by <code>execute_mem</code> and turned into either the OOM reply or the collision
+one. Threading a result out through all 68 <code>mem_*</code> entry points — whose return
+types are <code>bool</code>, <code>i64</code>, <code>Result&lt;i64, String&gt;</code>, <code>Vec&lt;..&gt;</code> and more — was the
+alternative. A worker dispatches one command at a time on one thread, so the
+flag cannot cross commands.</p>
+<h3 id="expiry">Expiry</h3>
+<p><code>KvEntry</code> carries <code>expires_at</code> in microseconds since the epoch, 0 for none. Reads
+treat an expired entry as absent and delete it lazily; a background sweep also
+walks each database once a second and removes what it finds, returning the
+chunks. Only the KV table has expiry — Redis's TTLs are per key, and a
+collection's key lives in its meta.</p>
+<h3 id="lists">Lists</h3>
+<p>List elements are keyed on <code>(key hash, position)</code> with positions spaced
+<code>LIST_POS_STEP</code> = 1024 apart, so <code>LPUSH</code> and <code>RPUSH</code> are O(1) — they take the
+next position outside the current range from the meta.</p>
+<p>Readers walk positions as <code>min_pos + i * LIST_POS_STEP</code>, so an in-place removal
+leaves a hole that silently truncates the list at the first gap while the count
+still reports the full length. <code>LREM</code>, <code>LINSERT</code> and <code>LTRIM</code> therefore go
+through a read-modify-write that renumbers the whole list from a fresh base —
+O(n) on commands that were already O(n).</p>
+<h3 id="sizing-redismem_max_entries">Sizing <code>redis.mem_max_entries</code></h3>
+<p>This one number scales the whole reservation, so it is the only knob that
+decides how much memory the extension takes. Measured as <code>SHOW
+shared_memory_size</code> on PostgreSQL 17 at otherwise default settings:</p>
+<table>
+<thead>
+<tr>
+<th><code>redis.mem_max_entries</code></th>
+<th><code>shared_memory_size</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>256</td>
+<td>214 MB</td>
+</tr>
+<tr>
+<td>4,096</td>
+<td>245 MB</td>
+</tr>
+<tr>
+<td><strong>8,192 (default)</strong></td>
+<td><strong>280 MB</strong></td>
+</tr>
+<tr>
+<td>10,240</td>
+<td>297 MB</td>
+</tr>
+<tr>
+<td>12,288</td>
+<td>314 MB</td>
+</tr>
+<tr>
+<td>16,384</td>
+<td>349 MB</td>
+</tr>
+<tr>
+<td>32,768</td>
+<td>487 MB</td>
+</tr>
+</tbody>
+</table>
+<p>PostgreSQL's own share is roughly the 214 MB floor; the rest is the extension.
+It also sets the size of each pool, and with it the value cap above.</p>
+<p>The default was halved from 16,384 when the key limit grew to 512 bytes, and
+three rounds of shrinking the entries have not yet paid that back: hashing the
+key out of the KV table freed 28 MB, where doubling the setting costs 69 MB.
+Raising it is supported — it buys pool capacity as well as key capacity — but it
+is a memory-budget decision, not something the entry layout funds.</p>
+<h3 id="how-the-reservation-got-here">How the reservation got here</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th><code>shared_memory_size</code></th>
+<th>What changed</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Composite key hashing</td>
+<td>587 → 413 MB</td>
+<td>Hash, set, zset and list entries key on a 128-bit hash instead of carrying a 512-byte copy of the Redis key</td>
+</tr>
+<tr>
+<td>Chunked value pool</td>
+<td>413 → 308 MB</td>
+<td>Three fixed overflow tables became one 64-byte-chunk slab per table; the value cap went 512 B → 64 KiB</td>
+</tr>
+<tr>
+<td>KV key hashing</td>
+<td>308 → <strong>280 MB</strong></td>
+<td>The last table storing keys verbatim; <code>KvEntry</code> 592 → 232 bytes</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="4-pubsub">4. Pub/Sub</h2>
+<p>Pub/sub is independent of <code>storage_mode</code> and always allocated — it needs
+<code>shared_preload_libraries</code>, not memory mode.</p>
+<p>Each subscribing connection claims one of 256 slots. A slot holds a ring buffer
+of 256 messages and the connection's subscriptions (16 channels and 16 patterns).
+<code>PUBLISH</code> writes into the ring of every matching slot and bumps that slot's tail
+counter.</p>
+<p>Subscribers <strong>wait on the tail counter</strong>, not on the socket. A subscriber that
+discovered messages by letting a 5 ms socket read time out would cost ~200
+wakeups per second while idle and still delay delivery by up to 5 ms. The futex
+lives in PostgreSQL's shared memory segment, so the shared (not <code>PRIVATE</code>)
+operations are required — waiter and waker are different processes. The socket
+poll that remains backs off from 5 ms to 250 ms while a connection stays silent;
+it bounds only how long a <em>command</em> from a quiet subscriber sits unread, never
+delivery latency.</p>
+<p>Route lookups short-circuit on an atomic counter, so an installation with no
+routes configured pays nothing.</p>
+<h3 id="size-limits">Size limits</h3>
+<p>Everything runs through fixed-size slots, so these are hard caps:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Limit</th>
+<th>Over the limit</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Channel / pattern name</td>
+<td>255 bytes</td>
+<td><code>SUBSCRIBE</code>, <code>PSUBSCRIBE</code>, <code>PUBLISH</code> error</td>
+</tr>
+<tr>
+<td>Message payload</td>
+<td>512 bytes</td>
+<td><code>PUBLISH</code> errors</td>
+</tr>
+<tr>
+<td>Concurrent subscriber connections</td>
+<td>256</td>
+<td><code>SUBSCRIBE</code> returns "max pub/sub subscribers reached"</td>
+</tr>
+<tr>
+<td>Channels + patterns per connection</td>
+<td>16 each</td>
+<td>Further subscriptions ignored</td>
+</tr>
+<tr>
+<td>Queued undelivered messages per subscriber</td>
+<td>256</td>
+<td>Further messages dropped for that subscriber</td>
+</tr>
+<tr>
+<td>Active routes</td>
+<td>64</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<p>Names and payloads are <strong>rejected, not truncated</strong>: a truncated subscription
+would never match a publish to the same name, leaving the client waiting on a
+channel it believed it was subscribed to.</p>
+<p>The payload cap is deliberately <em>not</em> memory mode's value cap. Every slot in the
+ring reserves its payload whether or not anyone publishes, so tracking a 64 KiB
+cap would cost the ring 128× what it costs now. The slot table is ~66 MiB,
+allocated at server start whether or not pub/sub is used.</p>
+<h3 id="table-routing">Table routing</h3>
+<p>Any <code>PUBLISH</code> can additionally be INSERTed into a PostgreSQL table — enough for
+<a href="https://supabase.com/docs/guides/realtime/broadcast">Supabase Realtime broadcast from database</a>
+or any trigger-based integration. The extension is decoupled from Supabase; it
+just INSERTs rows.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">create_pubsub_table</span><span class="p">(</span><span class="s1">&#39;public&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;chat_messages&#39;</span><span class="p">);</span>
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">route_publish</span><span class="p">(</span><span class="s1">&#39;chat&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;public&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;chat_messages&#39;</span><span class="p">);</span>
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="c1">-- redis-cli&gt; PUBLISH chat &quot;hello&quot;</span>
+<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">channel</span><span class="p">,</span><span class="w"> </span><span class="n">payload</span><span class="p">,</span><span class="w"> </span><span class="n">inserted_at</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="k">public</span><span class="p">.</span><span class="n">chat_messages</span><span class="p">;</span>
+</code></pre></div>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>redis.create_pubsub_table(schema, table)</code></td>
+<td>Create a routing target with the required columns</td>
+</tr>
+<tr>
+<td><code>redis.route_publish(channel, schema, table)</code></td>
+<td>Route <code>PUBLISH</code> on <code>channel</code> into <code>schema.table</code></td>
+</tr>
+<tr>
+<td><code>redis.unroute_publish(channel)</code></td>
+<td>Remove the route</td>
+</tr>
+</tbody>
+</table>
+<p>Routes live in <code>redis.pubsub_routes</code>, are loaded into shared memory at startup,
+and survive restart. The INSERT is dispatched fire-and-forget <em>after</em> in-memory
+delivery completes and after the <code>PUBLISH</code> reply is sent.</p>
+<p>Bring your own table if you prefer — it needs <code>channel BYTEA</code> and
+<code>payload BYTEA</code>. <code>BYTEA</code> is required, not recommended: channels and payloads are
+arbitrary bytes. Because the insert is fire-and-forget, a routed insert into a
+wrongly-typed table fails <em>after</em> <code>PUBLISH</code> has already succeeded, and the error
+goes to the PostgreSQL log rather than to the client. Check there if routed rows
+stop appearing.</p>
+<hr />
+<h2 id="5-watch">5. WATCH</h2>
+<p><code>WATCH</code> snapshots a write-version counter per key and <code>EXEC</code> aborts if it moved.</p>
+<p>The counters live in shared memory rather than per worker because of
+<code>SO_REUSEPORT</code>: a client's <code>WATCH</code> is served by whichever worker accepted its
+connection, while the conflicting write may be dispatched through any other
+worker. Per-process counters reported "no conflict" for writes the process never
+saw, and <code>EXEC</code> committed when it should have aborted.</p>
+<p>Keys are hashed (FNV-1a over the database number followed by the key bytes) into
+a fixed table of 65,536 <code>AtomicU64</code> counters — 512 KiB — rather than stored. That
+keeps the structure allocation-free, lock-free and fixed-size: no eviction
+policy, and no growth a client can drive by writing unique keys. The cost is that
+two keys can share a counter, which makes an <code>EXEC</code> abort when it strictly did
+not have to. <strong>That direction is safe; the reverse would not be.</strong></p>
+<hr />
+<h2 id="6-the-resp-layer">6. The RESP layer</h2>
+<p>RESP2, with <code>HELLO 3</code> negotiating RESP3 push frames for pub/sub.</p>
+<table>
+<thead>
+<tr>
+<th>Bound</th>
+<th>Value</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>MAX_BULK_LEN</code></td>
+<td>512 MiB</td>
+<td>Matches Redis's <code>proto-max-bulk-len</code></td>
+</tr>
+<tr>
+<td><code>MAX_ARRAY_LEN</code></td>
+<td>65,536 elements</td>
+<td></td>
+</tr>
+<tr>
+<td><code>MAX_INLINE_LEN</code></td>
+<td>8 KiB</td>
+<td>Inline (non-array) command form</td>
+</tr>
+<tr>
+<td><code>BULK_CHUNK</code></td>
+<td>64 KiB</td>
+<td>Read granularity</td>
+</tr>
+<tr>
+<td><code>QUEUE_LIMIT</code></td>
+<td>10,000</td>
+<td>Commands queued in one <code>MULTI</code></td>
+</tr>
+</tbody>
+</table>
+<p>A declared bulk length does not commit memory: the parser grows the buffer as
+bytes actually arrive, so a client announcing a 512 MiB bulk string and then
+stalling holds only what it sent, not what it promised.</p>
+<p>Error replies carry their own code when they have one. <code>write_error</code> prefixes
+<code>ERR</code> only for messages that do not already start with a code from
+<code>ERROR_CODES</code>, so an OOM goes out as <code>-OOM ...</code> — which is what clients match on.</p>
+<hr />
+<h2 id="7-limits">7. Limits</h2>
+<p>Everything the memory-mode backend refuses, in one place. The durable half
+(8–15) has none of them and is bounded only by disk; <code>auto</code> has none of the
+shared-memory ones.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Limit</th>
+<th>Where it comes from</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Key</td>
+<td>512 bytes</td>
+<td>Share of the chunk pool</td>
+</tr>
+<tr>
+<td>Value</td>
+<td>64 KiB</td>
+<td>An eighth of the pool, capped by the copy-under-lock ceiling</td>
+</tr>
+<tr>
+<td>Hash field / set member</td>
+<td>128 bytes</td>
+<td>Fixed array in the entry</td>
+</tr>
+<tr>
+<td>Keys per type per database</td>
+<td><code>redis.mem_max_entries</code></td>
+<td>Fixed-size HTAB</td>
+</tr>
+<tr>
+<td>Channel / pattern</td>
+<td>255 bytes</td>
+<td>Fixed slot</td>
+</tr>
+<tr>
+<td>Pub/sub payload</td>
+<td>512 bytes</td>
+<td>Fixed ring slot</td>
+</tr>
+<tr>
+<td>Bulk string on the wire</td>
+<td>512 MiB</td>
+<td>RESP parser, matches Redis</td>
+</tr>
+</tbody>
+</table>
+<p>Redis caps a string at 512 MiB and places no limit at all on key or field
+length. pg_redis honours the protocol limit at the parser, so <strong>the durable half
+matches Redis</strong> — values there are bounded only by PostgreSQL's ~1 GB per-field
+TOAST limit. The memory-mode limits are lower because shared memory is a
+fixed-size region sized at postmaster start, so nothing in it can grow on
+demand. That is a property of the backend, not of the protocol: switch the
+database to <code>auto</code>, or use <code>SELECT durable</code>, and the same command is stored
+exactly as Redis would store it.</p>
+<hr />
+<h2 id="8-performance">8. Performance</h2>
+<p>Requests/second on Docker, Apple M-series, <code>redis-benchmark -n 50000 -c 200</code>
+against the default database.</p>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th style="text-align: right;">Redis 7</th>
+<th style="text-align: right;">memory</th>
+<th style="text-align: right;">SPI/unlogged</th>
+<th style="text-align: right;">SPI/logged</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PING</td>
+<td style="text-align: right;">234,000</td>
+<td style="text-align: right;">112,000</td>
+<td style="text-align: right;">113,000</td>
+<td style="text-align: right;">103,000</td>
+</tr>
+<tr>
+<td>GET</td>
+<td style="text-align: right;">243,000</td>
+<td style="text-align: right;">106,000</td>
+<td style="text-align: right;">85,000</td>
+<td style="text-align: right;">92,000</td>
+</tr>
+<tr>
+<td>SET</td>
+<td style="text-align: right;">224,000</td>
+<td style="text-align: right;">103,000</td>
+<td style="text-align: right;">22,000</td>
+<td style="text-align: right;">12,000</td>
+</tr>
+<tr>
+<td>INCR</td>
+<td style="text-align: right;">253,000</td>
+<td style="text-align: right;">116,000</td>
+<td style="text-align: right;">32,000</td>
+<td style="text-align: right;">14,000</td>
+</tr>
+<tr>
+<td>HSET</td>
+<td style="text-align: right;">227,000</td>
+<td style="text-align: right;">83,000</td>
+<td style="text-align: right;">26,000</td>
+<td style="text-align: right;">13,000</td>
+</tr>
+<tr>
+<td>ZADD</td>
+<td style="text-align: right;">185,000</td>
+<td style="text-align: right;">118,000</td>
+<td style="text-align: right;">15,000</td>
+<td style="text-align: right;">7,000</td>
+</tr>
+<tr>
+<td>SADD</td>
+<td style="text-align: right;">194,000</td>
+<td style="text-align: right;">82,000</td>
+<td style="text-align: right;">71,000</td>
+<td style="text-align: right;">66,000</td>
+</tr>
+<tr>
+<td>SPOP</td>
+<td style="text-align: right;">183,000</td>
+<td style="text-align: right;">116,000</td>
+<td style="text-align: right;">51,000</td>
+<td style="text-align: right;">64,000</td>
+</tr>
+<tr>
+<td>ZPOPMIN</td>
+<td style="text-align: right;">183,000</td>
+<td style="text-align: right;">118,000</td>
+<td style="text-align: right;">48,000</td>
+<td style="text-align: right;">47,000</td>
+</tr>
+</tbody>
+</table>
+<p><code>redis-benchmark</code> writes 3-byte values, which never leave the 64-byte inline
+slot — so the table above says nothing about the chunk pool.
+<code>mise run bench-value-sizes</code> sweeps 3/63/64/65/200/512/4096/65536 bytes for
+that. <code>mise run bench-high-write</code> (8 workers, <code>batch_size=256</code>) spreads
+connections across more dispatchers.</p>
+<h3 id="pubsub">Pub/Sub</h3>
+<p>One publisher, varying subscriber counts. <strong>recv/s</strong> is total deliveries across
+all subscribers.</p>
+<table>
+<thead>
+<tr>
+<th>Subscribers</th>
+<th>Redis 7 pub/s</th>
+<th>Redis 7 recv/s</th>
+<th>pg_redis pub/s</th>
+<th>pg_redis recv/s</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>2,509</td>
+<td>2,506</td>
+<td>9,451</td>
+<td>9,172</td>
+</tr>
+<tr>
+<td>4</td>
+<td>2,359</td>
+<td>9,433</td>
+<td>12,297</td>
+<td>38,086</td>
+</tr>
+<tr>
+<td>16</td>
+<td>3,865</td>
+<td>61,762</td>
+<td>49,810</td>
+<td>348,682</td>
+</tr>
+<tr>
+<td>32</td>
+<td>2,896</td>
+<td>92,516</td>
+<td>8,993</td>
+<td>237,891</td>
+</tr>
+</tbody>
+</table>
+<p>recv/s scales linearly — one <code>PUBLISH</code> fans to N ring buffers in parallel.
+Routing to a table roughly halves publisher throughput with no subscribers
+(10,833 → 5,577) and costs progressively less as subscribers are added.</p>
+<h3 id="where-the-ceiling-is">Where the ceiling is</h3>
+<p><strong>Sharding the shared-memory LWLocks is not worth doing</strong>, measured rather than
+assumed:</p>
+<table>
+<thead>
+<tr>
+<th>Measurement</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Throughput at 1 / 2 / 4 workers</td>
+<td>55k / 48k / 55k — no scaling at all</td>
+</tr>
+<tr>
+<td>Worker wait events, 120 samples under <code>SET</code> load</td>
+<td>100% <code>RUNNING/cpu</code>, zero LWLock waits</td>
+</tr>
+<tr>
+<td><code>SET</code> (exclusive lock) vs <code>GET</code> (shared lock)</td>
+<td>52k vs 54k — indistinguishable</td>
+</tr>
+<tr>
+<td>Pipelining <code>-P 1</code> → <code>-P 32</code></td>
+<td>47.5k → 151k (3.2×)</td>
+</tr>
+</tbody>
+</table>
+<p>One worker matches four, and pipelining triples throughput without touching the
+lock. The ceiling is the two mpsc thread hops per command. Memory-mode commands
+need no SPI and no transaction, so a connection thread could in principle
+execute them inline and skip both — the blocker is that PostgreSQL LWLocks
+require a valid <code>MyProc</code>, which non-backend threads do not have. Closing that
+needs a design, not a patch, and lock sharding only becomes interesting
+afterwards.</p>
+<h3 id="benchmarking-without-fooling-yourself">Benchmarking without fooling yourself</h3>
+<ul>
+<li><strong>Point the benchmark at db 0 with <code>storage_mode=memory</code>.</strong> The compose default
+  is <code>redis.default_db=8</code>, the WAL-logged half — a benchmark that forgets this
+  measures fsync and reports ~500 requests/second for everything.
+  <code>bench-value-sizes</code> and <code>bench-report</code> set both; <code>bench</code> does not, by design.</li>
+<li><strong><code>redis-benchmark</code> never clears <code>mylist</code>.</strong> Its <code>lpush</code>, <code>rpush</code> and <code>lrange</code>
+  tests build the list up over the whole run, and <code>-n 20000</code> is past what a list
+  table holds at the default, so the run ends in the OOM the server is supposed
+  to give and reports nothing at all. <code>docker/bench/report.sh</code> clears the key and
+  uses 4,000 requests for those.</li>
+<li><strong>The noise band is ±6%, which is wider than most changes worth measuring.</strong>
+  Three rounds is not enough. One attempt at measuring the KV key change read as
+  "SET and GET are 10% slower" while <code>PING</code>, which the change cannot touch, read
+  as 8% <em>faster</em> — both noise. What works: alternate the two builds, nine rounds
+  each at 50,000 requests, take medians, and include a command the change cannot
+  reach as a calibration. At that sample size <code>PING</code> came back at +0.5% and
+  everything else sat inside ±5% straddling zero.</li>
+<li><strong><code>KEYS</code> needs its own measurement.</strong> It is not a <code>redis-benchmark</code> test, and
+  reading every key out of every entry is exactly what it does. Time it directly
+  over a populated database.</li>
+</ul>
+<p>CI runs <code>docker/bench/report.sh</code> on every pull request against memory mode and a
+Redis 7 container on the same runner, and posts the result as one comment —
+keyed on an HTML marker, so a push edits it in place and duplicates are deleted.
+The same report goes to the job summary, which is all a fork's token can write.
+It is a smoke signal, not a gate: what it catches is a collapse from tens of
+thousands per second to hundreds. The ratio against the Redis beside it travels
+better than the absolute numbers. <code>mise run bench-report</code> runs it locally.</p>
+<hr />
+<h2 id="9-testing">9. Testing</h2>
+<p>Three layers covering different code. Running one is not running the others.</p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Command</th>
+<th>What it actually covers</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Unit</td>
+<td><code>mise run test-unit</code></td>
+<td>Pure functions: parsing, key layout, limits, SipHash, the pool — no PostgreSQL</td>
+</tr>
+<tr>
+<td>pgrx</td>
+<td><code>mise run test-pg</code></td>
+<td><strong>The SPI path only</strong> — never the shared-memory backend</td>
+</tr>
+<tr>
+<td>End-to-end</td>
+<td><code>mise run e2e</code></td>
+<td>Everything, in whichever storage mode the server runs</td>
+</tr>
+</tbody>
+</table>
+<p><strong>The gap in the middle is the important one.</strong> <code>cargo pgrx test</code> starts its own
+throwaway cluster <em>without</em> <code>shared_preload_libraries</code>, so memory mode — the
+default storage mode, and all of <code>mem.rs</code> — is invisible to it. Four bugs
+reached a branch that way. Run both storage modes for anything touching
+<code>mem.rs</code>; CI does:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>mise<span class="w"> </span>run<span class="w"> </span>e2e<span class="w">                              </span><span class="c1"># storage_mode=auto</span>
+<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="nv">PG_REDIS_STORAGE_MODE</span><span class="o">=</span>memory<span class="w"> </span>mise<span class="w"> </span>run<span class="w"> </span>e2e<span class="w"> </span><span class="c1"># the shared-memory backend</span>
+</code></pre></div>
+<h3 id="running-the-e2e-suite-without-docker">Running the e2e suite without Docker</h3>
+<p><code>docker compose --profile e2e up</code> is the supported path, but <code>bun</code> runs the same
+suite against any live server:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="c1"># 1. A cluster with the extension preloaded. Run as an unprivileged user —</span>
+<a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="c1">#    initdb refuses to run as root, and a long $HOME breaks the socket path.</span>
+<a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a>initdb<span class="w"> </span>-D<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PGDATA</span><span class="s2">&quot;</span><span class="w"> </span>-U<span class="w"> </span>postgres<span class="w"> </span>-A<span class="w"> </span>trust
+<a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a>cat<span class="w"> </span>&gt;&gt;<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PGDATA</span><span class="s2">/postgresql.conf&quot;</span><span class="w"> </span><span class="s">&lt;&lt;&#39;CONF&#39;</span>
+<a id="__codelineno-10-5" name="__codelineno-10-5" href="#__codelineno-10-5"></a><span class="s">listen_addresses = &#39;localhost&#39;</span>
+<a id="__codelineno-10-6" name="__codelineno-10-6" href="#__codelineno-10-6"></a><span class="s">shared_preload_libraries = &#39;pg_redis&#39;</span>
+<a id="__codelineno-10-7" name="__codelineno-10-7" href="#__codelineno-10-7"></a><span class="s">redis.storage_mode = &#39;memory&#39;      # or &#39;auto&#39; — run both</span>
+<a id="__codelineno-10-8" name="__codelineno-10-8" href="#__codelineno-10-8"></a><span class="s">redis.port = 6379</span>
+<a id="__codelineno-10-9" name="__codelineno-10-9" href="#__codelineno-10-9"></a><span class="s">redis.database = &#39;postgres&#39;</span>
+<a id="__codelineno-10-10" name="__codelineno-10-10" href="#__codelineno-10-10"></a><span class="s">redis.default_db = 8</span>
+<a id="__codelineno-10-11" name="__codelineno-10-11" href="#__codelineno-10-11"></a><span class="s">redis.password = &#39;testpass&#39;</span>
+<a id="__codelineno-10-12" name="__codelineno-10-12" href="#__codelineno-10-12"></a><span class="s">CONF</span>
+<a id="__codelineno-10-13" name="__codelineno-10-13" href="#__codelineno-10-13"></a>
+<a id="__codelineno-10-14" name="__codelineno-10-14" href="#__codelineno-10-14"></a><span class="c1"># 2. Install the extension into that PostgreSQL, then start it.</span>
+<a id="__codelineno-10-15" name="__codelineno-10-15" href="#__codelineno-10-15"></a>cargo<span class="w"> </span>pgrx<span class="w"> </span>install<span class="w"> </span>--release<span class="w"> </span>--pg-config<span class="w"> </span>/usr/lib/postgresql/17/bin/pg_config
+<a id="__codelineno-10-16" name="__codelineno-10-16" href="#__codelineno-10-16"></a>pg_ctl<span class="w"> </span>-D<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PGDATA</span><span class="s2">&quot;</span><span class="w"> </span>-o<span class="w"> </span><span class="s1">&#39;-k /tmp&#39;</span><span class="w"> </span>start
+<a id="__codelineno-10-17" name="__codelineno-10-17" href="#__codelineno-10-17"></a>psql<span class="w"> </span>-h<span class="w"> </span><span class="m">127</span>.0.0.1<span class="w"> </span>-U<span class="w"> </span>postgres<span class="w"> </span>-c<span class="w"> </span><span class="s1">&#39;CREATE EXTENSION pg_redis;&#39;</span>
+<a id="__codelineno-10-18" name="__codelineno-10-18" href="#__codelineno-10-18"></a>
+<a id="__codelineno-10-19" name="__codelineno-10-19" href="#__codelineno-10-19"></a><span class="c1"># 3. The suite.</span>
+<a id="__codelineno-10-20" name="__codelineno-10-20" href="#__codelineno-10-20"></a><span class="nb">cd</span><span class="w"> </span>docker/e2e<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>bun<span class="w"> </span>install
+<a id="__codelineno-10-21" name="__codelineno-10-21" href="#__codelineno-10-21"></a><span class="nv">DATABASE_URL</span><span class="o">=</span><span class="s2">&quot;postgres://postgres@localhost:5432/postgres&quot;</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-10-22" name="__codelineno-10-22" href="#__codelineno-10-22"></a><span class="nv">REDIS_HOST</span><span class="o">=</span>localhost<span class="w"> </span><span class="nv">REDIS_PORT</span><span class="o">=</span><span class="m">6379</span><span class="w"> </span><span class="nv">REDIS_PASSWORD</span><span class="o">=</span>testpass<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-10-23" name="__codelineno-10-23" href="#__codelineno-10-23"></a><span class="w">  </span>bun<span class="w"> </span><span class="nb">test</span><span class="w"> </span>index.test.ts
+</code></pre></div>
+<p>Re-run step 2 after every code change — the running server holds the old <code>.so</code>
+until it restarts.</p>
+<h3 id="against-an-assert-enabled-postgresql">Against an assert-enabled PostgreSQL</h3>
+<p><code>cargo pgrx init --pgN download</code> configures PostgreSQL with <code>--enable-cassert</code>,
+which distribution packages do not. Code that misuses a PostgreSQL internal can
+pass against system packages and fail only in CI, with an assertion crash that
+also takes down the backend and cascades into unrelated tests. If a test fails
+in CI and passes locally, suspect this first.</p>
+<p>Not hypothetical: <code>UpdateActiveSnapshotCommandId</code> asserts the active snapshot
+has <code>active_count == 1</code> and <code>regd_count == 0</code>, which the snapshot SPI has
+already pushed satisfies neither. It passed locally and failed every CI leg.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="c1"># ftp.postgresql.org may be unreachable; the Debian source package works.</span>
+<a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;deb-src [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \</span>
+<a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a><span class="s2">  https://apt.postgresql.org/pub/repos/apt noble-pgdg main&quot;</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a><span class="w">  </span>&gt;<span class="w"> </span>/etc/apt/sources.list.d/pgdg-src.list
+<a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a>apt-get<span class="w"> </span>update<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>apt-get<span class="w"> </span>install<span class="w"> </span>-y<span class="w"> </span>flex<span class="w"> </span>bison<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>apt-get<span class="w"> </span><span class="nb">source</span><span class="w"> </span>postgresql-17
+<a id="__codelineno-11-6" name="__codelineno-11-6" href="#__codelineno-11-6"></a>
+<a id="__codelineno-11-7" name="__codelineno-11-7" href="#__codelineno-11-7"></a><span class="nb">cd</span><span class="w"> </span>postgresql-17-*/
+<a id="__codelineno-11-8" name="__codelineno-11-8" href="#__codelineno-11-8"></a>./configure<span class="w"> </span>--prefix<span class="o">=</span><span class="nv">$HOME</span>/pgassert<span class="w"> </span>--enable-cassert<span class="w"> </span>--enable-debug<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-11-9" name="__codelineno-11-9" href="#__codelineno-11-9"></a><span class="w">  </span>--without-icu<span class="w"> </span>--without-readline<span class="w"> </span>--without-zlib<span class="w"> </span>--with-openssl
+<a id="__codelineno-11-10" name="__codelineno-11-10" href="#__codelineno-11-10"></a>make<span class="w"> </span>-j<span class="s2">&quot;</span><span class="k">$(</span>nproc<span class="k">)</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>make<span class="w"> </span>install
+<a id="__codelineno-11-11" name="__codelineno-11-11" href="#__codelineno-11-11"></a>
+<a id="__codelineno-11-12" name="__codelineno-11-12" href="#__codelineno-11-12"></a><span class="nv">PGRX_HOME</span><span class="o">=</span><span class="nv">$HOME</span>/pgrxassert<span class="w"> </span>cargo<span class="w"> </span>pgrx<span class="w"> </span>init<span class="w"> </span>--pg17<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$HOME</span><span class="s2">/pgassert/bin/pg_config&quot;</span>
+<a id="__codelineno-11-13" name="__codelineno-11-13" href="#__codelineno-11-13"></a><span class="nv">PGRX_HOME</span><span class="o">=</span><span class="nv">$HOME</span>/pgrxassert<span class="w"> </span>cargo<span class="w"> </span>pgrx<span class="w"> </span><span class="nb">test</span><span class="w"> </span>pg17
+</code></pre></div>
+<p>Keep it under its own <code>PGRX_HOME</code> so the fast system-PostgreSQL config stays
+intact, and give it its own <code>CARGO_TARGET_DIR</code> — the bindings differ, so sharing
+one target directory means a full rebuild on every switch.</p>
+<p><strong>Build it under the test user's home.</strong> <code>$HOME/pgassert</code> as root plus tests as
+the unprivileged user below means <code>pgrx install --test</code> cannot write to
+<code>/root/pgassert</code>. That build's <code>pg_config --pkglibdir</code> also reports the <em>system</em>
+lib dir, so its <code>.so</code> lands there rather than under the prefix — reinstall the
+ordinary build before benchmarking anything.</p>
+<h3 id="cargo-pgrx-test-has-to-run-as-a-non-root-user"><code>cargo pgrx test</code> has to run as a non-root user</h3>
+<p>It runs <code>initdb</code>, which refuses to run as root. The failure is a wall of "Could
+not obtain test mutex" from every test after the first, with the real message
+only in the first one's output.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>useradd<span class="w"> </span>-m<span class="w"> </span>pgu
+<a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a>cp<span class="w"> </span>-a<span class="w"> </span>~/.cargo<span class="w"> </span>~/.pgrx<span class="w"> </span>/home/pgu/<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>chown<span class="w"> </span>-R<span class="w"> </span>pgu<span class="w"> </span>/home/pgu
+<a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a>chown<span class="w"> </span>-R<span class="w"> </span>pgu<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PWD</span><span class="s2">&quot;</span><span class="w">                                   </span><span class="c1"># target/ is written during the run</span>
+<a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a>chown<span class="w"> </span>-R<span class="w"> </span>pgu<span class="w"> </span>/usr/lib/postgresql/*/lib<span class="w"> </span>/usr/share/postgresql/*/extension
+<a id="__codelineno-12-5" name="__codelineno-12-5" href="#__codelineno-12-5"></a>sudo<span class="w"> </span>-u<span class="w"> </span>pgu<span class="w"> </span>env<span class="w"> </span><span class="nv">HOME</span><span class="o">=</span>/home/pgu<span class="w"> </span><span class="nv">PATH</span><span class="o">=</span>/home/pgu/.cargo/bin:<span class="nv">$PATH</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-12-6" name="__codelineno-12-6" href="#__codelineno-12-6"></a><span class="w">  </span><span class="nv">RUSTUP_HOME</span><span class="o">=</span><span class="nv">$HOME</span>/.rustup<span class="w"> </span><span class="nv">CARGO_HOME</span><span class="o">=</span>/home/pgu/.cargo<span class="w"> </span>cargo<span class="w"> </span>pgrx<span class="w"> </span><span class="nb">test</span><span class="w"> </span>pg17
+</code></pre></div>
+<p><code>cargo pgrx init --pgN download</code> fetches from <code>ftp.postgresql.org</code>, not always
+reachable. Pointing pgrx at the PGDG packages
+(<code>cargo pgrx init --pg15 /usr/lib/postgresql/15/bin/pg_config …</code>) gets the matrix
+running; only the assert-enabled build has to be compiled.</p>
+<h3 id="traps">Traps</h3>
+<ul>
+<li><strong>A <code>describe</code> that does not <code>SELECT cache</code> runs on db 8</strong>, the durable half,
+  whatever <code>storage_mode</code> says — so it says nothing about the shared-memory
+  backend. The "Binary safety" describe sat there for its whole life and passed
+  while memory mode collapsed two NUL-containing keys onto one entry. Put
+  memory-mode tests in a describe that selects <code>cache</code>, and confirm they <em>fail</em>
+  against <code>main</code> before believing they cover anything.</li>
+<li><strong><code>bun test -t "&lt;filter&gt;"</code> changes which database the tests run against.</strong> The
+  <code>SELECT isolation</code> describe is what leaves the pooled client on db 0; a
+  filtered run skips it, so the connection stays on db 8. A list bug was
+  misdiagnosed twice this way. Prefer a full run when a failure looks
+  order-dependent.</li>
+<li><strong><code>redis-cli -n 0</code> does not select the database on this server.</strong> The
+  connection stays on <code>redis.default_db</code>. Send <code>SELECT 0</code> as a command.</li>
+<li><strong><code>Bun.RedisClient</code> encodes arguments as UTF-8.</strong> It cannot express a <code>0xff</code>
+  byte and reports 10 for a 7-byte value. Anything asserting on exact bytes or
+  lengths must go through the <code>RawRedis</code> helper at the top of
+  <code>docker/e2e/index.test.ts</code>.</li>
+<li><strong>A rejected <code>client.send()</code> leaves the pooled client's replies out of step</strong>
+  for later tests. Where an error reply is the expected outcome, use <code>RawRedis</code>,
+  which returns the frame as data.</li>
+<li><strong><code>SHOW redis.foo</code> names the result column <code>redis.foo</code></strong>, dot included.
+  Destructuring by <code>foo</code> yields <code>undefined</code> with no error. Use
+  <code>SELECT current_setting('redis.foo') AS mode</code>.</li>
+</ul>
+<hr />
+<h2 id="10-continuous-integration">10. Continuous integration</h2>
+<p><code>.github/workflows/ci.yml</code> is seven jobs. Two are trivial and gate the rest, so
+a formatting mistake costs seconds rather than a full matrix:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>Workflows ─┐
+<a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a>Format    ─┴─&gt; Clippy
+<a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a>               Test (pg15, pg16, pg17)
+<a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a>               Build image ──&gt; E2E (auto), E2E (memory)
+<a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a>                           └─&gt; Benchmarks (pull requests only)
+</code></pre></div>
+<p><code>Build image</code> exists because the end-to-end legs and the benchmark need the same
+container. When they each built it they started together, so none could reuse
+another's layer cache; now it is built once and the rest restore it warm.</p>
+<p>The pgrx version comes from <code>Cargo.toml</code> — CI reads it from there rather than
+keeping its own copy, because the auto-update workflow's token is not allowed to
+rewrite a workflow file.</p>
+<hr />
+<h2 id="11-local-development">11. Local development</h2>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a>mise<span class="w"> </span>run<span class="w"> </span>run<span class="w">     </span><span class="c1"># cargo pgrx run pg17, extension hot-reloaded</span>
+<a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a><span class="c1"># then, in psql:  CREATE EXTENSION pg_redis;</span>
+<a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a><span class="c1"># and elsewhere:  redis-cli -p 6379 ping</span>
+<a id="__codelineno-14-4" name="__codelineno-14-4" href="#__codelineno-14-4"></a>
+<a id="__codelineno-14-5" name="__codelineno-14-5" href="#__codelineno-14-5"></a>mise<span class="w"> </span>run<span class="w"> </span>fmt<span class="w">     </span><span class="c1"># cargo fmt</span>
+<a id="__codelineno-14-6" name="__codelineno-14-6" href="#__codelineno-14-6"></a>mise<span class="w"> </span>run<span class="w"> </span>lint<span class="w">    </span><span class="c1"># cargo clippy -D warnings</span>
+</code></pre></div>
+<hr />
+<h2 id="12-open-work">12. Open work</h2>
+<h3 id="the-dispatch-handoff">The dispatch handoff</h3>
+<p>See <a href="#where-the-ceiling-is">Where the ceiling is</a>. Closing it needs a design,
+not a patch.</p>
+<h3 id="max_member_len-is-still-128-bytes"><code>MAX_MEMBER_LEN</code> is still 128 bytes</h3>
+<p>Redis has no limit on hash fields or set members. Memory mode caps them because
+five fixed <code>[u8; MAX_MEMBER_LEN]</code> arrays remain — <code>HashEntry::field</code>,
+<code>SetEntry::member</code>, <code>ZsetEntry::member</code>, and <code>ZsetMeta</code>'s <code>min_member</code> and
+<code>max_member</code>. They are what is left of the pattern the last three changes have
+been removing, and they are <strong>25 MiB</strong> at the default:</p>
+<table>
+<thead>
+<tr>
+<th>Array</th>
+<th style="text-align: right;">Bytes per entry</th>
+<th style="text-align: right;">Cost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ZsetMeta::min_member</code> + <code>max_member</code></td>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">10.00 MiB</td>
+</tr>
+<tr>
+<td><code>HashEntry::field</code></td>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">5.00 MiB</td>
+</tr>
+<tr>
+<td><code>ZsetEntry::member</code></td>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">5.00 MiB</td>
+</tr>
+<tr>
+<td><code>SetEntry::member</code></td>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">5.00 MiB</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Do not just copy what the KV table did.</strong> Priced out, the same move gives
+three different answers, and the obvious one is the worst:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Change</th>
+<th style="text-align: right;">Saves</th>
+<th>Costs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>HashEntry</code></td>
+<td>field → hash + 48 inline + pooled tail (216 → 160)</td>
+<td style="text-align: right;">2.19 MiB</td>
+<td>nothing — the hash table already has a pool</td>
+</tr>
+<tr>
+<td><code>SetEntry</code>, <code>ZsetEntry</code></td>
+<td>same (144 → 88, 152 → 96)</td>
+<td style="text-align: right;">4.38 MiB</td>
+<td><strong>8.50 MiB</strong> — neither table has a pool, and one costs 4.25 MiB across eight databases</td>
+</tr>
+<tr>
+<td><code>ZsetMeta</code></td>
+<td>keep member <em>hashes</em>, not bytes (304 → 72)</td>
+<td style="text-align: right;"><strong>9.06 MiB</strong></td>
+<td>no pool at all, but <code>ZPOPMIN</code>/<code>ZPOPMAX</code> stop reading the member straight out of the meta</td>
+</tr>
+</tbody>
+</table>
+<p>So the set and zset entries do not pay for themselves as a straight copy — the
+two new pools cost about twice what the smaller entries save. Options worth
+pricing first: one pool shared by both tables, a pool sized below one chunk per
+entry, or leaving those two alone.</p>
+<p><code>ZsetMeta</code> is the opposite. At 304 bytes it is the <strong>largest entry in the
+extension</strong>, bigger than <code>KvEntry</code>, and 256 of those bytes are two copies of a
+member it stores only to name the current min and max. Replacing them with
+hashes is the single biggest win left and needs no new shared memory — the
+question is what <code>ZPOPMIN</code> pays, since it reads the member from the meta in O(1)
+today and would have to find it by hash in the entry table instead.</p>
+<p>One number that does not carry over: these tables hold <code>mem_max_entries / 2</code>
+entries, so 8 bytes of entry costs 320 KiB rather than the KV table's 640 KiB.
+Real members are also shorter than real keys, so the inline prefix probably
+wants to be smaller than 128 — price it against pool pressure the way
+<code>INLINE_KEY_LEN</code> is priced rather than reusing that number.</p>
+<h3 id="multi-key-writes-are-not-atomic-under-oom">Multi-key writes are not atomic under OOM</h3>
+<p>An <code>MSET</code> or multi-member <code>SADD</code> that fills a table part-way through stores the
+earlier keys and then errors, where Redis rejects the command whole. Whether
+there is room is only knowable at the insert, so this needs a capacity pre-check
+against the command's key count. Commented at the check site in <code>execute_mem</code>.</p>
+<h3 id="settled-so-not-on-this-list">Settled, so not on this list</h3>
+<ul>
+<li><strong><code>redis.mem_max_entries</code> stays at 8192</strong> — see
+  <a href="#sizing-redismem_max_entries">Sizing</a>. Measured, not assumed.</li>
+<li><strong>Sharding the shared-memory LWLocks</strong>, for the reason above.</li>
+</ul>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; 2026 Filipe Cabaço — MIT License
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/filipecabaco/pg_redis" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://supabase.com" target="_blank" rel="noopener" title="supabase.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M11.9 1.036c-.015-.986-1.26-1.41-1.874-.637L.764 12.05C-.33 13.427.65 15.455 2.409 15.455h9.579l.113 7.51c.014.985 1.259 1.408 1.873.636l9.262-11.653c1.093-1.375.113-3.403-1.645-3.403h-9.642z"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.sections", "navigation.top", "content.code.copy", "content.action.edit"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>

@@ -5,7 +5,7 @@
          <lastmod>2026-07-27</lastmod>
     </url>
     <url>
-         <loc>https://filipecabaco.github.io/pg_redis/benchmarks/</loc>
+         <loc>https://filipecabaco.github.io/pg_redis/IMPLEMENTATION/</loc>
          <lastmod>2026-07-27</lastmod>
     </url>
     <url>
@@ -21,23 +21,7 @@
          <lastmod>2026-07-27</lastmod>
     </url>
     <url>
-         <loc>https://filipecabaco.github.io/pg_redis/development/</loc>
-         <lastmod>2026-07-27</lastmod>
-    </url>
-    <url>
-         <loc>https://filipecabaco.github.io/pg_redis/handoff/</loc>
-         <lastmod>2026-07-27</lastmod>
-    </url>
-    <url>
          <loc>https://filipecabaco.github.io/pg_redis/installation/</loc>
-         <lastmod>2026-07-27</lastmod>
-    </url>
-    <url>
-         <loc>https://filipecabaco.github.io/pg_redis/pubsub/</loc>
-         <lastmod>2026-07-27</lastmod>
-    </url>
-    <url>
-         <loc>https://filipecabaco.github.io/pg_redis/storage-modes/</loc>
          <lastmod>2026-07-27</lastmod>
     </url>
 </urlset>

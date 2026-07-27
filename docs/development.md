@@ -43,24 +43,39 @@ exact bytes or lengths has to go through the `RawRedis` helper at the top of
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` is six jobs. Two are trivial and gate the rest, so a
-formatting mistake costs seconds rather than a full matrix:
+`.github/workflows/ci.yml` is seven jobs. Two are trivial and gate the rest, so
+a formatting mistake costs seconds rather than a full matrix:
 
 ```
 Workflows ─┐
 Format    ─┴─> Clippy
                Test (pg15, pg16, pg17)
                Build image ──> E2E (auto), E2E (memory)
+                           └─> Benchmarks (pull requests only)
 ```
 
-`Build image` exists because both end-to-end legs need the same container. When
-they each built it they started together, so neither could reuse the other's
-layer cache and both paid full price; now it is built once and the legs restore
-the warm cache.
+`Build image` exists because the end-to-end legs and the benchmark all need the
+same container. When they each built it they started together, so none could
+reuse another's layer cache and each paid full price; now it is built once and
+the rest restore the warm cache.
 
 The pgrx version comes from `Cargo.toml` — CI reads it from there rather than
 keeping its own copy, because the auto-update workflow's token is not allowed
 to rewrite a workflow file.
+
+### Benchmarks
+
+On a pull request, `Benchmarks` runs `docker/bench/report.sh` against memory
+mode and a Redis 7 container on the same runner, and posts the result as a
+comment. There is only ever one such comment: it is keyed on an HTML marker,
+so a push edits the numbers in place, and a duplicate left by an earlier run is
+deleted rather than left to accumulate. The same report also goes to the job
+summary, which is all the token on a pull request from a fork can write.
+
+It is a smoke signal, not a gate — runners are shared and the absolute figures
+move on their own. What it catches is a collapse: a command going from tens of
+thousands per second to hundreds. `mise run bench-report` produces the same
+report locally.
 
 ## Local development
 

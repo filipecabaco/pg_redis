@@ -63,6 +63,25 @@ class RawRedis {
 		return done;
 	}
 
+	/** The elements of a multi-bulk reply, with nil elements as null. */
+	async array(...args: Array<string | Buffer>): Promise<Array<Buffer | null>> {
+		const reply = await this.send(...args);
+		if (reply[0] !== 0x2a) {
+			throw new Error(`expected an array reply, got ${reply.subarray(0, 64)}`);
+		}
+		const first = reply.indexOf("\r\n") + 2;
+		const count = Number(reply.subarray(1, first - 2).toString());
+		const out: Array<Buffer | null> = [];
+		let cur = first;
+		for (let i = 0; i < count; i++) {
+			const head = reply.indexOf("\r\n", cur);
+			const len = Number(reply.subarray(cur + 1, head).toString());
+			out.push(len < 0 ? null : reply.subarray(head + 2, head + 2 + len));
+			cur = replyEnd(reply, cur);
+		}
+		return out;
+	}
+
 	/** The payload of a bulk-string reply, or null for a nil reply. */
 	async bulk(...args: Array<string | Buffer>): Promise<Buffer | null> {
 		const reply = await this.send(...args);
@@ -78,14 +97,26 @@ class RawRedis {
 	}
 }
 
-/** Offset just past the first complete RESP reply in `buf`, or -1. */
-function replyEnd(buf: Buffer): number {
-	if (buf.length === 0) return -1;
-	const head = buf.indexOf("\r\n");
+/** Offset just past the complete RESP reply starting at `from` in `buf`, or -1. */
+function replyEnd(buf: Buffer, from = 0): number {
+	if (from >= buf.length) return -1;
+	const head = buf.indexOf("\r\n", from);
 	if (head < 0) return -1;
+	// An array is a header and then that many replies, each of which has to be
+	// walked: stopping at the header would leave the elements in the buffer and
+	// hand them to whatever command replies next.
+	if (buf[from] === 0x2a) {
+		const count = Number(buf.subarray(from + 1, head).toString());
+		let cur = head + 2;
+		for (let i = 0; i < count; i++) {
+			cur = replyEnd(buf, cur);
+			if (cur < 0) return -1;
+		}
+		return cur;
+	}
 	// Bulk strings carry a length; every other reply type ends at the newline.
-	if (buf[0] !== 0x24) return head + 2;
-	const len = Number(buf.subarray(1, head).toString());
+	if (buf[from] !== 0x24) return head + 2;
+	const len = Number(buf.subarray(from + 1, head).toString());
 	if (len < 0) return head + 2;
 	const end = head + 2 + len + 2;
 	return buf.length >= end ? end : -1;
@@ -1803,12 +1834,16 @@ describe("Pub/Sub size limits", () => {
 });
 
 // The shared-memory backend stores the first INLINE_VAL_LEN (64) bytes of a
-// value inside the entry and spills the rest into a separate overflow table.
-// `redis-benchmark` writes 3-byte values, so nothing in the benchmark suite has
-// ever crossed that boundary, and the spill/reclaim paths were where two
-// silent-truncation bugs lived.
+// value inside the entry and spills the rest into a pool of fixed-size chunks,
+// one chunk per CHUNK_LEN bytes, chained by index. `redis-benchmark` writes
+// 3-byte values, so nothing in the benchmark suite has ever crossed either
+// boundary, and the spill/reclaim paths were where two silent-truncation bugs
+// lived.
 const INLINE_VAL_LEN = 64;
-const MAX_TOTAL_VAL_LEN = 512;
+const CHUNK_LEN = 64;
+// An eighth of a pool of `redis.mem_max_entries` chunks, capped at 64 KiB —
+// which is where the default 8192 lands. See docs/storage-modes.md.
+const MAX_TOTAL_VAL_LEN = 64 * 1024;
 const MAX_MEMBER_LEN = 128;
 const MEM_MAX_KEY = 511;
 
@@ -1822,12 +1857,16 @@ function payload(n: number): Buffer {
 /** Sizes either side of every boundary the value path has. */
 const VALUE_SIZES = [
 	1,
-	INLINE_VAL_LEN - 1, // 63  last fully-inline size
-	INLINE_VAL_LEN, // 64  exactly fills the inline slot
-	INLINE_VAL_LEN + 1, // 65  first byte to reach the overflow table
-	200, // comfortably inside overflow
-	MAX_TOTAL_VAL_LEN - 1, // 511
-	MAX_TOTAL_VAL_LEN, // 512 largest the memory backend accepts
+	INLINE_VAL_LEN - 1, // 63    last fully-inline size
+	INLINE_VAL_LEN, // 64    exactly fills the inline slot
+	INLINE_VAL_LEN + 1, // 65    first byte to reach the chunk pool
+	INLINE_VAL_LEN + CHUNK_LEN, // 128   inline slot plus exactly one full chunk
+	INLINE_VAL_LEN + CHUNK_LEN + 1, // 129   first byte of a second chunk
+	200, // comfortably mid-chunk
+	511, // the cap before the pool replaced the fixed overflow row...
+	512, // ...and one byte past it, now unremarkable
+	MAX_TOTAL_VAL_LEN - 1, // 65535
+	MAX_TOTAL_VAL_LEN, // 65536 largest the memory backend accepts
 ];
 
 describe("Value size limits", () => {
@@ -1869,9 +1908,9 @@ describe("Value size limits", () => {
 		await raw.send("DEL", "vs:list");
 	});
 
-	// Shrinking a value has to release the overflow row it used to own.
-	// Leaving it behind, or leaving has_overflow set, makes the next read
-	// splice a stale tail onto the new value.
+	// Shrinking a value has to release the chunks it used to own. Leaving them
+	// chained to the entry makes the next read splice a stale tail onto the new
+	// value — and never returns them to the pool.
 	test("shrinking a value past the inline boundary drops its overflow tail", async () => {
 		const big = payload(300);
 		const small = payload(10);
@@ -1898,6 +1937,134 @@ describe("Value size limits", () => {
 			Buffer.concat([head, tail]),
 		);
 		await raw.send("DEL", "vs:app");
+	});
+
+	// Every APPEND past the inline slot is a read-modify-write that releases the
+	// whole chain and allocates a longer one. Sixteen of them in a row walk a
+	// value from one chunk to a thousand, so a chain rebuilt one link short —
+	// or one that keeps the released chunks — shows up as wrong bytes here
+	// rather than as a pool that quietly runs down.
+	test("APPEND grows a value one chunk at a time to the cap", async () => {
+		await raw.send("DEL", "vs:grow");
+		const step = MAX_TOTAL_VAL_LEN / 16;
+		let expected = Buffer.alloc(0);
+		for (let i = 0; i < 16; i++) {
+			const part = payload(step);
+			await raw.send(i === 0 ? "SET" : "APPEND", "vs:grow", part);
+			expected = Buffer.concat([expected, part]);
+			expect((await raw.send("STRLEN", "vs:grow")).toString()).toBe(
+				`:${expected.length}\r\n`,
+			);
+		}
+		expect(await raw.bulk("GET", "vs:grow")).toEqual(expected);
+		await raw.send("DEL", "vs:grow");
+	});
+
+	// One reply, several chains walked back to back. A chain walk that reads one
+	// link too far only shows up when the next value's chunks are adjacent to
+	// this one's — which is what allocating them in sequence arranges.
+	test("commands returning several large values splice each chain correctly", async () => {
+		const vals = [payload(MAX_TOTAL_VAL_LEN / 2), payload(300), payload(7000)];
+
+		// biome-ignore format: a key and its value per line reads worse than the row
+		await raw.send("MSET", "vs:m0", vals[0], "vs:m1", vals[1], "vs:m2", vals[2]);
+		expect(await raw.array("MGET", "vs:m0", "vs:m1", "vs:m2")).toEqual(vals);
+
+		await raw.send("DEL", "vs:mh");
+		await raw.send("HSET", "vs:mh", "a", vals[0], "b", vals[1], "c", vals[2]);
+		// HMGET, not HVALS: a hash has no field order to assert against.
+		expect(await raw.array("HMGET", "vs:mh", "a", "b", "c")).toEqual(vals);
+
+		await raw.send("DEL", "vs:ml");
+		await raw.send("RPUSH", "vs:ml", vals[0], vals[1], vals[2]);
+		expect(await raw.array("LRANGE", "vs:ml", "0", "-1")).toEqual(vals);
+
+		await raw.send("DEL", "vs:m0", "vs:m1", "vs:m2", "vs:mh", "vs:ml");
+	});
+
+	// The pool is finite, so filling it has to end in a refusal rather than a
+	// truncated value or a dead worker — and deleting what filled it has to
+	// hand every chunk back. Written as a loop rather than a fixed count so it
+	// keeps testing the property if `redis.mem_max_entries` ever changes.
+	test("a full chunk pool refuses cleanly and recovers on delete", async () => {
+		if (!memoryMode) return; // db 0 is a table here; nothing is pooled
+
+		const big = payload(MAX_TOTAL_VAL_LEN);
+		const stored: string[] = [];
+		let refusal = "";
+
+		for (let i = 0; i < 64 && !refusal; i++) {
+			const key = `vs:fill:${i}`;
+			const reply = (await raw.send("SET", key, big)).toString();
+			if (reply === "+OK\r\n") stored.push(key);
+			else refusal = reply;
+		}
+
+		expect(refusal).toMatch(/^-OOM /);
+		expect(stored.length).toBeGreaterThan(1);
+		// Nothing that was stored was damaged by the write that failed.
+		expect(await raw.bulk("GET", stored[0])).toEqual(big);
+		expect(await raw.bulk("GET", stored[stored.length - 1])).toEqual(big);
+		// ...and the key the refusal names was never created.
+		expect(await raw.bulk("GET", `vs:fill:${stored.length}`)).toBeNull();
+
+		for (const key of stored) await raw.send("DEL", key);
+
+		// Every chunk is back: the pool takes the same number of values again.
+		for (const key of stored) {
+			expect((await raw.send("SET", key, big)).toString()).toBe("+OK\r\n");
+		}
+		for (const key of stored) await raw.send("DEL", key);
+	});
+
+	// The pool is finite and shared by every value in its table, so a path that
+	// drops a value without returning its chunks is invisible until the pool
+	// runs dry. Each of these rewrites far more than a pool's worth of chunks
+	// through one key: with any of the overwrite, delete or replace paths
+	// leaking, the run stops storing values partway through.
+	test("rewriting a large value many times does not exhaust the chunk pool", async () => {
+		const big = payload(MAX_TOTAL_VAL_LEN);
+		const rounds = 24;
+
+		for (let i = 0; i < rounds; i++) {
+			await raw.send("SET", "vs:churn", big);
+			await raw.send("DEL", "vs:churn");
+		}
+		await raw.send("SET", "vs:churn", big);
+		expect(await raw.bulk("GET", "vs:churn")).toEqual(big);
+		await raw.send("DEL", "vs:churn");
+
+		for (let i = 0; i < rounds; i++) {
+			await raw.send("HSET", "vs:churnh", "f", big);
+			await raw.send("HDEL", "vs:churnh", "f");
+		}
+		await raw.send("HSET", "vs:churnh", "f", big);
+		expect(await raw.bulk("HGET", "vs:churnh", "f")).toEqual(big);
+		await raw.send("DEL", "vs:churnh");
+
+		for (let i = 0; i < rounds; i++) {
+			await raw.send("RPUSH", "vs:churnl", big);
+			await raw.send("LPOP", "vs:churnl");
+		}
+		await raw.send("RPUSH", "vs:churnl", big);
+		expect(await raw.bulk("LINDEX", "vs:churnl", "0")).toEqual(big);
+		await raw.send("DEL", "vs:churnl");
+
+		// The expiry sweep frees values nobody deleted, and has to return their
+		// chunks too. Four of these fill half the pool; the eight that follow
+		// only fit if the sweep gave them back. 1.5s covers the sweep's own
+		// one-second period.
+		for (let i = 0; i < 4; i++) {
+			await raw.send("SET", `vs:exp:${i}`, big, "PX", "50");
+		}
+		await Bun.sleep(1500);
+		for (let i = 0; i < 8; i++) {
+			expect((await raw.send("SET", `vs:swept:${i}`, big)).toString()).toBe(
+				"+OK\r\n",
+			);
+		}
+		expect(await raw.bulk("GET", "vs:swept:7")).toEqual(big);
+		for (let i = 0; i < 8; i++) await raw.send("DEL", `vs:swept:${i}`);
 	});
 
 	test("a value one byte over the limit is refused in memory mode, stored otherwise", async () => {

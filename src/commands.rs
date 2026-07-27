@@ -4651,6 +4651,11 @@ impl Command {
     /// Redis has no length limit at all, so the closest we can get in a
     /// fixed-size region is to refuse and name the database that has no limit.
     ///
+    /// A value is bounded for a different reason: it spills into a chunk pool
+    /// rather than a fixed slot, so the limit is what one value may claim of
+    /// that pool — see `mem::max_total_val_len`. Over it is still a refusal,
+    /// never a truncation.
+    ///
     /// Runs before the command executes, so a refusal never leaves a partial
     /// write behind. Allocation-free — the arms borrow and the iterators are
     /// lazy, because this sits on the hot path.
@@ -4887,7 +4892,7 @@ pub const MEM_MAX_KEY: usize = crate::mem::MAX_KEY_LEN - 1;
 /// Longest hash field or set/zset member the shared-memory backend stores intact.
 pub const MEM_MAX_MEMBER: usize = crate::mem::MAX_MEMBER_LEN;
 
-/// What overflowed a fixed-size shared-memory slot, if anything.
+/// What exceeded a shared-memory limit, if anything.
 enum Over {
     Key,
     Member,
@@ -4911,14 +4916,14 @@ fn over_members<'a>(members: impl IntoIterator<Item = &'a [u8]>) -> Option<Over>
 fn over_values<'a>(values: impl IntoIterator<Item = &'a [u8]>) -> Option<Over> {
     values
         .into_iter()
-        .find_map(|v| (v.len() > crate::mem::MAX_TOTAL_VAL_LEN).then_some(Over::Value))
+        .find_map(|v| (v.len() > crate::mem::max_total_val_len()).then_some(Over::Value))
 }
 
 fn mem_too_long(over: Over) -> Response {
     let (what, limit) = match over {
         Over::Key => ("key", MEM_MAX_KEY),
         Over::Member => ("hash field or set member", MEM_MAX_MEMBER),
-        Over::Value => ("value", crate::mem::MAX_TOTAL_VAL_LEN),
+        Over::Value => ("value", crate::mem::max_total_val_len()),
     };
     Response::Error(format!(
         "ERR {what} exceeds redis.storage_mode='memory' limit of {limit} bytes \
@@ -6805,7 +6810,7 @@ mod tests {
     fn oversized_keys_fields_and_values_are_refused_by_memory_mode() {
         let key = "k".repeat(MEM_MAX_KEY + 1);
         let member = "m".repeat(MEM_MAX_MEMBER + 1);
-        let value = "v".repeat(crate::mem::MAX_TOTAL_VAL_LEN + 1);
+        let value = "v".repeat(crate::mem::max_total_val_len() + 1);
         let ok = "x";
 
         // (command, which limit the reply must name)
@@ -6847,7 +6852,7 @@ mod tests {
             "HSET",
             &"k".repeat(MEM_MAX_KEY),
             &"m".repeat(MEM_MAX_MEMBER),
-            &"v".repeat(crate::mem::MAX_TOTAL_VAL_LEN),
+            &"v".repeat(crate::mem::max_total_val_len()),
         ];
         let cmd = is_ok(Command::parse(parts(at_limit)));
         assert!(cmd.mem_too_long_error().is_none());

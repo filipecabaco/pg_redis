@@ -41,11 +41,18 @@ pub(crate) static STORAGE_MODE: GucSetting<Option<std::ffi::CString>> =
 pub(crate) static MAXMEMORY_POLICY: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(Some(c"noeviction"));
 
+/// Boot value of `redis.mem_max_entries`, and the sizing memory mode assumes
+/// when it is asked about its limits without shared memory attached.
+///
 /// Halved from 16384 when MAX_KEY_LEN grew to 512, to hold the shared-memory
-/// request steady. Hashing the key out of the composite tables has since taken
-/// that request from ~376 MiB to ~202 MiB, so there is now room to raise this
-/// again if you need the key capacity more than the memory.
-pub(crate) static MEM_MAX_ENTRIES: GucSetting<i32> = GucSetting::<i32>::new(8192);
+/// request steady. Hashing the key out of the composite tables took that
+/// request from ~376 MiB to ~202 MiB, and the chunked value pool took it to
+/// ~72 MiB, so there is room to raise this again if you need the key capacity
+/// more than the memory. It also sets the size of each pool, and with it the
+/// largest value memory mode accepts — see `mem::max_total_val_len`.
+pub(crate) const MEM_MAX_ENTRIES_DEFAULT: i32 = 8192;
+pub(crate) static MEM_MAX_ENTRIES: GucSetting<i32> =
+    GucSetting::<i32>::new(MEM_MAX_ENTRIES_DEFAULT);
 
 #[derive(Copy, Clone, PartialEq)]
 pub enum StorageMode {
@@ -92,9 +99,7 @@ unsafe extern "C-unwind" fn pg_redis_shmem_request() {
             pg_sys::RequestAddinShmemSpace(mem::mem_list_meta_htab_total_size());
             pg_sys::RequestAddinShmemSpace(mem::mem_zset_meta_htab_total_size());
             pg_sys::RequestAddinShmemSpace(mem::mem_set_meta_htab_total_size());
-            pg_sys::RequestAddinShmemSpace(mem::mem_kv_overflow_total_size());
-            pg_sys::RequestAddinShmemSpace(mem::mem_hash_overflow_total_size());
-            pg_sys::RequestAddinShmemSpace(mem::mem_list_overflow_total_size());
+            pg_sys::RequestAddinShmemSpace(mem::mem_val_pool_total_size());
             pg_sys::RequestNamedLWLockTranche(
                 c"pg_redis_mem".as_ptr(),
                 (mem::NUM_MEM_DBS * 5) as i32,

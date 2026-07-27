@@ -802,10 +802,12 @@ mod tests {
             "pub/sub slots would request {} MiB of shared memory",
             bytes / 1024 / 1024
         );
-        // A payload that fits in memory mode must also fit through pub/sub.
-        const {
-            assert!(PUBSUB_MSG_LEN >= crate::mem::MAX_TOTAL_VAL_LEN);
-        }
+        // The pub/sub payload limit is its own, and used to be pinned to
+        // memory mode's value cap. The chunked value pool took that cap to
+        // 64 KiB, which every slot in this ring would have to reserve whether
+        // or not anyone publishes — so the two parted ways. An over-long
+        // PUBLISH is refused in `worker.rs`, naming this limit.
+        assert_eq!(PUBSUB_MSG_LEN, 512);
         // One byte of every channel slot is reserved for the terminator.
         assert_eq!(MAX_CHANNEL_LEN, CHAN_LEN - 1);
     }

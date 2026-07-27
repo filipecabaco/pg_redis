@@ -7,10 +7,10 @@ how to verify a change, and which traps have already cost someone a day.
 
 | | |
 |---|---|
-| Rust tests | 111/111 on pg15, pg16, pg17 |
-| E2E | 205/205 under **both** `storage_mode=memory` and `storage_mode=auto` |
+| Rust tests | 120/120 on pg15, pg16, pg17 |
+| E2E | 209/209 under **both** `storage_mode=memory` and `storage_mode=auto` |
 | Lint | clippy clean at `-D warnings`, `cargo fmt --check` clean |
-| Shared memory | 413 MB `shared_memory_size` at the defaults, down from 587 MB |
+| Shared memory | 308 MB `shared_memory_size` at the defaults, down from 587 MB |
 
 ## Verifying a change
 
@@ -94,7 +94,30 @@ PGRX_HOME=$HOME/pgrxassert cargo pgrx test pg17
 ```
 
 Keep it under its own `PGRX_HOME` so the fast system-PostgreSQL config stays
-intact for everyday runs.
+intact for everyday runs, and give it its own `CARGO_TARGET_DIR` — the bindings
+differ from the system build's, so sharing one target directory means a full
+rebuild every time you switch.
+
+### `cargo pgrx test` also has to run as a non-root user
+
+It runs `initdb` itself, which refuses to run as root exactly as the e2e setup
+above does — the failure is a wall of "Could not obtain test mutex" from every
+test after the first, with the real message ("initdb: error: cannot be run as
+root") only in the first one's output. From a root container:
+
+```bash
+useradd -m pgu
+cp -a ~/.cargo ~/.pgrx /home/pgu/ && chown -R pgu /home/pgu
+chown -R pgu "$PWD"                                   # target/ is written during the run
+chown -R pgu /usr/lib/postgresql/*/lib /usr/share/postgresql/*/extension
+sudo -u pgu env HOME=/home/pgu PATH=/home/pgu/.cargo/bin:$PATH \
+  RUSTUP_HOME=$HOME/.rustup CARGO_HOME=/home/pgu/.cargo cargo pgrx test pg17
+```
+
+`cargo pgrx init --pgN download` fetches from `ftp.postgresql.org`, which is not
+always reachable. Pointing pgrx at the PGDG packages
+(`cargo pgrx init --pg15 /usr/lib/postgresql/15/bin/pg_config …`) gets the
+matrix running; it is the assert-enabled build above that has to be compiled.
 
 ### Traps
 
@@ -140,18 +163,29 @@ have — which is why everything funnels through the bgworker main thread today.
 Closing this needs a design, not a patch. Lock sharding only becomes
 interesting afterwards.
 
-### 2. Chunked value pool (memory, and the value cap)
+### 2. Done — chunked value pool
 
-Roughly **155 MiB of the 202 MiB** the extension reserves is overflow tables —
-`kv_overflow` 75 MiB, `hash_overflow` 42.5 MiB, `list_overflow` 37.8 MiB — all
-preallocated as though every value exceeded the 64-byte inline slot. Almost
-none do.
+The three overflow tables are gone. Values spill into a per-table slab of
+64-byte chunks on a free list, chained by index; `shared_memory_size` went from
+413 MB to 308 MB and the value cap from 512 bytes to 64 KiB. See
+`docs/storage-modes.md` for the sizing and the two bounds on the cap.
 
-Replacing the fixed 448-byte overflow entry with a shared slab of fixed-size
-chunks on a free list, chained by index, reclaims most of that. It also turns
-`MAX_TOTAL_VAL_LEN` from a compile-time constant into a function of pool
-capacity, which makes the 512-byte value limit a sizing question rather than a
-Redis-parity gap.
+What is left over from it:
+
+- **A full pool refuses spilling writes, and only `reserve_chunks` asks for
+  room.** It runs on the paths where bulk data arrives — `SET`, `MSET`,
+  `GETSET`, `APPEND`, `HSET`, `HSETNX`, `LPUSH`, `RPUSH`. The others (`LSET`,
+  `LINSERT`, `LMOVE`) reply `OOM` on an empty pool without trying to evict
+  first. Eviction cannot simply be moved into `value_write`: it may remove any
+  entry in the table, including the one being written, which is why it runs
+  before the entry exists.
+- **Chunk lifecycle is the thing to be careful with.** Every removal of an
+  entry that owns a value goes through `remove_valued` (or `list_remove_at`,
+  its bare-HTAB twin), which frees the chain *before* the entry — the chain head
+  lives in the entry. A path that calls `hash_search(HASH_REMOVE)` on the KV,
+  hash or list table directly would leak silently until the pool ran dry.
+  `values_round_trip_through_the_pool_at_every_boundary` and the e2e
+  "rewriting a large value many times" test are the guards.
 
 ### 3. Smaller items
 
@@ -164,7 +198,8 @@ Redis-parity gap.
   set members. Hashing the key out of the composite tables freed 174 MiB, so
   there is headroom to raise it now.
 - **`redis.mem_max_entries` is still 8192**, halved when `MAX_KEY_LEN` grew to
-  512. The same headroom applies.
+  512. The same headroom applies, and the chunked pool added ~105 MB more of
+  it. Note that raising it now buys pool capacity as well as key capacity.
 
 ## Design notes
 
@@ -197,5 +232,22 @@ Things that are easy to get wrong without knowing why they are the way they are.
 ## Benchmarking
 
 `redis-benchmark` defaults to 3-byte values, so the standard suite never leaves
-the 64-byte inline slot. `mise run bench-value-sizes` sweeps 3/63/64/65/200/512
-bytes to make the inline-to-overflow boundary visible.
+the 64-byte inline slot. `mise run bench-value-sizes` sweeps
+3/63/64/65/200/512/4096/65536 bytes to make the inline-to-pool boundary
+visible.
+
+**Point the benchmark at db 0 with `storage_mode=memory`.** The compose default
+is `redis.default_db=8`, the WAL-logged half — a benchmark that forgets this
+measures fsync and reports ~500 requests/second for everything.
+`bench-value-sizes` and `bench-report` set both; `bench` does not, by design.
+
+**`redis-benchmark` never clears `mylist`.** Its `lpush`, `rpush` and `lrange`
+tests build the list up over the whole run and `-n 20000` is past what a list
+table holds at the default `redis.mem_max_entries`, so the run ends in an OOM
+the tool reports as nothing at all. `docker/bench/report.sh` clears the key and
+uses 4,000 requests for those.
+
+CI runs `docker/bench/report.sh` on every pull request and posts it as a
+comment, keyed on an HTML marker so each push edits the same one — and deletes
+any duplicate, so the thread carries exactly one report however many times it
+runs.

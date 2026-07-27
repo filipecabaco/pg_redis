@@ -340,3 +340,105 @@ jobs:
       - name: Print logs on failure
         if: failure()
         run: docker compose --profile e2e logs
+
+  # Benchmarks, published on the pull request rather than buried in a log.
+  #
+  # Not a gate. GitHub-hosted runners are shared, so absolute numbers move
+  # between runs on their own; what this catches is a collapse — a change that
+  # takes a command from tens of thousands per second to hundreds. The
+  # reference Redis runs on the same runner for exactly that reason: the ratio
+  # survives a noisy neighbour where the raw figure does not.
+  bench:
+    name: Benchmarks
+    needs: [image]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      # Memory mode on db 0. The compose default is the durable half, which
+      # measures WAL rather than anything this repository changes.
+      PG_REDIS_STORAGE_MODE: memory
+      PG_REDIS_DEFAULT_DB: "0"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+
+      - name: Restore Docker layers
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ hashFiles('Dockerfile', 'Cargo.toml', 'Cargo.lock', 'src/**', 'sql/**') }}
+          restore-keys: ${{ runner.os }}-buildx-
+
+      - name: Load postgres image from cache
+        uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1 # v6.16.0
+        with:
+          context: .
+          load: true
+          tags: pg_redis:latest
+          cache-from: type=local,src=/tmp/.buildx-cache
+
+      - name: Start pg_redis and the reference Redis
+        run: docker compose --profile bench up -d --no-build --wait
+
+      - name: Run benchmarks
+        run: bash docker/bench/report.sh | tee bench.md
+
+      # Always visible, including on pull requests from forks, where the token
+      # this job is handed cannot write a comment.
+      - name: Publish to the job summary
+        run: cat bench.md >> "$GITHUB_STEP_SUMMARY"
+
+      # Exactly one report on the thread, always. The marker in the report is
+      # what identifies it, so this edits its own comment and never anyone
+      # else's; a push updates the numbers rather than appending a second
+      # table, and any duplicate an earlier run left behind is removed.
+      - name: Comment on the pull request
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/$REPO"
+          auth=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
+          marker='<!-- pg_redis-bench -->'
+
+          # Every page, not just the first hundred comments: on a long thread
+          # the report would otherwise scroll out of sight and a second one
+          # would be posted beside it on every push from then on.
+          ids=""
+          page=1
+          while :; do
+            batch=$(curl -sS "${auth[@]}" "$api/issues/$PR/comments?per_page=100&page=$page")
+            if [ "$(jq 'length' <<< "$batch")" -eq 0 ]; then
+              break
+            fi
+            ids="$ids $(jq -r --arg m "$marker" '.[] | select(.body | contains($m)) | .id' <<< "$batch")"
+            page=$((page + 1))
+          done
+
+          body=$(jq -Rs '{body: .}' < bench.md)
+          # shellcheck disable=SC2086 -- ids are integers, splitting is the point
+          set -- $ids
+          if [ $# -eq 0 ]; then
+            curl -sS -X POST "${auth[@]}" "$api/issues/$PR/comments" -d "$body" > /dev/null
+            echo "posted the report"
+          else
+            curl -sS -X PATCH "${auth[@]}" "$api/issues/comments/$1" -d "$body" > /dev/null
+            echo "updated report $1 in place"
+            shift
+            for extra in "$@"; do
+              curl -sS -X DELETE "${auth[@]}" "$api/issues/comments/$extra" > /dev/null
+              echo "deleted duplicate report $extra"
+            done
+          fi
+
+      - name: Print logs on failure
+        if: failure()
+        run: docker compose --profile bench logs

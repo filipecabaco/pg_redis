@@ -118,18 +118,33 @@ run_suite 'Redis 7 (reference)' redis
 run_suite 'pg_redis' postgres
 """
 
+[tasks.bench-report]
+description = "Benchmark memory mode against Redis and print the markdown CI posts on a PR"
+run = """
+set -e
+PG_REDIS_STORAGE_MODE=memory PG_REDIS_DEFAULT_DB=0 \
+  docker compose -f docker-compose.yml -f docker-compose.noports.yml --profile bench up -d --build --wait
+trap 'docker compose --profile bench down' EXIT INT TERM
+bash docker/bench/report.sh
+"""
+
 [tasks.bench-value-sizes]
 description = "Benchmark SET/GET across the value-size boundaries the default -d 3 never reaches"
 run = """
 set -e
-docker compose -f docker-compose.yml -f docker-compose.noports.yml --profile bench up -d --build --wait
+# Memory mode on db 0: the inline slot and the chunk pool this sweeps only
+# exist there. The compose default is the durable half, where every size is a
+# bytea column and the boundaries do not exist.
+PG_REDIS_STORAGE_MODE=memory PG_REDIS_DEFAULT_DB=0 \
+  docker compose -f docker-compose.yml -f docker-compose.noports.yml --profile bench up -d --build --wait
 trap 'docker compose --profile bench down' EXIT INT TERM
 sleep 2
 
 # redis-benchmark defaults to 3-byte values, so the standard suite never leaves
 # the 64-byte inline slot. These sizes straddle every boundary the memory
-# backend has: the inline slot, the overflow table, and the 512-byte cap.
-for d in 3 63 64 65 200 512; do
+# backend has: the inline slot, the first chunk of the value pool, several
+# chunks, and the 64 KiB cap.
+for d in 3 63 64 65 200 512 4096 65536; do
   echo ''
   echo "══ value size ${d} bytes ═══════════════════════════════"
   for t in set get; do

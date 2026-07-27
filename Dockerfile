@@ -38,9 +38,7 @@ RUN PG_CONFIG=$(cat /pg_config_path) && \
     cargo pgrx init --pg17 "$PG_CONFIG"
 
 RUN PG_CONFIG=$(cat /pg_config_path) && \
-    cargo pgrx package --pg-config "$PG_CONFIG" --features pg17 && \
-    grep -v '\\echo\|\\quit' /build/sql/pg_redis--0.0.0.sql \
-      >> /build/target/release/pg_redis-pg17/usr/local/share/postgresql/extension/pg_redis--0.0.0.sql
+    cargo pgrx package --pg-config "$PG_CONFIG" --features pg17
 
 # ── Runtime image ──────────────────────────────────────────────────────────────
 FROM postgres:17-alpine

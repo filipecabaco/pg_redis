@@ -3,8 +3,20 @@
 All figures are requests/second on Docker, Apple M-series. Benchmarks use [`redis-benchmark`](https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/benchmarks/) with `-n 50000 -c 200`, connecting to the default database (db 0 for memory/unlogged, db 8 for logged).
 
 `redis-benchmark` writes 3-byte values by default, which never leave memory
-mode's 64-byte inline slot — so these figures say nothing about the overflow
-path. `mise run bench-value-sizes` sweeps 3/63/64/65/200/512 bytes for that.
+mode's 64-byte inline slot — so these figures say nothing about the chunk pool
+that holds anything longer. `mise run bench-value-sizes` sweeps
+3/63/64/65/200/512/4096/65536 bytes for that.
+
+## On every pull request
+
+CI runs the suite below against memory mode and a Redis 7 container on the same
+runner, and posts the result as a comment on the pull request (updating it in
+place on each push). Runners are shared and the absolute numbers move between
+runs, so it is a smoke signal — a command falling from tens of thousands per
+second to hundreds — rather than a regression gate. The ratio against the
+Redis running beside it is the part that travels.
+
+`mise run bench-report` produces the same report locally.
 
 ## Commands
 

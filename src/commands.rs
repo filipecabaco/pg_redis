@@ -11,10 +11,10 @@ pub const NUM_DBS: usize = 16;
 pub const DURABLE_FROM: u8 = 8;
 
 /// Lowest ephemeral database — what `SELECT cache` resolves to.
-pub const CACHE_DB: u8 = 0;
+const CACHE_DB: u8 = 0;
 
 /// Lowest durable database — what `SELECT durable` resolves to.
-pub const DURABLE_DB: u8 = DURABLE_FROM;
+const DURABLE_DB: u8 = DURABLE_FROM;
 
 /// Whether `db` belongs to the ephemeral half.
 pub const fn is_ephemeral(db: u8) -> bool {
@@ -3761,12 +3761,13 @@ impl Command {
         // write that fills the table part-way through (MSET, SADD with many
         // members) the earlier keys are already stored when the error is
         // reported, where Redis would have rejected the command whole.
-        crate::mem::take_oom();
+        crate::mem::take_refusal();
         let response = self.execute_mem_inner(db as usize);
-        if crate::mem::take_oom() {
-            return mem_out_of_memory();
+        match crate::mem::take_refusal() {
+            crate::mem::Refusal::None => response,
+            crate::mem::Refusal::OutOfMemory => mem_out_of_memory(),
+            crate::mem::Refusal::KeyCollision => mem_key_collision(),
         }
-        response
     }
 
     fn execute_mem_inner(&self, db_idx: usize) -> Response {
@@ -4644,17 +4645,18 @@ impl Command {
     /// Refuse anything the shared-memory backend would have to truncate to
     /// store.
     ///
-    /// Keys and members live in fixed-size arrays, and the old behaviour was to
-    /// copy as much as fit. That is the one failure mode worse than an error:
-    /// two distinct keys sharing a 511-byte prefix collapse onto the same
-    /// entry, so a `GET` returns another key's value and a `DEL` removes it.
-    /// Redis has no length limit at all, so the closest we can get in a
-    /// fixed-size region is to refuse and name the database that has no limit.
+    /// Hash fields and set members live in fixed-size arrays, so the only
+    /// alternative to refusing is to copy as much as fits — the one failure
+    /// mode worse than an error. Two members sharing a `MEM_MAX_MEMBER`-byte
+    /// prefix would collapse onto the same entry, so an `HGET` returns another
+    /// field's value and an `HDEL` removes it. Redis has no length limit at
+    /// all, so the closest a fixed-size region gets is to refuse and name the
+    /// database that has no limit.
     ///
-    /// A value is bounded for a different reason: it spills into a chunk pool
-    /// rather than a fixed slot, so the limit is what one value may claim of
-    /// that pool — see `mem::max_total_val_len`. Over it is still a refusal,
-    /// never a truncation.
+    /// Keys and values are bounded for a different reason: they spill into a
+    /// chunk pool rather than a fixed slot, so the limit is what one of them
+    /// may claim of that pool — see `mem::max_total_val_len` and `MEM_MAX_KEY`.
+    /// Over it is still a refusal, never a truncation.
     ///
     /// Runs before the command executes, so a refusal never leaves a partial
     /// write behind. Allocation-free — the arms borrow and the iterators are
@@ -4878,6 +4880,19 @@ fn mem_value_too_large() -> Response {
 
 /// Redis's own wording for a write refused because the store is full, so a
 /// client's existing OOM handling recognises it.
+/// Two distinct keys whose 128-bit keyed hashes agree.
+///
+/// Unreachable in practice at `redis.mem_max_entries` keys per database. It
+/// exists because the KV table keeps the key bytes and can therefore tell; the
+/// alternative is to write over the key already there, silently.
+fn mem_key_collision() -> Response {
+    Response::Error(
+        "ERR key hash collides with a different key already stored; \
+         rename the key, or use SELECT durable."
+            .to_string(),
+    )
+}
+
 fn mem_out_of_memory() -> Response {
     Response::Error(
         "OOM command not allowed when used memory > 'maxmemory'. Raise \
@@ -4886,11 +4901,13 @@ fn mem_out_of_memory() -> Response {
     )
 }
 
-/// Longest key the shared-memory backend stores intact. `make_key` reserves the
-/// final byte of the slot for the NUL terminator.
-pub const MEM_MAX_KEY: usize = crate::mem::MAX_KEY_LEN - 1;
+/// Longest key the shared-memory backend stores intact.
+///
+/// The whole of `MAX_KEY_LEN`: keys are length-prefixed, so none of it goes to
+/// a terminator.
+const MEM_MAX_KEY: usize = crate::mem::MAX_KEY_LEN;
 /// Longest hash field or set/zset member the shared-memory backend stores intact.
-pub const MEM_MAX_MEMBER: usize = crate::mem::MAX_MEMBER_LEN;
+const MEM_MAX_MEMBER: usize = crate::mem::MAX_MEMBER_LEN;
 
 /// What exceeded a shared-memory limit, if anything.
 enum Over {
@@ -6802,10 +6819,10 @@ mod tests {
         assert_eq!(crate::mem::NUM_MEM_DBS, DURABLE_FROM as usize);
     }
 
-    /// Memory mode used to copy as much of an over-long key, field or value as
-    /// fit into its fixed-size slot. Every command that reaches the
-    /// shared-memory backend must now refuse instead, before it writes
-    /// anything — a truncated key collides with whatever shares its prefix.
+    /// Every command that reaches the shared-memory backend must refuse an
+    /// over-long key, field or value before it writes anything. Copying as much
+    /// as fits is the alternative, and a truncated member collides with
+    /// whatever shares its prefix.
     #[test]
     fn oversized_keys_fields_and_values_are_refused_by_memory_mode() {
         let key = "k".repeat(MEM_MAX_KEY + 1);

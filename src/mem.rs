@@ -4,41 +4,65 @@ use std::ffi::c_void;
 use std::ptr::addr_of;
 use std::ptr::addr_of_mut;
 
-// Maximum key length (null-terminated string fits in HTAB key). Keys are the
-// thing applications namespace and make long, so this is generous.
+/// Maximum key length. Keys are the thing applications namespace and make long,
+/// so this is generous.
+///
+/// Not an entry-layout bound: keys are length-prefixed and only the first
+/// `INLINE_KEY_LEN` bytes live in the entry. This is a pool bound — how much of
+/// the slab the values spill into one key is allowed to take.
 pub const MAX_KEY_LEN: usize = 512;
 // Maximum hash field / set member / sorted-set member length. Kept smaller than
 // MAX_KEY_LEN on purpose: the hash, set and zset entries each store a key *and*
 // a member, so this length is multiplied across the largest tables.
 pub const MAX_MEMBER_LEN: usize = 128;
 // HTAB key for the hash/set/zset tables: the redis key followed by the member.
-/// Composite tables index on a 128-bit keyed hash of the Redis key rather than
+/// Every table indexes on a 128-bit keyed hash of the Redis key rather than on
 /// the key itself.
 ///
-/// A hash, a set, a sorted set and a list all store one entry per member, and
-/// each entry carried a full `[u8; MAX_KEY_LEN]` copy of the key it belongs to
-/// — 512 of a `SetEntry`'s 640 bytes, repeated for every member. Nothing ever
-/// needed those bytes back: every composite-table access is a comparison
-/// against a key the caller already holds, and the only paths that hand a key
-/// to a client (`KEYS`, `SCAN`, `RANDOMKEY`) read the KV table, which still
-/// stores keys verbatim.
+/// A hash, a set, a sorted set and a list store one entry per member, and a
+/// full copy of the key in each would dominate the entry — 512 bytes against a
+/// `SetEntry`'s 144, repeated for every member. They need no more than the
+/// hash: every composite-table access is a comparison against a key the caller
+/// already holds.
+///
+/// The KV table is the exception. `KEYS`, `SCAN` and `RANDOMKEY` hand real keys
+/// to clients, so it keys on the hash like the rest and keeps the bytes
+/// alongside — see `KvEntry`.
 ///
 /// Keyed with per-postmaster random material, so a client cannot craft two keys
 /// that collide and merge their contents.
-pub const KEY_HASH_LEN: usize = 16;
-pub type KeyHash = [u8; KEY_HASH_LEN];
+const KEY_HASH_LEN: usize = 16;
+type KeyHash = [u8; KEY_HASH_LEN];
 
-pub const COMPOSITE_KEY_LEN: usize = KEY_HASH_LEN + MAX_MEMBER_LEN;
+const COMPOSITE_KEY_LEN: usize = KEY_HASH_LEN + MAX_MEMBER_LEN;
 // HTAB key for the list tables: the redis key followed by the 8-byte position.
-pub const LIST_KEY_LEN: usize = KEY_HASH_LEN + 8;
+const LIST_KEY_LEN: usize = KEY_HASH_LEN + 8;
 // Inline value bytes stored directly in the main HTAB entry.
-pub const INLINE_VAL_LEN: usize = 64;
+const INLINE_VAL_LEN: usize = 64;
+
+/// Key bytes stored directly in a `KvEntry`; the rest spills into the pool.
+///
+/// Eight bytes here is 640 KiB of shared memory — 8192 entries × 8 databases,
+/// plus dynahash's 5/4 — so the prefix costs 10 MiB. What stops it being
+/// shorter is the pool rather than the entry: a key longer than this takes a
+/// chunk out of the *same* slab the values spill into, and that slab holds one
+/// chunk per entry.
+///
+/// Hence 128 and not 64. At 64 a key of 65–128 bytes costs a chunk, and
+/// `myapp:prod:session:<uuid>` is 60 to 90 — so a full table of ordinary keys
+/// would claim every chunk and leave nothing for any value past its own inline
+/// slot. At 128 the same cliff sits at 129 bytes, which conventional keys do
+/// not reach.
+///
+/// A longer key still works, at one chunk per 64 bytes over: a database of
+/// 200-byte keys holds 4,096 rather than 8,192. See `docs/IMPLEMENTATION.md`.
+const INLINE_KEY_LEN: usize = 128;
 // Number of even databases: 0,2,4,6,8,10,12,14 → indices 0..7
 /// One shared-memory database per entry in the ephemeral half; `db` indexes
 /// these directly.
 pub const NUM_MEM_DBS: usize = crate::commands::DURABLE_FROM as usize;
 // Step between list positions for LPUSH/RPUSH.
-pub const LIST_POS_STEP: i64 = 1024;
+const LIST_POS_STEP: i64 = 1024;
 
 fn htab_init_size() -> i64 {
     crate::MEM_MAX_ENTRIES.get() as i64
@@ -50,14 +74,26 @@ fn htab_init_size_small() -> i64 {
 
 /// Fixed-size entry stored in the HTAB shared memory hash table.
 /// The key field MUST be first — HTAB uses keysize bytes from the start.
+///
+/// Keyed on the same 128-bit hash the composite tables use, with the key bytes
+/// kept alongside it the way a value is kept: `INLINE_KEY_LEN` inline and the
+/// tail pooled. `KEYS`, `SCAN` and `RANDOMKEY` need those bytes back; keeping
+/// them is also what lets a lookup verify the key it found is the key it asked
+/// for, which no composite table can do.
 #[repr(C)]
-pub struct KvEntry {
-    /// Null-terminated key (up to MAX_KEY_LEN - 1 chars). This is the HTAB lookup key.
-    pub key: [u8; MAX_KEY_LEN],
+struct KvEntry {
+    /// SipHash of the Redis key — see `KEY_HASH_LEN`. The HTAB lookup key.
+    pub key: KeyHash,
+    /// First `INLINE_KEY_LEN` bytes of the key. The rest is in the chunk pool.
+    pub key_inline: [u8; INLINE_KEY_LEN],
     /// Inline value bytes (not null-terminated). Holds first INLINE_VAL_LEN bytes.
     pub value: [u8; INLINE_VAL_LEN],
     /// Expiry: microseconds since Unix epoch; 0 = no expiry.
     pub expires_at: i64,
+    /// Total key length; anything past INLINE_KEY_LEN lives in the chunk pool.
+    pub key_len: u32,
+    /// First chunk of the key's tail, `NIL_CHUNK` when the key fits inline.
+    pub key_overflow: u32,
     /// Total value length; anything past INLINE_VAL_LEN lives in the chunk pool.
     pub value_len: u32,
     /// First chunk of the tail in the database's value pool, `NIL_CHUNK` when
@@ -67,7 +103,7 @@ pub struct KvEntry {
 
 /// Fixed-size entry for the hash HTAB. Key is (redis_key[128], field[128]).
 #[repr(C)]
-pub struct HashEntry {
+struct HashEntry {
     /// SipHash of the Redis key — see `KEY_HASH_LEN`.
     pub key: KeyHash,
     pub field: [u8; MAX_MEMBER_LEN],
@@ -79,7 +115,7 @@ pub struct HashEntry {
 
 /// Fixed-size entry for the set HTAB. Key is (redis_key[128], member[128]).
 #[repr(C)]
-pub struct SetEntry {
+struct SetEntry {
     /// SipHash of the Redis key — see `KEY_HASH_LEN`.
     pub key: KeyHash,
     pub member: [u8; MAX_MEMBER_LEN],
@@ -87,7 +123,7 @@ pub struct SetEntry {
 
 /// Fixed-size entry for the sorted set HTAB. Key is (redis_key[128], member[128]).
 #[repr(C)]
-pub struct ZsetEntry {
+struct ZsetEntry {
     /// SipHash of the Redis key — see `KEY_HASH_LEN`.
     pub key: KeyHash,
     pub member: [u8; MAX_MEMBER_LEN],
@@ -96,7 +132,7 @@ pub struct ZsetEntry {
 
 /// Fixed-size entry for the list HTAB. Key is (redis_key[128], pos_bytes[8]).
 #[repr(C)]
-pub struct ListEntry {
+struct ListEntry {
     /// SipHash of the Redis key — see `KEY_HASH_LEN`.
     pub key: KeyHash,
     pub pos_bytes: [u8; 8],
@@ -109,7 +145,7 @@ pub struct ListEntry {
 /// Metadata entry for the list meta HTAB. Key is redis_key[128].
 /// Tracks min/max position and count for O(1) LPUSH/RPUSH/LPOP/RPOP.
 #[repr(C)]
-pub struct ListMeta {
+struct ListMeta {
     /// SipHash of the Redis key — see `KEY_HASH_LEN`.
     pub key: KeyHash,
     pub min_pos: i64,
@@ -120,7 +156,7 @@ pub struct ListMeta {
 /// Metadata entry for the sorted set meta HTAB. Key is redis_key[128].
 /// Tracks min/max score and members for O(1) ZPOPMIN/ZPOPMAX/ZCARD.
 #[repr(C)]
-pub struct ZsetMeta {
+struct ZsetMeta {
     /// SipHash of the Redis key — see `KEY_HASH_LEN`.
     pub key: KeyHash,
     pub count: i64,
@@ -135,7 +171,7 @@ pub struct ZsetMeta {
 /// Metadata entry for the set meta HTAB. Key is redis_key[128].
 /// Tracks count for O(1) SCARD/SPOP.
 #[repr(C)]
-pub struct SetMeta {
+struct SetMeta {
     /// SipHash of the Redis key — see `KEY_HASH_LEN`.
     pub key: KeyHash,
     pub count: i64,
@@ -145,10 +181,10 @@ pub struct SetMeta {
 
 /// Payload bytes in one pool chunk. Matches `INLINE_VAL_LEN`, so a value costs
 /// `ceil((len - 64) / 64)` chunks and the arithmetic has one boundary, not two.
-pub const CHUNK_LEN: usize = 64;
+const CHUNK_LEN: usize = 64;
 
 /// End of a chain, and the head of a value with no tail at all.
-pub const NIL_CHUNK: u32 = u32::MAX;
+const NIL_CHUNK: u32 = u32::MAX;
 
 /// A single value may claim at most this fraction of its table's pool.
 ///
@@ -162,7 +198,7 @@ const POOL_SHARE_PER_VALUE: usize = 8;
 /// table's LWLock is held, so an unbounded value would hold a whole database
 /// still for the length of one memcpy — and an order of magnitude more than
 /// this belongs in the durable half anyway.
-pub const MAX_VAL_CEILING: usize = 64 * 1024;
+const MAX_VAL_CEILING: usize = 64 * 1024;
 
 /// Chunks each pool is built with. One per entry slot: the inline slot already
 /// covers the values that motivated it, so a chunk apiece doubles what an
@@ -181,7 +217,7 @@ fn configured_pool_chunks() -> usize {
 /// off the per-command path. Falls back to the boot value when shared memory
 /// is not attached — unit tests, and the `auto` storage mode, where no pool
 /// exists and nothing is stored under this limit anyway.
-pub fn pool_chunks() -> usize {
+fn pool_chunks() -> usize {
     let c = ctl();
     if c.is_null() {
         return crate::MEM_MAX_ENTRIES_DEFAULT as usize;
@@ -217,13 +253,19 @@ pub struct ValPool {
 }
 
 /// Bytes one pool of `chunks` chunks occupies, header and links included.
-pub fn val_pool_size(chunks: usize) -> usize {
+fn val_pool_size(chunks: usize) -> usize {
     std::mem::size_of::<ValPool>() + chunks * (std::mem::size_of::<u32>() + CHUNK_LEN)
 }
 
 /// Chunks a value of `len` bytes needs beyond its inline slot.
 fn chunks_for(len: usize) -> usize {
-    len.saturating_sub(INLINE_VAL_LEN).div_ceil(CHUNK_LEN)
+    chunks_beyond(len, INLINE_VAL_LEN)
+}
+
+/// Chunks a byte string of `len` needs beyond an inline slot of `inline`.
+/// Keys and values have different inline slots — see `INLINE_KEY_LEN`.
+fn chunks_beyond(len: usize, inline: usize) -> usize {
+    len.saturating_sub(inline).div_ceil(CHUNK_LEN)
 }
 
 unsafe fn pool_links(pool: *mut ValPool) -> *mut u32 {
@@ -245,7 +287,7 @@ unsafe fn chunk_data(pool: *mut ValPool, idx: u32) -> *mut u8 {
 ///
 /// # Safety
 /// `pool` must point at `val_pool_size(capacity)` writable bytes.
-pub unsafe fn pool_init(pool: *mut ValPool, capacity: usize) {
+unsafe fn pool_init(pool: *mut ValPool, capacity: usize) {
     let capacity = capacity.min(NIL_CHUNK as usize) as u32;
     unsafe {
         addr_of_mut!((*pool).capacity).write(capacity);
@@ -363,14 +405,48 @@ unsafe fn pool_read_into(pool: *mut ValPool, head: u32, len: usize, out: &mut Ve
     }
 }
 
-/// The three fields that make up a stored value, wherever it lives.
+/// Whether the chain starting at `head` holds exactly `expect`.
+///
+/// The comparing form of `pool_read_into`. A lookup that verifies its key runs
+/// on the read path of every command that takes one, so it must not allocate a
+/// `Vec` to do the comparison.
+unsafe fn pool_chain_eq(pool: *mut ValPool, head: u32, expect: &[u8]) -> bool {
+    if pool.is_null() {
+        return expect.is_empty();
+    }
+    unsafe {
+        let links = pool_links(pool);
+        let capacity = (*pool).capacity;
+        let mut idx = head;
+        let mut rest = expect;
+        while !rest.is_empty() {
+            if idx == NIL_CHUNK || idx >= capacity {
+                return false;
+            }
+            let n = rest.len().min(CHUNK_LEN);
+            if std::slice::from_raw_parts(chunk_data(pool, idx), n) != &rest[..n] {
+                return false;
+            }
+            rest = &rest[n..];
+            idx = links.add(idx as usize).read();
+        }
+        true
+    }
+}
+
+/// The fields that make up a stored byte string, wherever it lives.
 ///
 /// `KvEntry`, `HashEntry` and `ListEntry` carry the same trio at different
-/// offsets; naming it once is what keeps the chunk lifecycle to a single
-/// implementation rather than three that have to be kept in step.
+/// offsets, and a `KvEntry` carries it twice — once for its value and once for
+/// its key. Naming it once is what keeps the chunk lifecycle to a single
+/// implementation rather than four that have to be kept in step.
+///
+/// `inline_cap` is a field rather than a constant because the key prefix and
+/// the value prefix are not the same size — see `INLINE_KEY_LEN`.
 #[derive(Copy, Clone)]
 struct ValueSlot {
     inline: *mut u8,
+    inline_cap: usize,
     len: *mut u32,
     head: *mut u32,
 }
@@ -379,8 +455,26 @@ unsafe fn kv_slot(entry: *mut KvEntry) -> ValueSlot {
     unsafe {
         ValueSlot {
             inline: addr_of_mut!((*entry).value).cast(),
+            inline_cap: INLINE_VAL_LEN,
             len: addr_of_mut!((*entry).value_len),
             head: addr_of_mut!((*entry).overflow),
+        }
+    }
+}
+
+/// The key of a KV entry, as a `ValueSlot`.
+///
+/// A key is stored exactly the way a value is — inline prefix, pooled tail —
+/// so it reads, writes and frees through the same three functions. `key_slot`
+/// and `kv_slot` name disjoint fields of the same entry, so a caller may hold
+/// both at once.
+unsafe fn key_slot(entry: *mut KvEntry) -> ValueSlot {
+    unsafe {
+        ValueSlot {
+            inline: addr_of_mut!((*entry).key_inline).cast(),
+            inline_cap: INLINE_KEY_LEN,
+            len: addr_of_mut!((*entry).key_len),
+            head: addr_of_mut!((*entry).key_overflow),
         }
     }
 }
@@ -389,6 +483,7 @@ unsafe fn hash_slot(entry: *mut HashEntry) -> ValueSlot {
     unsafe {
         ValueSlot {
             inline: addr_of_mut!((*entry).value).cast(),
+            inline_cap: INLINE_VAL_LEN,
             len: addr_of_mut!((*entry).value_len),
             head: addr_of_mut!((*entry).overflow),
         }
@@ -399,6 +494,7 @@ unsafe fn list_slot(entry: *mut ListEntry) -> ValueSlot {
     unsafe {
         ValueSlot {
             inline: addr_of_mut!((*entry).value).cast(),
+            inline_cap: INLINE_VAL_LEN,
             len: addr_of_mut!((*entry).value_len),
             head: addr_of_mut!((*entry).overflow),
         }
@@ -409,13 +505,33 @@ unsafe fn list_slot(entry: *mut ListEntry) -> ValueSlot {
 unsafe fn value_read(pool: *mut ValPool, slot: ValueSlot) -> Vec<u8> {
     unsafe {
         let total = slot.len.read() as usize;
-        let inline_len = total.min(INLINE_VAL_LEN);
+        let inline_len = total.min(slot.inline_cap);
         let mut out = Vec::with_capacity(total);
         out.extend_from_slice(std::slice::from_raw_parts(slot.inline, inline_len));
-        if total > INLINE_VAL_LEN {
-            pool_read_into(pool, slot.head.read(), total - INLINE_VAL_LEN, &mut out);
+        if total > slot.inline_cap {
+            pool_read_into(pool, slot.head.read(), total - slot.inline_cap, &mut out);
         }
         out
+    }
+}
+
+/// Whether the slot holds exactly `expect`, without copying it out.
+///
+/// The length is checked first, so the byte comparison only runs for a slot
+/// that could still match, and the inline prefix — already in cache, the entry
+/// having just been fetched — settles all but the keys longer than it.
+unsafe fn value_eq(pool: *mut ValPool, slot: ValueSlot, expect: &[u8]) -> bool {
+    unsafe {
+        let total = slot.len.read() as usize;
+        if total != expect.len() {
+            return false;
+        }
+        let inline_len = total.min(slot.inline_cap);
+        if std::slice::from_raw_parts(slot.inline, inline_len) != &expect[..inline_len] {
+            return false;
+        }
+        total <= slot.inline_cap
+            || pool_chain_eq(pool, slot.head.read(), &expect[slot.inline_cap..])
     }
 }
 
@@ -426,7 +542,7 @@ unsafe fn value_read(pool: *mut ValPool, slot: ValueSlot) -> Vec<u8> {
 /// removal helpers below take the entry rather than its key.
 unsafe fn value_free(pool: *mut ValPool, slot: ValueSlot) {
     unsafe {
-        if slot.len.read() as usize > INLINE_VAL_LEN {
+        if slot.len.read() as usize > slot.inline_cap {
             pool_release(pool, slot.head.read());
         }
         slot.len.write(0);
@@ -434,13 +550,13 @@ unsafe fn value_free(pool: *mut ValPool, slot: ValueSlot) {
     }
 }
 
-/// Store `value` in the slot, spilling past `INLINE_VAL_LEN` into the pool.
+/// Store `value` in the slot, spilling past the slot's inline capacity.
 ///
 /// Returns false with the slot left empty when the pool cannot hold the tail.
 /// The slot is always written, never left as the caller found it: an entry
 /// fresh out of `hash_search(HASH_ENTER)` is recycled shared memory with only
-/// its key initialised, so a return without a write would expose whichever
-/// value previously occupied it.
+/// its key initialised, so a return without a write would expose whatever the
+/// last occupant left there.
 unsafe fn value_write(pool: *mut ValPool, slot: ValueSlot, value: &[u8]) -> bool {
     let limit = max_total_val_len();
     debug_assert!(
@@ -453,12 +569,12 @@ unsafe fn value_write(pool: *mut ValPool, slot: ValueSlot, value: &[u8]) -> bool
     if value.len() > limit {
         return false;
     }
-    let inline_len = value.len().min(INLINE_VAL_LEN);
+    let inline_len = value.len().min(slot.inline_cap);
     unsafe {
         std::ptr::copy_nonoverlapping(value.as_ptr(), slot.inline, inline_len);
         slot.len.write(value.len() as u32);
-        if value.len() > INLINE_VAL_LEN {
-            let Some(head) = pool_store(pool, &value[INLINE_VAL_LEN..]) else {
+        if value.len() > slot.inline_cap {
+            let Some(head) = pool_store(pool, &value[slot.inline_cap..]) else {
                 // `value_len` already promises a tail that has nowhere to live.
                 slot.len.write(0);
                 signal_oom();
@@ -618,7 +734,7 @@ fn hash_key_material() -> [u64; 4] {
 }
 
 /// The 128-bit handle a composite table stores in place of the Redis key.
-pub fn key_hash(key: &[u8]) -> KeyHash {
+fn key_hash(key: &[u8]) -> KeyHash {
     let k = hash_key_material();
     let mut out = [0u8; KEY_HASH_LEN];
     out[..8].copy_from_slice(&siphash24(k[0], k[1], key).to_le_bytes());
@@ -634,13 +750,13 @@ pub fn key_hash(key: &[u8]) -> KeyHash {
 /// there too — refusing the write is the behaviour a client is most likely to
 /// already handle.
 #[derive(Copy, Clone, PartialEq)]
-pub enum EvictPolicy {
+enum EvictPolicy {
     NoEviction,
     AllKeysRandom,
     VolatileTtl,
 }
 
-pub fn evict_policy() -> EvictPolicy {
+fn evict_policy() -> EvictPolicy {
     match crate::MAXMEMORY_POLICY
         .get()
         .as_deref()
@@ -659,25 +775,42 @@ pub fn evict_policy() -> EvictPolicy {
 /// that scan over the next `EVICT_BATCH` inserts.
 const EVICT_BATCH: usize = 64;
 
+/// Why a shared-memory write was refused, when it was.
+///
+/// One value rather than a flag per cause, so reading it costs two
+/// thread-local accesses per command however many causes there are.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Refusal {
+    None,
+    /// The table or its chunk pool had no room.
+    OutOfMemory,
+    /// The key hashed onto an entry holding a different key.
+    KeyCollision,
+}
+
 thread_local! {
-    /// Set when an insert was refused for want of room. Read and cleared by
-    /// `Command::execute_mem`, which turns it into Redis's OOM error.
+    /// Set when a write was refused. Read and cleared by
+    /// `Command::execute_mem`, which turns it into the matching error.
     ///
     /// The alternative was threading a "table full" result out through all 68
     /// `mem_*` entry points, whose return types are `bool`, `i64`,
     /// `Result<i64, String>`, `Vec<..>` and more. A worker dispatches one
     /// command at a time on one thread, so the flag cannot cross commands.
-    static OOM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static REFUSED: std::cell::Cell<Refusal> = const { std::cell::Cell::new(Refusal::None) };
 }
 
 fn signal_oom() {
-    OOM.set(true);
+    REFUSED.set(Refusal::OutOfMemory);
 }
 
-/// Clears the flag and reports whether the command just executed was refused
-/// for want of shared memory.
-pub fn take_oom() -> bool {
-    OOM.replace(false)
+fn signal_key_collision() {
+    REFUSED.set(Refusal::KeyCollision);
+}
+
+/// Clears the flag and reports why the command just executed was refused, if it
+/// was. Last cause wins.
+pub fn take_refusal() -> Refusal {
+    REFUSED.replace(Refusal::None)
 }
 
 /// Enter `key_ptr`, calling `make_room` and retrying once if the table is full.
@@ -719,6 +852,22 @@ unsafe fn reserve_chunks(pool: *mut ValPool, value_len: usize, make_room: impl F
     }
 }
 
+/// `reserve_chunks` for the KV table, where a write may need chunks for the
+/// value *and* — when the key is new and longer than `INLINE_KEY_LEN` — for the
+/// key. Same contract: runs before the entry exists, and costs one comparison
+/// under `noeviction`.
+unsafe fn kv_reserve(
+    pool: *mut ValPool,
+    key: &[u8],
+    value_len: usize,
+    make_room: impl FnOnce() -> bool,
+) {
+    let need = chunks_beyond(key.len(), INLINE_KEY_LEN) + chunks_for(value_len);
+    if need > 0 && unsafe { pool_free_chunks(pool) } < need {
+        make_room();
+    }
+}
+
 /// Bare-pointer form of `enter_or_evict`, for the call sites that carry an
 /// HTAB rather than a `SharedTable`.
 unsafe fn enter_raw<E>(
@@ -750,8 +899,10 @@ unsafe fn evict_kv(htab: *mut pg_sys::HTAB, pool: *mut ValPool) -> bool {
     };
     let table = &table;
     let now = now_micros();
-    // (expiry used for ranking, key). Expired entries rank first by using 0.
-    let mut victims: Vec<(i64, [u8; MAX_KEY_LEN])> = Vec::with_capacity(EVICT_BATCH);
+    // (expiry used for ranking, key hash). Expired entries rank first by using
+    // 0. Eviction removes by the hash it read out of the entry, so it never
+    // needs the key bytes and never has to verify them.
+    let mut victims: Vec<(i64, KeyHash)> = Vec::with_capacity(EVICT_BATCH);
     let mut saw_expired = false;
 
     let mut scan = unsafe { table.scan() };
@@ -785,23 +936,41 @@ unsafe fn evict_kv(htab: *mut pg_sys::HTAB, pool: *mut ValPool) -> bool {
 
 /// Remove an entry and return its chunks to the pool.
 ///
-/// The chain head lives in the entry, so the release has to happen while the
-/// entry is still there. Every removal of a valued entry goes through here for
-/// that reason — a chunk leak is invisible until the pool runs dry.
+/// The chain heads live in the entry, so the release has to happen while the
+/// entry is still there. Every removal of an entry that owns a chain goes
+/// through here for that reason — a chunk leak is invisible until the pool runs
+/// dry. `free_of` rather than a single slot because a `KvEntry` owns two.
 unsafe fn remove_valued<E>(
     table: &SharedTable<E>,
     pool: *mut ValPool,
     key_ptr: *const c_void,
-    slot_of: unsafe fn(*mut E) -> ValueSlot,
+    free_of: unsafe fn(*mut ValPool, *mut E),
 ) -> bool {
     unsafe {
         let Some(entry) = table.find(key_ptr) else {
             return false;
         };
-        value_free(pool, slot_of(entry));
+        free_of(pool, entry);
         table.remove(key_ptr);
         true
     }
+}
+
+/// A KV entry owns two chains: its value's and its key's. Both have to go back,
+/// and both before the entry does.
+unsafe fn kv_free(pool: *mut ValPool, entry: *mut KvEntry) {
+    unsafe {
+        value_free(pool, kv_slot(entry));
+        value_free(pool, key_slot(entry));
+    }
+}
+
+unsafe fn hash_free(pool: *mut ValPool, entry: *mut HashEntry) {
+    unsafe { value_free(pool, hash_slot(entry)) }
+}
+
+unsafe fn list_free(pool: *mut ValPool, entry: *mut ListEntry) {
+    unsafe { value_free(pool, list_slot(entry)) }
 }
 
 unsafe fn kv_remove(
@@ -809,7 +978,7 @@ unsafe fn kv_remove(
     pool: *mut ValPool,
     key_ptr: *const c_void,
 ) -> bool {
-    unsafe { remove_valued(table, pool, key_ptr, kv_slot) }
+    unsafe { remove_valued(table, pool, key_ptr, kv_free) }
 }
 
 unsafe fn hash_remove(
@@ -817,7 +986,7 @@ unsafe fn hash_remove(
     pool: *mut ValPool,
     key_ptr: *const c_void,
 ) -> bool {
-    unsafe { remove_valued(table, pool, key_ptr, hash_slot) }
+    unsafe { remove_valued(table, pool, key_ptr, hash_free) }
 }
 
 unsafe fn list_remove(
@@ -825,7 +994,7 @@ unsafe fn list_remove(
     pool: *mut ValPool,
     key_ptr: *const c_void,
 ) -> bool {
-    unsafe { remove_valued(table, pool, key_ptr, list_slot) }
+    unsafe { remove_valued(table, pool, key_ptr, list_free) }
 }
 
 /// `list_remove` for the list paths that carry a bare HTAB rather than a
@@ -1077,20 +1246,106 @@ fn lwlock(db_idx: usize) -> *mut pg_sys::LWLock {
     unsafe { addr_of!((*c).lwlock[db_idx]).read() }
 }
 
+/// The HTAB key of a KV entry: the 128-bit handle, not the key itself.
+///
 /// Callers are expected to have refused an over-long key already
-/// (`Command::mem_too_long_error`). The assertions are the backstop for a
-/// command that grows a new key argument without extending that check: two keys
-/// sharing a prefix would otherwise silently collapse onto one entry.
-fn make_key(s: &[u8]) -> [u8; MAX_KEY_LEN] {
+/// (`Command::mem_too_long_error`). The assertion backstops a command that
+/// grows a new key argument without extending that check: an over-long key
+/// hashes fine, so it would otherwise be refused at the write with an OOM
+/// rather than a limit error.
+fn make_key(s: &[u8]) -> KeyHash {
     debug_assert!(
-        s.len() < MAX_KEY_LEN,
+        s.len() <= MAX_KEY_LEN,
         "over-long key reached memory backend"
     );
-    let mut key = [0u8; MAX_KEY_LEN];
-    let bytes = s;
-    let len = bytes.len().min(MAX_KEY_LEN - 1);
-    key[..len].copy_from_slice(&bytes[..len]);
-    key
+    key_hash(s)
+}
+
+/// Whether a KV entry holds exactly `key`.
+///
+/// A 128-bit keyed SipHash will not collide across `redis.mem_max_entries`
+/// keys, but the entry keeps the key bytes for `KEYS` and `SCAN` anyway, so the
+/// check is free to make here and impossible to make in a composite table. It
+/// costs a length test plus, at most, a compare of the inline prefix against
+/// bytes the lookup has already pulled into cache; only a key over
+/// `INLINE_KEY_LEN` matching on both goes as far as walking the pool.
+unsafe fn kv_key_matches(entry: *mut KvEntry, pool: *mut ValPool, key: &[u8]) -> bool {
+    unsafe { value_eq(pool, key_slot(entry), key) }
+}
+
+/// Run `f` on a KV entry's key, without copying it when it fits inline.
+///
+/// `KEYS` and `SCAN` glob every key in the table and keep the few that match,
+/// so reading each one into a `Vec` first would allocate once per entry to
+/// return three. Only a key past the inline prefix has to be assembled at all,
+/// and only a match is copied.
+unsafe fn with_kv_key<R>(entry: *mut KvEntry, pool: *mut ValPool, f: impl FnOnce(&[u8]) -> R) -> R {
+    unsafe {
+        let total = (*entry).key_len as usize;
+        if total <= INLINE_KEY_LEN {
+            let inline = addr_of!((*entry).key_inline).cast::<u8>();
+            f(std::slice::from_raw_parts(inline, total))
+        } else {
+            f(&value_read(pool, key_slot(entry)))
+        }
+    }
+}
+
+/// Find the entry for `key`, or `None` if it is absent — or if what is there
+/// belongs to a different key that hashed the same.
+unsafe fn kv_find(
+    table: &SharedTable<KvEntry>,
+    pool: *mut ValPool,
+    kh: &KeyHash,
+    key: &[u8],
+) -> Option<*mut KvEntry> {
+    unsafe {
+        let entry = table.find(kh.as_ptr().cast())?;
+        kv_key_matches(entry, pool, key).then_some(entry)
+    }
+}
+
+/// Enter the entry for `key`, writing the key bytes into a slot that did not
+/// already hold them.
+///
+/// Null with a `Refusal` raised in three cases: the table is full, the key's
+/// tail has nowhere to live, or the slot is held by a different key that hashed
+/// the same. The last is the one a composite table can only answer by silently
+/// merging the two keys' contents; here the write is refused and the key
+/// already stored keeps its value.
+unsafe fn kv_enter(
+    table: &SharedTable<KvEntry>,
+    pool: *mut ValPool,
+    kh: &KeyHash,
+    key: &[u8],
+    make_room: impl FnOnce() -> bool,
+) -> (*mut KvEntry, bool) {
+    unsafe {
+        let (entry, found) = enter_or_evict(table, kh.as_ptr().cast(), make_room);
+        if entry.is_null() {
+            return (entry, false);
+        }
+        if found {
+            if kv_key_matches(entry, pool, key) {
+                return (entry, true);
+            }
+            // Its own cause, not OOM: raising `redis.mem_max_entries` is the
+            // obvious response to an OOM and does nothing for a collision.
+            // The key already stored keeps its value.
+            signal_key_collision();
+            return (std::ptr::null_mut(), false);
+        }
+        // A fresh slot is recycled shared memory. Its chains were released by
+        // whoever removed the last occupant, so `value_write` finds them empty;
+        // the expiry is the one field no chain lifecycle clears, so it is
+        // cleared here rather than left to each caller to remember.
+        addr_of_mut!((*entry).expires_at).write(0);
+        if !value_write(pool, key_slot(entry), key) {
+            table.remove(kh.as_ptr().cast());
+            return (std::ptr::null_mut(), false);
+        }
+        (entry, false)
+    }
 }
 
 /// GET: returns value if key exists and not expired.
@@ -1106,7 +1361,7 @@ pub unsafe fn mem_get(db_idx: usize, key: &[u8]) -> Option<Vec<u8>> {
 
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED) };
 
-    let (result, was_expired) = match unsafe { table.find(key_buf.as_ptr().cast()) } {
+    let (result, was_expired) = match unsafe { kv_find(&table, pool, &key_buf, key) } {
         Some(entry) if unsafe { entry_is_expired(entry) } => (None, true),
         Some(entry) => (Some(unsafe { kv_read_full_value(entry, pool) }), false),
         None => (None, false),
@@ -1116,7 +1371,7 @@ pub unsafe fn mem_get(db_idx: usize, key: &[u8]) -> Option<Vec<u8>> {
 
     if was_expired {
         unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
-        if let Some(entry2) = unsafe { table.find(key_buf.as_ptr().cast()) }
+        if let Some(entry2) = unsafe { kv_find(&table, pool, &key_buf, key) }
             && unsafe { entry_is_expired(entry2) }
         {
             unsafe { kv_remove(&table, pool, key_buf.as_ptr().cast()) };
@@ -1145,13 +1400,13 @@ pub unsafe fn mem_set(db_idx: usize, key: &[u8], value: &[u8], expires_at_us: i6
 
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
 
-    unsafe { reserve_chunks(pool, value.len(), || evict_kv(htab, pool)) };
-    let (entry, found) =
-        unsafe { enter_or_evict(&table, key_buf.as_ptr().cast(), || evict_kv(htab, pool)) };
+    unsafe { kv_reserve(pool, key, value.len(), || evict_kv(htab, pool)) };
+    let (entry, found) = unsafe { kv_enter(&table, pool, &key_buf, key, || evict_kv(htab, pool)) };
     let ok = !entry.is_null() && unsafe { kv_write_full_value(entry, pool, value, expires_at_us) };
     if !ok && !found && !entry.is_null() {
-        // A rejected SET must not leave a phantom empty key behind.
-        unsafe { table.remove(key_buf.as_ptr().cast()) };
+        // A rejected SET must not leave a phantom empty key behind — and the
+        // entry owns the key chain `kv_enter` just gave it.
+        unsafe { kv_remove(&table, pool, key_buf.as_ptr().cast()) };
     }
 
     unsafe { pg_sys::LWLockRelease(lk) };
@@ -1174,7 +1429,7 @@ pub unsafe fn mem_del(db_idx: usize, keys: &[&[u8]]) -> i64 {
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
     for key in keys {
         let key_buf = make_key(key);
-        if let Some(entry) = unsafe { table.find(key_buf.as_ptr().cast()) } {
+        if let Some(entry) = unsafe { kv_find(&table, pool, &key_buf, key) } {
             let expired = unsafe { entry_is_expired(entry) };
             unsafe { kv_remove(&table, pool, key_buf.as_ptr().cast()) };
             if !expired {
@@ -1195,13 +1450,14 @@ pub unsafe fn mem_exists(db_idx: usize, keys: &[&[u8]]) -> i64 {
     let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else {
         return 0;
     };
+    let pool = kv_pool_for(db_idx);
     let lk = lwlock(db_idx);
     let mut count = 0i64;
 
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED) };
     for key in keys {
         let key_buf = make_key(key);
-        if let Some(entry) = unsafe { table.find(key_buf.as_ptr().cast()) }
+        if let Some(entry) = unsafe { kv_find(&table, pool, &key_buf, key) }
             && !unsafe { entry_is_expired(entry) }
         {
             count += 1;
@@ -1226,8 +1482,8 @@ pub unsafe fn mem_incr(db_idx: usize, key: &[u8], delta: i64) -> Result<i64, Str
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
 
     let pool = kv_pool_for(db_idx);
-    let (entry, found) =
-        unsafe { enter_or_evict(&table, key_buf.as_ptr().cast(), || evict_kv(htab, pool)) };
+    unsafe { kv_reserve(pool, key, 0, || evict_kv(htab, pool)) };
+    let (entry, found) = unsafe { kv_enter(&table, pool, &key_buf, key, || evict_kv(htab, pool)) };
 
     let result = if entry.is_null() {
         unsafe { pg_sys::LWLockRelease(lk) };
@@ -1238,22 +1494,25 @@ pub unsafe fn mem_incr(db_idx: usize, key: &[u8], delta: i64) -> Result<i64, Str
         unsafe { kv_write_full_value(entry, pool, s.as_bytes(), 0) };
         Ok(new_val)
     } else {
-        let current_str = {
-            let slice = unsafe { kv_read_inline_slice(entry) };
-            std::str::from_utf8(slice)
-                .map_err(|_| "ERR value is not an integer or out of range".to_string())?
-                .to_owned()
-        };
-        let current: i64 = current_str
-            .parse()
-            .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
-        let new_val = current
-            .checked_add(delta)
-            .ok_or_else(|| "ERR increment or decrement would overflow".to_string())?;
-        let ns = new_val.to_string();
-        let exp = unsafe { (*entry).expires_at };
-        unsafe { kv_write_full_value(entry, pool, ns.as_bytes(), exp) };
-        Ok(new_val)
+        // Every failure below has to fall through to the release at the end.
+        // A `?` here returns with the database's LWLock still held, which wedges
+        // the worker on its next command.
+        let slice = unsafe { kv_read_inline_slice(entry) };
+        let current = std::str::from_utf8(slice)
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok());
+        match current {
+            None => Err("ERR value is not an integer or out of range".to_string()),
+            Some(current) => match current.checked_add(delta) {
+                None => Err("ERR increment or decrement would overflow".to_string()),
+                Some(new_val) => {
+                    let ns = new_val.to_string();
+                    let exp = unsafe { (*entry).expires_at };
+                    unsafe { kv_write_full_value(entry, pool, ns.as_bytes(), exp) };
+                    Ok(new_val)
+                }
+            },
+        }
     };
 
     unsafe { pg_sys::LWLockRelease(lk) };
@@ -1275,8 +1534,8 @@ pub unsafe fn mem_incr_float(db_idx: usize, key: &[u8], delta: f64) -> Result<St
 
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
 
-    let (entry, found) =
-        unsafe { enter_or_evict(&table, key_buf.as_ptr().cast(), || evict_kv(htab, pool)) };
+    unsafe { kv_reserve(pool, key, 0, || evict_kv(htab, pool)) };
+    let (entry, found) = unsafe { kv_enter(&table, pool, &key_buf, key, || evict_kv(htab, pool)) };
 
     let result = if entry.is_null() {
         unsafe { pg_sys::LWLockRelease(lk) };
@@ -1286,24 +1545,25 @@ pub unsafe fn mem_incr_float(db_idx: usize, key: &[u8], delta: f64) -> Result<St
         unsafe { kv_write_full_value(entry, pool, s.as_bytes(), 0) };
         Ok(s)
     } else {
-        let current_str = {
-            let slice = unsafe { kv_read_inline_slice(entry) };
-            std::str::from_utf8(slice)
-                .map_err(|_| "ERR value is not a valid float".to_string())?
-                .to_owned()
-        };
-        let current: f64 = current_str
-            .parse()
-            .map_err(|_| "ERR value is not a valid float".to_string())?;
-        let new_val = current + delta;
-        if new_val.is_nan() || new_val.is_infinite() {
-            unsafe { pg_sys::LWLockRelease(lk) };
-            return Err("ERR increment would produce NaN or Infinity".to_string());
+        // Falls through to the release below on every path — see `mem_incr`.
+        let slice = unsafe { kv_read_inline_slice(entry) };
+        let current = std::str::from_utf8(slice)
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok());
+        match current {
+            None => Err("ERR value is not a valid float".to_string()),
+            Some(current) => {
+                let new_val = current + delta;
+                if new_val.is_nan() || new_val.is_infinite() {
+                    Err("ERR increment would produce NaN or Infinity".to_string())
+                } else {
+                    let ns = format_float(new_val);
+                    let exp = unsafe { (*entry).expires_at };
+                    unsafe { kv_write_full_value(entry, pool, ns.as_bytes(), exp) };
+                    Ok(ns)
+                }
+            }
         }
-        let ns = format_float(new_val);
-        let exp = unsafe { (*entry).expires_at };
-        unsafe { kv_write_full_value(entry, pool, ns.as_bytes(), exp) };
-        Ok(ns)
     };
 
     unsafe { pg_sys::LWLockRelease(lk) };
@@ -1327,9 +1587,8 @@ pub unsafe fn mem_getset(db_idx: usize, key: &[u8], value: &[u8]) -> Option<Vec<
 
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
 
-    unsafe { reserve_chunks(pool, value.len(), || evict_kv(htab, pool)) };
-    let (entry, found) =
-        unsafe { enter_or_evict(&table, key_buf.as_ptr().cast(), || evict_kv(htab, pool)) };
+    unsafe { kv_reserve(pool, key, value.len(), || evict_kv(htab, pool)) };
+    let (entry, found) = unsafe { kv_enter(&table, pool, &key_buf, key, || evict_kv(htab, pool)) };
 
     let old = if found && !entry.is_null() && !unsafe { entry_is_expired(entry) } {
         Some(unsafe { kv_read_full_value(entry, pool) })
@@ -1358,7 +1617,7 @@ pub unsafe fn mem_getdel(db_idx: usize, key: &[u8]) -> Option<Vec<u8>> {
 
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
 
-    let result = if let Some(entry) = unsafe { table.find(key_buf.as_ptr().cast()) } {
+    let result = if let Some(entry) = unsafe { kv_find(&table, pool, &key_buf, key) } {
         let val = if !unsafe { entry_is_expired(entry) } {
             Some(unsafe { kv_read_full_value(entry, pool) })
         } else {
@@ -1390,9 +1649,8 @@ pub unsafe fn mem_append(db_idx: usize, key: &[u8], suffix: &[u8]) -> i64 {
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
 
     let pool = kv_pool_for(db_idx);
-    unsafe { reserve_chunks(pool, suffix_bytes.len(), || evict_kv(htab, pool)) };
-    let (entry, found) =
-        unsafe { enter_or_evict(&table, key_buf.as_ptr().cast(), || evict_kv(htab, pool)) };
+    unsafe { kv_reserve(pool, key, suffix_bytes.len(), || evict_kv(htab, pool)) };
+    let (entry, found) = unsafe { kv_enter(&table, pool, &key_buf, key, || evict_kv(htab, pool)) };
 
     let limit = max_total_val_len();
     let new_len = if entry.is_null() {
@@ -1425,12 +1683,13 @@ pub unsafe fn mem_strlen(db_idx: usize, key: &[u8]) -> i64 {
     let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else {
         return 0;
     };
+    let pool = kv_pool_for(db_idx);
     let lk = lwlock(db_idx);
     let key_buf = make_key(key);
 
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED) };
 
-    let result = match unsafe { table.find(key_buf.as_ptr().cast()) } {
+    let result = match unsafe { kv_find(&table, pool, &key_buf, key) } {
         Some(entry) if !unsafe { entry_is_expired(entry) } => unsafe { (*entry).value_len as i64 },
         _ => 0,
     };
@@ -1448,12 +1707,13 @@ pub unsafe fn mem_ttl_raw(db_idx: usize, key: &[u8]) -> (bool, i64) {
     let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else {
         return (false, 0);
     };
+    let pool = kv_pool_for(db_idx);
     let lk = lwlock(db_idx);
     let key_buf = make_key(key);
 
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED) };
 
-    let result = match unsafe { table.find(key_buf.as_ptr().cast()) } {
+    let result = match unsafe { kv_find(&table, pool, &key_buf, key) } {
         Some(entry) if !unsafe { entry_is_expired(entry) } => {
             (true, unsafe { (*entry).expires_at })
         }
@@ -1473,12 +1733,13 @@ pub unsafe fn mem_set_expiry(db_idx: usize, key: &[u8], expires_at_us: i64) -> b
     let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else {
         return false;
     };
+    let pool = kv_pool_for(db_idx);
     let lk = lwlock(db_idx);
     let key_buf = make_key(key);
 
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
 
-    let result = if let Some(entry) = unsafe { table.find(key_buf.as_ptr().cast()) } {
+    let result = if let Some(entry) = unsafe { kv_find(&table, pool, &key_buf, key) } {
         if !unsafe { entry_is_expired(entry) } {
             unsafe { addr_of_mut!((*entry).expires_at).write(expires_at_us) };
             true
@@ -1502,12 +1763,13 @@ pub unsafe fn mem_persist(db_idx: usize, key: &[u8]) -> bool {
     let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else {
         return false;
     };
+    let pool = kv_pool_for(db_idx);
     let lk = lwlock(db_idx);
     let key_buf = make_key(key);
 
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
 
-    let result = if let Some(entry) = unsafe { table.find(key_buf.as_ptr().cast()) } {
+    let result = if let Some(entry) = unsafe { kv_find(&table, pool, &key_buf, key) } {
         if !unsafe { entry_is_expired(entry) } {
             let had_expiry = unsafe { (*entry).expires_at } != 0;
             if had_expiry {
@@ -1543,7 +1805,7 @@ pub unsafe fn mem_mget(db_idx: usize, keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> 
         .iter()
         .map(|key| {
             let key_buf = make_key(key);
-            match unsafe { table.find(key_buf.as_ptr().cast()) } {
+            match unsafe { kv_find(&table, pool, &key_buf, key) } {
                 Some(entry) if !unsafe { entry_is_expired(entry) } => {
                     Some(unsafe { kv_read_full_value(entry, pool) })
                 }
@@ -1572,9 +1834,9 @@ pub unsafe fn mem_mset(db_idx: usize, pairs: &[(&[u8], &[u8])]) {
 
     for (key, value) in pairs {
         let key_buf = make_key(key);
-        unsafe { reserve_chunks(pool, value.len(), || evict_kv(htab, pool)) };
+        unsafe { kv_reserve(pool, key, value.len(), || evict_kv(htab, pool)) };
         let (entry, _found) =
-            unsafe { enter_or_evict(&table, key_buf.as_ptr().cast(), || evict_kv(htab, pool)) };
+            unsafe { kv_enter(&table, pool, &key_buf, key, || evict_kv(htab, pool)) };
         if !entry.is_null() {
             unsafe { kv_write_full_value(entry, pool, value, 0) };
         }
@@ -1592,27 +1854,28 @@ pub unsafe fn mem_scan(db_idx: usize, pattern: &[u8]) -> Vec<Vec<u8>> {
     let Some(table) = (unsafe { SharedTable::<KvEntry>::from_raw(htab) }) else {
         return vec![];
     };
+    let pool = kv_pool_for(db_idx);
     let lk = lwlock(db_idx);
     let now = now_micros();
     let mut results = Vec::new();
 
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED) };
 
+    // The inline prefix is in the entry the scan just touched, so only a key
+    // past `INLINE_KEY_LEN` walks the pool.
     let mut scan = unsafe { table.scan() };
     while let Some(entry) = unsafe { scan.next() } {
         let exp = unsafe { (*entry).expires_at };
         if exp != 0 && exp <= now {
             continue;
         }
-        let key_ptr = unsafe { addr_of!((*entry).key) as *const u8 };
-        let key_slice = unsafe { std::slice::from_raw_parts(key_ptr, MAX_KEY_LEN) };
-        let key_end = key_slice
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(MAX_KEY_LEN);
-        let key_str = &key_slice[..key_end];
-        if glob_matches(pattern, key_str) {
-            results.push(key_str.to_vec());
+        let matched = unsafe {
+            with_kv_key(entry, pool, |k| {
+                glob_matches(pattern, k).then(|| k.to_vec())
+            })
+        };
+        if let Some(k) = matched {
+            results.push(k);
         }
     }
 
@@ -1661,7 +1924,10 @@ pub unsafe fn mem_sweep_expired(db_idx: usize) {
 
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
 
-    let mut to_delete: Vec<[u8; MAX_KEY_LEN]> = Vec::new();
+    // The hash, not the key: the sweep removes what it found and never has to
+    // name it. Collected before any removal — `hash_search(HASH_REMOVE)` may
+    // not run while a sequential scan over the same table is open.
+    let mut to_delete: Vec<KeyHash> = Vec::new();
     let mut scan = unsafe { table.scan() };
     while let Some(entry) = unsafe { scan.next() } {
         let exp = unsafe { (*entry).expires_at };
@@ -1692,7 +1958,8 @@ pub unsafe fn mem_type(db_idx: usize, key: &[u8]) -> &'static str {
 
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED) };
     let is_string = if let Some(table) = unsafe { SharedTable::<KvEntry>::from_raw(htab) } {
-        matches!(unsafe { table.find(key_buf.as_ptr().cast()) }, Some(e) if !unsafe { entry_is_expired(e) })
+        let pool = kv_pool_for(db_idx);
+        matches!(unsafe { kv_find(&table, pool, &key_buf, key) }, Some(e) if !unsafe { entry_is_expired(e) })
     } else {
         false
     };
@@ -1786,7 +2053,7 @@ unsafe fn has_any_list_entry_for_key(meta_htab: *mut pg_sys::HTAB, key: &[u8]) -
 
 /// Glob pattern matching supporting `*`, `?`, and `[...]` character classes.
 /// Delegates to the iterative implementation in pubsub for consistency with PSUBSCRIBE.
-pub fn glob_matches(pattern: &[u8], s: &[u8]) -> bool {
+fn glob_matches(pattern: &[u8], s: &[u8]) -> bool {
     crate::pubsub::glob_match(pattern, s)
 }
 
@@ -1888,12 +2155,11 @@ pub unsafe fn mem_init_tables(ctl: *mut MemControlBlock) {
         addr_of_mut!((*ctl).hash_key).write(seed);
     }
 
+    // Every table is `HASH_BLOBS`, and none may be `HASH_STRINGS`: dynahash
+    // compares string keys with `strncmp`, which makes two keys agreeing up to
+    // their first NUL byte the same key. Redis keys are arbitrary bytes.
     let blob_flags = (pg_sys::HASH_ELEM
         | pg_sys::HASH_BLOBS
-        | pg_sys::HASH_SHARED_MEM
-        | pg_sys::HASH_FIXED_SIZE) as i32;
-    let str_flags = (pg_sys::HASH_ELEM
-        | pg_sys::HASH_STRINGS
         | pg_sys::HASH_SHARED_MEM
         | pg_sys::HASH_FIXED_SIZE) as i32;
 
@@ -1904,11 +2170,11 @@ pub unsafe fn mem_init_tables(ctl: *mut MemControlBlock) {
         unsafe {
             let name = format!("pg_redis_kv_{}\0", i * 2);
             let mut info = pg_sys::HASHCTL {
-                keysize: MAX_KEY_LEN as pg_sys::Size,
+                keysize: KEY_HASH_LEN as pg_sys::Size,
                 entrysize: std::mem::size_of::<KvEntry>() as pg_sys::Size,
                 ..Default::default()
             };
-            let htab = pg_sys::ShmemInitHash(name.as_ptr().cast(), sz, sz, &mut info, str_flags);
+            let htab = pg_sys::ShmemInitHash(name.as_ptr().cast(), sz, sz, &mut info, blob_flags);
             std::ptr::addr_of_mut!((*ctl).htab[i]).write(htab);
 
             let name = format!("pg_redis_hash_{}\0", i * 2);
@@ -2430,7 +2696,7 @@ pub unsafe fn mem_hsetnx(db_idx: usize, key: &[u8], field: &[u8], value: &[u8]) 
 /// # Safety
 /// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
-pub unsafe fn mem_del_hash_key(db_idx: usize, key: &[u8]) -> i64 {
+unsafe fn mem_del_hash_key(db_idx: usize, key: &[u8]) -> i64 {
     let htab = hash_htab_for(db_idx);
     let Some(table) = (unsafe { SharedTable::<HashEntry>::from_raw(htab) }) else {
         return 0;
@@ -2883,7 +3149,7 @@ pub unsafe fn mem_sdiffstore(db_idx: usize, dst: &[u8], keys: &[&[u8]]) -> i64 {
 /// # Safety
 /// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
-pub unsafe fn mem_del_set_key(db_idx: usize, key: &[u8]) -> i64 {
+unsafe fn mem_del_set_key(db_idx: usize, key: &[u8]) -> i64 {
     let htab = set_htab_for(db_idx);
     let Some(table) = (unsafe { SharedTable::<SetEntry>::from_raw(htab) }) else {
         return 0;
@@ -2985,20 +3251,7 @@ pub unsafe fn mem_zadd(
             unsafe { addr_of_mut!((*entry).score).write(*score) };
             added += 1;
             changed += 1;
-            if !meta.is_null() {
-                let count = unsafe { (*meta).count };
-                if count == 0 || *score < unsafe { (*meta).min_score } {
-                    unsafe { addr_of_mut!((*meta).min_score).write(*score) };
-                    let len = unsafe { &mut *addr_of_mut!((*meta).min_member_len) };
-                    unsafe { write_meta_member(&mut (*meta).min_member, len, member) };
-                }
-                if count == 0 || *score > unsafe { (*meta).max_score } {
-                    unsafe { addr_of_mut!((*meta).max_score).write(*score) };
-                    let len = unsafe { &mut *addr_of_mut!((*meta).max_member_len) };
-                    unsafe { write_meta_member(&mut (*meta).max_member, len, member) };
-                }
-                unsafe { addr_of_mut!((*meta).count).write(count + 1) };
-            }
+            unsafe { zset_meta_member_added(meta, *score, member) };
         } else {
             if nx {
                 continue;
@@ -3016,30 +3269,7 @@ pub unsafe fn mem_zadd(
                     changed += 1;
                 }
                 unsafe { addr_of_mut!((*entry).score).write(*score) };
-                if !meta.is_null() {
-                    let cur_min = unsafe { (*meta).min_score };
-                    let cur_max = unsafe { (*meta).max_score };
-                    let was_min =
-                        unsafe { read_meta_member(&(*meta).min_member, (*meta).min_member_len) }
-                            == *member;
-                    let was_max =
-                        unsafe { read_meta_member(&(*meta).max_member, (*meta).max_member_len) }
-                            == *member;
-                    if *score < cur_min {
-                        unsafe { addr_of_mut!((*meta).min_score).write(*score) };
-                        let len = unsafe { &mut *addr_of_mut!((*meta).min_member_len) };
-                        unsafe { write_meta_member(&mut (*meta).min_member, len, member) };
-                    } else if was_min && *score > cur_min {
-                        unsafe { refresh_zset_meta(htab, meta, key) };
-                    }
-                    if *score > cur_max {
-                        unsafe { addr_of_mut!((*meta).max_score).write(*score) };
-                        let len = unsafe { &mut *addr_of_mut!((*meta).max_member_len) };
-                        unsafe { write_meta_member(&mut (*meta).max_member, len, member) };
-                    } else if was_max && *score < cur_max {
-                        unsafe { refresh_zset_meta(htab, meta, key) };
-                    }
-                }
+                unsafe { zset_meta_score_changed(htab, meta, key, member, *score) };
             }
         }
     }
@@ -3072,6 +3302,13 @@ pub unsafe fn mem_zadd_incr(
             evict_zset_key(htab, meta_htab, &key_hash(key))
         })
     };
+    // The meta is maintained here exactly as `mem_zadd` maintains it. A member
+    // that reaches the entry table and not the meta is invisible to `ZCARD` and
+    // `ZPOPMIN` while `ZRANGE` still lists it, and the count stays wrong for
+    // the life of the key. `ZADD ... INCR` comes through here too.
+    //
+    // Created lazily rather than up front so a refused `XX` leaves no empty
+    // meta behind.
     let result = if entry.is_null() {
         None
     } else if !found {
@@ -3080,6 +3317,12 @@ pub unsafe fn mem_zadd_incr(
             None
         } else {
             unsafe { addr_of_mut!((*entry).score).write(delta) };
+            let meta = unsafe {
+                get_or_create_zset_meta(meta_htab, key, || {
+                    evict_zset_key(htab, meta_htab, &key_hash(key))
+                })
+            };
+            unsafe { zset_meta_member_added(meta, delta, member) };
             Some(delta)
         }
     } else if nx {
@@ -3096,6 +3339,8 @@ pub unsafe fn mem_zadd_incr(
         };
         if should_update {
             unsafe { addr_of_mut!((*entry).score).write(new_score) };
+            let meta = unsafe { find_zset_meta(meta_htab, key) };
+            unsafe { zset_meta_score_changed(htab, meta, key, member, new_score) };
             Some(new_score)
         } else {
             Some(old)
@@ -4120,7 +4365,7 @@ unsafe fn remove_meta(meta_htab: *mut pg_sys::HTAB, key: &[u8]) {
 
 // ─────────────────────────── Random number generator ────────────────────────
 
-pub fn fast_random() -> u64 {
+fn fast_random() -> u64 {
     static SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut s = SEED.load(std::sync::atomic::Ordering::Relaxed);
     if s == 0 {
@@ -4171,6 +4416,70 @@ unsafe fn get_or_create_zset_meta(
             addr_of_mut!((*meta).max_member_len).write(0);
         }
         meta
+    }
+}
+
+/// Fold a member that has just been created into its sorted set's meta.
+///
+/// A member the meta never hears about is invisible to everything that reads
+/// the meta — `ZCARD` counts it out and `ZPOPMIN` cannot see it — while
+/// `ZRANGE`, which scans the entries themselves, still returns it. `ZINCRBY`
+/// creating a member is exactly that shape, which is why this is shared rather
+/// than written out at each site.
+unsafe fn zset_meta_member_added(meta: *mut ZsetMeta, score: f64, member: &[u8]) {
+    if meta.is_null() {
+        return;
+    }
+    unsafe {
+        let count = (*meta).count;
+        if count == 0 || score < (*meta).min_score {
+            addr_of_mut!((*meta).min_score).write(score);
+            let len = &mut *addr_of_mut!((*meta).min_member_len);
+            write_meta_member(&mut (*meta).min_member, len, member);
+        }
+        if count == 0 || score > (*meta).max_score {
+            addr_of_mut!((*meta).max_score).write(score);
+            let len = &mut *addr_of_mut!((*meta).max_member_len);
+            write_meta_member(&mut (*meta).max_member, len, member);
+        }
+        addr_of_mut!((*meta).count).write(count + 1);
+    }
+}
+
+/// Fold a score change on an existing member into the meta.
+///
+/// A new extreme names itself. A score that moves *off* an extreme cannot name
+/// its replacement without looking, which is the one case that pays for
+/// `refresh_zset_meta`'s scan.
+unsafe fn zset_meta_score_changed(
+    zset_htab: *mut pg_sys::HTAB,
+    meta: *mut ZsetMeta,
+    key: &[u8],
+    member: &[u8],
+    score: f64,
+) {
+    if meta.is_null() {
+        return;
+    }
+    unsafe {
+        let cur_min = (*meta).min_score;
+        let cur_max = (*meta).max_score;
+        let was_min = read_meta_member(&(*meta).min_member, (*meta).min_member_len) == member;
+        let was_max = read_meta_member(&(*meta).max_member, (*meta).max_member_len) == member;
+        if score < cur_min {
+            addr_of_mut!((*meta).min_score).write(score);
+            let len = &mut *addr_of_mut!((*meta).min_member_len);
+            write_meta_member(&mut (*meta).min_member, len, member);
+        } else if was_min && score > cur_min {
+            refresh_zset_meta(zset_htab, meta, key);
+        }
+        if score > cur_max {
+            addr_of_mut!((*meta).max_score).write(score);
+            let len = &mut *addr_of_mut!((*meta).max_member_len);
+            write_meta_member(&mut (*meta).max_member, len, member);
+        } else if was_max && score < cur_max {
+            refresh_zset_meta(zset_htab, meta, key);
+        }
     }
 }
 
@@ -4768,6 +5077,13 @@ pub unsafe fn mem_lset(db_idx: usize, key: &[u8], index: i64, value: &[u8]) -> b
         let min_pos = (*meta).min_pos;
         let pos = min_pos + idx * LIST_POS_STEP;
         let k = make_list_key(key, pos);
+        // `reserve_chunks` normally has to run before the entry exists; here it
+        // already does, and `evict_list_key` is told to keep this key, so the
+        // element being rewritten cannot be the one eviction takes. Nothing
+        // below reads `meta` again, so a victim's meta going away is harmless.
+        reserve_chunks(pool, value.len(), || {
+            evict_list_key(htab, meta_htab, pool, &key_hash(key))
+        });
         let mut found = false;
         let entry = pg_sys::hash_search(
             htab,
@@ -4824,10 +5140,9 @@ unsafe fn list_elements(
 /// Replace a list's contents, renumbering positions from a fresh base.
 ///
 /// Removing elements in place leaves holes, and every reader walks positions as
-/// `min_pos + i * LIST_POS_STEP` — so a hole silently truncates the list. LREM
-/// used to leave exactly that: it removed the right elements, reported the
-/// right count, and made the tail unreachable. Rewriting the whole list is O(n)
-/// on commands that were already O(n).
+/// `min_pos + i * LIST_POS_STEP` — so a hole silently truncates the list at the
+/// first gap, with the right count still reported. Rewriting the whole list is
+/// O(n) on commands that were already O(n).
 unsafe fn list_replace(
     htab: *mut pg_sys::HTAB,
     meta_htab: *mut pg_sys::HTAB,
@@ -4902,6 +5217,13 @@ pub unsafe fn mem_linsert(
         let result = match elems.iter().position(|e| e == pivot) {
             None => -1,
             Some(at) => {
+                // `list_replace` returns the old elements' chunks before it
+                // writes the new ones, so the only net demand is the inserted
+                // value. `elems` is already an owned copy and `evict_list_key`
+                // keeps this key, so evicting here cannot disturb either.
+                reserve_chunks(pool, value.len(), || {
+                    evict_list_key(htab, meta_htab, pool, &key_hash(key))
+                });
                 elems.insert(if before { at } else { at + 1 }, value.to_vec());
                 list_replace(htab, meta_htab, pool, key, meta, &elems);
                 elems.len() as i64
@@ -5128,6 +5450,13 @@ pub unsafe fn mem_lmove(
         };
 
         let dk = make_list_key(dst, dst_pos);
+        // The source element's chunks went back above, so this normally finds
+        // room already. It does not when the source value was inline and the
+        // destination has to spill — an APPEND-shaped LMOVE onto a full pool.
+        // Runs before the destination entry exists, as `reserve_chunks` asks.
+        reserve_chunks(pool, value.len(), || {
+            evict_list_key(htab, meta_htab, pool, &key_hash(dst))
+        });
         let (entry, _f2): (*mut ListEntry, bool) =
             enter_raw(htab, dk.as_ptr().cast::<c_void>(), || {
                 evict_list_key(htab, meta_htab, pool, &key_hash(dst))
@@ -5246,7 +5575,7 @@ pub unsafe fn mem_lpos(
 /// # Safety
 /// - Must be called from a bgworker thread after `mem_init_worker` has set the thread-local CTL_PTR.
 /// - The caller must ensure no concurrent writers bypass the per-db LWLock acquired internally.
-pub unsafe fn mem_del_list_key(db_idx: usize, key: &[u8]) -> i64 {
+unsafe fn mem_del_list_key(db_idx: usize, key: &[u8]) -> i64 {
     unsafe {
         let htab = list_htab_for(db_idx);
         let meta_htab = list_meta_htab_for(db_idx);
@@ -5316,6 +5645,7 @@ pub unsafe fn mem_random_key(db_idx: usize) -> Option<Vec<u8>> {
         if htab.is_null() {
             return None;
         }
+        let pool = kv_pool_for(db_idx);
         let lk = lwlock(db_idx);
         pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
         let now = now_micros();
@@ -5331,12 +5661,7 @@ pub unsafe fn mem_random_key(db_idx: usize) -> Option<Vec<u8>> {
             if exp != 0 && exp <= now {
                 continue;
             }
-            let key_end = (*entry)
-                .key
-                .iter()
-                .position(|&b| b == 0)
-                .unwrap_or(MAX_KEY_LEN);
-            result = Some((&(*entry).key)[..key_end].to_vec());
+            result = Some(with_kv_key(entry, pool, <[u8]>::to_vec));
             pg_sys::hash_seq_term(&mut status);
             break;
         }
@@ -5461,7 +5786,7 @@ mod tests {
     #[test]
     fn entry_sizes_stay_within_their_shared_memory_budget() {
         let sizes = [
-            ("KvEntry", size_of::<KvEntry>(), 592),
+            ("KvEntry", size_of::<KvEntry>(), 232),
             ("HashEntry", size_of::<HashEntry>(), 216),
             ("SetEntry", size_of::<SetEntry>(), 144),
             ("ZsetEntry", size_of::<ZsetEntry>(), 152),
@@ -5477,7 +5802,7 @@ mod tests {
                  before accepting this"
             );
         }
-        // At the 8192 default this totals ~72 MiB of shared memory.
+        // At the 8192 default this totals ~70 MiB of shared memory.
         let per_entry: usize = sizes.iter().map(|(_, s, _)| s).sum();
         assert!(
             per_entry <= 2048,
@@ -5574,9 +5899,12 @@ mod tests {
 
     fn blank_entry() -> KvEntry {
         KvEntry {
-            key: [0; MAX_KEY_LEN],
+            key: [0; KEY_HASH_LEN],
+            key_inline: [0; INLINE_KEY_LEN],
             value: [0; INLINE_VAL_LEN],
             expires_at: 0,
+            key_len: 0,
+            key_overflow: NIL_CHUNK,
             value_len: 0,
             overflow: NIL_CHUNK,
         }
@@ -5676,7 +6004,11 @@ mod tests {
         assert_eq!(unsafe { (*e).value_len }, 0);
         assert!(unsafe { value_read(p.pool, kv_slot(e)) }.is_empty());
         assert_eq!(free_chunks(&p), 2, "a refused write kept its chunks");
-        assert!(take_oom(), "a refused write must report OOM");
+        assert_eq!(
+            take_refusal(),
+            Refusal::OutOfMemory,
+            "a refused write must report OOM"
+        );
     }
 
     /// The cap is a function of the pool now, not a constant — an eighth of it,
@@ -5690,6 +6022,122 @@ mod tests {
         assert!(chunks_for(limit) <= pool_chunks() / POOL_SHARE_PER_VALUE);
     }
 
+    /// A key is stored the way a value is, so it has the same two boundaries
+    /// and has to survive both — including the 512-byte cap, which is six
+    /// chunks of tail.
+    #[test]
+    fn keys_round_trip_through_the_pool_at_every_boundary() {
+        let p = test_pool(256);
+        let mut entry = blank_entry();
+        let e = &mut entry as *mut KvEntry;
+
+        for n in [
+            1usize,
+            63,
+            INLINE_KEY_LEN,
+            65,
+            128,
+            129,
+            200,
+            511,
+            MAX_KEY_LEN,
+        ] {
+            let k = payload(n);
+            assert!(unsafe { value_write(p.pool, key_slot(e), &k) }, "{n} bytes");
+            assert_eq!(unsafe { value_read(p.pool, key_slot(e)) }, k, "{n} bytes");
+            assert!(unsafe { kv_key_matches(e, p.pool, &k) }, "{n} bytes");
+        }
+
+        unsafe { value_free(p.pool, key_slot(e)) };
+        assert_eq!(free_chunks(&p), 256, "rewriting a key leaked its chunks");
+    }
+
+    /// The verification a `GET` does. It has to see a difference wherever it
+    /// falls: in the length, in the inline prefix, or only in the pooled tail —
+    /// the case an inline-only comparison would pass.
+    #[test]
+    fn a_stored_key_only_matches_itself() {
+        let p = test_pool(64);
+        let mut entry = blank_entry();
+        let e = &mut entry as *mut KvEntry;
+
+        let stored = payload(300);
+        assert!(unsafe { value_write(p.pool, key_slot(e), &stored) });
+        assert!(unsafe { kv_key_matches(e, p.pool, &stored) });
+
+        // Same length, differing only in the last byte — well past the inline
+        // prefix, so nothing but a walk of the chain can tell.
+        let mut tail_differs = stored.clone();
+        *tail_differs.last_mut().unwrap() ^= 1;
+        assert!(!unsafe { kv_key_matches(e, p.pool, &tail_differs) });
+
+        // Same length, differing in the inline prefix.
+        let mut head_differs = stored.clone();
+        head_differs[0] ^= 1;
+        assert!(!unsafe { kv_key_matches(e, p.pool, &head_differs) });
+
+        // A prefix of the stored key, and the stored key plus a byte.
+        assert!(!unsafe { kv_key_matches(e, p.pool, &stored[..299]) });
+        let mut longer = stored.clone();
+        longer.push(b'x');
+        assert!(!unsafe { kv_key_matches(e, p.pool, &longer) });
+
+        unsafe { value_free(p.pool, key_slot(e)) };
+    }
+
+    /// A `HASH_STRINGS` table compares keys with `strncmp`, which makes two
+    /// keys agreeing up to their first NUL one entry. Both halves of the
+    /// defence have to hold: the hashes differ, and so does a stored key's
+    /// comparison against the other.
+    #[test]
+    fn keys_differing_only_after_a_nul_are_distinct() {
+        let a = b"a\0one";
+        let b = b"a\0two";
+        assert_ne!(key_hash(a), key_hash(b));
+        assert_ne!(key_hash(b"a"), key_hash(a));
+
+        let p = test_pool(4);
+        let mut entry = blank_entry();
+        let e = &mut entry as *mut KvEntry;
+        assert!(unsafe { value_write(p.pool, key_slot(e), a) });
+        assert!(unsafe { kv_key_matches(e, p.pool, a) });
+        assert!(!unsafe { kv_key_matches(e, p.pool, b) });
+        assert!(!unsafe { kv_key_matches(e, p.pool, b"a") });
+        assert_eq!(unsafe { value_read(p.pool, key_slot(e)) }, a);
+    }
+
+    /// The refusal reasons must not be confusable: a collision reported as OOM
+    /// points at `redis.mem_max_entries`, which cannot fix it.
+    #[test]
+    fn a_refusal_reports_the_cause_it_had() {
+        assert_eq!(take_refusal(), Refusal::None);
+        signal_oom();
+        assert_eq!(take_refusal(), Refusal::OutOfMemory);
+        assert_eq!(take_refusal(), Refusal::None, "reading clears the flag");
+        signal_key_collision();
+        assert_eq!(take_refusal(), Refusal::KeyCollision);
+    }
+
+    /// Both of a KV entry's chains have to come back, not just the value's.
+    /// A key chain left behind is a leak nothing notices until the pool is dry.
+    #[test]
+    fn freeing_a_kv_entry_releases_both_its_chains() {
+        let p = test_pool(64);
+        let mut entry = blank_entry();
+        let e = &mut entry as *mut KvEntry;
+
+        assert!(unsafe { value_write(p.pool, key_slot(e), &payload(300)) });
+        assert!(unsafe { value_write(p.pool, kv_slot(e), &payload(400)) });
+        assert!(free_chunks(&p) < 64);
+
+        unsafe { kv_free(p.pool, e) };
+        assert_eq!(free_chunks(&p), 64);
+        assert_eq!(unsafe { (*e).key_len }, 0);
+        assert_eq!(unsafe { (*e).value_len }, 0);
+        assert_eq!(unsafe { (*e).key_overflow }, NIL_CHUNK);
+        assert_eq!(unsafe { (*e).overflow }, NIL_CHUNK);
+    }
+
     /// The HTAB key layouts must match the `keysize` values passed to
     /// `ShmemInitHash`, or lookups read past the end of the key.
     #[test]
@@ -5697,6 +6145,21 @@ mod tests {
         assert_eq!(COMPOSITE_KEY_LEN, KEY_HASH_LEN + MAX_MEMBER_LEN);
         assert_eq!(LIST_KEY_LEN, KEY_HASH_LEN + 8);
         assert!(size_of::<HashEntry>() >= COMPOSITE_KEY_LEN);
+
+        // The KV table keys on the hash too now, so its entry must start with
+        // one — dynahash reads `keysize` bytes from the front of the entry.
+        assert_eq!(make_key(b"mykey"), key_hash(b"mykey"));
+        assert_eq!(std::mem::offset_of!(KvEntry, key), 0);
+        assert!(size_of::<KvEntry>() >= KEY_HASH_LEN);
+        // A key at the cap is six chunks of tail out of the pool the values
+        // share — the reason the cap is still a cap. A key of conventional
+        // length costs none of it, which is what sets `INLINE_KEY_LEN`.
+        assert_eq!(chunks_beyond(MAX_KEY_LEN, INLINE_KEY_LEN), 6);
+        assert_eq!(chunks_beyond(INLINE_KEY_LEN, INLINE_KEY_LEN), 0);
+        assert_eq!(chunks_beyond(INLINE_KEY_LEN + 1, INLINE_KEY_LEN), 1);
+        // A full table of keys this long must still leave the whole pool to
+        // the values — the cliff `INLINE_KEY_LEN` was chosen to move.
+        assert_eq!(chunks_beyond(96, INLINE_KEY_LEN), 0);
 
         let composite = make_composite_key(b"mykey", b"myfield");
         assert_eq!(&composite[..KEY_HASH_LEN], &key_hash(b"mykey"));

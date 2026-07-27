@@ -56,10 +56,4 @@ nav:
   - Reference:
       - Commands: commands.md
       - Command coverage: command-coverage.md
-      - Storage modes: storage-modes.md
-      - Pub/Sub routing: pubsub.md
-  - Performance:
-      - Benchmarks: benchmarks.md
-  - Contributing:
-      - Development: development.md
-      - Handoff: handoff.md
+  - Implementation: IMPLEMENTATION.md

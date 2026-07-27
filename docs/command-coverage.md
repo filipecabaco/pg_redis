@@ -8,7 +8,7 @@ implemented without appearing here, or listed here without existing.
 
 Behaviour is identical in both storage modes unless a note says otherwise. The
 limits that apply only to `storage_mode = 'memory'` are described in
-[Storage modes](storage-modes.md#where-this-differs-from-redis) rather than
+[Storage modes](IMPLEMENTATION.md#7-limits) rather than
 repeated per command.
 
 

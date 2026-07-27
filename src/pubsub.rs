@@ -1,19 +1,19 @@
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
-pub const MAX_PUBSUB_SLOTS: usize = 256;
-pub const PUBSUB_RING_CAP: usize = 256;
-pub const MAX_SUBS_PER_SLOT: usize = 16;
+const MAX_PUBSUB_SLOTS: usize = 256;
+const PUBSUB_RING_CAP: usize = 256;
+const MAX_SUBS_PER_SLOT: usize = 16;
 /// Maximum PUBLISH payload. Matches `mem::MAX_TOTAL_VAL_LEN` so a value that
 /// fits in memory mode also fits through pub/sub.
 pub const PUBSUB_MSG_LEN: usize = 512;
 /// Maximum channel or pattern name. One byte is reserved for the NUL
 /// terminator, so `MAX_CHANNEL_LEN` is what callers may actually use.
-pub const CHAN_LEN: usize = 256;
+const CHAN_LEN: usize = 256;
 pub const MAX_CHANNEL_LEN: usize = CHAN_LEN - 1;
 
-pub const MAX_ROUTES: usize = 64;
-pub const ROUTE_SCHEMA_LEN: usize = 64;
-pub const ROUTE_TABLE_LEN: usize = 64;
+const MAX_ROUTES: usize = 64;
+const ROUTE_SCHEMA_LEN: usize = 64;
+const ROUTE_TABLE_LEN: usize = 64;
 
 #[repr(C, align(8))]
 pub struct RouteEntry {
@@ -502,11 +502,11 @@ pub unsafe fn current_tail(slots: *mut PubsubSlot, idx: usize) -> u32 {
 
 /// Block until this slot's ring advances past `seen_tail`, or `timeout` elapses.
 ///
-/// Subscribers used to discover messages by letting a 5 ms socket read time out,
-/// which cost ~200 wakeups per second per idle subscriber and still delayed
-/// delivery by up to 5 ms. Waiting on the tail counter instead makes delivery
-/// immediate and leaves the timeout doing nothing but bounding how long a client
-/// command sits unread.
+/// Waiting on the tail counter rather than polling the socket is what makes
+/// delivery immediate: a subscriber that discovered messages by letting a 5 ms
+/// read time out would cost ~200 wakeups per second while idle and still delay
+/// delivery by up to 5 ms. Here the timeout does nothing but bound how long a
+/// client command sits unread.
 ///
 /// The futex lives in PostgreSQL's shared memory segment, so the shared (not
 /// `PRIVATE`) operations are required: the waiter and the waker are different
@@ -802,11 +802,11 @@ mod tests {
             "pub/sub slots would request {} MiB of shared memory",
             bytes / 1024 / 1024
         );
-        // The pub/sub payload limit is its own, and used to be pinned to
-        // memory mode's value cap. The chunked value pool took that cap to
-        // 64 KiB, which every slot in this ring would have to reserve whether
-        // or not anyone publishes — so the two parted ways. An over-long
-        // PUBLISH is refused in `worker.rs`, naming this limit.
+        // The pub/sub payload limit is its own, deliberately not memory
+        // mode's value cap: every slot in this ring reserves its payload
+        // whether or not anyone publishes, so tracking a 64 KiB cap would cost
+        // the ring 128× this. An over-long PUBLISH is refused in `worker.rs`,
+        // naming this limit.
         assert_eq!(PUBSUB_MSG_LEN, 512);
         // One byte of every channel slot is reserved for the terminator.
         assert_eq!(MAX_CHANNEL_LEN, CHAN_LEN - 1);
@@ -857,7 +857,7 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        // A ten-second timeout that we expect to return in ~100 ms: if the
+        // A ten-second timeout expected to return in ~100 ms: if the
         // wakeup were lost this test would take the full timeout.
         unsafe { wait_for_message(ptr, 0, 0, std::time::Duration::from_secs(10)) };
         let waited = start.elapsed();

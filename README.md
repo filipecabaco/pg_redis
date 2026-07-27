@@ -18,10 +18,10 @@ Data is stored across 16 databases (0–15), mirroring Redis's native database m
 
 Memory mode buys its speed with a fixed-size shared-memory region, reserved at
 server start, and that has consequences worth knowing before you rely on it:
-keys are capped at 511 bytes, values at 64 KiB, and hash fields and set members
+keys are capped at 512 bytes, values at 64 KiB, and hash fields and set members
 at 128; a full table either evicts or refuses the write depending on
 `redis.maxmemory_policy`. Nothing is ever silently truncated. The durable half
-has none of these limits. See [Storage modes](./docs/storage-modes.md).
+has none of these limits. See [Implementation](./docs/IMPLEMENTATION.md#7-limits).
 
 ## Performance
 
@@ -35,7 +35,7 @@ Benchmarked with `redis-benchmark -n 50000 -c 200` on Docker, Apple M-series:
 | ZADD    | 185,000 | **118,000**       | 7,000                 |
 | SADD    | 194,000 | 82,000            | 66,000                |
 
-Memory mode reaches ~50–70% of Redis throughput for writes and reads. See [Benchmarks](./docs/benchmarks.md) for the full table and tuning options.
+Memory mode reaches ~50–70% of Redis throughput for writes and reads. See [Performance](./docs/IMPLEMENTATION.md#8-performance) for the full table and tuning options.
 
 ## Quick start
 
@@ -72,7 +72,6 @@ Full docs at **[filipecabaco.github.io/pg_redis](https://filipecabaco.github.io/
 - [Installation](./docs/installation.md) — requirements, building from source, enabling the extension
 - [Configuration](./docs/configuration.md) — GUC reference, database selection, worker management
 - [Commands](./docs/commands.md) — supported Redis commands
-- [Storage modes](./docs/storage-modes.md) — in-memory mode, logged vs unlogged tables
-- [Pub/Sub table routing](./docs/pubsub.md) — routing PUBLISH to PostgreSQL tables
-- [Benchmarks](./docs/benchmarks.md) — performance results and batch size tuning
-- [Development](./docs/development.md) — running tests, local dev workflow, schema
+- [Command coverage](./docs/command-coverage.md) — full compatibility matrix
+- [Implementation](./docs/IMPLEMENTATION.md) — architecture, storage backends, the shared-memory
+  layout, pub/sub, WATCH, limits, performance, testing and CI

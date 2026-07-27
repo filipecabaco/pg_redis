@@ -6,7 +6,7 @@
 |---------|-----------|
 | `PING [msg]` | Returns `PONG` or echoes `msg` |
 | `ECHO msg` | Returns `msg` |
-| `SELECT db` | 0–15, or the names `cache` (0) and `durable` (8). Databases 0–7 are ephemeral, 8–15 WAL-logged — see [Storage modes](storage-modes.md) |
+| `SELECT db` | 0–15, or the names `cache` (0) and `durable` (8). Databases 0–7 are ephemeral, 8–15 WAL-logged — see [Storage modes](IMPLEMENTATION.md) |
 | `AUTH [password]` | Validates against `redis.password` GUC; no-op when unset |
 | `INFO` | Returns server info string |
 | `COMMAND` | Returns empty array (client compatibility) |
@@ -73,10 +73,11 @@ works unchanged:
 | Reply | Meaning |
 |---|---|
 | `-ERR ...` | The general case |
-| `-OOM command not allowed when used memory > 'maxmemory'` | A shared-memory table is full and `redis.maxmemory_policy` is `noeviction`. See [When a table fills](storage-modes.md#when-a-table-fills) |
-| `-ERR key exceeds redis.storage_mode='memory' limit of 511 bytes ...` | The key, hash field, set member or value is larger than a shared-memory slot |
+| `-OOM command not allowed when used memory > 'maxmemory'` | A shared-memory table is full and `redis.maxmemory_policy` is `noeviction`. See [When a table fills](IMPLEMENTATION.md#when-a-table-fills) |
+| `-ERR key exceeds redis.storage_mode='memory' limit of 512 bytes ...` | The key, hash field, set member or value is larger than memory mode accepts |
+| `-ERR key hash collides with a different key already stored ...` | Two keys shared a 128-bit keyed hash. Refused rather than merged — see [how keys are stored](IMPLEMENTATION.md#lookups-verify-the-key) |
 
-Both of those are specific to `storage_mode = 'memory'`; the durable half is
+All of those are specific to `storage_mode = 'memory'`; the durable half is
 bounded only by disk. Size limits are checked before the command runs, so a
 refusal never leaves a partial write — no half-stored value and no entry under
 a truncated key.

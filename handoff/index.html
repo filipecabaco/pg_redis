@@ -845,6 +845,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#cargo-pgrx-test-also-has-to-run-as-a-non-root-user" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        cargo pgrx test also has to run as a non-root user
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#traps" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -884,10 +895,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#2-chunked-value-pool-memory-and-the-value-cap" class="md-nav__link">
+  <a href="#2-done-chunked-value-pool" class="md-nav__link">
     <span class="md-ellipsis">
       
-        2. Chunked value pool (memory, and the value cap)
+        2. Done — chunked value pool
       
     </span>
   </a>
@@ -1020,6 +1031,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#cargo-pgrx-test-also-has-to-run-as-a-non-root-user" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        cargo pgrx test also has to run as a non-root user
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#traps" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1059,10 +1081,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#2-chunked-value-pool-memory-and-the-value-cap" class="md-nav__link">
+  <a href="#2-done-chunked-value-pool" class="md-nav__link">
     <span class="md-ellipsis">
       
-        2. Chunked value pool (memory, and the value cap)
+        2. Done — chunked value pool
       
     </span>
   </a>
@@ -1146,11 +1168,11 @@ how to verify a change, and which traps have already cost someone a day.</p>
 <tbody>
 <tr>
 <td>Rust tests</td>
-<td>111/111 on pg15, pg16, pg17</td>
+<td>120/120 on pg15, pg16, pg17</td>
 </tr>
 <tr>
 <td>E2E</td>
-<td>205/205 under <strong>both</strong> <code>storage_mode=memory</code> and <code>storage_mode=auto</code></td>
+<td>209/209 under <strong>both</strong> <code>storage_mode=memory</code> and <code>storage_mode=auto</code></td>
 </tr>
 <tr>
 <td>Lint</td>
@@ -1158,7 +1180,7 @@ how to verify a change, and which traps have already cost someone a day.</p>
 </tr>
 <tr>
 <td>Shared memory</td>
-<td>413 MB <code>shared_memory_size</code> at the defaults, down from 587 MB</td>
+<td>308 MB <code>shared_memory_size</code> at the defaults, down from 587 MB</td>
 </tr>
 </tbody>
 </table>
@@ -1250,7 +1272,25 @@ has already pushed satisfies neither. It passed locally and failed every CI leg.
 <a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a><span class="nv">PGRX_HOME</span><span class="o">=</span><span class="nv">$HOME</span>/pgrxassert<span class="w"> </span>cargo<span class="w"> </span>pgrx<span class="w"> </span><span class="nb">test</span><span class="w"> </span>pg17
 </code></pre></div>
 <p>Keep it under its own <code>PGRX_HOME</code> so the fast system-PostgreSQL config stays
-intact for everyday runs.</p>
+intact for everyday runs, and give it its own <code>CARGO_TARGET_DIR</code> — the bindings
+differ from the system build's, so sharing one target directory means a full
+rebuild every time you switch.</p>
+<h3 id="cargo-pgrx-test-also-has-to-run-as-a-non-root-user"><code>cargo pgrx test</code> also has to run as a non-root user</h3>
+<p>It runs <code>initdb</code> itself, which refuses to run as root exactly as the e2e setup
+above does — the failure is a wall of "Could not obtain test mutex" from every
+test after the first, with the real message ("initdb: error: cannot be run as
+root") only in the first one's output. From a root container:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>useradd<span class="w"> </span>-m<span class="w"> </span>pgu
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>cp<span class="w"> </span>-a<span class="w"> </span>~/.cargo<span class="w"> </span>~/.pgrx<span class="w"> </span>/home/pgu/<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>chown<span class="w"> </span>-R<span class="w"> </span>pgu<span class="w"> </span>/home/pgu
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>chown<span class="w"> </span>-R<span class="w"> </span>pgu<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PWD</span><span class="s2">&quot;</span><span class="w">                                   </span><span class="c1"># target/ is written during the run</span>
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>chown<span class="w"> </span>-R<span class="w"> </span>pgu<span class="w"> </span>/usr/lib/postgresql/*/lib<span class="w"> </span>/usr/share/postgresql/*/extension
+<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>sudo<span class="w"> </span>-u<span class="w"> </span>pgu<span class="w"> </span>env<span class="w"> </span><span class="nv">HOME</span><span class="o">=</span>/home/pgu<span class="w"> </span><span class="nv">PATH</span><span class="o">=</span>/home/pgu/.cargo/bin:<span class="nv">$PATH</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="w">  </span><span class="nv">RUSTUP_HOME</span><span class="o">=</span><span class="nv">$HOME</span>/.rustup<span class="w"> </span><span class="nv">CARGO_HOME</span><span class="o">=</span>/home/pgu/.cargo<span class="w"> </span>cargo<span class="w"> </span>pgrx<span class="w"> </span><span class="nb">test</span><span class="w"> </span>pg17
+</code></pre></div>
+<p><code>cargo pgrx init --pgN download</code> fetches from <code>ftp.postgresql.org</code>, which is not
+always reachable. Pointing pgrx at the PGDG packages
+(<code>cargo pgrx init --pg15 /usr/lib/postgresql/15/bin/pg_config …</code>) gets the
+matrix running; it is the assert-enabled build above that has to be compiled.</p>
 <h3 id="traps">Traps</h3>
 <ul>
 <li><strong><code>bun test -t "&lt;filter&gt;"</code> changes which database the tests run against.</strong>
@@ -1309,16 +1349,28 @@ PostgreSQL LWLocks require a valid <code>MyProc</code>, which non-backend thread
 have — which is why everything funnels through the bgworker main thread today.
 Closing this needs a design, not a patch. Lock sharding only becomes
 interesting afterwards.</p>
-<h3 id="2-chunked-value-pool-memory-and-the-value-cap">2. Chunked value pool (memory, and the value cap)</h3>
-<p>Roughly <strong>155 MiB of the 202 MiB</strong> the extension reserves is overflow tables —
-<code>kv_overflow</code> 75 MiB, <code>hash_overflow</code> 42.5 MiB, <code>list_overflow</code> 37.8 MiB — all
-preallocated as though every value exceeded the 64-byte inline slot. Almost
-none do.</p>
-<p>Replacing the fixed 448-byte overflow entry with a shared slab of fixed-size
-chunks on a free list, chained by index, reclaims most of that. It also turns
-<code>MAX_TOTAL_VAL_LEN</code> from a compile-time constant into a function of pool
-capacity, which makes the 512-byte value limit a sizing question rather than a
-Redis-parity gap.</p>
+<h3 id="2-done-chunked-value-pool">2. Done — chunked value pool</h3>
+<p>The three overflow tables are gone. Values spill into a per-table slab of
+64-byte chunks on a free list, chained by index; <code>shared_memory_size</code> went from
+413 MB to 308 MB and the value cap from 512 bytes to 64 KiB. See
+<code>docs/storage-modes.md</code> for the sizing and the two bounds on the cap.</p>
+<p>What is left over from it:</p>
+<ul>
+<li><strong>A full pool refuses spilling writes, and only <code>reserve_chunks</code> asks for
+  room.</strong> It runs on the paths where bulk data arrives — <code>SET</code>, <code>MSET</code>,
+  <code>GETSET</code>, <code>APPEND</code>, <code>HSET</code>, <code>HSETNX</code>, <code>LPUSH</code>, <code>RPUSH</code>. The others (<code>LSET</code>,
+  <code>LINSERT</code>, <code>LMOVE</code>) reply <code>OOM</code> on an empty pool without trying to evict
+  first. Eviction cannot simply be moved into <code>value_write</code>: it may remove any
+  entry in the table, including the one being written, which is why it runs
+  before the entry exists.</li>
+<li><strong>Chunk lifecycle is the thing to be careful with.</strong> Every removal of an
+  entry that owns a value goes through <code>remove_valued</code> (or <code>list_remove_at</code>,
+  its bare-HTAB twin), which frees the chain <em>before</em> the entry — the chain head
+  lives in the entry. A path that calls <code>hash_search(HASH_REMOVE)</code> on the KV,
+  hash or list table directly would leak silently until the pool ran dry.
+  <code>values_round_trip_through_the_pool_at_every_boundary</code> and the e2e
+  "rewriting a large value many times" test are the guards.</li>
+</ul>
 <h3 id="3-smaller-items">3. Smaller items</h3>
 <ul>
 <li><strong>Multi-key writes are not atomic under OOM.</strong> An <code>MSET</code> or multi-member
@@ -1330,7 +1382,8 @@ Redis-parity gap.</p>
   set members. Hashing the key out of the composite tables freed 174 MiB, so
   there is headroom to raise it now.</li>
 <li><strong><code>redis.mem_max_entries</code> is still 8192</strong>, halved when <code>MAX_KEY_LEN</code> grew to</li>
-<li>The same headroom applies.</li>
+<li>The same headroom applies, and the chunked pool added ~105 MB more of
+  it. Note that raising it now buys pool capacity as well as key capacity.</li>
 </ul>
 <h2 id="design-notes">Design notes</h2>
 <p>Things that are easy to get wrong without knowing why they are the way they are.</p>
@@ -1361,8 +1414,22 @@ Redis-parity gap.</p>
 </ul>
 <h2 id="benchmarking">Benchmarking</h2>
 <p><code>redis-benchmark</code> defaults to 3-byte values, so the standard suite never leaves
-the 64-byte inline slot. <code>mise run bench-value-sizes</code> sweeps 3/63/64/65/200/512
-bytes to make the inline-to-overflow boundary visible.</p>
+the 64-byte inline slot. <code>mise run bench-value-sizes</code> sweeps
+3/63/64/65/200/512/4096/65536 bytes to make the inline-to-pool boundary
+visible.</p>
+<p><strong>Point the benchmark at db 0 with <code>storage_mode=memory</code>.</strong> The compose default
+is <code>redis.default_db=8</code>, the WAL-logged half — a benchmark that forgets this
+measures fsync and reports ~500 requests/second for everything.
+<code>bench-value-sizes</code> and <code>bench-report</code> set both; <code>bench</code> does not, by design.</p>
+<p><strong><code>redis-benchmark</code> never clears <code>mylist</code>.</strong> Its <code>lpush</code>, <code>rpush</code> and <code>lrange</code>
+tests build the list up over the whole run and <code>-n 20000</code> is past what a list
+table holds at the default <code>redis.mem_max_entries</code>, so the run ends in an OOM
+the tool reports as nothing at all. <code>docker/bench/report.sh</code> clears the key and
+uses 4,000 requests for those.</p>
+<p>CI runs <code>docker/bench/report.sh</code> on every pull request and posts it as a
+comment, keyed on an HTML marker so each push edits the same one — and deletes
+any duplicate, so the thread carries exactly one report however many times it
+runs.</p>
 
 
 

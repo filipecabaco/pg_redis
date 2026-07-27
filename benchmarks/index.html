@@ -687,6 +687,17 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#on-every-pull-request" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        On every pull request
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#commands" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -888,6 +899,17 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#on-every-pull-request" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        On every pull request
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#commands" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -959,8 +981,17 @@
 <h1 id="benchmarks">Benchmarks</h1>
 <p>All figures are requests/second on Docker, Apple M-series. Benchmarks use <a href="https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/benchmarks/"><code>redis-benchmark</code></a> with <code>-n 50000 -c 200</code>, connecting to the default database (db 0 for memory/unlogged, db 8 for logged).</p>
 <p><code>redis-benchmark</code> writes 3-byte values by default, which never leave memory
-mode's 64-byte inline slot — so these figures say nothing about the overflow
-path. <code>mise run bench-value-sizes</code> sweeps 3/63/64/65/200/512 bytes for that.</p>
+mode's 64-byte inline slot — so these figures say nothing about the chunk pool
+that holds anything longer. <code>mise run bench-value-sizes</code> sweeps
+3/63/64/65/200/512/4096/65536 bytes for that.</p>
+<h2 id="on-every-pull-request">On every pull request</h2>
+<p>CI runs the suite below against memory mode and a Redis 7 container on the same
+runner, and posts the result as a comment on the pull request (updating it in
+place on each push). Runners are shared and the absolute numbers move between
+runs, so it is a smoke signal — a command falling from tens of thousands per
+second to hundreds — rather than a regression gate. The ratio against the
+Redis running beside it is the part that travels.</p>
+<p><code>mise run bench-report</code> produces the same report locally.</p>
 <h2 id="commands">Commands</h2>
 <table>
 <thead>

@@ -666,6 +666,34 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#how-values-are-stored" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How values are stored
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="How values are stored">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#the-value-size-limit" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The value size limit
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#logged-tables-databases-815" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1065,6 +1093,34 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#how-values-are-stored" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How values are stored
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="How values are stored">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#the-value-size-limit" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The value size limit
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#logged-tables-databases-815" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1219,12 +1275,12 @@ database collation.</p>
 </tr>
 <tr>
 <td>Shared memory at the default</td>
-<td>~202 MiB, reserved at server start</td>
+<td>~98 MiB, reserved at server start</td>
 <td>None</td>
 </tr>
 <tr>
 <td>Max value size</td>
-<td>512 bytes</td>
+<td>64 KiB — see <a href="#how-values-are-stored">values</a></td>
 <td>Unlimited (TOAST)</td>
 </tr>
 <tr>
@@ -1245,14 +1301,15 @@ on key or field length. pg_redis honours the 512 MiB protocol limit at the
 parser, so <strong>the durable half (8–15) matches Redis</strong>: values there are bounded
 only by PostgreSQL's ~1 GB per-field TOAST limit.</p>
 <p>The memory-mode limits above are far lower because shared memory is a
-fixed-size region allocated at postmaster start — every slot has to be sized up
-front, so an entry cannot grow to 512 MiB on demand. This is a property of the
-backend, not of the protocol.</p>
+fixed-size region allocated at postmaster start — the whole region has to be
+sized up front, so nothing in it can grow to 512 MiB on demand. This is a
+property of the backend, not of the protocol.</p>
 <p>Anything over a limit is <strong>rejected, never truncated</strong>. A truncated key is worse
 than an error: two keys sharing a 511-byte prefix would collapse onto one entry,
 so a <code>GET</code> returns another key's value and a <code>DEL</code> removes it. The reply names
 both the limit and the way past it:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>ERR key exceeds redis.storage_mode=&#39;memory&#39; limit of 511 bytes (use SELECT durable for unbounded values)
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>ERR value exceeds redis.storage_mode=&#39;memory&#39; limit of 65536 bytes (use SELECT durable for unbounded values)
 </code></pre></div>
 <p>The check runs before the command executes, so a refusal never leaves a partial
 write behind — no half-stored value, no entry under a truncated key. Switch the
@@ -1289,6 +1346,10 @@ policy. A background sweep also removes them once a second.</p>
 <p>A full table has never been able to take the server down: <code>HASH_ENTER_NULL</code>
 returns a null the command turns into the error above, rather than the
 <code>out of shared memory</code> that dynahash raises for <code>HASH_ENTER</code>.</p>
+<p>A table's <strong>chunk pool</strong> can run out before its entries do — see below. That is
+reported as the same <code>OOM</code>, and eviction is asked for room the same way, so a
+pool emptied by long values recovers under <code>allkeys-random</code> exactly as a full
+table does.</p>
 <p>The durable half has no such limit — it is bounded by disk.</p>
 <h2 id="how-keys-are-stored-in-memory-mode">How keys are stored in memory mode</h2>
 <p>A hash, a set, a sorted set or a list holds one shared-memory entry per member,
@@ -1304,6 +1365,66 @@ client cannot construct two keys that collide and merge their contents.</p>
 <p>At the default <code>redis.mem_max_entries</code> this takes the extension's shared-memory
 reservation from <strong>376 MiB to 202 MiB</strong> — measured as a drop in
 <code>shared_memory_size</code> from 587 MB to 413 MB.</p>
+<h2 id="how-values-are-stored">How values are stored</h2>
+<p>An entry carries the first <strong>64 bytes</strong> of its value inline. That covers most of
+what a cache holds — <code>redis-benchmark</code> writes 3-byte values — and costs nothing
+beyond the entry itself.</p>
+<p>Anything longer spills into a <strong>chunk pool</strong>: one shared slab per table per
+ephemeral database, holding <code>redis.mem_max_entries</code> chunks of 64 bytes each on a
+free list, chained by index. A value of <em>n</em> bytes occupies <code>ceil((n - 64) / 64)</code>
+chunks; the entry stores the index of the first, and each chunk the index of the
+next. Freeing a value returns its chain to the free list in one pointer move.</p>
+<p>The pool replaced a fixed overflow row per entry — 448 bytes reserved for every
+key the table could ever hold, against the possibility that every value might
+exceed the inline slot. Almost none do:</p>
+<table>
+<thead>
+<tr>
+<th>At the default <code>redis.mem_max_entries</code></th>
+<th>Before</th>
+<th>After</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Overflow storage</td>
+<td>155 MiB of fixed rows</td>
+<td>12.8 MiB of pooled chunks</td>
+</tr>
+<tr>
+<td>Extension's reservation</td>
+<td>~202 MiB</td>
+<td>~98 MiB</td>
+</tr>
+<tr>
+<td><code>shared_memory_size</code></td>
+<td>413 MB</td>
+<td><strong>308 MB</strong></td>
+</tr>
+</tbody>
+</table>
+<h3 id="the-value-size-limit">The value size limit</h3>
+<p>The 512-byte cap was the size of that fixed row. It is now a function of the
+pool:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>max value = min(64 KiB, 64 + (redis.mem_max_entries / 8) * 64 bytes)
+</code></pre></div>
+<p>which is <strong>65,536 bytes</strong> at the default, where the two bounds meet:</p>
+<ul>
+<li><strong>An eighth of the pool.</strong> A pool is shared by every value in its table, so
+  one value must not be able to take all of it. At the default that eighth is
+  1,024 chunks — 64 KiB.</li>
+<li><strong>64 KiB outright.</strong> Every read copies the value out of shared memory while
+  the table's LWLock is held. That ceiling holds however large the pool is
+  configured, so raising <code>redis.mem_max_entries</code> buys capacity, not longer
+  values.</li>
+</ul>
+<p>The limit is still a limit, and for the same reason as before: shared memory is
+fixed at server start, so a value cannot grow into it on demand. What changed is
+that a database's capacity for long values is now pooled rather than reserved
+per key — 8,192 chunks per table per database at the default, which is 512 KiB
+of spill, enough for every key to carry 128 bytes or for a handful to carry
+64 KiB. A write that finds the pool empty is refused with <code>OOM</code>, exactly as a
+full table is; nothing is truncated and nothing already stored is lost.</p>
 <h2 id="logged-tables-databases-815">Logged tables (databases 8–15)</h2>
 <p>The durable half always uses WAL-logged tables regardless of <code>storage_mode</code>.</p>
 <table>

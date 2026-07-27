@@ -65,10 +65,10 @@ database collation.
 | Survives crash | No (shared memory, lost) | No (UNLOGGED, truncated) |
 | SQL-visible | Returns nothing | `SELECT * FROM redis.kv_0` returns data |
 | Max keys | `redis.mem_max_entries` per KV db (default 8,192) | Unlimited (disk) |
-| Shared memory at the default | ~98 MiB, reserved at server start | None |
+| Shared memory at the default | ~91 MiB, reserved at server start | None |
 | Max value size | 64 KiB — see [values](#how-values-are-stored) | Unlimited (TOAST) |
 | Max key size | 511 bytes | Unlimited |
-| Max hash field / set member | 128 bytes | Unlimited |
+| Max hash field / set member | 64 KiB — see [members](#how-members-are-stored) | Unlimited |
 
 ### Where this differs from Redis
 
@@ -90,6 +90,7 @@ both the limit and the way past it:
 ```
 ERR key exceeds redis.storage_mode='memory' limit of 511 bytes (use SELECT durable for unbounded values)
 ERR value exceeds redis.storage_mode='memory' limit of 65536 bytes (use SELECT durable for unbounded values)
+ERR hash field or set member exceeds redis.storage_mode='memory' limit of 65536 bytes (use SELECT durable for unbounded values)
 ```
 
 The check runs before the command executes, so a refusal never leaves a partial
@@ -141,6 +142,81 @@ At the default `redis.mem_max_entries` this takes the extension's shared-memory
 reservation from **376 MiB to 202 MiB** — measured as a drop in
 `shared_memory_size` from 587 MB to 413 MB.
 
+## How members are stored
+
+The member half of those composite keys was the same problem one level down. A
+`SetEntry` was a 16-byte key hash and a fixed `[u8; 128]` member — which both
+capped a hash field or a set member at 128 bytes, where Redis caps neither, and
+reserved 128 bytes in every entry of the three largest tables whether the member
+needed them or not.
+
+Members are now hashed into the key the same way keys are, so a composite key is
+**32 bytes rather than 144**, and the bytes themselves live in the entry: the
+first 48 inline, the rest chained through the same chunk pool a value spills
+into. A member's length stops being a property of the table's key layout and
+becomes a property of the pool, exactly as a value's did.
+
+More has to come back out than for a Redis key, which is why the bytes are kept
+at all. `KEYS` and `SCAN` read key bytes from the string table, but `HGETALL`,
+`HKEYS`, `SMEMBERS`, `SPOP`, `ZRANGE` and `ZPOPMIN` all hand a *member* back to
+the client and there is no second table holding those. Storing them per entry
+reuses the existing spill machinery and needs no reference counting; a shared,
+deduplicated member table would halve the cost of a set stored twice, but it
+would put a refcount on every eviction, `DEL`, `SPOP`, `ZREM` and
+`ZREMRANGEBY*` path — and an entry that is dropped without its member being
+released is invisible until the pool runs dry. Per-entry bytes were the cheaper
+correctness bargain.
+
+`ZsetMeta` pays for itself twice over here. It cached the extreme members as two
+more 128-byte arrays, to keep `ZPOPMIN`/`ZPOPMAX` O(1); it now caches their
+16-byte hashes instead. That is still O(1) and still one lookup — the hash *is*
+half of the composite key — and the entry it lands on is where the member bytes
+come from.
+
+| At the default `redis.mem_max_entries` | Before | After |
+|---|---|---|
+| Composite key | 144 bytes | 32 bytes |
+| `HashEntry` / `SetEntry` / `ZsetEntry` | 216 / 144 / 152 bytes | 160 / 88 / 96 bytes |
+| `ZsetMeta` | 304 bytes | 72 bytes |
+| Chunk pools | 3 per database, 12.8 MiB | 5 per database, 21.3 MiB |
+| Extension's reservation | ~98 MiB | ~91 MiB |
+| `shared_memory_size` | 308 MB | **301 MB** |
+
+The pools grew because sets and sorted sets had no pool at all before — their
+entries held nothing variable-length. Each table keeps its own so that every
+pool operation runs under that table's LWLock and none needs a lock of its own.
+
+The net 7 MB is those three numbers against each other. The three entry types
+shed 56 bytes each and `ZsetMeta` shed 232, which is 6.6 MiB and 9.1 MiB across
+the eight databases; the two new pools cost 8.5 MiB back. Shrinking the entries
+does not save the full 128 bytes a member array held, because 16 of them come
+back as the member's hash and 8 more as its length and chain head — the
+remaining 48 are the inline slot, and each 8 bytes of that is 320 KiB.
+
+### The member size limit
+
+A member is bounded by the same expression a value is, against its own inline
+slot:
+
+```
+max member = min(64 KiB, 48 + (redis.mem_max_entries / 8) * 64 bytes)
+```
+
+which is **65,536 bytes** at the default — the same number as a value, for the
+same two reasons ([an eighth of the pool, and the ceiling on what one read may
+copy under an LWLock](#the-value-size-limit)). There is one limit to remember
+rather than two.
+
+A hash's members and its values share one pool, so a hash whose fields are all
+long has less room for long values, and the other way round. Both are refused
+with `OOM` when the pool is empty, and both are recovered by `allkeys-random`
+exactly as a full table is.
+
+One thing the old layout got wrong went with it. A member was stored NUL-padded
+inside the key and read back at the first NUL, so `a\0b` and `a` were stored as
+two distinct entries that both read back as `a`. Members are length-prefixed
+now, and arbitrary bytes round-trip.
+
 ## How values are stored
 
 An entry carries the first **64 bytes** of its value inline. That covers most of
@@ -161,7 +237,11 @@ exceed the inline slot. Almost none do:
 |---|---|---|
 | Overflow storage | 155 MiB of fixed rows | 12.8 MiB of pooled chunks |
 | Extension's reservation | ~202 MiB | ~98 MiB |
-| `shared_memory_size` | 413 MB | **308 MB** |
+| `shared_memory_size` | 413 MB | 308 MB |
+
+(Members later moved into the pools too, taking the reservation to ~91 MiB and
+`shared_memory_size` to 308 MB → **301 MB** — see
+[members](#how-members-are-stored).)
 
 ### The value size limit
 
@@ -189,6 +269,9 @@ per key — 8,192 chunks per table per database at the default, which is 512 KiB
 of spill, enough for every key to carry 128 bytes or for a handful to carry
 64 KiB. A write that finds the pool empty is refused with `OOM`, exactly as a
 full table is; nothing is truncated and nothing already stored is lost.
+
+In the hash, set and zset tables that same pool also holds every member past its
+48-byte inline slot, so the spill is shared between the two.
 
 ## Logged tables (databases 8–15)
 

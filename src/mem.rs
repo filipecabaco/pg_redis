@@ -7,11 +7,6 @@ use std::ptr::addr_of_mut;
 // Maximum key length (null-terminated string fits in HTAB key). Keys are the
 // thing applications namespace and make long, so this is generous.
 pub const MAX_KEY_LEN: usize = 512;
-// Maximum hash field / set member / sorted-set member length. Kept smaller than
-// MAX_KEY_LEN on purpose: the hash, set and zset entries each store a key *and*
-// a member, so this length is multiplied across the largest tables.
-pub const MAX_MEMBER_LEN: usize = 128;
-// HTAB key for the hash/set/zset tables: the redis key followed by the member.
 /// Composite tables index on a 128-bit keyed hash of the Redis key rather than
 /// the key itself.
 ///
@@ -28,11 +23,38 @@ pub const MAX_MEMBER_LEN: usize = 128;
 pub const KEY_HASH_LEN: usize = 16;
 pub type KeyHash = [u8; KEY_HASH_LEN];
 
-pub const COMPOSITE_KEY_LEN: usize = KEY_HASH_LEN + MAX_MEMBER_LEN;
+/// The member half of a composite key gets the same treatment, and for the same
+/// reason: it was a fixed `[u8; 128]` array, which both capped a hash field or a
+/// set member at 128 bytes — Redis caps neither — and reserved those 128 bytes
+/// in every entry of the three largest tables whether the member needed them or
+/// not.
+///
+/// The bytes themselves now live in the entry rather than in its key, inline up
+/// to `INLINE_MEMBER_LEN` and spilling into the table's chunk pool past it, so
+/// the commands that hand a member back to a client (`HGETALL`, `HKEYS`,
+/// `SMEMBERS`, `SPOP`, `ZRANGE`, `ZPOPMIN`) read it from there.
+///
+/// Same keyed SipHash as `key_hash`, so the collision argument is the same one:
+/// two members that collide would merge, and with 128 bits keyed from
+/// `pg_strong_random` per postmaster a client cannot construct the pair.
+pub const MEMBER_HASH_LEN: usize = 16;
+pub type MemberHash = [u8; MEMBER_HASH_LEN];
+
+// HTAB key for the hash/set/zset tables: the key's hash followed by the
+// member's.
+pub const COMPOSITE_KEY_LEN: usize = KEY_HASH_LEN + MEMBER_HASH_LEN;
 // HTAB key for the list tables: the redis key followed by the 8-byte position.
 pub const LIST_KEY_LEN: usize = KEY_HASH_LEN + 8;
 // Inline value bytes stored directly in the main HTAB entry.
 pub const INLINE_VAL_LEN: usize = 64;
+/// Inline member bytes stored directly in a composite entry.
+///
+/// Smaller than `INLINE_VAL_LEN` because it is paid by every member of every
+/// hash, set and sorted set — each eight bytes of it costs 320 KiB of shared
+/// memory at the defaults. Forty-eight covers a bare UUID (36 bytes), a
+/// prefixed one, and `redis-benchmark`'s twenty-byte members, so the common
+/// case never reaches the pool.
+pub const INLINE_MEMBER_LEN: usize = 48;
 // Number of even databases: 0,2,4,6,8,10,12,14 → indices 0..7
 /// One shared-memory database per entry in the ephemeral half; `db` indexes
 /// these directly.
@@ -65,32 +87,48 @@ pub struct KvEntry {
     pub overflow: u32,
 }
 
-/// Fixed-size entry for the hash HTAB. Key is (redis_key[128], field[128]).
+/// Fixed-size entry for the hash HTAB. Key is (key_hash[16], member_hash[16]).
 #[repr(C)]
 pub struct HashEntry {
     /// SipHash of the Redis key — see `KEY_HASH_LEN`.
     pub key: KeyHash,
-    pub field: [u8; MAX_MEMBER_LEN],
+    /// SipHash of the field — see `MEMBER_HASH_LEN`. Key and hash together are
+    /// the HTAB lookup key, so they must stay first and stay adjacent.
+    pub member: MemberHash,
+    /// Inline field bytes; anything past `INLINE_MEMBER_LEN` lives in the
+    /// table's chunk pool, exactly as a value's tail does.
+    pub member_bytes: [u8; INLINE_MEMBER_LEN],
+    pub member_len: u32,
+    pub member_overflow: u32,
+    /// Inline value bytes (not null-terminated). Holds first INLINE_VAL_LEN bytes.
     pub value: [u8; INLINE_VAL_LEN],
     pub value_len: u32,
     /// See `KvEntry::overflow`.
     pub overflow: u32,
 }
 
-/// Fixed-size entry for the set HTAB. Key is (redis_key[128], member[128]).
+/// Fixed-size entry for the set HTAB. Key is (key_hash[16], member_hash[16]).
 #[repr(C)]
 pub struct SetEntry {
     /// SipHash of the Redis key — see `KEY_HASH_LEN`.
     pub key: KeyHash,
-    pub member: [u8; MAX_MEMBER_LEN],
+    /// SipHash of the member — see `MEMBER_HASH_LEN`.
+    pub member: MemberHash,
+    pub member_bytes: [u8; INLINE_MEMBER_LEN],
+    pub member_len: u32,
+    pub member_overflow: u32,
 }
 
-/// Fixed-size entry for the sorted set HTAB. Key is (redis_key[128], member[128]).
+/// Fixed-size entry for the sorted set HTAB. Key is (key_hash[16], member_hash[16]).
 #[repr(C)]
 pub struct ZsetEntry {
     /// SipHash of the Redis key — see `KEY_HASH_LEN`.
     pub key: KeyHash,
-    pub member: [u8; MAX_MEMBER_LEN],
+    /// SipHash of the member — see `MEMBER_HASH_LEN`.
+    pub member: MemberHash,
+    pub member_bytes: [u8; INLINE_MEMBER_LEN],
+    pub member_len: u32,
+    pub member_overflow: u32,
     pub score: f64,
 }
 
@@ -117,8 +155,14 @@ pub struct ListMeta {
     pub count: i64,
 }
 
-/// Metadata entry for the sorted set meta HTAB. Key is redis_key[128].
+/// Metadata entry for the sorted set meta HTAB. Key is key_hash[16].
 /// Tracks min/max score and members for O(1) ZPOPMIN/ZPOPMAX/ZCARD.
+///
+/// The extremes are held as member *hashes*, not member bytes. That is all
+/// `ZPOPMIN` needs to stay O(1): the composite key it looks up is
+/// `key_hash ++ member_hash`, and the entry it lands on carries the member's
+/// bytes to hand back to the client. Two 128-byte arrays here cost 10.5 MB at
+/// the defaults — more than the hash, set and zset member arrays put together.
 #[repr(C)]
 pub struct ZsetMeta {
     /// SipHash of the Redis key — see `KEY_HASH_LEN`.
@@ -126,10 +170,8 @@ pub struct ZsetMeta {
     pub count: i64,
     pub min_score: f64,
     pub max_score: f64,
-    pub min_member: [u8; MAX_MEMBER_LEN],
-    pub max_member: [u8; MAX_MEMBER_LEN],
-    pub min_member_len: u16,
-    pub max_member_len: u16,
+    pub min_member: MemberHash,
+    pub max_member: MemberHash,
 }
 
 /// Metadata entry for the set meta HTAB. Key is redis_key[128].
@@ -198,6 +240,18 @@ pub fn max_total_val_len() -> usize {
     (INLINE_VAL_LEN + share).min(MAX_VAL_CEILING)
 }
 
+/// Longest hash field or set/zset member the shared-memory backend accepts.
+///
+/// A member spills into its table's pool exactly as a value does, so it is
+/// bounded by exactly the same two things — an eighth of the pool, and the
+/// ceiling on what one read may copy under an LWLock. At the default
+/// `redis.mem_max_entries` the two meet at 64 KiB, the same number as a value,
+/// which is the whole point: there is one limit to document, not two.
+pub fn max_member_len() -> usize {
+    let share = (pool_chunks() / POOL_SHARE_PER_VALUE) * CHUNK_LEN;
+    (INLINE_MEMBER_LEN + share).min(MAX_VAL_CEILING)
+}
+
 /// Header of one pool. The chunk links and the chunk payloads follow it in the
 /// same shared-memory allocation:
 ///
@@ -221,9 +275,9 @@ pub fn val_pool_size(chunks: usize) -> usize {
     std::mem::size_of::<ValPool>() + chunks * (std::mem::size_of::<u32>() + CHUNK_LEN)
 }
 
-/// Chunks a value of `len` bytes needs beyond its inline slot.
-fn chunks_for(len: usize) -> usize {
-    len.saturating_sub(INLINE_VAL_LEN).div_ceil(CHUNK_LEN)
+/// Chunks a payload of `len` bytes needs beyond an inline slot of `inline`.
+fn chunks_for(len: usize, inline: usize) -> usize {
+    len.saturating_sub(inline).div_ceil(CHUNK_LEN)
 }
 
 unsafe fn pool_links(pool: *mut ValPool) -> *mut u32 {
@@ -363,14 +417,20 @@ unsafe fn pool_read_into(pool: *mut ValPool, head: u32, len: usize, out: &mut Ve
     }
 }
 
-/// The three fields that make up a stored value, wherever it lives.
+/// The four fields that make up one variable-length payload in an entry,
+/// wherever the payload lives.
 ///
-/// `KvEntry`, `HashEntry` and `ListEntry` carry the same trio at different
-/// offsets; naming it once is what keeps the chunk lifecycle to a single
-/// implementation rather than three that have to be kept in step.
+/// Values in `KvEntry`, `HashEntry` and `ListEntry` and members in `HashEntry`,
+/// `SetEntry` and `ZsetEntry` are all the same shape at different offsets and
+/// with different inline capacities; naming it once is what keeps the chunk
+/// lifecycle to a single implementation rather than six that have to be kept in
+/// step.
 #[derive(Copy, Clone)]
 struct ValueSlot {
     inline: *mut u8,
+    /// Bytes the inline array holds — `INLINE_VAL_LEN` for a value,
+    /// `INLINE_MEMBER_LEN` for a member. Everything past it is chunked.
+    inline_cap: usize,
     len: *mut u32,
     head: *mut u32,
 }
@@ -379,6 +439,7 @@ unsafe fn kv_slot(entry: *mut KvEntry) -> ValueSlot {
     unsafe {
         ValueSlot {
             inline: addr_of_mut!((*entry).value).cast(),
+            inline_cap: INLINE_VAL_LEN,
             len: addr_of_mut!((*entry).value_len),
             head: addr_of_mut!((*entry).overflow),
         }
@@ -389,6 +450,7 @@ unsafe fn hash_slot(entry: *mut HashEntry) -> ValueSlot {
     unsafe {
         ValueSlot {
             inline: addr_of_mut!((*entry).value).cast(),
+            inline_cap: INLINE_VAL_LEN,
             len: addr_of_mut!((*entry).value_len),
             head: addr_of_mut!((*entry).overflow),
         }
@@ -399,21 +461,81 @@ unsafe fn list_slot(entry: *mut ListEntry) -> ValueSlot {
     unsafe {
         ValueSlot {
             inline: addr_of_mut!((*entry).value).cast(),
+            inline_cap: INLINE_VAL_LEN,
             len: addr_of_mut!((*entry).value_len),
             head: addr_of_mut!((*entry).overflow),
         }
     }
 }
 
+unsafe fn hash_member_slot(entry: *mut HashEntry) -> ValueSlot {
+    unsafe {
+        ValueSlot {
+            inline: addr_of_mut!((*entry).member_bytes).cast(),
+            inline_cap: INLINE_MEMBER_LEN,
+            len: addr_of_mut!((*entry).member_len),
+            head: addr_of_mut!((*entry).member_overflow),
+        }
+    }
+}
+
+unsafe fn set_member_slot(entry: *mut SetEntry) -> ValueSlot {
+    unsafe {
+        ValueSlot {
+            inline: addr_of_mut!((*entry).member_bytes).cast(),
+            inline_cap: INLINE_MEMBER_LEN,
+            len: addr_of_mut!((*entry).member_len),
+            head: addr_of_mut!((*entry).member_overflow),
+        }
+    }
+}
+
+unsafe fn zset_member_slot(entry: *mut ZsetEntry) -> ValueSlot {
+    unsafe {
+        ValueSlot {
+            inline: addr_of_mut!((*entry).member_bytes).cast(),
+            inline_cap: INLINE_MEMBER_LEN,
+            len: addr_of_mut!((*entry).member_len),
+            head: addr_of_mut!((*entry).member_overflow),
+        }
+    }
+}
+
+/// Everything an entry owns in the pool, released together because it is all
+/// lost together — see `remove_valued`. A `HashEntry` owns two chains, its
+/// field and its value; the others own one apiece.
+unsafe fn kv_free(pool: *mut ValPool, entry: *mut KvEntry) {
+    unsafe { value_free(pool, kv_slot(entry)) };
+}
+
+unsafe fn hash_free(pool: *mut ValPool, entry: *mut HashEntry) {
+    unsafe {
+        value_free(pool, hash_member_slot(entry));
+        value_free(pool, hash_slot(entry));
+    }
+}
+
+unsafe fn set_free(pool: *mut ValPool, entry: *mut SetEntry) {
+    unsafe { value_free(pool, set_member_slot(entry)) };
+}
+
+unsafe fn zset_free(pool: *mut ValPool, entry: *mut ZsetEntry) {
+    unsafe { value_free(pool, zset_member_slot(entry)) };
+}
+
+unsafe fn list_free(pool: *mut ValPool, entry: *mut ListEntry) {
+    unsafe { value_free(pool, list_slot(entry)) };
+}
+
 /// Read a value back, inline part and chunked tail together.
 unsafe fn value_read(pool: *mut ValPool, slot: ValueSlot) -> Vec<u8> {
     unsafe {
         let total = slot.len.read() as usize;
-        let inline_len = total.min(INLINE_VAL_LEN);
+        let inline_len = total.min(slot.inline_cap);
         let mut out = Vec::with_capacity(total);
         out.extend_from_slice(std::slice::from_raw_parts(slot.inline, inline_len));
-        if total > INLINE_VAL_LEN {
-            pool_read_into(pool, slot.head.read(), total - INLINE_VAL_LEN, &mut out);
+        if total > slot.inline_cap {
+            pool_read_into(pool, slot.head.read(), total - slot.inline_cap, &mut out);
         }
         out
     }
@@ -421,12 +543,18 @@ unsafe fn value_read(pool: *mut ValPool, slot: ValueSlot) -> Vec<u8> {
 
 /// Release whatever the slot holds and mark it empty.
 ///
-/// Every path that drops or overwrites a value goes through here — a chain that
-/// is not released is not noticed until the pool runs dry, which is why the
+/// Every path that drops or overwrites a payload goes through here — a chain
+/// that is not released is not noticed until the pool runs dry, which is why the
 /// removal helpers below take the entry rather than its key.
+///
+/// Zeroing the length is what makes the scheme safe on recycled memory:
+/// dynahash hands a removed entry straight back out on the next insert, so the
+/// invariant every path relies on is that an entry leaving the table has
+/// `len == 0` in each of its slots. A head is only ever read when its length
+/// says there is a tail, so a stale one can never be released twice.
 unsafe fn value_free(pool: *mut ValPool, slot: ValueSlot) {
     unsafe {
-        if slot.len.read() as usize > INLINE_VAL_LEN {
+        if slot.len.read() as usize > slot.inline_cap {
             pool_release(pool, slot.head.read());
         }
         slot.len.write(0);
@@ -434,32 +562,31 @@ unsafe fn value_free(pool: *mut ValPool, slot: ValueSlot) {
     }
 }
 
-/// Store `value` in the slot, spilling past `INLINE_VAL_LEN` into the pool.
+/// Store `bytes` in the slot, spilling past its inline capacity into the pool.
 ///
 /// Returns false with the slot left empty when the pool cannot hold the tail.
 /// The slot is always written, never left as the caller found it: an entry
 /// fresh out of `hash_search(HASH_ENTER)` is recycled shared memory with only
 /// its key initialised, so a return without a write would expose whichever
 /// value previously occupied it.
-unsafe fn value_write(pool: *mut ValPool, slot: ValueSlot, value: &[u8]) -> bool {
-    let limit = max_total_val_len();
+unsafe fn value_write(pool: *mut ValPool, slot: ValueSlot, bytes: &[u8], limit: usize) -> bool {
     debug_assert!(
-        value.len() <= limit,
-        "over-long value reached memory backend"
+        bytes.len() <= limit,
+        "over-long payload reached memory backend"
     );
     // The old chain goes back first, so overwriting a value in place reuses its
     // own chunks instead of needing the pool to hold both copies at once.
     unsafe { value_free(pool, slot) };
-    if value.len() > limit {
+    if bytes.len() > limit {
         return false;
     }
-    let inline_len = value.len().min(INLINE_VAL_LEN);
+    let inline_len = bytes.len().min(slot.inline_cap);
     unsafe {
-        std::ptr::copy_nonoverlapping(value.as_ptr(), slot.inline, inline_len);
-        slot.len.write(value.len() as u32);
-        if value.len() > INLINE_VAL_LEN {
-            let Some(head) = pool_store(pool, &value[INLINE_VAL_LEN..]) else {
-                // `value_len` already promises a tail that has nowhere to live.
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), slot.inline, inline_len);
+        slot.len.write(bytes.len() as u32);
+        if bytes.len() > slot.inline_cap {
+            let Some(head) = pool_store(pool, &bytes[slot.inline_cap..]) else {
+                // The length already promises a tail that has nowhere to live.
                 slot.len.write(0);
                 signal_oom();
                 return false;
@@ -468,6 +595,12 @@ unsafe fn value_write(pool: *mut ValPool, slot: ValueSlot, value: &[u8]) -> bool
         }
     }
     true
+}
+
+/// `value_write` for the payload that is a member rather than a value. Split
+/// out only so the two limits stay apart at the call sites.
+unsafe fn member_write(pool: *mut ValPool, slot: ValueSlot, member: &[u8]) -> bool {
+    unsafe { value_write(pool, slot, member, max_member_len()) }
 }
 
 /// Control block in static shared memory.
@@ -495,11 +628,15 @@ pub struct MemControlBlock {
     pub list_meta_htab: [*mut pg_sys::HTAB; NUM_MEM_DBS],
     pub zset_meta_htab: [*mut pg_sys::HTAB; NUM_MEM_DBS],
     pub set_meta_htab: [*mut pg_sys::HTAB; NUM_MEM_DBS],
-    /// Chunk pools holding the tail of every value past `INLINE_VAL_LEN`.
-    /// One per table per database, so each is covered by that table's LWLock.
+    /// Chunk pools holding the tail of every value past `INLINE_VAL_LEN` and of
+    /// every member past `INLINE_MEMBER_LEN`. One per table per database, so
+    /// each is covered by that table's LWLock and no pool operation needs a
+    /// lock of its own.
     pub kv_pool: [*mut ValPool; NUM_MEM_DBS],
     pub hash_pool: [*mut ValPool; NUM_MEM_DBS],
     pub list_pool: [*mut ValPool; NUM_MEM_DBS],
+    pub set_pool: [*mut ValPool; NUM_MEM_DBS],
+    pub zset_pool: [*mut ValPool; NUM_MEM_DBS],
 }
 
 // Safety: MemControlBlock lives in Postgres shared memory; all interior raw pointers
@@ -626,6 +763,15 @@ pub fn key_hash(key: &[u8]) -> KeyHash {
     out
 }
 
+/// The 128-bit handle a composite table stores in place of the member.
+///
+/// The same function under the same key material: a member hash and a key hash
+/// never occupy the same position in a composite key, so nothing is gained by
+/// separating their domains, and one hash is one thing to get right.
+pub fn member_hash(member: &[u8]) -> MemberHash {
+    key_hash(member)
+}
+
 // ───────────────────────── Full tables and eviction ─────────────────────────
 
 /// What to do when a shared-memory table has no room for a new entry.
@@ -713,10 +859,20 @@ unsafe fn enter_or_evict<E>(
 ///
 /// Under `noeviction` — the default — `make_room` returns false without
 /// scanning anything, so this costs one comparison.
-unsafe fn reserve_chunks(pool: *mut ValPool, value_len: usize, make_room: impl FnOnce() -> bool) {
-    if value_len > INLINE_VAL_LEN && unsafe { pool_free_chunks(pool) } < chunks_for(value_len) {
+unsafe fn reserve_chunks(pool: *mut ValPool, needed: usize, make_room: impl FnOnce() -> bool) {
+    if needed > 0 && unsafe { pool_free_chunks(pool) } < needed {
         make_room();
     }
+}
+
+/// Chunks a value of `len` bytes will ask its pool for.
+fn value_chunks(len: usize) -> usize {
+    chunks_for(len, INLINE_VAL_LEN)
+}
+
+/// Chunks a member of `len` bytes will ask its pool for.
+fn member_chunks(len: usize) -> usize {
+    chunks_for(len, INLINE_MEMBER_LEN)
 }
 
 /// Bare-pointer form of `enter_or_evict`, for the call sites that carry an
@@ -785,20 +941,22 @@ unsafe fn evict_kv(htab: *mut pg_sys::HTAB, pool: *mut ValPool) -> bool {
 
 /// Remove an entry and return its chunks to the pool.
 ///
-/// The chain head lives in the entry, so the release has to happen while the
-/// entry is still there. Every removal of a valued entry goes through here for
-/// that reason — a chunk leak is invisible until the pool runs dry.
+/// The chain heads live in the entry, so the release has to happen while the
+/// entry is still there. Every removal of an entry that owns pooled bytes goes
+/// through here for that reason — a chunk leak is invisible until the pool runs
+/// dry. Since members became pooled too, that is every removal from the hash,
+/// set, zset and list tables, not just the ones that carry a value.
 unsafe fn remove_valued<E>(
     table: &SharedTable<E>,
     pool: *mut ValPool,
     key_ptr: *const c_void,
-    slot_of: unsafe fn(*mut E) -> ValueSlot,
+    free_of: unsafe fn(*mut ValPool, *mut E),
 ) -> bool {
     unsafe {
         let Some(entry) = table.find(key_ptr) else {
             return false;
         };
-        value_free(pool, slot_of(entry));
+        free_of(pool, entry);
         table.remove(key_ptr);
         true
     }
@@ -809,7 +967,7 @@ unsafe fn kv_remove(
     pool: *mut ValPool,
     key_ptr: *const c_void,
 ) -> bool {
-    unsafe { remove_valued(table, pool, key_ptr, kv_slot) }
+    unsafe { remove_valued(table, pool, key_ptr, kv_free) }
 }
 
 unsafe fn hash_remove(
@@ -817,7 +975,23 @@ unsafe fn hash_remove(
     pool: *mut ValPool,
     key_ptr: *const c_void,
 ) -> bool {
-    unsafe { remove_valued(table, pool, key_ptr, hash_slot) }
+    unsafe { remove_valued(table, pool, key_ptr, hash_free) }
+}
+
+unsafe fn set_remove(
+    table: &SharedTable<SetEntry>,
+    pool: *mut ValPool,
+    key_ptr: *const c_void,
+) -> bool {
+    unsafe { remove_valued(table, pool, key_ptr, set_free) }
+}
+
+unsafe fn zset_remove(
+    table: &SharedTable<ZsetEntry>,
+    pool: *mut ValPool,
+    key_ptr: *const c_void,
+) -> bool {
+    unsafe { remove_valued(table, pool, key_ptr, zset_free) }
 }
 
 unsafe fn list_remove(
@@ -825,7 +999,7 @@ unsafe fn list_remove(
     pool: *mut ValPool,
     key_ptr: *const c_void,
 ) -> bool {
-    unsafe { remove_valued(table, pool, key_ptr, list_slot) }
+    unsafe { remove_valued(table, pool, key_ptr, list_free) }
 }
 
 /// `list_remove` for the list paths that carry a bare HTAB rather than a
@@ -840,6 +1014,21 @@ unsafe fn list_remove_at(
         return false;
     };
     unsafe { list_remove(&table, pool, k.as_ptr().cast()) }
+}
+
+/// The same, for the sorted-set paths that carry a bare HTAB. They are the bulk
+/// of the removals in this file — every `ZREMRANGEBY*`, every `Z*STORE`
+/// rewriting its destination — and none of them may drop an entry without
+/// returning its member.
+unsafe fn zset_remove_at(
+    htab: *mut pg_sys::HTAB,
+    pool: *mut ValPool,
+    k: &[u8; COMPOSITE_KEY_LEN],
+) -> bool {
+    let Some(table) = (unsafe { SharedTable::<ZsetEntry>::from_raw(htab) }) else {
+        return false;
+    };
+    unsafe { zset_remove(&table, pool, k.as_ptr().cast()) }
 }
 
 /// Keep the `EVICT_BATCH` lowest-ranked candidates seen so far, without sorting
@@ -930,6 +1119,7 @@ unsafe fn evict_hash_key(htab: *mut pg_sys::HTAB, pool: *mut ValPool, keep: &Key
 unsafe fn evict_set_key(
     htab: *mut pg_sys::HTAB,
     meta_htab: *mut pg_sys::HTAB,
+    pool: *mut ValPool,
     keep: &KeyHash,
 ) -> bool {
     let Some(table) = (unsafe { SharedTable::<SetEntry>::from_raw(htab) }) else {
@@ -941,7 +1131,7 @@ unsafe fn evict_set_key(
     };
     let keys: Vec<[u8; COMPOSITE_KEY_LEN]> = unsafe { entries_of(table, &victim) };
     for k in &keys {
-        unsafe { table.remove(k.as_ptr().cast()) };
+        unsafe { set_remove(table, pool, k.as_ptr().cast()) };
     }
     unsafe { remove_meta_of(meta_htab, &victim) };
     !keys.is_empty()
@@ -950,6 +1140,7 @@ unsafe fn evict_set_key(
 unsafe fn evict_zset_key(
     htab: *mut pg_sys::HTAB,
     meta_htab: *mut pg_sys::HTAB,
+    pool: *mut ValPool,
     keep: &KeyHash,
 ) -> bool {
     let Some(table) = (unsafe { SharedTable::<ZsetEntry>::from_raw(htab) }) else {
@@ -961,7 +1152,7 @@ unsafe fn evict_zset_key(
     };
     let keys: Vec<[u8; COMPOSITE_KEY_LEN]> = unsafe { entries_of(table, &victim) };
     for k in &keys {
-        unsafe { table.remove(k.as_ptr().cast()) };
+        unsafe { zset_remove(table, pool, k.as_ptr().cast()) };
     }
     unsafe { remove_meta_of(meta_htab, &victim) };
     !keys.is_empty()
@@ -1012,6 +1203,70 @@ fn list_pool_for(db_idx: usize) -> *mut ValPool {
     unsafe { addr_of!((*c).list_pool[db_idx]).read() }
 }
 
+fn set_pool_for(db_idx: usize) -> *mut ValPool {
+    let c = ctl();
+    if c.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe { addr_of!((*c).set_pool[db_idx]).read() }
+}
+
+fn zset_pool_for(db_idx: usize) -> *mut ValPool {
+    let c = ctl();
+    if c.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe { addr_of!((*c).zset_pool[db_idx]).read() }
+}
+
+/// Enter a composite entry and, when it is new, give it its member bytes.
+///
+/// The member is no longer part of the HTAB key, so an entry that is not
+/// written here reads back as the empty member — or, worse, as whatever the
+/// previous occupant of the slot had. Every insert into the hash, set and zset
+/// tables goes through this or `enter_member_raw`, which is what keeps that to
+/// one place rather than a dozen.
+///
+/// A null entry means either that the table was full or that the pool could not
+/// hold the member's tail; in the second case the entry has already been taken
+/// back out, so the caller has nothing to undo. `found` is only ever true with a
+/// non-null entry.
+unsafe fn enter_member<E>(
+    table: &SharedTable<E>,
+    pool: *mut ValPool,
+    k: &[u8; COMPOSITE_KEY_LEN],
+    member: &[u8],
+    slot_of: unsafe fn(*mut E) -> ValueSlot,
+    make_room: impl FnOnce() -> bool,
+) -> (*mut E, bool) {
+    unsafe {
+        let (entry, found) = enter_or_evict(table, k.as_ptr().cast(), make_room);
+        if entry.is_null() || found {
+            return (entry, found);
+        }
+        if !member_write(pool, slot_of(entry), member) {
+            table.remove(k.as_ptr().cast());
+            return (std::ptr::null_mut(), false);
+        }
+        (entry, false)
+    }
+}
+
+/// `enter_member` for the call sites that carry a bare HTAB.
+unsafe fn enter_member_raw<E>(
+    htab: *mut pg_sys::HTAB,
+    pool: *mut ValPool,
+    k: &[u8; COMPOSITE_KEY_LEN],
+    member: &[u8],
+    slot_of: unsafe fn(*mut E) -> ValueSlot,
+    make_room: impl FnOnce() -> bool,
+) -> (*mut E, bool) {
+    let Some(table) = (unsafe { SharedTable::<E>::from_raw(htab) }) else {
+        return (std::ptr::null_mut(), false);
+    };
+    unsafe { enter_member(&table, pool, k, member, slot_of, make_room) }
+}
+
 /// The full value of a KV entry, inline part and pooled tail together.
 unsafe fn kv_read_full_value(entry: *mut KvEntry, pool: *mut ValPool) -> Vec<u8> {
     unsafe { value_read(pool, kv_slot(entry)) }
@@ -1035,7 +1290,7 @@ unsafe fn kv_write_full_value(
     expires_at: i64,
 ) -> bool {
     unsafe {
-        let ok = value_write(pool, kv_slot(entry), value);
+        let ok = value_write(pool, kv_slot(entry), value, max_total_val_len());
         addr_of_mut!((*entry).expires_at).write(expires_at);
         ok
     }
@@ -1048,7 +1303,20 @@ unsafe fn hash_read_full_value(entry: *mut HashEntry, pool: *mut ValPool) -> Vec
 /// Returns false when the value's tail had nowhere to go; the caller must then
 /// drop the entry it just created.
 unsafe fn hash_write_full_value(entry: *mut HashEntry, pool: *mut ValPool, value: &[u8]) -> bool {
-    unsafe { value_write(pool, hash_slot(entry), value) }
+    unsafe { value_write(pool, hash_slot(entry), value, max_total_val_len()) }
+}
+
+/// The field a hash entry belongs to, read back out of the entry.
+unsafe fn hash_read_member(entry: *mut HashEntry, pool: *mut ValPool) -> Vec<u8> {
+    unsafe { value_read(pool, hash_member_slot(entry)) }
+}
+
+unsafe fn set_read_member(entry: *mut SetEntry, pool: *mut ValPool) -> Vec<u8> {
+    unsafe { value_read(pool, set_member_slot(entry)) }
+}
+
+unsafe fn zset_read_member(entry: *mut ZsetEntry, pool: *mut ValPool) -> Vec<u8> {
+    unsafe { value_read(pool, zset_member_slot(entry)) }
 }
 
 unsafe fn list_read_full_value(entry: *mut ListEntry, pool: *mut ValPool) -> Vec<u8> {
@@ -1058,7 +1326,7 @@ unsafe fn list_read_full_value(entry: *mut ListEntry, pool: *mut ValPool) -> Vec
 /// Returns false when the value's tail had nowhere to go; the caller must then
 /// drop the entry it just created.
 unsafe fn list_write_full_value(entry: *mut ListEntry, pool: *mut ValPool, value: &[u8]) -> bool {
-    unsafe { value_write(pool, list_slot(entry), value) }
+    unsafe { value_write(pool, list_slot(entry), value, max_total_val_len()) }
 }
 
 fn htab_for(db_idx: usize) -> *mut pg_sys::HTAB {
@@ -1145,7 +1413,7 @@ pub unsafe fn mem_set(db_idx: usize, key: &[u8], value: &[u8], expires_at_us: i6
 
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
 
-    unsafe { reserve_chunks(pool, value.len(), || evict_kv(htab, pool)) };
+    unsafe { reserve_chunks(pool, value_chunks(value.len()), || evict_kv(htab, pool)) };
     let (entry, found) =
         unsafe { enter_or_evict(&table, key_buf.as_ptr().cast(), || evict_kv(htab, pool)) };
     let ok = !entry.is_null() && unsafe { kv_write_full_value(entry, pool, value, expires_at_us) };
@@ -1327,7 +1595,7 @@ pub unsafe fn mem_getset(db_idx: usize, key: &[u8], value: &[u8]) -> Option<Vec<
 
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
 
-    unsafe { reserve_chunks(pool, value.len(), || evict_kv(htab, pool)) };
+    unsafe { reserve_chunks(pool, value_chunks(value.len()), || evict_kv(htab, pool)) };
     let (entry, found) =
         unsafe { enter_or_evict(&table, key_buf.as_ptr().cast(), || evict_kv(htab, pool)) };
 
@@ -1390,7 +1658,11 @@ pub unsafe fn mem_append(db_idx: usize, key: &[u8], suffix: &[u8]) -> i64 {
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
 
     let pool = kv_pool_for(db_idx);
-    unsafe { reserve_chunks(pool, suffix_bytes.len(), || evict_kv(htab, pool)) };
+    unsafe {
+        reserve_chunks(pool, value_chunks(suffix_bytes.len()), || {
+            evict_kv(htab, pool)
+        })
+    };
     let (entry, found) =
         unsafe { enter_or_evict(&table, key_buf.as_ptr().cast(), || evict_kv(htab, pool)) };
 
@@ -1572,7 +1844,7 @@ pub unsafe fn mem_mset(db_idx: usize, pairs: &[(&[u8], &[u8])]) {
 
     for (key, value) in pairs {
         let key_buf = make_key(key);
-        unsafe { reserve_chunks(pool, value.len(), || evict_kv(htab, pool)) };
+        unsafe { reserve_chunks(pool, value_chunks(value.len()), || evict_kv(htab, pool)) };
         let (entry, _found) =
             unsafe { enter_or_evict(&table, key_buf.as_ptr().cast(), || evict_kv(htab, pool)) };
         if !entry.is_null() {
@@ -1846,8 +2118,11 @@ pub fn mem_set_meta_htab_total_size() -> usize {
     per_table * NUM_MEM_DBS
 }
 
-/// Pools per database: one each for the KV, hash and list tables.
-const POOLS_PER_DB: usize = 3;
+/// Pools per database: one for every table whose entries hold variable-length
+/// bytes. The KV, hash and list tables spill values; the hash, set and zset
+/// tables spill members. One pool per table rather than one per database is
+/// what lets every pool operation run under the table's own LWLock.
+const POOLS_PER_DB: usize = 5;
 
 /// Stride between pools inside the single allocation that holds them all.
 /// Rounded up so every pool starts aligned, whatever `pool_chunks()` is.
@@ -2042,6 +2317,8 @@ pub unsafe fn mem_init_tables(ctl: *mut MemControlBlock) {
             addr_of_mut!((*ctl).kv_pool[i]).write(pools[0]);
             addr_of_mut!((*ctl).hash_pool[i]).write(pools[1]);
             addr_of_mut!((*ctl).list_pool[i]).write(pools[2]);
+            addr_of_mut!((*ctl).set_pool[i]).write(pools[3]);
+            addr_of_mut!((*ctl).zset_pool[i]).write(pools[4]);
         }
     }
 }
@@ -2052,17 +2329,22 @@ fn make_composite_key(key: &[u8], field: &[u8]) -> [u8; COMPOSITE_KEY_LEN] {
     composite_key_of(&key_hash(key), field)
 }
 
-/// Same layout, for callers that already hold the hash — eviction works in hash
-/// space, having never had the plaintext key.
+/// Same layout, for callers that already hold the key's hash — eviction works in
+/// hash space, having never had the plaintext key.
 fn composite_key_of(kh: &KeyHash, field: &[u8]) -> [u8; COMPOSITE_KEY_LEN] {
     debug_assert!(
-        field.len() <= MAX_MEMBER_LEN,
+        field.len() <= max_member_len(),
         "over-long member reached memory backend"
     );
+    composite_key_from_hashes(kh, &member_hash(field))
+}
+
+/// And again for callers that hold both hashes and no bytes at all — `ZPOPMIN`
+/// and `ZPOPMAX`, which read the extreme member out of `ZsetMeta` as a hash.
+fn composite_key_from_hashes(kh: &KeyHash, mh: &MemberHash) -> [u8; COMPOSITE_KEY_LEN] {
     let mut buf = [0u8; COMPOSITE_KEY_LEN];
-    let fl = field.len().min(MAX_MEMBER_LEN);
     buf[..KEY_HASH_LEN].copy_from_slice(kh);
-    buf[KEY_HASH_LEN..KEY_HASH_LEN + fl].copy_from_slice(&field[..fl]);
+    buf[KEY_HASH_LEN..].copy_from_slice(mh);
     buf
 }
 
@@ -2180,18 +2462,23 @@ pub unsafe fn mem_hset(db_idx: usize, key: &[u8], field: &[u8], value: &[u8]) ->
     let k = make_composite_key(key, field);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
     unsafe {
-        reserve_chunks(pool, value.len(), || {
-            evict_hash_key(htab, pool, &key_hash(key))
-        })
+        reserve_chunks(
+            pool,
+            value_chunks(value.len()) + member_chunks(field.len()),
+            || evict_hash_key(htab, pool, &key_hash(key)),
+        )
     };
     let (entry, found) = unsafe {
-        enter_or_evict(&table, k.as_ptr().cast(), || {
+        enter_member(&table, pool, &k, field, hash_member_slot, || {
             evict_hash_key(htab, pool, &key_hash(key))
         })
     };
     let mut is_new = !found;
-    if !entry.is_null() && !unsafe { hash_write_full_value(entry, pool, value) } {
-        unsafe { table.remove(k.as_ptr().cast()) };
+    if entry.is_null() {
+        is_new = false;
+    } else if !unsafe { hash_write_full_value(entry, pool, value) } {
+        // Takes the field's chunks back with it — the entry owns both.
+        unsafe { hash_remove(&table, pool, k.as_ptr().cast()) };
         is_new = false;
     }
     unsafe { pg_sys::LWLockRelease(lk) };
@@ -2225,9 +2512,10 @@ pub unsafe fn mem_hdel(db_idx: usize, key: &[u8], fields: &[&[u8]]) -> i64 {
     let pool = hash_pool_for(db_idx);
     let lk = hash_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
+    let kh = key_hash(key);
     let mut count = 0i64;
     for f in fields {
-        let k = make_composite_key(key, f);
+        let k = composite_key_of(&kh, f);
         if unsafe { hash_remove(&table, pool, k.as_ptr().cast()) } {
             count += 1;
         }
@@ -2269,10 +2557,7 @@ pub unsafe fn mem_hgetall(db_idx: usize, key: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> 
         if !unsafe { key_matches_entry(addr_of!((*entry).key) as *const u8, key) } {
             continue;
         }
-        let fb = unsafe { addr_of!((*entry).field) as *const u8 };
-        let fs = unsafe { std::slice::from_raw_parts(fb, MAX_MEMBER_LEN) };
-        let fe = fs.iter().position(|&b| b == 0).unwrap_or(MAX_MEMBER_LEN);
-        let field_str = fs[..fe].to_vec();
+        let field_str = unsafe { hash_read_member(entry, pool) };
         let val_str = unsafe { hash_read_full_value(entry, pool) };
         collected.push((field_str, val_str));
     }
@@ -2333,10 +2618,11 @@ pub unsafe fn mem_hmget(db_idx: usize, key: &[u8], fields: &[&[u8]]) -> Vec<Opti
     let pool = hash_pool_for(db_idx);
     let lk = hash_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED) };
+    let kh = key_hash(key);
     let results: Vec<Option<Vec<u8>>> = fields
         .iter()
         .map(|f| {
-            let k = make_composite_key(key, f);
+            let k = composite_key_of(&kh, f);
             unsafe { table.find(k.as_ptr().cast()) }
                 .map(|entry| unsafe { hash_read_full_value(entry, pool) })
         })
@@ -2362,8 +2648,13 @@ pub unsafe fn mem_hincrby(
     let lk = hash_lwlock(db_idx);
     let k = make_composite_key(key, field);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
+    unsafe {
+        reserve_chunks(pool, member_chunks(field.len()), || {
+            evict_hash_key(htab, pool, &key_hash(key))
+        })
+    };
     let (entry, found) = unsafe {
-        enter_or_evict(&table, k.as_ptr().cast(), || {
+        enter_member(&table, pool, &k, field, hash_member_slot, || {
             evict_hash_key(htab, pool, &key_hash(key))
         })
     };
@@ -2376,17 +2667,23 @@ pub unsafe fn mem_hincrby(
         let _ = unsafe { hash_write_full_value(entry, pool, s.as_bytes()) };
         Ok(delta)
     } else {
+        // Every arm has to fall through to the release below. An early `?` here
+        // would carry the database's hash LWLock out of the function with it,
+        // and the next command on that table would wait on a lock its own
+        // worker holds.
         let cur_bytes = unsafe { hash_read_full_value(entry, pool) };
-        let cur: i64 = std::str::from_utf8(&cur_bytes)
-            .map_err(|_| "ERR value is not an integer or out of range".to_string())?
-            .parse()
-            .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
-        let new_val = cur
-            .checked_add(delta)
-            .ok_or_else(|| "ERR increment or decrement would overflow".to_string())?;
-        let ns = new_val.to_string();
-        let _ = unsafe { hash_write_full_value(entry, pool, ns.as_bytes()) };
-        Ok(new_val)
+        std::str::from_utf8(&cur_bytes)
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .ok_or_else(|| "ERR value is not an integer or out of range".to_string())
+            .and_then(|cur| {
+                cur.checked_add(delta)
+                    .ok_or_else(|| "ERR increment or decrement would overflow".to_string())
+            })
+            .inspect(|new_val| {
+                let ns = new_val.to_string();
+                let _ = unsafe { hash_write_full_value(entry, pool, ns.as_bytes()) };
+            })
     };
     unsafe { pg_sys::LWLockRelease(lk) };
     result
@@ -2405,19 +2702,21 @@ pub unsafe fn mem_hsetnx(db_idx: usize, key: &[u8], field: &[u8], value: &[u8]) 
     let k = make_composite_key(key, field);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
     unsafe {
-        reserve_chunks(pool, value.len(), || {
-            evict_hash_key(htab, pool, &key_hash(key))
-        })
+        reserve_chunks(
+            pool,
+            value_chunks(value.len()) + member_chunks(field.len()),
+            || evict_hash_key(htab, pool, &key_hash(key)),
+        )
     };
     let (entry, found) = unsafe {
-        enter_or_evict(&table, k.as_ptr().cast(), || {
+        enter_member(&table, pool, &k, field, hash_member_slot, || {
             evict_hash_key(htab, pool, &key_hash(key))
         })
     };
     let set = if !found && !entry.is_null() {
         let written = unsafe { hash_write_full_value(entry, pool, value) };
         if !written {
-            unsafe { table.remove(k.as_ptr().cast()) };
+            unsafe { hash_remove(&table, pool, k.as_ptr().cast()) };
         }
         written
     } else {
@@ -2460,14 +2759,21 @@ pub unsafe fn mem_sadd(db_idx: usize, key: &[u8], members: &[&[u8]]) -> i64 {
         return 0;
     };
     let meta_htab = set_meta_htab_for(db_idx);
+    let pool = set_pool_for(db_idx);
     let lk = set_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
+    let kh = key_hash(key);
     let mut count = 0i64;
     for m in members {
-        let k = make_composite_key(key, m);
+        let k = composite_key_of(&kh, m);
+        unsafe {
+            reserve_chunks(pool, member_chunks(m.len()), || {
+                evict_set_key(htab, meta_htab, pool, &kh)
+            })
+        };
         let (entry, found) = unsafe {
-            enter_or_evict(&table, k.as_ptr().cast(), || {
-                evict_set_key(htab, meta_htab, &key_hash(key))
+            enter_member(&table, pool, &k, m, set_member_slot, || {
+                evict_set_key(htab, meta_htab, pool, &kh)
             })
         };
         if !found && !entry.is_null() {
@@ -2476,9 +2782,7 @@ pub unsafe fn mem_sadd(db_idx: usize, key: &[u8], members: &[&[u8]]) -> i64 {
     }
     if count > 0 {
         let meta = unsafe {
-            get_or_create_set_meta(meta_htab, key, || {
-                evict_set_key(htab, meta_htab, &key_hash(key))
-            })
+            get_or_create_set_meta(meta_htab, key, || evict_set_key(htab, meta_htab, pool, &kh))
         };
         if !meta.is_null() {
             let old = unsafe { (*meta).count };
@@ -2498,14 +2802,14 @@ pub unsafe fn mem_srem(db_idx: usize, key: &[u8], members: &[&[u8]]) -> i64 {
         return 0;
     };
     let meta_htab = set_meta_htab_for(db_idx);
+    let pool = set_pool_for(db_idx);
     let lk = set_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
+    let kh = key_hash(key);
     let mut count = 0i64;
     for m in members {
-        let k = make_composite_key(key, m);
-        let existed = unsafe { table.find(k.as_ptr().cast()) }.is_some();
-        unsafe { table.remove(k.as_ptr().cast()) };
-        if existed {
+        let k = composite_key_of(&kh, m);
+        if unsafe { set_remove(&table, pool, k.as_ptr().cast()) } {
             count += 1;
         }
     }
@@ -2551,10 +2855,11 @@ pub unsafe fn mem_smismember(db_idx: usize, key: &[u8], members: &[&[u8]]) -> Ve
     };
     let lk = set_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED) };
+    let kh = key_hash(key);
     let results: Vec<bool> = members
         .iter()
         .map(|m| {
-            let k = make_composite_key(key, m);
+            let k = composite_key_of(&kh, m);
             unsafe { table.find(k.as_ptr().cast()) }.is_some()
         })
         .collect();
@@ -2562,7 +2867,11 @@ pub unsafe fn mem_smismember(db_idx: usize, key: &[u8], members: &[&[u8]]) -> Ve
     results
 }
 
-unsafe fn set_collect_members(htab: *mut pg_sys::HTAB, key: &[u8]) -> Vec<Vec<u8>> {
+unsafe fn set_collect_members(
+    htab: *mut pg_sys::HTAB,
+    pool: *mut ValPool,
+    key: &[u8],
+) -> Vec<Vec<u8>> {
     let Some(table) = (unsafe { SharedTable::<SetEntry>::from_raw(htab) }) else {
         return vec![];
     };
@@ -2572,10 +2881,7 @@ unsafe fn set_collect_members(htab: *mut pg_sys::HTAB, key: &[u8]) -> Vec<Vec<u8
         if !unsafe { key_matches_entry(addr_of!((*entry).key) as *const u8, key) } {
             continue;
         }
-        let mb = unsafe { addr_of!((*entry).member) as *const u8 };
-        let ms = unsafe { std::slice::from_raw_parts(mb, MAX_MEMBER_LEN) };
-        let me = ms.iter().position(|&b| b == 0).unwrap_or(MAX_MEMBER_LEN);
-        members.push(ms[..me].to_vec());
+        members.push(unsafe { set_read_member(entry, pool) });
     }
     members
 }
@@ -2588,9 +2894,10 @@ pub unsafe fn mem_smembers(db_idx: usize, key: &[u8]) -> Vec<Vec<u8>> {
     if htab.is_null() {
         return vec![];
     }
+    let pool = set_pool_for(db_idx);
     let lk = set_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED) };
-    let mut members = unsafe { set_collect_members(htab, key) };
+    let mut members = unsafe { set_collect_members(htab, pool, key) };
     unsafe { pg_sys::LWLockRelease(lk) };
     members.sort();
     members
@@ -2625,6 +2932,7 @@ pub unsafe fn mem_spop(db_idx: usize, key: &[u8], count: i64) -> Vec<Vec<u8>> {
         return vec![];
     };
     let meta_htab = set_meta_htab_for(db_idx);
+    let pool = set_pool_for(db_idx);
     let lk = set_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
 
@@ -2655,10 +2963,7 @@ pub unsafe fn mem_spop(db_idx: usize, key: &[u8], count: i64) -> Vec<Vec<u8>> {
                 continue;
             }
             if current_offset == target_offset {
-                let mb = unsafe { addr_of!((*entry).member) as *const u8 };
-                let ms = unsafe { std::slice::from_raw_parts(mb, MAX_MEMBER_LEN) };
-                let me = ms.iter().position(|&b| b == 0).unwrap_or(MAX_MEMBER_LEN);
-                let member = ms[..me].to_vec();
+                let member = unsafe { set_read_member(entry, pool) };
                 let mut composite = [0u8; COMPOSITE_KEY_LEN];
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -2676,7 +2981,7 @@ pub unsafe fn mem_spop(db_idx: usize, key: &[u8], count: i64) -> Vec<Vec<u8>> {
         // scan drops here, auto-terminating if not fully consumed
 
         if let Some(composite) = to_remove {
-            unsafe { table.remove(composite.as_ptr().cast()) };
+            unsafe { set_remove(&table, pool, composite.as_ptr().cast()) };
             results.push(to_remove_member);
             remaining -= 1;
         }
@@ -2700,9 +3005,10 @@ pub unsafe fn mem_srandmember(db_idx: usize, key: &[u8], count: i64) -> Vec<Vec<
     if htab.is_null() {
         return vec![];
     }
+    let pool = set_pool_for(db_idx);
     let lk = set_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED) };
-    let mut members = unsafe { set_collect_members(htab, key) };
+    let mut members = unsafe { set_collect_members(htab, pool, key) };
     unsafe { pg_sys::LWLockRelease(lk) };
     if count >= 0 {
         let take = (count as usize).min(members.len());
@@ -2730,16 +3036,23 @@ pub unsafe fn mem_smove(db_idx: usize, src: &[u8], dst: &[u8], member: &[u8]) ->
         return false;
     };
     let meta_htab = set_meta_htab_for(db_idx);
+    let pool = set_pool_for(db_idx);
     let lk = set_lwlock(db_idx);
     let src_k = make_composite_key(src, member);
     let dst_k = make_composite_key(dst, member);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
-    let found = unsafe { table.find(src_k.as_ptr().cast()) }.is_some();
-    unsafe { table.remove(src_k.as_ptr().cast()) };
+    // Frees the source's member before the destination's is written, so a move
+    // within a pool that is exactly full still succeeds.
+    let found = unsafe { set_remove(&table, pool, src_k.as_ptr().cast()) };
     if found {
+        unsafe {
+            reserve_chunks(pool, member_chunks(member.len()), || {
+                evict_set_key(htab, meta_htab, pool, &key_hash(dst))
+            })
+        };
         let (dst_entry, dst_existed) = unsafe {
-            enter_or_evict(&table, dst_k.as_ptr().cast(), || {
-                evict_set_key(htab, meta_htab, &key_hash(dst))
+            enter_member(&table, pool, &dst_k, member, set_member_slot, || {
+                evict_set_key(htab, meta_htab, pool, &key_hash(dst))
             })
         };
         let dst_is_new = !dst_existed && !dst_entry.is_null();
@@ -2757,7 +3070,7 @@ pub unsafe fn mem_smove(db_idx: usize, src: &[u8], dst: &[u8], member: &[u8]) ->
             if dst_is_new {
                 let dst_meta = unsafe {
                     get_or_create_set_meta(meta_htab, dst, || {
-                        evict_set_key(htab, meta_htab, &key_hash(dst))
+                        evict_set_key(htab, meta_htab, pool, &key_hash(dst))
                     })
                 };
                 if !dst_meta.is_null() {
@@ -2779,11 +3092,12 @@ pub unsafe fn mem_sunion(db_idx: usize, keys: &[&[u8]]) -> Vec<Vec<u8>> {
     if htab.is_null() {
         return vec![];
     }
+    let pool = set_pool_for(db_idx);
     let lk = set_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED) };
     let mut all: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     for k in keys {
-        let members = unsafe { set_collect_members(htab, k) };
+        let members = unsafe { set_collect_members(htab, pool, k) };
         all.extend(members);
     }
     unsafe { pg_sys::LWLockRelease(lk) };
@@ -2803,16 +3117,19 @@ pub unsafe fn mem_sinter(db_idx: usize, keys: &[&[u8]]) -> Vec<Vec<u8>> {
     if htab.is_null() {
         return vec![];
     }
+    let pool = set_pool_for(db_idx);
     let lk = set_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED) };
-    let first: std::collections::HashSet<Vec<u8>> = unsafe { set_collect_members(htab, keys[0]) }
-        .into_iter()
-        .collect();
-    let mut result: std::collections::HashSet<Vec<u8>> = first;
-    for k in &keys[1..] {
-        let other: std::collections::HashSet<Vec<u8>> = unsafe { set_collect_members(htab, k) }
+    let first: std::collections::HashSet<Vec<u8>> =
+        unsafe { set_collect_members(htab, pool, keys[0]) }
             .into_iter()
             .collect();
+    let mut result: std::collections::HashSet<Vec<u8>> = first;
+    for k in &keys[1..] {
+        let other: std::collections::HashSet<Vec<u8>> =
+            unsafe { set_collect_members(htab, pool, k) }
+                .into_iter()
+                .collect();
         result = result.intersection(&other).cloned().collect();
     }
     unsafe { pg_sys::LWLockRelease(lk) };
@@ -2832,16 +3149,19 @@ pub unsafe fn mem_sdiff(db_idx: usize, keys: &[&[u8]]) -> Vec<Vec<u8>> {
     if htab.is_null() {
         return vec![];
     }
+    let pool = set_pool_for(db_idx);
     let lk = set_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED) };
-    let first: std::collections::HashSet<Vec<u8>> = unsafe { set_collect_members(htab, keys[0]) }
-        .into_iter()
-        .collect();
-    let mut result = first;
-    for k in &keys[1..] {
-        let other: std::collections::HashSet<Vec<u8>> = unsafe { set_collect_members(htab, k) }
+    let first: std::collections::HashSet<Vec<u8>> =
+        unsafe { set_collect_members(htab, pool, keys[0]) }
             .into_iter()
             .collect();
+    let mut result = first;
+    for k in &keys[1..] {
+        let other: std::collections::HashSet<Vec<u8>> =
+            unsafe { set_collect_members(htab, pool, k) }
+                .into_iter()
+                .collect();
         result = result.difference(&other).cloned().collect();
     }
     unsafe { pg_sys::LWLockRelease(lk) };
@@ -2889,22 +3209,13 @@ pub unsafe fn mem_del_set_key(db_idx: usize, key: &[u8]) -> i64 {
         return 0;
     };
     let meta_htab = set_meta_htab_for(db_idx);
+    let pool = set_pool_for(db_idx);
     let lk = set_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
-    let mut to_del: Vec<[u8; COMPOSITE_KEY_LEN]> = Vec::new();
-    let mut scan = unsafe { table.scan() };
-    while let Some(entry) = unsafe { scan.next() } {
-        if unsafe { key_matches_entry(addr_of!((*entry).key) as *const u8, key) } {
-            let mut k = [0u8; COMPOSITE_KEY_LEN];
-            unsafe {
-                std::ptr::copy_nonoverlapping(entry as *const u8, k.as_mut_ptr(), COMPOSITE_KEY_LEN)
-            };
-            to_del.push(k);
-        }
-    }
+    let to_del: Vec<[u8; COMPOSITE_KEY_LEN]> = unsafe { entries_of(&table, &key_hash(key)) };
     let count = to_del.len() as i64;
     for k in &to_del {
-        unsafe { table.remove(k.as_ptr().cast()) };
+        unsafe { set_remove(&table, pool, k.as_ptr().cast()) };
     }
     if count > 0 {
         unsafe { remove_set_meta(meta_htab, key) };
@@ -2915,7 +3226,11 @@ pub unsafe fn mem_del_set_key(db_idx: usize, key: &[u8]) -> i64 {
 
 // ─────────────────────────── Sorted set operations ──────────────────────────
 
-unsafe fn zset_collect(htab: *mut pg_sys::HTAB, key: &[u8]) -> Vec<(Vec<u8>, f64)> {
+unsafe fn zset_collect(
+    htab: *mut pg_sys::HTAB,
+    pool: *mut ValPool,
+    key: &[u8],
+) -> Vec<(Vec<u8>, f64)> {
     let Some(table) = (unsafe { SharedTable::<ZsetEntry>::from_raw(htab) }) else {
         return vec![];
     };
@@ -2925,10 +3240,7 @@ unsafe fn zset_collect(htab: *mut pg_sys::HTAB, key: &[u8]) -> Vec<(Vec<u8>, f64
         if !unsafe { key_matches_entry(addr_of!((*entry).key) as *const u8, key) } {
             continue;
         }
-        let mb = unsafe { addr_of!((*entry).member) as *const u8 };
-        let ms = unsafe { std::slice::from_raw_parts(mb, MAX_MEMBER_LEN) };
-        let me = ms.iter().position(|&b| b == 0).unwrap_or(MAX_MEMBER_LEN);
-        let member = ms[..me].to_vec();
+        let member = unsafe { zset_read_member(entry, pool) };
         let score = unsafe { (*entry).score };
         entries.push((member, score));
     }
@@ -2954,6 +3266,7 @@ pub unsafe fn mem_zadd(
         return 0;
     };
     let meta_htab = zset_meta_htab_for(db_idx);
+    let pool = zset_pool_for(db_idx);
     let lk = zset_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
     let mut added = 0i64;
@@ -2961,17 +3274,24 @@ pub unsafe fn mem_zadd(
     let meta: *mut ZsetMeta = if !meta_htab.is_null() {
         unsafe {
             get_or_create_zset_meta(meta_htab, key, || {
-                evict_zset_key(htab, meta_htab, &key_hash(key))
+                evict_zset_key(htab, meta_htab, pool, &key_hash(key))
             })
         }
     } else {
         std::ptr::null_mut()
     };
+    let kh = key_hash(key);
     for (score, member) in members {
-        let k = make_composite_key(key, member);
+        let mh = member_hash(member);
+        let k = composite_key_from_hashes(&kh, &mh);
+        unsafe {
+            reserve_chunks(pool, member_chunks(member.len()), || {
+                evict_zset_key(htab, meta_htab, pool, &kh)
+            })
+        };
         let (entry, found) = unsafe {
-            enter_or_evict(&table, k.as_ptr().cast(), || {
-                evict_zset_key(htab, meta_htab, &key_hash(key))
+            enter_member(&table, pool, &k, member, zset_member_slot, || {
+                evict_zset_key(htab, meta_htab, pool, &key_hash(key))
             })
         };
         if entry.is_null() {
@@ -2979,7 +3299,7 @@ pub unsafe fn mem_zadd(
         }
         if !found {
             if xx {
-                unsafe { table.remove(k.as_ptr().cast()) };
+                unsafe { zset_remove(&table, pool, k.as_ptr().cast()) };
                 continue;
             }
             unsafe { addr_of_mut!((*entry).score).write(*score) };
@@ -2989,13 +3309,11 @@ pub unsafe fn mem_zadd(
                 let count = unsafe { (*meta).count };
                 if count == 0 || *score < unsafe { (*meta).min_score } {
                     unsafe { addr_of_mut!((*meta).min_score).write(*score) };
-                    let len = unsafe { &mut *addr_of_mut!((*meta).min_member_len) };
-                    unsafe { write_meta_member(&mut (*meta).min_member, len, member) };
+                    unsafe { addr_of_mut!((*meta).min_member).write(mh) };
                 }
                 if count == 0 || *score > unsafe { (*meta).max_score } {
                     unsafe { addr_of_mut!((*meta).max_score).write(*score) };
-                    let len = unsafe { &mut *addr_of_mut!((*meta).max_member_len) };
-                    unsafe { write_meta_member(&mut (*meta).max_member, len, member) };
+                    unsafe { addr_of_mut!((*meta).max_member).write(mh) };
                 }
                 unsafe { addr_of_mut!((*meta).count).write(count + 1) };
             }
@@ -3019,25 +3337,19 @@ pub unsafe fn mem_zadd(
                 if !meta.is_null() {
                     let cur_min = unsafe { (*meta).min_score };
                     let cur_max = unsafe { (*meta).max_score };
-                    let was_min =
-                        unsafe { read_meta_member(&(*meta).min_member, (*meta).min_member_len) }
-                            == *member;
-                    let was_max =
-                        unsafe { read_meta_member(&(*meta).max_member, (*meta).max_member_len) }
-                            == *member;
+                    let was_min = unsafe { (*meta).min_member } == mh;
+                    let was_max = unsafe { (*meta).max_member } == mh;
                     if *score < cur_min {
                         unsafe { addr_of_mut!((*meta).min_score).write(*score) };
-                        let len = unsafe { &mut *addr_of_mut!((*meta).min_member_len) };
-                        unsafe { write_meta_member(&mut (*meta).min_member, len, member) };
+                        unsafe { addr_of_mut!((*meta).min_member).write(mh) };
                     } else if was_min && *score > cur_min {
-                        unsafe { refresh_zset_meta(htab, meta, key) };
+                        unsafe { refresh_zset_meta(htab, pool, meta, key) };
                     }
                     if *score > cur_max {
                         unsafe { addr_of_mut!((*meta).max_score).write(*score) };
-                        let len = unsafe { &mut *addr_of_mut!((*meta).max_member_len) };
-                        unsafe { write_meta_member(&mut (*meta).max_member, len, member) };
+                        unsafe { addr_of_mut!((*meta).max_member).write(mh) };
                     } else if was_max && *score < cur_max {
-                        unsafe { refresh_zset_meta(htab, meta, key) };
+                        unsafe { refresh_zset_meta(htab, pool, meta, key) };
                     }
                 }
             }
@@ -3063,20 +3375,26 @@ pub unsafe fn mem_zadd_incr(
 ) -> Option<f64> {
     let htab = zset_htab_for(db_idx);
     let table = unsafe { SharedTable::<ZsetEntry>::from_raw(htab) }?;
+    let pool = zset_pool_for(db_idx);
     let lk = zset_lwlock(db_idx);
     let k = make_composite_key(key, member);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
     let meta_htab = zset_meta_htab_for(db_idx);
+    unsafe {
+        reserve_chunks(pool, member_chunks(member.len()), || {
+            evict_zset_key(htab, meta_htab, pool, &key_hash(key))
+        })
+    };
     let (entry, found) = unsafe {
-        enter_or_evict(&table, k.as_ptr().cast(), || {
-            evict_zset_key(htab, meta_htab, &key_hash(key))
+        enter_member(&table, pool, &k, member, zset_member_slot, || {
+            evict_zset_key(htab, meta_htab, pool, &key_hash(key))
         })
     };
     let result = if entry.is_null() {
         None
     } else if !found {
         if xx {
-            unsafe { table.remove(k.as_ptr().cast()) };
+            unsafe { zset_remove(&table, pool, k.as_ptr().cast()) };
             None
         } else {
             unsafe { addr_of_mut!((*entry).score).write(delta) };
@@ -3114,14 +3432,14 @@ pub unsafe fn mem_zrem(db_idx: usize, key: &[u8], members: &[&[u8]]) -> i64 {
         return 0;
     };
     let meta_htab = zset_meta_htab_for(db_idx);
+    let pool = zset_pool_for(db_idx);
     let lk = zset_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE) };
+    let kh = key_hash(key);
     let mut count = 0i64;
     for m in members {
-        let k = make_composite_key(key, m);
-        let existed = unsafe { table.find(k.as_ptr().cast()) }.is_some();
-        unsafe { table.remove(k.as_ptr().cast()) };
-        if existed {
+        let k = composite_key_of(&kh, m);
+        if unsafe { zset_remove(&table, pool, k.as_ptr().cast()) } {
             count += 1;
         }
     }
@@ -3134,7 +3452,7 @@ pub unsafe fn mem_zrem(db_idx: usize, key: &[u8], members: &[&[u8]]) -> i64 {
                 unsafe { remove_zset_meta(meta_htab, key) };
             } else {
                 unsafe { addr_of_mut!((*meta).count).write(new_count) };
-                unsafe { refresh_zset_meta(htab, meta, key) };
+                unsafe { refresh_zset_meta(htab, pool, meta, key) };
             }
         }
     }
@@ -3197,9 +3515,10 @@ pub unsafe fn mem_zrank(
     if htab.is_null() {
         return None;
     }
+    let pool = zset_pool_for(db_idx);
     let lk = zset_lwlock(db_idx);
     unsafe { pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED) };
-    let mut all = unsafe { zset_collect(htab, key) };
+    let mut all = unsafe { zset_collect(htab, pool, key) };
     unsafe { pg_sys::LWLockRelease(lk) };
     all.sort_by(|a, b| {
         a.1.partial_cmp(&b.1)
@@ -3233,9 +3552,10 @@ pub unsafe fn mem_zcount(
         if htab.is_null() {
             return 0;
         }
+        let pool = zset_pool_for(db_idx);
         let lk = zset_lwlock(db_idx);
         pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
-        let all = zset_collect(htab, key);
+        let all = zset_collect(htab, pool, key);
         pg_sys::LWLockRelease(lk);
         all.iter()
             .filter(|(_, s)| {
@@ -3263,9 +3583,10 @@ pub unsafe fn mem_zrange_by_index(
         if htab.is_null() {
             return vec![];
         }
+        let pool = zset_pool_for(db_idx);
         let lk = zset_lwlock(db_idx);
         pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
-        let mut all = zset_collect(htab, key);
+        let mut all = zset_collect(htab, pool, key);
         pg_sys::LWLockRelease(lk);
         all.sort_by(|a, b| {
             a.1.partial_cmp(&b.1)
@@ -3319,9 +3640,10 @@ pub unsafe fn mem_zrange_by_score(
         if htab.is_null() {
             return vec![];
         }
+        let pool = zset_pool_for(db_idx);
         let lk = zset_lwlock(db_idx);
         pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
-        let mut all = zset_collect(htab, key);
+        let mut all = zset_collect(htab, pool, key);
         pg_sys::LWLockRelease(lk);
         all.sort_by(|a, b| {
             a.1.partial_cmp(&b.1)
@@ -3371,9 +3693,10 @@ pub unsafe fn mem_zrangebylex(
         if htab.is_null() {
             return vec![];
         }
+        let pool = zset_pool_for(db_idx);
         let lk = zset_lwlock(db_idx);
         pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
-        let mut all = zset_collect(htab, key);
+        let mut all = zset_collect(htab, pool, key);
         pg_sys::LWLockRelease(lk);
         all.sort_by(|a, b| a.0.cmp(&b.0));
         if rev {
@@ -3442,6 +3765,7 @@ pub unsafe fn mem_zpopmin(db_idx: usize, key: &[u8], count: i64) -> Vec<(Vec<u8>
             return vec![];
         }
         let meta_htab = zset_meta_htab_for(db_idx);
+        let pool = zset_pool_for(db_idx);
         let lk = zset_lwlock(db_idx);
         pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
 
@@ -3453,16 +3777,20 @@ pub unsafe fn mem_zpopmin(db_idx: usize, key: &[u8], count: i64) -> Vec<(Vec<u8>
                     break;
                 }
                 let min_score = (*meta).min_score;
-                let min_len = (*meta).min_member_len;
-                let min_member = read_meta_member(&(*meta).min_member, min_len);
-                let k = make_composite_key(key, &min_member);
-                let mut found = false;
-                pg_sys::hash_search(
-                    htab,
-                    k.as_ptr().cast::<c_void>(),
-                    pg_sys::HASHACTION::HASH_REMOVE,
-                    &mut found,
-                );
+                // The meta carries the extreme member's *hash*, which is half
+                // of its composite key — so this is still one lookup, and the
+                // entry it lands on is where the bytes come from.
+                let k = composite_key_from_hashes(&key_hash(key), &(*meta).min_member);
+                let Some(table) = SharedTable::<ZsetEntry>::from_raw(htab) else {
+                    break;
+                };
+                // A meta that names a member the table does not hold is a
+                // disagreement, not a member: stop rather than report one.
+                let Some(entry) = table.find(k.as_ptr().cast()) else {
+                    break;
+                };
+                let min_member = zset_read_member(entry, pool);
+                zset_remove(&table, pool, k.as_ptr().cast());
                 results.push((min_member, min_score));
                 let old_count = (*meta).count;
                 let new_count = old_count - 1;
@@ -3470,14 +3798,14 @@ pub unsafe fn mem_zpopmin(db_idx: usize, key: &[u8], count: i64) -> Vec<(Vec<u8>
                     remove_zset_meta(meta_htab, key);
                 } else {
                     addr_of_mut!((*meta).count).write(new_count);
-                    refresh_zset_meta(htab, meta, key);
+                    refresh_zset_meta(htab, pool, meta, key);
                 }
             }
             pg_sys::LWLockRelease(lk);
             return results;
         }
 
-        let mut all = zset_collect(htab, key);
+        let mut all = zset_collect(htab, pool, key);
         all.sort_by(|a, b| {
             a.1.partial_cmp(&b.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -3486,14 +3814,7 @@ pub unsafe fn mem_zpopmin(db_idx: usize, key: &[u8], count: i64) -> Vec<(Vec<u8>
         let take = count.max(0) as usize;
         let chosen: Vec<(Vec<u8>, f64)> = all.into_iter().take(take).collect();
         for (m, _) in &chosen {
-            let k = make_composite_key(key, m);
-            let mut found = false;
-            pg_sys::hash_search(
-                htab,
-                k.as_ptr().cast::<c_void>(),
-                pg_sys::HASHACTION::HASH_REMOVE,
-                &mut found,
-            );
+            zset_remove_at(htab, pool, &make_composite_key(key, m));
         }
         pg_sys::LWLockRelease(lk);
         chosen.into_iter().collect()
@@ -3510,6 +3831,7 @@ pub unsafe fn mem_zpopmax(db_idx: usize, key: &[u8], count: i64) -> Vec<(Vec<u8>
             return vec![];
         }
         let meta_htab = zset_meta_htab_for(db_idx);
+        let pool = zset_pool_for(db_idx);
         let lk = zset_lwlock(db_idx);
         pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
 
@@ -3521,16 +3843,15 @@ pub unsafe fn mem_zpopmax(db_idx: usize, key: &[u8], count: i64) -> Vec<(Vec<u8>
                     break;
                 }
                 let max_score = (*meta).max_score;
-                let max_len = (*meta).max_member_len;
-                let max_member = read_meta_member(&(*meta).max_member, max_len);
-                let k = make_composite_key(key, &max_member);
-                let mut found = false;
-                pg_sys::hash_search(
-                    htab,
-                    k.as_ptr().cast::<c_void>(),
-                    pg_sys::HASHACTION::HASH_REMOVE,
-                    &mut found,
-                );
+                let k = composite_key_from_hashes(&key_hash(key), &(*meta).max_member);
+                let Some(table) = SharedTable::<ZsetEntry>::from_raw(htab) else {
+                    break;
+                };
+                let Some(entry) = table.find(k.as_ptr().cast()) else {
+                    break;
+                };
+                let max_member = zset_read_member(entry, pool);
+                zset_remove(&table, pool, k.as_ptr().cast());
                 results.push((max_member, max_score));
                 let old_count = (*meta).count;
                 let new_count = old_count - 1;
@@ -3538,14 +3859,14 @@ pub unsafe fn mem_zpopmax(db_idx: usize, key: &[u8], count: i64) -> Vec<(Vec<u8>
                     remove_zset_meta(meta_htab, key);
                 } else {
                     addr_of_mut!((*meta).count).write(new_count);
-                    refresh_zset_meta(htab, meta, key);
+                    refresh_zset_meta(htab, pool, meta, key);
                 }
             }
             pg_sys::LWLockRelease(lk);
             return results;
         }
 
-        let mut all = zset_collect(htab, key);
+        let mut all = zset_collect(htab, pool, key);
         all.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -3554,14 +3875,7 @@ pub unsafe fn mem_zpopmax(db_idx: usize, key: &[u8], count: i64) -> Vec<(Vec<u8>
         let take = count.max(0) as usize;
         let chosen: Vec<(Vec<u8>, f64)> = all.into_iter().take(take).collect();
         for (m, _) in &chosen {
-            let k = make_composite_key(key, m);
-            let mut found = false;
-            pg_sys::hash_search(
-                htab,
-                k.as_ptr().cast::<c_void>(),
-                pg_sys::HASHACTION::HASH_REMOVE,
-                &mut found,
-            );
+            zset_remove_at(htab, pool, &make_composite_key(key, m));
         }
         pg_sys::LWLockRelease(lk);
         chosen.into_iter().collect()
@@ -3582,9 +3896,10 @@ pub unsafe fn mem_zrandmember(
         if htab.is_null() {
             return vec![];
         }
+        let pool = zset_pool_for(db_idx);
         let lk = zset_lwlock(db_idx);
         pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
-        let mut all = zset_collect(htab, key);
+        let mut all = zset_collect(htab, pool, key);
         pg_sys::LWLockRelease(lk);
         if all.is_empty() {
             return vec![];
@@ -3618,9 +3933,10 @@ pub unsafe fn mem_zremrangebyrank(db_idx: usize, key: &[u8], start: i64, stop: i
             return 0;
         }
         let meta_htab = zset_meta_htab_for(db_idx);
+        let pool = zset_pool_for(db_idx);
         let lk = zset_lwlock(db_idx);
         pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
-        let mut all = zset_collect(htab, key);
+        let mut all = zset_collect(htab, pool, key);
         all.sort_by(|a, b| {
             a.1.partial_cmp(&b.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -3648,14 +3964,7 @@ pub unsafe fn mem_zremrangebyrank(db_idx: usize, key: &[u8], start: i64, stop: i
         }
         let to_del: Vec<Vec<u8>> = all[s..=e].iter().map(|(m, _)| m.clone()).collect();
         for m in &to_del {
-            let k = make_composite_key(key, m);
-            let mut found = false;
-            pg_sys::hash_search(
-                htab,
-                k.as_ptr().cast::<c_void>(),
-                pg_sys::HASHACTION::HASH_REMOVE,
-                &mut found,
-            );
+            zset_remove_at(htab, pool, &make_composite_key(key, m));
         }
         if !to_del.is_empty() && !meta_htab.is_null() {
             let new_count = (len - to_del.len()) as i64;
@@ -3665,7 +3974,7 @@ pub unsafe fn mem_zremrangebyrank(db_idx: usize, key: &[u8], start: i64, stop: i
                 let meta = find_zset_meta(meta_htab, key);
                 if !meta.is_null() {
                     addr_of_mut!((*meta).count).write(new_count);
-                    refresh_zset_meta(htab, meta, key);
+                    refresh_zset_meta(htab, pool, meta, key);
                 }
             }
         }
@@ -3691,9 +4000,10 @@ pub unsafe fn mem_zremrangebyscore(
             return 0;
         }
         let meta_htab = zset_meta_htab_for(db_idx);
+        let pool = zset_pool_for(db_idx);
         let lk = zset_lwlock(db_idx);
         pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
-        let all = zset_collect(htab, key);
+        let all = zset_collect(htab, pool, key);
         let total = all.len();
         let to_del: Vec<Vec<u8>> = all
             .into_iter()
@@ -3705,14 +4015,7 @@ pub unsafe fn mem_zremrangebyscore(
             .map(|(m, _)| m)
             .collect();
         for m in &to_del {
-            let k = make_composite_key(key, m);
-            let mut found = false;
-            pg_sys::hash_search(
-                htab,
-                k.as_ptr().cast::<c_void>(),
-                pg_sys::HASHACTION::HASH_REMOVE,
-                &mut found,
-            );
+            zset_remove_at(htab, pool, &make_composite_key(key, m));
         }
         if !to_del.is_empty() && !meta_htab.is_null() {
             let new_count = (total - to_del.len()) as i64;
@@ -3722,7 +4025,7 @@ pub unsafe fn mem_zremrangebyscore(
                 let meta = find_zset_meta(meta_htab, key);
                 if !meta.is_null() {
                     addr_of_mut!((*meta).count).write(new_count);
-                    refresh_zset_meta(htab, meta, key);
+                    refresh_zset_meta(htab, pool, meta, key);
                 }
             }
         }
@@ -3746,9 +4049,10 @@ pub unsafe fn mem_zremrangebylex(
             return 0;
         }
         let meta_htab = zset_meta_htab_for(db_idx);
+        let pool = zset_pool_for(db_idx);
         let lk = zset_lwlock(db_idx);
         pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
-        let all = zset_collect(htab, key);
+        let all = zset_collect(htab, pool, key);
         let total = all.len();
         let to_del: Vec<Vec<u8>> = all
             .into_iter()
@@ -3756,14 +4060,7 @@ pub unsafe fn mem_zremrangebylex(
             .map(|(m, _)| m)
             .collect();
         for m in &to_del {
-            let k = make_composite_key(key, m);
-            let mut found = false;
-            pg_sys::hash_search(
-                htab,
-                k.as_ptr().cast::<c_void>(),
-                pg_sys::HASHACTION::HASH_REMOVE,
-                &mut found,
-            );
+            zset_remove_at(htab, pool, &make_composite_key(key, m));
         }
         if !to_del.is_empty() && !meta_htab.is_null() {
             let new_count = (total - to_del.len()) as i64;
@@ -3773,7 +4070,7 @@ pub unsafe fn mem_zremrangebylex(
                 let meta = find_zset_meta(meta_htab, key);
                 if !meta.is_null() {
                     addr_of_mut!((*meta).count).write(new_count);
-                    refresh_zset_meta(htab, meta, key);
+                    refresh_zset_meta(htab, pool, meta, key);
                 }
             }
         }
@@ -3840,12 +4137,13 @@ pub unsafe fn mem_zunionstore(
             return 0;
         }
         let meta_htab = zset_meta_htab_for(db_idx);
+        let pool = zset_pool_for(db_idx);
         let lk = zset_lwlock(db_idx);
         pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
         let mut map: std::collections::HashMap<Vec<u8>, f64> = std::collections::HashMap::new();
         for (ki, k) in keys.iter().enumerate() {
             let w = weights.get(ki).copied().unwrap_or(1.0);
-            let entries = zset_collect(htab, k);
+            let entries = zset_collect(htab, pool, k);
             for (m, s) in entries {
                 let weighted = s * w;
                 map.entry(m)
@@ -3854,25 +4152,21 @@ pub unsafe fn mem_zunionstore(
             }
         }
         let to_del: Vec<Vec<u8>> = {
-            let old = zset_collect(htab, dst);
+            let old = zset_collect(htab, pool, dst);
             old.into_iter().map(|(m, _)| m).collect()
         };
         for m in &to_del {
-            let k = make_composite_key(dst, m);
-            let mut found = false;
-            pg_sys::hash_search(
-                htab,
-                k.as_ptr().cast::<c_void>(),
-                pg_sys::HASHACTION::HASH_REMOVE,
-                &mut found,
-            );
+            zset_remove_at(htab, pool, &make_composite_key(dst, m));
         }
         let count = map.len() as i64;
         for (m, s) in &map {
             let k = make_composite_key(dst, m);
+            reserve_chunks(pool, member_chunks(m.len()), || {
+                evict_zset_key(htab, meta_htab, pool, &key_hash(dst))
+            });
             let (entry, _found): (*mut ZsetEntry, bool) =
-                enter_raw(htab, k.as_ptr().cast::<c_void>(), || {
-                    evict_zset_key(htab, meta_htab, &key_hash(dst))
+                enter_member_raw(htab, pool, &k, m, zset_member_slot, || {
+                    evict_zset_key(htab, meta_htab, pool, &key_hash(dst))
                 });
             if !entry.is_null() {
                 addr_of_mut!((*entry).score).write(*s);
@@ -3883,11 +4177,11 @@ pub unsafe fn mem_zunionstore(
                 remove_zset_meta(meta_htab, dst);
             } else {
                 let meta = get_or_create_zset_meta(meta_htab, dst, || {
-                    evict_zset_key(htab, meta_htab, &key_hash(dst))
+                    evict_zset_key(htab, meta_htab, pool, &key_hash(dst))
                 });
                 if !meta.is_null() {
                     addr_of_mut!((*meta).count).write(count);
-                    refresh_zset_meta(htab, meta, dst);
+                    refresh_zset_meta(htab, pool, meta, dst);
                 }
             }
         }
@@ -3915,17 +4209,18 @@ pub unsafe fn mem_zinterstore(
             return 0;
         }
         let meta_htab = zset_meta_htab_for(db_idx);
+        let pool = zset_pool_for(db_idx);
         let lk = zset_lwlock(db_idx);
         pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
         let w0 = weights.first().copied().unwrap_or(1.0);
-        let first: std::collections::HashMap<Vec<u8>, f64> = zset_collect(htab, keys[0])
+        let first: std::collections::HashMap<Vec<u8>, f64> = zset_collect(htab, pool, keys[0])
             .into_iter()
             .map(|(m, s)| (m, s * w0))
             .collect();
         let mut result = first;
         for (ki, k) in keys[1..].iter().enumerate() {
             let w = weights.get(ki + 1).copied().unwrap_or(1.0);
-            let other: std::collections::HashMap<Vec<u8>, f64> = zset_collect(htab, k)
+            let other: std::collections::HashMap<Vec<u8>, f64> = zset_collect(htab, pool, k)
                 .into_iter()
                 .map(|(m, s)| (m, s * w))
                 .collect();
@@ -3938,26 +4233,22 @@ pub unsafe fn mem_zinterstore(
                 })
                 .collect();
         }
-        let to_del: Vec<Vec<u8>> = zset_collect(htab, dst)
+        let to_del: Vec<Vec<u8>> = zset_collect(htab, pool, dst)
             .into_iter()
             .map(|(m, _)| m)
             .collect();
         for m in &to_del {
-            let k = make_composite_key(dst, m);
-            let mut found = false;
-            pg_sys::hash_search(
-                htab,
-                k.as_ptr().cast::<c_void>(),
-                pg_sys::HASHACTION::HASH_REMOVE,
-                &mut found,
-            );
+            zset_remove_at(htab, pool, &make_composite_key(dst, m));
         }
         let count = result.len() as i64;
         for (m, s) in &result {
             let k = make_composite_key(dst, m);
+            reserve_chunks(pool, member_chunks(m.len()), || {
+                evict_zset_key(htab, meta_htab, pool, &key_hash(dst))
+            });
             let (entry, _found): (*mut ZsetEntry, bool) =
-                enter_raw(htab, k.as_ptr().cast::<c_void>(), || {
-                    evict_zset_key(htab, meta_htab, &key_hash(dst))
+                enter_member_raw(htab, pool, &k, m, zset_member_slot, || {
+                    evict_zset_key(htab, meta_htab, pool, &key_hash(dst))
                 });
             if !entry.is_null() {
                 addr_of_mut!((*entry).score).write(*s);
@@ -3968,11 +4259,11 @@ pub unsafe fn mem_zinterstore(
                 remove_zset_meta(meta_htab, dst);
             } else {
                 let meta = get_or_create_zset_meta(meta_htab, dst, || {
-                    evict_zset_key(htab, meta_htab, &key_hash(dst))
+                    evict_zset_key(htab, meta_htab, pool, &key_hash(dst))
                 });
                 if !meta.is_null() {
                     addr_of_mut!((*meta).count).write(count);
-                    refresh_zset_meta(htab, meta, dst);
+                    refresh_zset_meta(htab, pool, meta, dst);
                 }
             }
         }
@@ -3994,36 +4285,35 @@ pub unsafe fn mem_zdiffstore(db_idx: usize, dst: &[u8], keys: &[&[u8]]) -> i64 {
             return 0;
         }
         let meta_htab = zset_meta_htab_for(db_idx);
+        let pool = zset_pool_for(db_idx);
         let lk = zset_lwlock(db_idx);
         pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
         let first: std::collections::HashMap<Vec<u8>, f64> =
-            zset_collect(htab, keys[0]).into_iter().collect();
+            zset_collect(htab, pool, keys[0]).into_iter().collect();
         let mut result = first;
         for k in &keys[1..] {
-            let other: std::collections::HashSet<Vec<u8>> =
-                zset_collect(htab, k).into_iter().map(|(m, _)| m).collect();
+            let other: std::collections::HashSet<Vec<u8>> = zset_collect(htab, pool, k)
+                .into_iter()
+                .map(|(m, _)| m)
+                .collect();
             result.retain(|m, _| !other.contains(m));
         }
-        let to_del: Vec<Vec<u8>> = zset_collect(htab, dst)
+        let to_del: Vec<Vec<u8>> = zset_collect(htab, pool, dst)
             .into_iter()
             .map(|(m, _)| m)
             .collect();
         for m in &to_del {
-            let k = make_composite_key(dst, m);
-            let mut found = false;
-            pg_sys::hash_search(
-                htab,
-                k.as_ptr().cast::<c_void>(),
-                pg_sys::HASHACTION::HASH_REMOVE,
-                &mut found,
-            );
+            zset_remove_at(htab, pool, &make_composite_key(dst, m));
         }
         let count = result.len() as i64;
         for (m, s) in &result {
             let k = make_composite_key(dst, m);
+            reserve_chunks(pool, member_chunks(m.len()), || {
+                evict_zset_key(htab, meta_htab, pool, &key_hash(dst))
+            });
             let (entry, _found): (*mut ZsetEntry, bool) =
-                enter_raw(htab, k.as_ptr().cast::<c_void>(), || {
-                    evict_zset_key(htab, meta_htab, &key_hash(dst))
+                enter_member_raw(htab, pool, &k, m, zset_member_slot, || {
+                    evict_zset_key(htab, meta_htab, pool, &key_hash(dst))
                 });
             if !entry.is_null() {
                 addr_of_mut!((*entry).score).write(*s);
@@ -4034,11 +4324,11 @@ pub unsafe fn mem_zdiffstore(db_idx: usize, dst: &[u8], keys: &[&[u8]]) -> i64 {
                 remove_zset_meta(meta_htab, dst);
             } else {
                 let meta = get_or_create_zset_meta(meta_htab, dst, || {
-                    evict_zset_key(htab, meta_htab, &key_hash(dst))
+                    evict_zset_key(htab, meta_htab, pool, &key_hash(dst))
                 });
                 if !meta.is_null() {
                     addr_of_mut!((*meta).count).write(count);
-                    refresh_zset_meta(htab, meta, dst);
+                    refresh_zset_meta(htab, pool, meta, dst);
                 }
             }
         }
@@ -4057,21 +4347,15 @@ pub unsafe fn mem_del_zset_key(db_idx: usize, key: &[u8]) -> i64 {
             return 0;
         }
         let meta_htab = zset_meta_htab_for(db_idx);
+        let pool = zset_pool_for(db_idx);
         let lk = zset_lwlock(db_idx);
         pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_EXCLUSIVE);
-        let to_del: Vec<Vec<u8>> = zset_collect(htab, key)
+        let to_del: Vec<Vec<u8>> = zset_collect(htab, pool, key)
             .into_iter()
             .map(|(m, _)| m)
             .collect();
         for m in &to_del {
-            let k = make_composite_key(key, m);
-            let mut found = false;
-            pg_sys::hash_search(
-                htab,
-                k.as_ptr().cast::<c_void>(),
-                pg_sys::HASHACTION::HASH_REMOVE,
-                &mut found,
-            );
+            zset_remove_at(htab, pool, &make_composite_key(key, m));
         }
         if !to_del.is_empty() {
             remove_zset_meta(meta_htab, key);
@@ -4139,21 +4423,6 @@ pub fn fast_random() -> u64 {
 
 // ─────────────────────────── ZsetMeta helpers ───────────────────────────────
 
-unsafe fn write_meta_member(dest: &mut [u8; MAX_MEMBER_LEN], len: &mut u16, member: &[u8]) {
-    let mb = member;
-    let ml = mb.len().min(MAX_MEMBER_LEN);
-    dest[..ml].copy_from_slice(&mb[..ml]);
-    if ml < MAX_MEMBER_LEN {
-        dest[ml] = 0;
-    }
-    *len = ml as u16;
-}
-
-unsafe fn read_meta_member(src: &[u8; MAX_MEMBER_LEN], len: u16) -> Vec<u8> {
-    let l = (len as usize).min(MAX_MEMBER_LEN);
-    src[..l].to_vec()
-}
-
 unsafe fn get_or_create_zset_meta(
     meta_htab: *mut pg_sys::HTAB,
     key: &[u8],
@@ -4167,8 +4436,8 @@ unsafe fn get_or_create_zset_meta(
             addr_of_mut!((*meta).count).write(0);
             addr_of_mut!((*meta).min_score).write(f64::INFINITY);
             addr_of_mut!((*meta).max_score).write(f64::NEG_INFINITY);
-            addr_of_mut!((*meta).min_member_len).write(0);
-            addr_of_mut!((*meta).max_member_len).write(0);
+            addr_of_mut!((*meta).min_member).write([0; MEMBER_HASH_LEN]);
+            addr_of_mut!((*meta).max_member).write([0; MEMBER_HASH_LEN]);
         }
         meta
     }
@@ -4207,7 +4476,17 @@ unsafe fn remove_zset_meta(meta_htab: *mut pg_sys::HTAB, key: &[u8]) {
     }
 }
 
-unsafe fn refresh_zset_meta(zset_htab: *mut pg_sys::HTAB, meta: *mut ZsetMeta, key: &[u8]) {
+/// Recompute the cached extremes after a removal or a score change.
+///
+/// The scan still needs the member *bytes* — ties on score are broken
+/// lexicographically, as `ZRANGE` orders them — and reads them from each entry.
+/// Only the winner's hash is stored.
+unsafe fn refresh_zset_meta(
+    zset_htab: *mut pg_sys::HTAB,
+    pool: *mut ValPool,
+    meta: *mut ZsetMeta,
+    key: &[u8],
+) {
     unsafe {
         let mut new_min = f64::INFINITY;
         let mut new_max = f64::NEG_INFINITY;
@@ -4225,10 +4504,7 @@ unsafe fn refresh_zset_meta(zset_htab: *mut pg_sys::HTAB, meta: *mut ZsetMeta, k
                 continue;
             }
             let score = (*entry).score;
-            let mb = addr_of!((*entry).member) as *const u8;
-            let ms = std::slice::from_raw_parts(mb, MAX_MEMBER_LEN);
-            let me = ms.iter().position(|&b| b == 0).unwrap_or(MAX_MEMBER_LEN);
-            let member = ms[..me].to_vec();
+            let member = zset_read_member(entry, pool);
             if score < new_min || (score == new_min && member < min_member) {
                 new_min = score;
                 min_member = member.clone();
@@ -4241,10 +4517,8 @@ unsafe fn refresh_zset_meta(zset_htab: *mut pg_sys::HTAB, meta: *mut ZsetMeta, k
 
         addr_of_mut!((*meta).min_score).write(new_min);
         addr_of_mut!((*meta).max_score).write(new_max);
-        let min_len = &mut *addr_of_mut!((*meta).min_member_len);
-        let max_len = &mut *addr_of_mut!((*meta).max_member_len);
-        write_meta_member(&mut (*meta).min_member, min_len, &min_member);
-        write_meta_member(&mut (*meta).max_member, max_len, &max_member);
+        addr_of_mut!((*meta).min_member).write(member_hash(&min_member));
+        addr_of_mut!((*meta).max_member).write(member_hash(&max_member));
     }
 }
 
@@ -4339,7 +4613,7 @@ pub unsafe fn mem_lpush(db_idx: usize, key: &[u8], values: &[&[u8]]) -> i64 {
         for (i, v) in values.iter().enumerate() {
             let pos = current_min - LIST_POS_STEP * (i as i64 + 1);
             let k = make_list_key(key, pos);
-            reserve_chunks(pool, v.len(), || {
+            reserve_chunks(pool, value_chunks(v.len()), || {
                 evict_list_key(htab, meta_htab, pool, &key_hash(key))
             });
             let (entry, _found): (*mut ListEntry, bool) =
@@ -4408,7 +4682,7 @@ pub unsafe fn mem_rpush(db_idx: usize, key: &[u8], values: &[&[u8]]) -> i64 {
         for (i, v) in values.iter().enumerate() {
             let pos = current_max + LIST_POS_STEP * (i as i64 + 1);
             let k = make_list_key(key, pos);
-            reserve_chunks(pool, v.len(), || {
+            reserve_chunks(pool, value_chunks(v.len()), || {
                 evict_list_key(htab, meta_htab, pool, &key_hash(key))
             });
             let (entry, _found): (*mut ListEntry, bool) =
@@ -5291,9 +5565,10 @@ pub unsafe fn mem_zset_collect_all(db_idx: usize, key: &[u8]) -> Vec<(Vec<u8>, f
         if htab.is_null() {
             return vec![];
         }
+        let pool = zset_pool_for(db_idx);
         let lk = zset_lwlock(db_idx);
         pg_sys::LWLockAcquire(lk, pg_sys::LWLockMode::LW_SHARED);
-        let mut all = zset_collect(htab, key);
+        let mut all = zset_collect(htab, pool, key);
         pg_sys::LWLockRelease(lk);
         all.sort_by(|a, b| {
             a.1.partial_cmp(&b.1)
@@ -5394,21 +5669,43 @@ mod tests {
         assert!(evict_policy() == EvictPolicy::NoEviction);
     }
 
-    /// `composite_owner` reads the hash half of a composite key back out — it
-    /// is how eviction finds every row belonging to a victim without ever
-    /// seeing the Redis key.
+    /// `composite_owner` reads the key half of a composite key back out — it is
+    /// how eviction finds every row belonging to a victim without ever seeing
+    /// the Redis key.
     #[test]
-    fn composite_keys_split_back_into_hash_and_member() {
+    fn composite_keys_split_back_into_two_hashes() {
         let k = make_composite_key(b"mykey", b"myfield");
-        assert_eq!(&k[KEY_HASH_LEN..KEY_HASH_LEN + 7], b"myfield");
         assert_eq!(unsafe { composite_owner(k.as_ptr()) }, key_hash(b"mykey"));
+        assert_eq!(&k[KEY_HASH_LEN..], &member_hash(b"myfield"));
         assert!(hash_matches_entry(k.as_ptr(), &key_hash(b"mykey")));
         assert!(!hash_matches_entry(k.as_ptr(), &key_hash(b"otherkey")));
 
-        // A member filling the slot exactly leaves no NUL in the key at all.
-        let full = vec![b'm'; MAX_MEMBER_LEN];
-        let k = make_composite_key(b"k", &full);
-        assert_eq!(&k[KEY_HASH_LEN..], &full[..]);
+        // Neither half is length-bounded any more: a member far past the old
+        // 128-byte cap hashes to the same 16 bytes as any other.
+        let long = vec![b'm'; 4096];
+        let k = make_composite_key(b"k", &long);
+        assert_eq!(&k[KEY_HASH_LEN..], &member_hash(&long));
+        assert_ne!(k, make_composite_key(b"k", &long[..4095]));
+
+        // And the halves are addressable separately, which is what lets
+        // ZPOPMIN rebuild a composite key from `ZsetMeta`'s cached hash.
+        assert_eq!(
+            composite_key_from_hashes(&key_hash(b"mykey"), &member_hash(b"myfield")),
+            make_composite_key(b"mykey", b"myfield")
+        );
+    }
+
+    /// Members are binary, and the composite key used to hold them verbatim in
+    /// a NUL-padded array — so `a\0b` and `a` were distinct entries that both
+    /// read back as `a`. Hashing the member removes the padding entirely.
+    #[test]
+    fn members_containing_nul_hash_apart() {
+        assert_ne!(member_hash(b"a\0b"), member_hash(b"a"));
+        assert_ne!(
+            make_composite_key(b"k", b"a\0b"),
+            make_composite_key(b"k", b"a")
+        );
+        assert_ne!(member_hash(b"ab\0"), member_hash(b"ab"));
     }
 
     /// SipHash-2-4 against the reference vectors from the original paper, key
@@ -5462,12 +5759,12 @@ mod tests {
     fn entry_sizes_stay_within_their_shared_memory_budget() {
         let sizes = [
             ("KvEntry", size_of::<KvEntry>(), 592),
-            ("HashEntry", size_of::<HashEntry>(), 216),
-            ("SetEntry", size_of::<SetEntry>(), 144),
-            ("ZsetEntry", size_of::<ZsetEntry>(), 152),
+            ("HashEntry", size_of::<HashEntry>(), 160),
+            ("SetEntry", size_of::<SetEntry>(), 88),
+            ("ZsetEntry", size_of::<ZsetEntry>(), 96),
             ("ListEntry", size_of::<ListEntry>(), 96),
             ("ListMeta", size_of::<ListMeta>(), 40),
-            ("ZsetMeta", size_of::<ZsetMeta>(), 304),
+            ("ZsetMeta", size_of::<ZsetMeta>(), 72),
             ("SetMeta", size_of::<SetMeta>(), 24),
         ];
         for (name, actual, expected) in sizes {
@@ -5477,17 +5774,24 @@ mod tests {
                  before accepting this"
             );
         }
-        // At the 8192 default this totals ~72 MiB of shared memory.
+        // At the 8192 default this totals ~65 MiB of shared memory.
         let per_entry: usize = sizes.iter().map(|(_, s, _)| s).sum();
         assert!(
             per_entry <= 2048,
             "combined entry size {per_entry} exceeds the budget"
         );
 
+        // The composite tables index on two hashes and nothing else, so their
+        // keys no longer grow with what a client puts in them.
+        assert_eq!(COMPOSITE_KEY_LEN, 32);
+
         // The pool costs one link and one chunk per chunk, and nothing per
-        // entry — which is the whole point of it. Three per database.
+        // entry — which is the whole point of it. Five per database now: the
+        // set and zset tables gained one apiece when their members started
+        // spilling.
         assert_eq!(val_pool_size(1), size_of::<ValPool>() + 4 + CHUNK_LEN);
         assert_eq!(val_pool_size(8192), 16 + 8192 * 68);
+        assert_eq!(POOLS_PER_DB, 5);
     }
 
     /// A scratch pool on the heap. The pool code only ever touches the bytes
@@ -5514,12 +5818,19 @@ mod tests {
     /// inline slot — the boundary the value-size tests walk.
     #[test]
     fn a_value_costs_one_chunk_per_chunk_length_past_the_inline_slot() {
-        assert_eq!(chunks_for(0), 0);
-        assert_eq!(chunks_for(INLINE_VAL_LEN), 0);
-        assert_eq!(chunks_for(INLINE_VAL_LEN + 1), 1);
-        assert_eq!(chunks_for(INLINE_VAL_LEN + CHUNK_LEN), 1);
-        assert_eq!(chunks_for(INLINE_VAL_LEN + CHUNK_LEN + 1), 2);
-        assert_eq!(chunks_for(512), 7);
+        assert_eq!(value_chunks(0), 0);
+        assert_eq!(value_chunks(INLINE_VAL_LEN), 0);
+        assert_eq!(value_chunks(INLINE_VAL_LEN + 1), 1);
+        assert_eq!(value_chunks(INLINE_VAL_LEN + CHUNK_LEN), 1);
+        assert_eq!(value_chunks(INLINE_VAL_LEN + CHUNK_LEN + 1), 2);
+        assert_eq!(value_chunks(512), 7);
+
+        // A member's inline slot is a different size, and the arithmetic has
+        // to follow it rather than the value's.
+        assert_eq!(member_chunks(INLINE_MEMBER_LEN), 0);
+        assert_eq!(member_chunks(INLINE_MEMBER_LEN + 1), 1);
+        assert_eq!(member_chunks(INLINE_MEMBER_LEN + CHUNK_LEN), 1);
+        assert_eq!(member_chunks(INLINE_MEMBER_LEN + CHUNK_LEN + 1), 2);
     }
 
     /// Whatever a chain is used for, every chunk in it has to come back — a
@@ -5582,6 +5893,22 @@ mod tests {
         }
     }
 
+    /// A `HashEntry` as `hash_search(HASH_ENTER)` hands one back: key written,
+    /// everything else whatever the previous occupant left. Zeroed here, which
+    /// is what the invariant in `value_free` guarantees a recycled entry is.
+    fn blank_hash_entry() -> HashEntry {
+        HashEntry {
+            key: [0; KEY_HASH_LEN],
+            member: [0; MEMBER_HASH_LEN],
+            member_bytes: [0; INLINE_MEMBER_LEN],
+            member_len: 0,
+            member_overflow: NIL_CHUNK,
+            value: [0; INLINE_VAL_LEN],
+            value_len: 0,
+            overflow: NIL_CHUNK,
+        }
+    }
+
     /// Position-dependent bytes: a chain spliced back in the wrong order, or a
     /// chunk boundary off by one, cannot pass by luck.
     fn payload(n: usize) -> Vec<u8> {
@@ -5598,7 +5925,10 @@ mod tests {
 
         for n in [0usize, 1, 63, 64, 65, 128, 129, 200, 511, 512, 1024] {
             let v = payload(n);
-            assert!(unsafe { value_write(p.pool, kv_slot(e), &v) }, "{n} bytes");
+            assert!(
+                unsafe { value_write(p.pool, kv_slot(e), &v, max_total_val_len()) },
+                "{n} bytes"
+            );
             assert_eq!(unsafe { value_read(p.pool, kv_slot(e)) }, v, "{n} bytes");
         }
 
@@ -5617,7 +5947,7 @@ mod tests {
     #[test]
     fn a_value_at_the_cap_round_trips_through_its_whole_chain() {
         let limit = max_total_val_len();
-        let needed = chunks_for(limit);
+        let needed = value_chunks(limit);
         assert!(
             needed > 1000,
             "the cap should be a long chain, not {needed}"
@@ -5628,7 +5958,7 @@ mod tests {
         let e = &mut entry as *mut KvEntry;
 
         let v = payload(limit);
-        assert!(unsafe { value_write(p.pool, kv_slot(e), &v) });
+        assert!(unsafe { value_write(p.pool, kv_slot(e), &v, limit) });
         assert_eq!(free_chunks(&p), 4, "the chain took more than it needed");
         assert_eq!(unsafe { value_read(p.pool, kv_slot(e)) }, v);
 
@@ -5650,9 +5980,9 @@ mod tests {
         let mut entry = blank_entry();
         let e = &mut entry as *mut KvEntry;
 
-        assert!(unsafe { value_write(p.pool, kv_slot(e), &payload(500)) });
+        assert!(unsafe { value_write(p.pool, kv_slot(e), &payload(500), max_total_val_len()) });
         assert!(free_chunks(&p) < 64);
-        assert!(unsafe { value_write(p.pool, kv_slot(e), &payload(10)) });
+        assert!(unsafe { value_write(p.pool, kv_slot(e), &payload(10), max_total_val_len()) });
         assert_eq!(free_chunks(&p), 64);
         assert_eq!(unsafe { (*e).overflow }, NIL_CHUNK);
         assert_eq!(unsafe { value_read(p.pool, kv_slot(e)) }, payload(10));
@@ -5667,12 +5997,16 @@ mod tests {
         let mut entry = blank_entry();
         let e = &mut entry as *mut KvEntry;
 
-        assert!(unsafe { value_write(p.pool, kv_slot(e), &payload(64 + 128)) });
+        assert!(unsafe {
+            value_write(p.pool, kv_slot(e), &payload(64 + 128), max_total_val_len())
+        });
         assert_eq!(free_chunks(&p), 0);
 
         // The overwrite returns the old chain first, so this fails on size
         // alone: three chunks' worth of tail into a two-chunk pool.
-        assert!(!unsafe { value_write(p.pool, kv_slot(e), &payload(64 + 129)) });
+        assert!(!unsafe {
+            value_write(p.pool, kv_slot(e), &payload(64 + 129), max_total_val_len())
+        });
         assert_eq!(unsafe { (*e).value_len }, 0);
         assert!(unsafe { value_read(p.pool, kv_slot(e)) }.is_empty());
         assert_eq!(free_chunks(&p), 2, "a refused write kept its chunks");
@@ -5687,21 +6021,145 @@ mod tests {
         assert!(limit <= MAX_VAL_CEILING);
         // At the default 8192 chunks the eighth and the ceiling coincide.
         assert_eq!(limit, MAX_VAL_CEILING);
-        assert!(chunks_for(limit) <= pool_chunks() / POOL_SHARE_PER_VALUE);
+        assert!(value_chunks(limit) <= pool_chunks() / POOL_SHARE_PER_VALUE);
+    }
+
+    /// Members go through the same pool as values and at the same boundaries,
+    /// but against a smaller inline slot — an off-by-one there would truncate
+    /// every member of exactly `INLINE_MEMBER_LEN + 1` bytes.
+    #[test]
+    fn members_round_trip_through_the_pool_at_every_boundary() {
+        let p = test_pool(256);
+        let mut entry = blank_hash_entry();
+        let e = &mut entry as *mut HashEntry;
+
+        for n in [
+            0usize,
+            1,
+            INLINE_MEMBER_LEN - 1,
+            INLINE_MEMBER_LEN,
+            INLINE_MEMBER_LEN + 1,
+            INLINE_MEMBER_LEN + CHUNK_LEN,
+            INLINE_MEMBER_LEN + CHUNK_LEN + 1,
+            200,
+            1024,
+        ] {
+            let m = payload(n);
+            assert!(
+                unsafe { member_write(p.pool, hash_member_slot(e), &m) },
+                "{n} bytes"
+            );
+            assert_eq!(unsafe { hash_read_member(e, p.pool) }, m, "{n} bytes");
+        }
+
+        unsafe { value_free(p.pool, hash_member_slot(e)) };
+        assert_eq!(free_chunks(&p), 256, "rewriting a member leaked its chunks");
+    }
+
+    /// A hash entry owns two chains, and dropping it has to return both. This
+    /// is the lifecycle the pool has no way to notice going wrong: a member
+    /// left behind is invisible until the pool runs dry.
+    #[test]
+    fn dropping_a_hash_entry_returns_both_its_member_and_its_value() {
+        let p = test_pool(64);
+        let mut entry = blank_hash_entry();
+        let e = &mut entry as *mut HashEntry;
+
+        let field = payload(INLINE_MEMBER_LEN + 300);
+        let value = payload(INLINE_VAL_LEN + 300);
+        assert!(unsafe { member_write(p.pool, hash_member_slot(e), &field) });
+        assert!(unsafe { value_write(p.pool, hash_slot(e), &value, max_total_val_len()) });
+        assert!(free_chunks(&p) < 64);
+
+        unsafe { hash_free(p.pool, e) };
+        assert_eq!(free_chunks(&p), 64, "a dropped hash entry kept chunks");
+        // ...and it leaves the entry in the state a recycled one must be in.
+        assert_eq!(unsafe { (*e).member_len }, 0);
+        assert_eq!(unsafe { (*e).value_len }, 0);
+        // Freeing again — as would happen if a removal path ran twice — must
+        // not put the same chain on the free list a second time.
+        unsafe { hash_free(p.pool, e) };
+        assert_eq!(free_chunks(&p), 64);
+    }
+
+    /// Sets and sorted sets carry a member and nothing else, and their entries
+    /// had no pooled bytes at all before this — so every one of their removal
+    /// paths is newly load-bearing.
+    #[test]
+    fn dropping_a_set_or_zset_entry_returns_its_member() {
+        let p = test_pool(64);
+        let member = payload(INLINE_MEMBER_LEN + 200);
+
+        let mut se = SetEntry {
+            key: [0; KEY_HASH_LEN],
+            member: [0; MEMBER_HASH_LEN],
+            member_bytes: [0; INLINE_MEMBER_LEN],
+            member_len: 0,
+            member_overflow: NIL_CHUNK,
+        };
+        let sp = &mut se as *mut SetEntry;
+        assert!(unsafe { member_write(p.pool, set_member_slot(sp), &member) });
+        assert_eq!(unsafe { set_read_member(sp, p.pool) }, member);
+        unsafe { set_free(p.pool, sp) };
+        assert_eq!(free_chunks(&p), 64);
+
+        let mut ze = ZsetEntry {
+            key: [0; KEY_HASH_LEN],
+            member: [0; MEMBER_HASH_LEN],
+            member_bytes: [0; INLINE_MEMBER_LEN],
+            member_len: 0,
+            member_overflow: NIL_CHUNK,
+            score: 0.0,
+        };
+        let zp = &mut ze as *mut ZsetEntry;
+        assert!(unsafe { member_write(p.pool, zset_member_slot(zp), &member) });
+        assert_eq!(unsafe { zset_read_member(zp, p.pool) }, member);
+        unsafe { zset_free(p.pool, zp) };
+        assert_eq!(free_chunks(&p), 64);
+    }
+
+    /// A member whose tail has nowhere to go must leave the slot empty, so the
+    /// caller that drops the entry has nothing to release and the entry never
+    /// reads back as a member it does not hold.
+    #[test]
+    fn a_member_the_pool_cannot_hold_leaves_the_slot_empty() {
+        let p = test_pool(2);
+        let mut entry = blank_hash_entry();
+        let e = &mut entry as *mut HashEntry;
+
+        let too_big = payload(INLINE_MEMBER_LEN + 3 * CHUNK_LEN);
+        assert!(!unsafe { member_write(p.pool, hash_member_slot(e), &too_big) });
+        assert_eq!(unsafe { (*e).member_len }, 0);
+        assert!(unsafe { hash_read_member(e, p.pool) }.is_empty());
+        assert_eq!(free_chunks(&p), 2, "a refused member kept its chunks");
+        assert!(take_oom(), "a refused member must report OOM");
+    }
+
+    /// A member is bounded by the same two things a value is, and at the
+    /// default the two bounds meet at the same number — which is what makes it
+    /// one limit to document rather than two.
+    #[test]
+    fn the_member_cap_follows_the_same_pool_bounds_as_a_value() {
+        let limit = max_member_len();
+        assert!(limit <= MAX_VAL_CEILING);
+        assert_eq!(limit, MAX_VAL_CEILING);
+        assert_eq!(limit, max_total_val_len());
+        assert!(member_chunks(limit) <= pool_chunks() / POOL_SHARE_PER_VALUE);
+        // 512 times what the fixed array allowed.
+        assert_eq!(limit / 128, 512);
     }
 
     /// The HTAB key layouts must match the `keysize` values passed to
     /// `ShmemInitHash`, or lookups read past the end of the key.
     #[test]
     fn composite_key_layout_matches_its_parts() {
-        assert_eq!(COMPOSITE_KEY_LEN, KEY_HASH_LEN + MAX_MEMBER_LEN);
+        assert_eq!(COMPOSITE_KEY_LEN, KEY_HASH_LEN + MEMBER_HASH_LEN);
         assert_eq!(LIST_KEY_LEN, KEY_HASH_LEN + 8);
         assert!(size_of::<HashEntry>() >= COMPOSITE_KEY_LEN);
 
         let composite = make_composite_key(b"mykey", b"myfield");
         assert_eq!(&composite[..KEY_HASH_LEN], &key_hash(b"mykey"));
-        assert_eq!(&composite[KEY_HASH_LEN..KEY_HASH_LEN + 7], b"myfield");
-        assert_eq!(composite[KEY_HASH_LEN + 7], 0, "member half is NUL-padded");
+        assert_eq!(&composite[KEY_HASH_LEN..], &member_hash(b"myfield"));
 
         let list_key = make_list_key(b"mykey", -42);
         assert_eq!(&list_key[..KEY_HASH_LEN], &key_hash(b"mykey"));

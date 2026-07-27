@@ -1844,8 +1844,26 @@ const CHUNK_LEN = 64;
 // An eighth of a pool of `redis.mem_max_entries` chunks, capped at 64 KiB —
 // which is where the default 8192 lands. See docs/storage-modes.md.
 const MAX_TOTAL_VAL_LEN = 64 * 1024;
-const MAX_MEMBER_LEN = 128;
+// A hash field or a set member spills into the same kind of chunk pool a value
+// does, so it is bounded by the same two things and lands on the same number.
+// It used to be a fixed 128-byte array inside the HTAB key.
+const INLINE_MEMBER_LEN = 48;
+const MAX_MEMBER_LEN = MAX_TOTAL_VAL_LEN;
 const MEM_MAX_KEY = 511;
+
+/** Sizes either side of every boundary the member path has. */
+const MEMBER_SIZES = [
+	1,
+	INLINE_MEMBER_LEN - 1, // 47    last fully-inline size
+	INLINE_MEMBER_LEN, // 48    exactly fills the inline slot
+	INLINE_MEMBER_LEN + 1, // 49    first byte to reach the chunk pool
+	INLINE_MEMBER_LEN + CHUNK_LEN, // 112   inline slot plus exactly one full chunk
+	INLINE_MEMBER_LEN + CHUNK_LEN + 1, // 113   first byte of a second chunk
+	128, // the cap before members were hashed out of the key...
+	129, // ...and one byte past it, now unremarkable
+	1024,
+	MAX_MEMBER_LEN, // 65536 largest the memory backend accepts
+];
 
 /** Distinct, position-dependent bytes, so a truncation cannot pass by luck. */
 function payload(n: number): Buffer {
@@ -2080,6 +2098,146 @@ describe("Value size limits", () => {
 			expect(await raw.bulk("GET", "vs:over")).toEqual(over);
 		}
 		await raw.send("DEL", "vs:over");
+	});
+
+	// Members are no longer part of the HTAB key — the key carries a hash of
+	// the member and the bytes live in the entry, spilling into the pool — so
+	// every command that hands a member back to a client reads it from there.
+	// A boundary missed in one of them would truncate silently.
+	test("hash fields round-trip byte for byte at every boundary", async () => {
+		for (const n of MEMBER_SIZES) {
+			const f = payload(n);
+			await raw.send("HSET", "ms:hash", f, `v${n}`);
+			expect((await raw.bulk("HGET", "ms:hash", f))?.toString()).toBe(`v${n}`);
+			expect(await raw.send("HEXISTS", "ms:hash", f)).toEqual(
+				Buffer.from(":1\r\n"),
+			);
+		}
+		// HGETALL and HKEYS hand the field bytes back, which HGET never has to.
+		const keys = (await raw.array("HKEYS", "ms:hash")).filter(
+			(k): k is Buffer => k !== null,
+		);
+		expect(keys.length).toBe(MEMBER_SIZES.length);
+		expect(new Set(keys.map((k) => k.length))).toEqual(new Set(MEMBER_SIZES));
+		for (const n of MEMBER_SIZES) {
+			expect(keys.some((k) => k.equals(payload(n)))).toBe(true);
+		}
+		await raw.send("DEL", "ms:hash");
+	});
+
+	test("set and sorted-set members round-trip byte for byte at every boundary", async () => {
+		for (const n of MEMBER_SIZES) {
+			const m = payload(n);
+			await raw.send("SADD", "ms:set", m);
+			await raw.send("ZADD", "ms:zset", `${n}`, m);
+		}
+		const members = (await raw.array("SMEMBERS", "ms:set")).filter(
+			(m): m is Buffer => m !== null,
+		);
+		expect(members.length).toBe(MEMBER_SIZES.length);
+		for (const n of MEMBER_SIZES) {
+			const m = payload(n);
+			expect(members.some((x) => x.equals(m))).toBe(true);
+			expect(await raw.send("SISMEMBER", "ms:set", m)).toEqual(
+				Buffer.from(":1\r\n"),
+			);
+			expect((await raw.bulk("ZSCORE", "ms:zset", m))?.toString()).toBe(`${n}`);
+		}
+		// ZRANGE reads members out of the entries, and ZPOPMIN reaches them
+		// through the hash cached in ZsetMeta rather than through a scan.
+		const range = await raw.array("ZRANGE", "ms:zset", "0", "-1");
+		expect(range.length).toBe(MEMBER_SIZES.length);
+		expect(range[0]).toEqual(payload(Math.min(...MEMBER_SIZES)));
+		const popped = await raw.array("ZPOPMIN", "ms:zset");
+		expect(popped[0]).toEqual(payload(Math.min(...MEMBER_SIZES)));
+		await raw.send("ZADD", "ms:zset", "0", payload(Math.min(...MEMBER_SIZES)));
+		await raw.send("DEL", "ms:set");
+		await raw.send("DEL", "ms:zset");
+	});
+
+	// Redis members are arbitrary bytes. While they were stored NUL-padded in
+	// the HTAB key, `a\0b` and `a` were distinct entries that both read back
+	// as `a`; hashing the member removes the padding along with the cap.
+	test("members containing NUL bytes stay distinct", async () => {
+		const a = Buffer.from([0x61]);
+		const anb = Buffer.from([0x61, 0x00, 0x62]);
+		const abn = Buffer.from([0x61, 0x62, 0x00]);
+
+		await raw.send("SADD", "ms:nul", a, anb, abn);
+		expect((await raw.send("SCARD", "ms:nul")).toString()).toBe(":3\r\n");
+		const members = (await raw.array("SMEMBERS", "ms:nul")).filter(
+			(m): m is Buffer => m !== null,
+		);
+		expect(members.length).toBe(3);
+		for (const m of [a, anb, abn]) {
+			expect(members.some((x) => x.equals(m))).toBe(true);
+		}
+		await raw.send("SREM", "ms:nul", anb);
+		expect((await raw.send("SCARD", "ms:nul")).toString()).toBe(":2\r\n");
+		expect(await raw.send("SISMEMBER", "ms:nul", a)).toEqual(
+			Buffer.from(":1\r\n"),
+		);
+		await raw.send("DEL", "ms:nul");
+	});
+
+	// The member pool is finite and shared by every member of its table, so a
+	// removal path that drops an entry without returning its member is
+	// invisible until the pool runs dry. Each of these churns far more than a
+	// pool's worth of chunks through one key.
+	test("churning large members does not exhaust the chunk pool", async () => {
+		const big = payload(MAX_MEMBER_LEN);
+		const rounds = 24;
+
+		for (let i = 0; i < rounds; i++) {
+			await raw.send("SADD", "ms:churn", big);
+			await raw.send("SREM", "ms:churn", big);
+		}
+		await raw.send("SADD", "ms:churn", big);
+		expect(await raw.send("SISMEMBER", "ms:churn", big)).toEqual(
+			Buffer.from(":1\r\n"),
+		);
+		await raw.send("DEL", "ms:churn");
+
+		// SPOP and DEL are separate removal paths from SREM.
+		for (let i = 0; i < rounds; i++) {
+			await raw.send("SADD", "ms:churn2", big);
+			await raw.send("SPOP", "ms:churn2");
+		}
+		for (let i = 0; i < rounds; i++) {
+			await raw.send("SADD", "ms:churn3", big);
+			await raw.send("DEL", "ms:churn3");
+		}
+
+		// ...and so are ZREM, ZPOPMIN and HDEL.
+		for (let i = 0; i < rounds; i++) {
+			await raw.send("ZADD", "ms:churnz", "1", big);
+			await raw.send(
+				i % 2 ? "ZREM" : "ZPOPMIN",
+				"ms:churnz",
+				...(i % 2 ? [big] : []),
+			);
+		}
+		for (let i = 0; i < rounds; i++) {
+			await raw.send("HSET", "ms:churnh", big, "v");
+			await raw.send("HDEL", "ms:churnh", big);
+		}
+
+		// Every chunk came back, or these no longer fit.
+		await raw.send("SADD", "ms:churn4", big);
+		expect(await raw.send("SISMEMBER", "ms:churn4", big)).toEqual(
+			Buffer.from(":1\r\n"),
+		);
+		await raw.send("HSET", "ms:churnh", big, "v");
+		expect((await raw.bulk("HGET", "ms:churnh", big))?.toString()).toBe("v");
+		for (const k of [
+			"ms:churn2",
+			"ms:churn3",
+			"ms:churn4",
+			"ms:churnz",
+			"ms:churnh",
+		]) {
+			await raw.send("DEL", k);
+		}
 	});
 
 	test("hash fields and keys are bounded the same way", async () => {

@@ -4644,17 +4644,18 @@ impl Command {
     /// Refuse anything the shared-memory backend would have to truncate to
     /// store.
     ///
-    /// Keys and members live in fixed-size arrays, and the old behaviour was to
-    /// copy as much as fit. That is the one failure mode worse than an error:
-    /// two distinct keys sharing a 511-byte prefix collapse onto the same
-    /// entry, so a `GET` returns another key's value and a `DEL` removes it.
-    /// Redis has no length limit at all, so the closest we can get in a
-    /// fixed-size region is to refuse and name the database that has no limit.
+    /// A key lives in a fixed-size array, and the old behaviour was to copy as
+    /// much as fit. That is the one failure mode worse than an error: two
+    /// distinct keys sharing a 511-byte prefix collapse onto the same entry, so
+    /// a `GET` returns another key's value and a `DEL` removes it. Redis has no
+    /// length limit at all, so the closest we can get in a fixed-size region is
+    /// to refuse and name the database that has no limit.
     ///
-    /// A value is bounded for a different reason: it spills into a chunk pool
-    /// rather than a fixed slot, so the limit is what one value may claim of
-    /// that pool — see `mem::max_total_val_len`. Over it is still a refusal,
-    /// never a truncation.
+    /// Values and members are bounded for a different reason: they spill into a
+    /// chunk pool rather than a fixed slot, so the limit is what one of them may
+    /// claim of that pool — see `mem::max_total_val_len` and
+    /// `mem::max_member_len`, which agree at 64 KiB by default. Over it is still
+    /// a refusal, never a truncation.
     ///
     /// Runs before the command executes, so a refusal never leaves a partial
     /// write behind. Allocation-free — the arms borrow and the iterators are
@@ -4889,8 +4890,13 @@ fn mem_out_of_memory() -> Response {
 /// Longest key the shared-memory backend stores intact. `make_key` reserves the
 /// final byte of the slot for the NUL terminator.
 pub const MEM_MAX_KEY: usize = crate::mem::MAX_KEY_LEN - 1;
-/// Longest hash field or set/zset member the shared-memory backend stores intact.
-pub const MEM_MAX_MEMBER: usize = crate::mem::MAX_MEMBER_LEN;
+/// Longest hash field or set/zset member the shared-memory backend stores
+/// intact. Like a value, and unlike a key, this is a function of the chunk pool
+/// the member spills into rather than the size of a fixed array — see
+/// `mem::max_member_len`.
+pub fn mem_max_member() -> usize {
+    crate::mem::max_member_len()
+}
 
 /// What exceeded a shared-memory limit, if anything.
 enum Over {
@@ -4910,7 +4916,7 @@ fn over_keys<'a>(keys: impl IntoIterator<Item = &'a [u8]>) -> Option<Over> {
 fn over_members<'a>(members: impl IntoIterator<Item = &'a [u8]>) -> Option<Over> {
     members
         .into_iter()
-        .find_map(|m| (m.len() > MEM_MAX_MEMBER).then_some(Over::Member))
+        .find_map(|m| (m.len() > mem_max_member()).then_some(Over::Member))
 }
 
 fn over_values<'a>(values: impl IntoIterator<Item = &'a [u8]>) -> Option<Over> {
@@ -4922,7 +4928,7 @@ fn over_values<'a>(values: impl IntoIterator<Item = &'a [u8]>) -> Option<Over> {
 fn mem_too_long(over: Over) -> Response {
     let (what, limit) = match over {
         Over::Key => ("key", MEM_MAX_KEY),
-        Over::Member => ("hash field or set member", MEM_MAX_MEMBER),
+        Over::Member => ("hash field or set member", mem_max_member()),
         Over::Value => ("value", crate::mem::max_total_val_len()),
     };
     Response::Error(format!(
@@ -6809,7 +6815,7 @@ mod tests {
     #[test]
     fn oversized_keys_fields_and_values_are_refused_by_memory_mode() {
         let key = "k".repeat(MEM_MAX_KEY + 1);
-        let member = "m".repeat(MEM_MAX_MEMBER + 1);
+        let member = "m".repeat(mem_max_member() + 1);
         let value = "v".repeat(crate::mem::max_total_val_len() + 1);
         let ok = "x";
 
@@ -6851,7 +6857,7 @@ mod tests {
         let at_limit: &[&str] = &[
             "HSET",
             &"k".repeat(MEM_MAX_KEY),
-            &"m".repeat(MEM_MAX_MEMBER),
+            &"m".repeat(mem_max_member()),
             &"v".repeat(crate::mem::max_total_val_len()),
         ];
         let cmd = is_ok(Command::parse(parts(at_limit)));

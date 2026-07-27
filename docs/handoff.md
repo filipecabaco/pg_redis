@@ -7,10 +7,10 @@ how to verify a change, and which traps have already cost someone a day.
 
 | | |
 |---|---|
-| Rust tests | 120/120 on pg15, pg16, pg17 |
-| E2E | 209/209 under **both** `storage_mode=memory` and `storage_mode=auto` |
+| Rust tests | 126/126 on pg15, pg16, pg17, and against an assert-enabled pg17 |
+| E2E | 213/213 under **both** `storage_mode=memory` and `storage_mode=auto` |
 | Lint | clippy clean at `-D warnings`, `cargo fmt --check` clean |
-| Shared memory | 308 MB `shared_memory_size` at the defaults, down from 587 MB |
+| Shared memory | 301 MB `shared_memory_size` at the defaults, down from 587 MB |
 
 ## Verifying a change
 
@@ -180,26 +180,46 @@ What is left over from it:
   entry in the table, including the one being written, which is why it runs
   before the entry exists.
 - **Chunk lifecycle is the thing to be careful with.** Every removal of an
-  entry that owns a value goes through `remove_valued` (or `list_remove_at`,
-  its bare-HTAB twin), which frees the chain *before* the entry — the chain head
-  lives in the entry. A path that calls `hash_search(HASH_REMOVE)` on the KV,
-  hash or list table directly would leak silently until the pool ran dry.
-  `values_round_trip_through_the_pool_at_every_boundary` and the e2e
-  "rewriting a large value many times" test are the guards.
+  entry that owns pooled bytes goes through `remove_valued` (or `list_remove_at`
+  / `zset_remove_at`, its bare-HTAB twins), which frees the chains *before* the
+  entry — the chain heads live in the entry. A path that calls
+  `hash_search(HASH_REMOVE)` on the KV, hash, set, zset or list table directly
+  would leak silently until the pool ran dry.
+  `values_round_trip_through_the_pool_at_every_boundary`,
+  `dropping_a_hash_entry_returns_both_its_member_and_its_value` and the e2e
+  "rewriting a large value many times" and "churning large members" tests are
+  the guards.
 
-### 3. Smaller items
+### 3. Done — members hashed out of the composite key
+
+The member half of a composite key is a 128-bit keyed SipHash now, so the key is
+32 bytes instead of 144 and the member bytes live in the entry — 48 inline, the
+rest in the same chunk pool a value spills into. `ZsetMeta` caches the extreme
+members as hashes rather than as two 128-byte arrays, which keeps `ZPOPMIN` and
+`ZPOPMAX` O(1) at 72 bytes instead of 304. The cap went from 128 bytes to 64 KiB
+— the same bound a value has, and derived the same way — and
+`shared_memory_size` from 308 MB to 301 MB. See `docs/storage-modes.md`.
+
+Sets and sorted sets gained a chunk pool each (`POOLS_PER_DB` is 5), costing
+8.5 MiB against the 15.7 MiB the entries shed. It also fixed a binary-safety bug
+nobody had noticed: members were NUL-padded inside the key and read back at the
+first NUL, so `a\0b` and `a` were two entries that both read back as `a`.
+
+### 4. Smaller items
 
 - **Multi-key writes are not atomic under OOM.** An `MSET` or multi-member
   `SADD` that fills a table part-way through stores the earlier keys and then
   errors, where Redis rejects the command whole. Whether there is room is only
   knowable at the insert, so this needs a capacity pre-check against the
   command's key count. Commented at the check site in `execute_mem`.
-- **`MAX_MEMBER_LEN` is still 128 bytes.** Redis has no limit on hash fields or
-  set members. Hashing the key out of the composite tables freed 174 MiB, so
-  there is headroom to raise it now.
-- **`redis.mem_max_entries` is still 8192**, halved when `MAX_KEY_LEN` grew to
-  512. The same headroom applies, and the chunked pool added ~105 MB more of
-  it. Note that raising it now buys pool capacity as well as key capacity.
+- **`redis.mem_max_entries` is still 8192**, and should stay there for now.
+  Raising it back to the 16384 it was before `MAX_KEY_LEN` grew costs **+90 MB**
+  (301 MB → 391 MB at `SHOW shared_memory_size`); the member work freed 7 MB, so
+  it funds 8% of that. The 512-byte `MAX_KEY_LEN` is what actually pays for it —
+  `KvEntry` is 592 bytes, of which 512 is the key, and the KV table alone is
+  46 MiB of the extension's 91 MiB. Hashing the KV table's key the way the
+  composite tables' is hashed is the change that would fund raising this, and it
+  is harder: `KEYS`, `SCAN` and `RANDOMKEY` read those bytes back.
 
 ## Design notes
 
@@ -207,11 +227,22 @@ Things that are easy to get wrong without knowing why they are the way they are.
 
 - **Databases split into contiguous halves**, not by parity: 0–7 ephemeral,
   8–15 durable. `SELECT` also accepts `cache` (0) and `durable` (8).
-- **Composite tables key on a 128-bit keyed SipHash of the Redis key**, not the
-  key bytes. Every access to those tables is a comparison against a key the
-  caller already holds; only `KEYS`, `SCAN` and `RANDOMKEY` need real key bytes,
-  and they read the string table. The hash is keyed from `pg_strong_random` per
-  postmaster so a client cannot craft a collision and merge two keys' contents.
+- **Composite tables key on two 128-bit keyed SipHashes** — one of the Redis
+  key, one of the member — and on nothing else. Every access to those tables is
+  a comparison against a key the caller already holds; only `KEYS`, `SCAN` and
+  `RANDOMKEY` need real key bytes, and they read the string table. The hash is
+  keyed from `pg_strong_random` per postmaster so a client cannot craft a
+  collision and merge two keys' contents.
+- **A composite entry must be given its member bytes when it is created.** The
+  member is no longer in the HTAB key, so `hash_search(HASH_ENTER)` no longer
+  writes it: `enter_member` (and `enter_member_raw`) is the only correct way to
+  insert into the hash, set or zset table. An entry created any other way reads
+  back with an empty member, or with the previous occupant's.
+- **The invariant that makes recycled entries safe is `len == 0`.** dynahash
+  hands a removed entry straight back out on the next insert, so `value_free`
+  zeroes the length as well as releasing the chain, and a chain head is only
+  ever read when its length says there is a tail. Every removal path has to go
+  through it or the next occupant releases a chain that is already free.
 - **Every insert uses `HASH_ENTER_NULL`, never `HASH_ENTER`.** On a
   `HASH_FIXED_SIZE` table dynahash answers a full table by raising
   `out of shared memory`, which unwinds by longjmp — past the Rust error

@@ -18,8 +18,8 @@ Data is stored across 16 databases (0–15), mirroring Redis's native database m
 
 Memory mode buys its speed with a fixed-size shared-memory region, reserved at
 server start, and that has consequences worth knowing before you rely on it:
-keys are capped at 511 bytes, values at 64 KiB, and hash fields and set members
-at 128; a full table either evicts or refuses the write depending on
+keys are capped at 511 bytes, and values, hash fields and set members at 64 KiB;
+a full table either evicts or refuses the write depending on
 `redis.maxmemory_policy`. Nothing is ever silently truncated. The durable half
 has none of these limits. See [Storage modes](./docs/storage-modes.md).
 

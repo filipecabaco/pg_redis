@@ -3423,3 +3423,407 @@ describe("COPY across the storage halves", () => {
 		await raw.send("DEL", "p5:x", "p5:xl");
 	});
 });
+
+// ─────────────────────── Concurrent clients ────────────────────────────────
+//
+// `redis.workers` defaults to 4, and a worker is a *process*: four dispatchers
+// sharing one set of HTABs, pools and LWLocks in memory mode, and one set of
+// tables on the durable half. Everything else in this file drives a single
+// connection in sequence, so none of it has ever put two writers on the same
+// key at once — the case the locking exists for.
+//
+// Each test runs on both halves. The durable half is not a formality: its
+// concurrency comes from PostgreSQL's own MVCC and a different set of
+// statements, so a defect on one half says nothing about the other.
+
+/** Distinct connections, so the writes really do arrive in parallel. */
+async function fanOut<T>(
+	n: number,
+	body: (c: Bun.RedisClient, i: number) => Promise<T>,
+): Promise<T[]> {
+	const clients = Array.from({ length: n }, () => new Bun.RedisClient(redisUrl));
+	try {
+		return await Promise.all(clients.map((c, i) => body(c, i)));
+	} finally {
+		for (const c of clients) c.close();
+	}
+}
+
+/** Both storage halves, by the name `SELECT` takes. */
+const HALVES = ["cache", "durable"] as const;
+
+describe("Concurrent clients", () => {
+	const WRITERS = 8;
+	const PER_WRITER = 25;
+
+	afterAll(async () => {
+		await raw.send("SELECT", "durable");
+	});
+
+	for (const half of HALVES) {
+		test(`${half}: every increment of a shared counter lands`, async () => {
+			const key = `conc:${half}:counter`;
+			await raw.send("SELECT", half);
+			await raw.send("DEL", key);
+
+			await fanOut(WRITERS, async (c) => {
+				await c.send("SELECT", [half]);
+				for (let i = 0; i < PER_WRITER; i++) await c.send("INCR", [key]);
+			});
+
+			// A read-modify-write that is not atomic loses updates under
+			// contention, and loses them silently: the reply to every INCR is
+			// still a plausible number.
+			expect((await raw.bulk("GET", key))?.toString()).toBe(
+				String(WRITERS * PER_WRITER),
+			);
+			await raw.send("DEL", key);
+		});
+
+		test(`${half}: every element pushed to a shared list survives`, async () => {
+			const key = `conc:${half}:list`;
+			await raw.send("SELECT", half);
+			await raw.send("DEL", key);
+
+			await fanOut(WRITERS, async (c, w) => {
+				await c.send("SELECT", [half]);
+				for (let i = 0; i < PER_WRITER; i++)
+					await c.send("RPUSH", [key, `${w}:${i}`]);
+			});
+
+			// Order across writers is not defined, so this asserts on the set.
+			// LLEN reads the meta's count and LRANGE walks the entries, so
+			// comparing them also catches a count that drifted from the data.
+			const expected = new Set<string>();
+			for (let w = 0; w < WRITERS; w++)
+				for (let i = 0; i < PER_WRITER; i++) expected.add(`${w}:${i}`);
+
+			expect(integerReply(await raw.send("LLEN", key))).toBe(expected.size);
+			const got = (await raw.array("LRANGE", key, "0", "-1")).map((b) =>
+				b?.toString(),
+			);
+			expect(got.length).toBe(expected.size);
+			expect(new Set(got)).toEqual(expected);
+			await raw.send("DEL", key);
+		});
+
+		test(`${half}: a shared set counts every distinct member once`, async () => {
+			const key = `conc:${half}:set`;
+			await raw.send("SELECT", half);
+			await raw.send("DEL", key);
+
+			// Half the members are written by two writers each, so SCARD has to
+			// be right about duplicates as well as about totals.
+			await fanOut(WRITERS, async (c, w) => {
+				await c.send("SELECT", [half]);
+				for (let i = 0; i < PER_WRITER; i++)
+					await c.send("SADD", [key, `m:${(w % (WRITERS / 2)) * PER_WRITER + i}`]);
+			});
+
+			const distinct = (WRITERS / 2) * PER_WRITER;
+			expect(integerReply(await raw.send("SCARD", key))).toBe(distinct);
+			const members = (await raw.array("SMEMBERS", key)).map((b) =>
+				b?.toString(),
+			);
+			expect(members.length).toBe(distinct);
+			expect(new Set(members).size).toBe(distinct);
+			await raw.send("DEL", key);
+		});
+
+		test(`${half}: concurrent hash fields all arrive, and HLEN agrees`, async () => {
+			const key = `conc:${half}:hash`;
+			await raw.send("SELECT", half);
+			await raw.send("DEL", key);
+
+			await fanOut(WRITERS, async (c, w) => {
+				await c.send("SELECT", [half]);
+				for (let i = 0; i < PER_WRITER; i++)
+					await c.send("HSET", [key, `f:${w}:${i}`, `${w}-${i}`]);
+				// One field every writer shares, incremented rather than set:
+				// the count must not double-count a field written eight times.
+				for (let i = 0; i < PER_WRITER; i++)
+					await c.send("HINCRBY", [key, "shared", "1"]);
+			});
+
+			expect(integerReply(await raw.send("HLEN", key))).toBe(
+				WRITERS * PER_WRITER + 1,
+			);
+			expect((await raw.bulk("HGET", key, "shared"))?.toString()).toBe(
+				String(WRITERS * PER_WRITER),
+			);
+			await raw.send("DEL", key);
+		});
+
+		test(`${half}: a sorted set's cardinality matches its members`, async () => {
+			const key = `conc:${half}:zset`;
+			await raw.send("SELECT", half);
+			await raw.send("DEL", key);
+
+			await fanOut(WRITERS, async (c, w) => {
+				await c.send("SELECT", [half]);
+				for (let i = 0; i < PER_WRITER; i++)
+					await c.send("ZADD", [key, String(w * PER_WRITER + i), `z:${w}:${i}`]);
+			});
+
+			// ZCARD is the meta's count and ZRANGE walks the entries; a member
+			// added without the meta hearing about it shows up as a mismatch.
+			const total = WRITERS * PER_WRITER;
+			expect(integerReply(await raw.send("ZCARD", key))).toBe(total);
+			const members = (await raw.array("ZRANGE", key, "0", "-1")).map((b) =>
+				b?.toString(),
+			);
+			expect(members.length).toBe(total);
+			expect(new Set(members).size).toBe(total);
+			await raw.send("DEL", key);
+		});
+
+		test(`${half}: a key read while it is repeatedly rewritten is never torn`, async () => {
+			const key = `conc:${half}:torn`;
+			await raw.send("SELECT", half);
+			await raw.send("DEL", key);
+
+			// Sizes either side of the inline slot and of a chunk boundary, so
+			// a reader can catch a writer between the inline prefix and the
+			// pooled tail if the two are not written under one lock.
+			const shapes = ["a".repeat(10), "b".repeat(300), "c".repeat(4096)];
+			for (const s of shapes) await raw.send("SET", key, s);
+
+			const seen = await fanOut(4, async (c, i) => {
+				await c.send("SELECT", [half]);
+				const bad: string[] = [];
+				for (let n = 0; n < 60; n++) {
+					if (i === 0) {
+						await c.send("SET", [key, shapes[n % shapes.length]]);
+						continue;
+					}
+					const v = (await c.send("GET", [key])) as string | null;
+					// Every legal value is one character repeated. A read that
+					// spliced two writes together is neither.
+					if (v !== null && !shapes.includes(v)) bad.push(v.slice(0, 32));
+				}
+				return bad;
+			});
+
+			expect(seen.flat()).toEqual([]);
+			await raw.send("DEL", key);
+		});
+	}
+});
+
+// ───────────────────── Pressure and FLUSHDB ────────────────────────────────
+//
+// The memory half has a fixed chunk pool, and `FLUSHDB` re-formats it rather
+// than handing chains back one at a time. That made a removed entry outlive
+// the chunks it named: the next key to land in its dynahash slot released them
+// a second time, which spliced the free list into a cycle and inflated its
+// count. The next large write walked off the end of the list and the worker
+// segfaulted — taking the postmaster, and every other connection, with it.
+//
+// Nothing here is memory-specific to *write*, so both halves run it: on db 8
+// it is an ordinary data-integrity check, and on db 0 it is the regression.
+
+describe("Pressure and FLUSHDB", () => {
+	// Past the 64-byte inline slot by several chunks, so every value owns a
+	// pooled tail. A value inside the inline slot exercises none of this.
+	const BIG = "v".repeat(4096);
+
+	afterAll(async () => {
+		await raw.send("SELECT", "durable");
+	});
+
+	for (const half of HALVES) {
+		test(`${half}: keys written after a flush read back whole`, async () => {
+			await raw.send("SELECT", half);
+			await raw.send("FLUSHDB");
+
+			// Fill, flush, refill. The refill is what lands in the slots the
+			// flush vacated, and what used to inherit their chains.
+			for (let round = 0; round < 3; round++) {
+				for (let i = 0; i < 40; i++)
+					await raw.send("SET", `flush:${round}:${i}`, BIG);
+				await raw.send("FLUSHDB");
+				expect(integerReply(await raw.send("DBSIZE"))).toBe(0);
+			}
+
+			for (let i = 0; i < 40; i++)
+				await raw.send("SET", `after:${i}`, `${i}:${BIG}`);
+			for (let i = 0; i < 40; i++) {
+				const v = await raw.bulk("GET", `after:${i}`);
+				expect(v?.toString()).toBe(`${i}:${BIG}`);
+			}
+			await raw.send("FLUSHDB");
+		});
+
+		test(`${half}: collections written after a flush read back whole`, async () => {
+			await raw.send("SELECT", half);
+			await raw.send("FLUSHDB");
+
+			const M = "m".repeat(400);
+			for (let round = 0; round < 3; round++) {
+				for (let i = 0; i < 20; i++) {
+					await raw.send("RPUSH", `fl:list:${i}`, BIG);
+					await raw.send("HSET", `fl:hash:${i}`, `f${i}`, BIG);
+					await raw.send("SADD", `fl:set:${i}`, `${i}:${M}`);
+					await raw.send("ZADD", `fl:zset:${i}`, "1", `${i}:${M}`);
+				}
+				await raw.send("FLUSHDB");
+			}
+
+			for (let i = 0; i < 20; i++) {
+				await raw.send("RPUSH", `post:list:${i}`, `${i}:${BIG}`);
+				await raw.send("HSET", `post:hash:${i}`, "f", `${i}:${BIG}`);
+				await raw.send("SADD", `post:set:${i}`, `${i}:${M}`);
+			}
+			for (let i = 0; i < 20; i++) {
+				expect(
+					(await raw.bulk("LINDEX", `post:list:${i}`, "0"))?.toString(),
+				).toBe(`${i}:${BIG}`);
+				expect((await raw.bulk("HGET", `post:hash:${i}`, "f"))?.toString()).toBe(
+					`${i}:${BIG}`,
+				);
+				expect(
+					integerReply(await raw.send("SISMEMBER", `post:set:${i}`, `${i}:${M}`)),
+				).toBe(1);
+			}
+			await raw.send("FLUSHDB");
+		});
+
+		test(`${half}: an exhausted pool refuses rather than corrupting`, async () => {
+			await raw.send("SELECT", half);
+			await raw.send("FLUSHDB");
+
+			// Write until something is refused, then prove the refusal was
+			// clean: everything already stored still reads back byte for byte.
+			// On db 8 nothing is refused and the loop just stores them all,
+			// which is the correct answer for a half with no such limit.
+			const stored: number[] = [];
+			let refusal: string | null = null;
+			for (let i = 0; i < 200; i++) {
+				const rep = (await raw.send("SET", `oom:${i}`, `${i}:${BIG}`)).toString();
+				if (rep.startsWith("+OK")) stored.push(i);
+				else {
+					refusal = rep;
+					break;
+				}
+			}
+			if (refusal !== null) {
+				expect(refusal).toMatch(/^-(OOM|ERR)/);
+				expect(half).toBe("cache");
+			}
+			for (const i of stored) {
+				expect((await raw.bulk("GET", `oom:${i}`))?.toString()).toBe(
+					`${i}:${BIG}`,
+				);
+			}
+
+			// And freeing must make the pool usable again, not merely present.
+			for (const i of stored) await raw.send("DEL", `oom:${i}`);
+			expect((await raw.send("SET", "oom:again", BIG)).toString()).toBe(
+				"+OK\r\n",
+			);
+			expect((await raw.bulk("GET", "oom:again"))?.toString()).toBe(BIG);
+			await raw.send("FLUSHDB");
+		});
+	}
+});
+
+// ─────────────────── Expiry and collections ────────────────────────────────
+//
+// A collection's rows do not carry its expiry. On the memory half the deadline
+// is in the key directory; on the durable half it is a row in `redis.expiry_N`.
+// Either way a sweep reclaims the rows about once a second, and until it runs
+// the key is in two states at once: `TYPE` and `EXISTS` call it gone, because
+// they read the deadline, while `LLEN`, `SMEMBERS`, `HGETALL` and `ZRANGE` read
+// the rows and find them still there.
+//
+// That is the one case where a client is served data for a key the same server
+// reports as absent, which is worse than either answer alone.
+
+describe("Expiry and collections", () => {
+	afterAll(async () => {
+		await raw.send("SELECT", "durable");
+	});
+
+	/// Drive `key` past its deadline and hand back the moment `TYPE` first says
+	/// `none`. Throws rather than returning if that never happens, so a test
+	/// built on it cannot pass by never reaching the window it is about.
+	async function pastItsExpiry(key: string, build: string[]) {
+		for (let attempt = 0; attempt < 40; attempt++) {
+			await raw.send("DEL", key);
+			await raw.send(...build);
+			await raw.send("PEXPIRE", key, "30");
+			const deadline = Date.now() + 800;
+			while (Date.now() < deadline) {
+				if (/none/.test((await raw.send("TYPE", key)).toString())) return;
+			}
+		}
+		throw new Error(`${key} never read as expired`);
+	}
+
+	const cases: [string, string, string[], [string, string[]][]][] = [
+		["a list", "x:l", ["RPUSH", "x:l", "a", "b", "c"], [
+			["LLEN", ["LLEN", "x:l"]],
+			["LRANGE", ["LRANGE", "x:l", "0", "-1"]],
+			["LINDEX", ["LINDEX", "x:l", "0"]]]],
+		["a set", "x:s", ["SADD", "x:s", "m1", "m2"], [
+			["SCARD", ["SCARD", "x:s"]],
+			["SMEMBERS", ["SMEMBERS", "x:s"]],
+			["SISMEMBER", ["SISMEMBER", "x:s", "m1"]],
+			["SRANDMEMBER", ["SRANDMEMBER", "x:s"]]]],
+		["a hash", "x:h", ["HSET", "x:h", "f", "v"], [
+			["HLEN", ["HLEN", "x:h"]],
+			["HGETALL", ["HGETALL", "x:h"]],
+			["HGET", ["HGET", "x:h", "f"]],
+			["HKEYS", ["HKEYS", "x:h"]]]],
+		["a sorted set", "x:z", ["ZADD", "x:z", "1", "m"], [
+			["ZCARD", ["ZCARD", "x:z"]],
+			["ZRANGE", ["ZRANGE", "x:z", "0", "-1"]],
+			["ZSCORE", ["ZSCORE", "x:z", "m"]],
+			["ZCOUNT", ["ZCOUNT", "x:z", "-inf", "+inf"]]]],
+	];
+
+	for (const half of HALVES) {
+		for (const [label, key, build, reads] of cases) {
+			test(`${half}: ${label} past its expiry reads empty, not stale`, async () => {
+				await raw.send("SELECT", half);
+				await pastItsExpiry(key, build);
+
+				// TYPE has just said `none`. Every read of the same key has to
+				// agree, before the sweep has run and without waiting for it.
+				expect(integerReply(await raw.send("EXISTS", key))).toBe(0);
+				for (const [name, cmd] of reads) {
+					const rep = (await raw.send(...cmd)).toString();
+					const isEmpty =
+						rep === ":0\r\n" || rep === "$-1\r\n" || rep === "*0\r\n" || rep === "*-1\r\n";
+					expect(`${name}=${rep.replace(/\r\n/g, "|")}`).toBe(
+						`${name}=${isEmpty ? rep.replace(/\r\n/g, "|") : "<empty>"}`,
+					);
+				}
+				await raw.send("DEL", key);
+			});
+		}
+
+		test(`${half}: a string past its expiry stays consistent too`, async () => {
+			await raw.send("SELECT", half);
+			await pastItsExpiry("x:str", ["SET", "x:str", "sv"]);
+			expect(await raw.bulk("GET", "x:str")).toBeNull();
+			expect(integerReply(await raw.send("STRLEN", "x:str"))).toBe(0);
+			expect(integerReply(await raw.send("EXISTS", "x:str"))).toBe(0);
+		});
+
+		test(`${half}: a key rewritten after expiring is the new key only`, async () => {
+			await raw.send("SELECT", half);
+			await pastItsExpiry("x:re", ["RPUSH", "x:re", "old1", "old2", "old3"]);
+
+			// The reap must not leave the old members behind for the new key,
+			// and the new key must not inherit the old deadline.
+			await raw.send("RPUSH", "x:re", "new");
+			expect(integerReply(await raw.send("LLEN", "x:re"))).toBe(1);
+			expect(
+				(await raw.array("LRANGE", "x:re", "0", "-1")).map((b) => b?.toString()),
+			).toEqual(["new"]);
+			expect(integerReply(await raw.send("TTL", "x:re"))).toBe(-1);
+			await raw.send("DEL", "x:re");
+		});
+	}
+});

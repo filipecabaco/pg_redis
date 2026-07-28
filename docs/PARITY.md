@@ -12,6 +12,12 @@ Written against `claude/pg-redis-member-array-b41dkl` at the point it went in.
 Re-measure before trusting any table here; the recipe is below and takes two
 minutes.
 
+**Re-measured against Redis 7.0.15 on `claude/pg-redis-correctness`.** Every
+table below still holds exactly: 240 top-level commands in the reference, 143
+accepted, 97 missing, and each tier-2 group the same size and the same members.
+The tier-3 rows reproduce unchanged, `COMMAND COUNT` included. Nothing in tiers
+1–3 has moved; what has changed is [tier 0](#tier-0--correctness-the-harness-never-looks-at).
+
 
 ## How to pick this up
 
@@ -73,13 +79,57 @@ in one place.
 | Gap | Half | Status |
 |---|---|---|
 | `INCRBYFLOAT` precision — `f64` against Redis's `long double` | both | **Accepted.** The 2 baseline entries. See [phase 2](IMPLEMENTATION.md#phase-2-ranges-shapes-and-ties) |
-| An expired collection outlives its expiry: `TYPE` answers `none` while `LLEN` still reports the old count, until the sweep runs | memory | Open, ~1s window. Fix is for `mem_type_error` to *reap* rather than ignore, which needs `dir_lookup` to tell "absent" from "expired" |
+| An expired collection outlives its expiry: `TYPE` answers `none` while `LLEN` still reports the old count, until the sweep runs | both | **Fixed.** It was never memory-only, and it was never one command — see [below](#the-stale-collection-read-was-bigger-than-this-table-said) |
 | `SCAN`/`KEYS` return the whole keyspace in one reply, cursor always 0 | both | Open. See [Incremental cursors](#incremental-cursors) below |
 | `RANDOMKEY` returns the first live key the KV scan reaches, and consults the collection metas only when there is none | memory | Open. Valid key either way, but a database of mostly collections will see strings far more often than it should |
 
 `ZPOPMIN` being O(entries in the database) is a performance defect rather than a
 parity one, so it stays in §12 and is not repeated here.
 
+### The stale-collection read was bigger than this table said
+
+The row above used to read "memory", and to describe one command. Measured
+against a live pair before touching it, it was **both halves and sixteen read
+commands**: `LLEN` `LRANGE` `LINDEX`, `SCARD` `SMEMBERS` `SISMEMBER`
+`SRANDMEMBER`, `HLEN` `HGETALL` `HGET` `HKEYS`, and `ZCARD` `ZRANGE` `ZSCORE`
+`ZCOUNT`. Strings were correct on both halves throughout, which is not luck:
+`kv_N` carries its own `expires_at` and every statement reading one tests it.
+A collection's rows carry nothing — the deadline lives in the key directory or
+in `redis.expiry_N` — so a read of the rows cannot tell a live key from one the
+sweep has not reached.
+
+Both halves had the same shape of bug and needed different fixes, because they
+disagree about when the type of a key is checked.
+
+- **Memory.** `dir_lookup` folded "expiry has passed" onto "absent", so
+  `mem_type_error` let the command through and the read went to the tables.
+  `dir_lookup_raw` keeps the distinction and `mem_key_kind_reaping` acts on it,
+  in the one place every memory command already passes through. Same single
+  directory lookup as before, so it costs nothing.
+- **Durable.** Reads deliberately skip the type check: a read runs first and
+  only asks what the key holds if it came back empty, which keeps a round trip
+  off every successful `GET`. That optimisation is exactly what made the stale
+  read reachable — coming back with data is not evidence the key is live. A
+  collection read now reaps first, with a keyed form of the sweep statement.
+
+**That costs about 63% of durable-half collection-read throughput**
+(`redis-benchmark -n 20000 -c 50`): `HGET` 35.2k → 12.1k, `LLEN` 33.2k → 12.2k,
+`ZCARD` 30.5k → 11.4k, `SCARD` 27.0k → 11.4k. `GET` is unchanged at ~32k.
+
+The price is the round trip and nothing else. The first attempt routed reads
+through `sql_type_error`, which runs five `EXISTS` across five tables; replacing
+it with one indexed lookup on `redis.expiry_N` that usually deletes nothing
+moved `HGET` from 11.3k to 12.1k. A second statement on the read path costs
+roughly two thirds of throughput whatever it does.
+
+The alternative is to put the guard in the read statements instead, which costs
+nothing at run time and is **12 cached statements plus 56 inline ones** — many
+of the 56 being `EXCEPT` chains and `unnest` joins where the predicate is not a
+one-line addition. It would want a source-scanning test asserting that no
+`SELECT` from a collection table lacks the guard, because one missed statement
+is a stale read that nothing else would catch. Guarding only the 12 cached ones
+covers every command in the table above for a twelfth of the work, at the cost
+of two mechanisms living side by side.
 
 ## Tier 2 — commands we do not implement
 
@@ -224,20 +274,32 @@ detail.
 
 ## Decisions needed before the next block
 
-Nothing below can be settled from the code.
+Nothing below can be settled from the code. Two of the four are now taken.
 
-1. **Are streams, scripting, ACL and cluster non-goals?** 50 of the 97 missing
-   commands. They read as out of scope for a Postgres-backed Redis endpoint, but
-   that has never been said out loud, so they are still counted as parity debt
-   on this page. Saying so would move the honest denominator from 240 to ~190
-   and make the number mean something.
-2. **Is polled blocking acceptable, losing FIFO fairness?** The alternative is
-   cross-process wake infrastructure, which is a much larger piece of work and
-   has to be built twice, once per storage half.
+1. **Are streams, scripting, ACL and cluster non-goals?** *Open.* 50 of the 97
+   missing commands. They read as out of scope for a Postgres-backed Redis
+   endpoint, but that has never been said out loud, so they are still counted as
+   parity debt on this page. Saying so would move the honest denominator from
+   240 to ~190 and make the number mean something.
+2. **Is polled blocking acceptable, losing FIFO fairness?** **Taken: neither —
+   blocking is deferred.** Not polling, and not the cross-process wake
+   infrastructure either. The eight blocking commands stay missing for now, on
+   the same principle that orders this page: an absent command errors, and an
+   error is honest, where a `BLPOP` that quietly serves the wrong waiter is a
+   difference no test here would catch. Revisit once the correctness work is
+   done, and take the decision then rather than inheriting it.
 3. **Real `SCAN` cursors, or the cursor-0 convention extended to the
-   collections?** See above. Cheap and consistent, or correct and structural.
-4. **Does `CLIENT` get real connection state?** It is a prerequisite for five
-   commands and is otherwise a family of plausible lies.
+   collections?** **Taken: real, on both halves, via a sorted index.** Not the
+   cheap split. The durable half gets `ORDER BY` plus a cursor predicate; the
+   memory half gets the sorted index it needs to answer honestly — which is the
+   same structure `ZPOPMIN`'s O(entries in the database) wants, so the two
+   should be planned as one piece of work rather than two. It changes the
+   shared-memory layout, so it wants sizing against
+   [§3](IMPLEMENTATION.md#3-the-shared-memory-backend) before any code, and it
+   is the largest item on this page that is not blocking.
+4. **Does `CLIENT` get real connection state?** *Open.* It is a prerequisite for
+   five commands and is otherwise a family of plausible lies. Needed before the
+   `CLIENT` half of tier 3; `COMMAND COUNT` does not wait on it.
 
 
 ## Tier 0 — correctness the harness never looks at
@@ -247,30 +309,43 @@ the answer is right at all, and none of it is parity debt in the sense the other
 tiers are — the differential harness cannot see any of it, because it runs one
 client, in sequence, against a freshly flushed database.
 
-Three gaps, found by reading rather than by any test failing:
+Three gaps, found by reading rather than by any test failing. **All three now
+have tests, and the third had a crash behind it.**
 
-- **The meta name chains have no leak test, and they are the one chain that has
-  actually corrupted the pool.** `mem.rs`'s test module checks that every
-  allocated chunk comes back for KV entries
-  (`freeing_a_kv_entry_releases_both_its_chains`) and for collection entries
-  (`freeing_a_collection_entry_releases_every_chain`). The four meta tables'
-  name chains — added when `KEYS`/`SCAN` learned to see collections — appear in
-  that module only in the size-budget assertion. That is precisely the chain
-  `remove_meta_of` failed to free: the next occupant of the slot inherited a
-  head pointing into the free list and the worker aborted. The bug was found by
-  a crash, fixed, and never given a regression test. `pool_free_chunks` already
-  gives the invariant; the test is a few lines and should exist before anything
-  else is built on top.
-- **Nothing tests concurrent clients for correctness.** `redis.workers` defaults
-  to 4 *processes* sharing one set of HTABs and pools. The only concurrent code
-  in the tree is `bench_pubsub.ts`, which measures throughput and asserts
-  nothing about the data. Two clients incrementing the same counter, pushing to
-  the same list, or racing an eviction against a read have never been checked to
-  produce a defensible result.
-- **Eviction under pressure is unproven end to end.** `key_evictor!` drops keys
-  when a table fills. Its *sampling* is unit-tested
-  (`the_eviction_sample_keeps_the_lowest_ranked_candidates`); what a client sees
-  when its key is evicted mid-sequence is not.
+- **The meta name chains had no leak test, and they are the one chain that has
+  actually corrupted the pool.** *Closed.*
+  `removing_a_meta_entry_releases_its_name_chain` drives all four meta tables
+  through both removal paths — the per-type `remove_meta`/`remove_zset_meta`/
+  `remove_count_meta` and the generic `remove_meta_of` that `DEL` and eviction
+  use — against real dynahash tables, and asserts every chunk comes back.
+  Deleting the `value_free` from any one of the four fails it, each with its own
+  label. `a_meta_name_round_trips_through_the_pool_and_comes_back` covers the
+  three slot accessors underneath.
+- **Nothing tested concurrent clients for correctness.** *Closed.* The
+  `Concurrent clients` describe runs eight connections on both halves against
+  one counter, one list, one set, one hash and one sorted set, plus a reader
+  racing a writer that keeps changing a value's size across the inline and chunk
+  boundaries. It asserts totals, that a collection's meta count matches the
+  members actually stored, and that no read is ever a splice of two writes.
+  Giving `mem_incr` a read-modify-write window loses 11 of 200 increments and
+  fails it.
+- **Eviction under pressure was unproven end to end.** *Closed, and it was not
+  eviction that was broken.* Writing past the chunk pool with the default
+  `noeviction` policy **segfaulted the worker**, which takes the whole
+  PostgreSQL instance down with it. The cause was `FLUSHDB`: `flush_table`
+  removed entries without clearing the chains they named, so a later write into
+  a recycled dynahash slot released those chunks a second time, spliced the free
+  list into a cycle, and left `free_count` claiming nodes that were not there.
+  `pool_alloc` trusted the count and walked off the list. Written up in
+  [§3](IMPLEMENTATION.md#an-entry-must-not-outlive-the-chunks-it-names); the
+  `Pressure and FLUSHDB` describe and
+  `flushing_a_table_leaves_no_entry_naming_freed_chunks` are the regression.
+
+What that third one says about the tier is worth keeping. It was the last item
+on the list, reached by writing the test the doc asked for, and the defect it
+found was not the one the entry predicted — it was a whole-instance crash
+reachable from `FLUSHDB` and ordinary traffic, with no eviction involved. The
+entry was right that the area was untested and wrong about what was in it.
 
 The stale-collection read in [tier 1](#tier-1--commands-we-have-that-behave-differently)
 belongs to this tier as much as to that one: `TYPE` answering `none` while
@@ -286,13 +361,13 @@ it is worth saying why: a missing command errors, and an error is honest. A
 wrong answer is not. That puts all of tier 0 and tier 3 ahead of the 97 absences
 in tier 2, even though tier 2 is where the visible feature gap is.
 
-1. **Tier 0.** The meta-name leak test first, since it is a few lines and guards
-   a failure mode that has already happened once. Then a concurrent-client
-   correctness test on both halves, then eviction under pressure. No decisions
-   needed for any of it.
-2. **The stale-collection read.** Make `dir_lookup` distinguish absent from
-   expired and have `mem_type_error` reap rather than ignore. This is the only
-   case where we knowingly serve data for a key we also report as gone.
+1. ~~**Tier 0.**~~ **Done.** All three items have tests on both halves, and the
+   third turned up a worker segfault reachable from `FLUSHDB` plus ordinary
+   traffic. See [tier 0](#tier-0--correctness-the-harness-never-looks-at).
+2. ~~**The stale-collection read.**~~ **Done**, on both halves rather than the
+   one this page predicted. See
+   [above](#the-stale-collection-read-was-bigger-than-this-table-said); the
+   durable half's fix costs throughput and the alternative is priced there.
 3. **Tier 3 introspection.** `COMMAND COUNT` is wrong by inspection and is one
    line. The `CLIENT` family needs question 4 answered first, because giving a
    connection an identity is the actual work.
@@ -300,11 +375,15 @@ in tier 2, even though tier 2 is where the visible feature gap is.
    parity hat.
 5. **The free wins in tier 2.** `TIME`, `HSTRLEN`, `TOUCH`, `ZINTERCARD`, and
    `DUMP`/`RESTORE` on top of the existing `dump_key`. Mechanical, no decisions.
-6. **`HSCAN`/`SSCAN`/`ZSCAN`**, under whatever comes out of question 3. Note
-   that the unbounded cursor-0 reply is itself a correctness concern on a large
+6. **The sorted index, then `HSCAN`/`SSCAN`/`ZSCAN` and `SCAN` on top of it.**
+   Question 3 is taken: real cursors on both halves. That makes this structural
+   rather than mechanical, and it absorbs `ZPOPMIN`'s O(entries in the database)
+   at the same time, so plan the index once and spend it twice. The unbounded
+   cursor-0 reply it replaces is itself a correctness concern on a large
    keyspace, not only a parity one.
-7. **Blocking**, under whatever comes out of question 2. Largest and most
-   valuable; it changes how a connection is serviced, so it wants its own PR.
+7. ~~**Blocking.**~~ Deferred by question 2 — the eight commands stay absent
+   until the correctness work above is done. When it is taken up it changes how
+   a connection is serviced, so it wants its own PR.
 8. **Finish the bitmap family**, then HyperLogLog, then GEO — bitmaps reuse code
    that exists, HyperLogLog is self-contained, GEO is the largest.
 

@@ -206,6 +206,48 @@ pool that is not already exhausted has the room.
 eviction paths — hands it back before the entry goes. Missing one is not a leak
 that shows up later: the next occupant of that slot inherits a head pointing
 into the free list, and the worker aborts. Which is what it did, once.
+`removing_a_meta_entry_releases_its_name_chain` drives all four against real
+tables; it exists because that bug was found by a crash and fixed without one.
+
+### An entry must not outlive the chunks it names
+
+The rule above is not about meta entries. It is about **dynahash**, and it
+applies to every table here.
+
+A removed element goes on dynahash's own free list holding the bytes it had. The
+next key to land in that slot gets them, and `value_free` reads exactly one
+field before deciding to release: a `value_len` past the inline slot. So an
+entry removed without its chains being cleared arms the *next* write of an
+unrelated key to release chunks it does not own.
+
+`FLUSHDB` broke this for every table at once, and the shape is worth keeping in
+mind because it looks correct. `flush_table` removes every entry and then calls
+`pool_init`, which reformats the whole pool — so not walking the chains
+individually is right, and freeing them one at a time would be wasted work. What
+it missed is that the *entries* still name chunks the reformat has just handed
+back. A later write into a recycled slot released one of those chains a second
+time, which splices the free list onto itself: a cycle, and a `free_count`
+inflated by however many nodes the walk crossed. `pool_alloc` trusts that count.
+
+The symptom is not a corrupt reply. It is a **segfault in a different command,
+on a different connection, some time later** — and because the crashing process
+is a background worker, PostgreSQL takes the whole instance down with it. Two
+things now stand between a mistake and that outcome:
+
+- `flush_table` **zeroes each entry past its key** before removing it. All-zero
+  is what `ShmemInitHash` hands out, so a recycled element is indistinguishable
+  from a fresh one — which is the state every entry path is already written
+  against. Clearing the length and head fields by name would work too, and was
+  the first fix; zeroing is shorter, needs no per-type function, and cannot be
+  out of date when a field is added.
+- `pool_alloc` bounds its walk by the pool's capacity, not only by `free_count`.
+  The count says *whether* to allocate; only the links say where to stop. A
+  short list against a count that disagrees is now a refused write with the free
+  list untouched, which a caller can survive.
+
+`flushing_a_table_leaves_no_entry_naming_freed_chunks` reproduces the recycle
+deterministically — dynahash hands back the element just freed — and asserts the
+free list is walkable, acyclic and the length its count claims.
 
 ### The key directory
 
@@ -762,16 +804,45 @@ Three layers covering different code. Running one is not running the others.
 | End-to-end | `mise run e2e` | Everything, in whichever storage mode the server runs |
 | Parity | `mise run parity` | Every reply, diffed against a real Redis, on both halves |
 
-**The gap in the middle is the important one.** `cargo pgrx test` starts its own
-throwaway cluster *without* `shared_preload_libraries`, so memory mode — the
-default storage mode, and all of `mem.rs` — is invisible to it. Four bugs
-reached a branch that way. Run both storage modes for anything touching
-`mem.rs`; CI does:
+**The gap in the middle is the important one.** `cargo pgrx test` never reaches
+the shared-memory tables. Its cluster *does* preload the library — `pg_test`'s
+`postgresql_conf_options` sets `shared_preload_libraries = 'pg_redis'`, which is
+what lets `watch_counters_are_visible_through_shared_memory` run — but it leaves
+`redis.storage_mode` at its `auto` default, and both the shmem request and
+`mem_init_tables` are gated on `memory`. So every HTAB in `mem.rs` is null
+there, and every `ctl_accessor!` returns a null pointer. Four bugs reached a
+branch that way. Run both storage modes for anything touching `mem.rs`; CI does:
 
 ```bash
 mise run e2e                              # storage_mode=auto
 PG_REDIS_STORAGE_MODE=memory mise run e2e # the shared-memory backend
 ```
+
+**A `#[pg_test]` can still reach the table code**, without the storage mode and
+without the postmaster's startup hook, by building the table it needs locally:
+`hash_create` with the same `keysize`/`entrysize` gives a backend-local HTAB
+that `SharedTable` wraps unchanged, and the chunk pool runs on a `Vec<u64>`
+because it only ever touches the bytes it was handed. That is how the meta and
+flush tests drive the real removal paths. Two things it has to get right, both
+of which are differences from shared memory rather than from dynahash:
+
+- **Ask for zeroed memory.** `ShmemInitHash` hands out zeroed shared memory and
+  the entry code depends on it — `value_write` frees whatever chain the slot
+  names before writing, so an uninitialised `value_len` releases a garbage chunk
+  index. Pass `alloc: palloc0` with `HASH_ALLOC`.
+- **Name the module `tests`.** pgrx resolves every `#[pg_test]` to the `tests`
+  schema (`framework.rs`: `let schema = "tests"`), so a module called anything
+  else compiles and then fails at the call. `pg_tests` is worse than wrong:
+  `#[pg_schema]` turns it into a schema name, and PostgreSQL reserves the `pg_`
+  prefix, so `CREATE EXTENSION` fails and *every* test in the run reports
+  "Could not obtain test mutex" instead.
+
+One constraint on the plain `#[test]`s in `mem.rs`: they may not call anything
+that reaches PostgreSQL. `cargo test --lib` links a binary with no PostgreSQL
+symbols to resolve against, and it only gets away with that because everything
+FFI is dead code there — a `#[pg_test]` body is not linked into it. Calling
+`meta_name_write` from a unit test is enough to break the link, because it can
+`warning!`; call `value_write` and check the chunk accounting instead.
 
 ### Parity against a real Redis
 

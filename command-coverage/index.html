@@ -958,7 +958,7 @@ repeated per command.</p>
 </tr>
 <tr>
 <td><code>COMMAND</code></td>
-<td>Returns an empty array, enough for client handshakes</td>
+<td>Returns an empty array, enough for client handshakes; <code>COUNT</code> reports the number of rows on this page</td>
 </tr>
 <tr>
 <td><code>CONFIG</code></td>
@@ -967,6 +967,10 @@ repeated per command.</p>
 <tr>
 <td><code>INFO</code></td>
 <td></td>
+</tr>
+<tr>
+<td><code>TIME</code></td>
+<td>Seconds and microseconds, from one clock reading</td>
 </tr>
 </tbody>
 </table>
@@ -1057,7 +1061,11 @@ repeated per command.</p>
 </tr>
 <tr>
 <td><code>GETRANGE</code></td>
-<td><code>SUBSTR</code> is accepted as its older name</td>
+<td></td>
+</tr>
+<tr>
+<td><code>SUBSTR</code></td>
+<td>Older name of <code>GETRANGE</code>; a separate command, as in Redis's own table</td>
 </tr>
 <tr>
 <td><code>SETBIT</code></td>
@@ -1095,6 +1103,10 @@ repeated per command.</p>
 <td></td>
 </tr>
 <tr>
+<td><code>TOUCH</code></td>
+<td>Counts as <code>EXISTS</code> does; there is no LRU clock to refresh</td>
+</tr>
+<tr>
 <td><code>TYPE</code></td>
 <td></td>
 </tr>
@@ -1108,7 +1120,15 @@ repeated per command.</p>
 </tr>
 <tr>
 <td><code>RANDOMKEY</code></td>
-<td>Favours strings over collections; see IMPLEMENTATION.md</td>
+<td>Uniform over every live key, whatever table holds it</td>
+</tr>
+<tr>
+<td><code>DUMP</code></td>
+<td>Redis's serialisation format, version 10; restores into a real 7.0</td>
+</tr>
+<tr>
+<td><code>RESTORE</code></td>
+<td>REPLACE and ABSTTL honoured, IDLETIME and FREQ accepted; refuses payloads newer than version 10 and pre-7 compact encodings</td>
 </tr>
 <tr>
 <td><code>RENAME</code></td>
@@ -1238,6 +1258,10 @@ repeated per command.</p>
 </tr>
 <tr>
 <td><code>HEXISTS</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>HSTRLEN</code></td>
 <td></td>
 </tr>
 <tr>
@@ -1510,6 +1534,10 @@ repeated per command.</p>
 <td></td>
 </tr>
 <tr>
+<td><code>ZINTERCARD</code></td>
+<td><code>LIMIT 0</code> means no limit, as <code>SINTERCARD</code></td>
+</tr>
+<tr>
 <td><code>ZDIFF</code></td>
 <td></td>
 </tr>
@@ -1595,10 +1623,9 @@ repeated per command.</p>
 </table>
 <h2 id="not-implemented">Not implemented</h2>
 <p>Notable absences, so you do not have to infer them from silence: <code>BITOP</code>,
-<code>BITPOS</code>, <code>BITFIELD</code>, <code>HSCAN</code>, <code>SSCAN</code>, <code>ZSCAN</code>, <code>SORT</code>, <code>DUMP</code>, <code>RESTORE</code>,
-<code>MIGRATE</code>, <code>BLPOP</code> and the other blocking list commands, <code>HEXPIRE</code> and the
-per-field TTLs, <code>EVAL</code> and scripting, streams (<code>XADD</code> and friends), and cluster
-commands.</p>
+<code>BITPOS</code>, <code>BITFIELD</code>, <code>HSCAN</code>, <code>SSCAN</code>, <code>ZSCAN</code>, <code>SORT</code>, <code>MIGRATE</code>, <code>BLPOP</code>
+and the other blocking list commands, <code>HEXPIRE</code> and the per-field TTLs, <code>EVAL</code>
+and scripting, streams (<code>XADD</code> and friends), and cluster commands.</p>
 <p>A test asserts that every command named above is genuinely rejected, so this
 paragraph cannot quietly go stale — which it did once, naming as absent two
 commands that had since been implemented.</p>

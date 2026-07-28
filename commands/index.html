@@ -550,6 +550,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#dump-and-restore" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        DUMP and RESTORE
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#object-encoding" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -790,6 +801,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#dump-and-restore" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        DUMP and RESTORE
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#object-encoding" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -928,11 +950,15 @@
 </tr>
 <tr>
 <td><code>COMMAND</code></td>
-<td>Returns empty array (client compatibility)</td>
+<td>Returns empty array (client compatibility); <code>COMMAND COUNT</code> reports the number of accepted commands</td>
 </tr>
 <tr>
 <td><code>CLIENT ...</code></td>
 <td>No-op, returns OK</td>
+</tr>
+<tr>
+<td><code>TIME</code></td>
+<td>Unix seconds and leftover microseconds, from one clock reading</td>
 </tr>
 </tbody>
 </table>
@@ -978,6 +1004,10 @@
 <td>Returns count of existing keys</td>
 </tr>
 <tr>
+<td><code>TOUCH key [key ...]</code></td>
+<td>Counts as <code>EXISTS</code> does; there is no LRU clock to refresh</td>
+</tr>
+<tr>
 <td><code>SETRANGE key offset value</code></td>
 <td>Overwrite from <code>offset</code>, padding the gap with NUL bytes; returns the new length</td>
 </tr>
@@ -1008,6 +1038,10 @@
 <tr>
 <td><code>COPY src dst [DB n] [REPLACE]</code></td>
 <td>Duplicate a key of any type — see below</td>
+</tr>
+<tr>
+<td><code>DUMP key</code> / <code>RESTORE key ttl payload [REPLACE\|ABSTTL]</code></td>
+<td>Redis's serialisation format, interchangeable with a real 7.0 — see below</td>
 </tr>
 <tr>
 <td><code>OBJECT ENCODING key</code></td>
@@ -1046,6 +1080,17 @@ one place <code>COPY</code> does more here than there. The read and the write la
 transaction, but they are two different storage engines: a crash between them
 cannot leave the destination half-written, though the value must also pass every
 limit of the half it is going to.</p>
+<h3 id="dump-and-restore"><code>DUMP</code> and <code>RESTORE</code></h3>
+<p><code>DUMP</code> emits Redis's own payload format — an RDB-serialised value, a two-byte
+version stamped 10, and a CRC-64 — so what it produces restores into a real
+Redis 7.0 and vice versa. The bytes are not identical to what Redis itself
+would emit for the same value, because valid encodings are not unique;
+<code>RESTORE</code> accepts everything a 7.0 produces, listpacks and compressed strings
+included. Two deliberate refusals, both loud: payloads stamped newer than
+version 10 (what a 7.2 would hand you — Redis 7.0 refuses them too), and the
+compact encodings no server since 6.x has written (ziplists, zipmaps).
+<code>REPLACE</code> and <code>ABSTTL</code> behave as in Redis; <code>IDLETIME</code> and <code>FREQ</code> are accepted
+and unused, there being no LRU or LFU clock to hand them to.</p>
 <h3 id="object-encoding"><code>OBJECT ENCODING</code></h3>
 <p>Reports the encoding <strong>Redis</strong> would use — <code>int</code>, <code>embstr</code>, <code>raw</code>, <code>listpack</code>,
 <code>quicklist</code>, <code>intset</code>, <code>hashtable</code>, <code>skiplist</code> — derived from the value's shape
@@ -1132,6 +1177,10 @@ its TTL, as in Redis — <code>SET</code> over a string, and <code>SUNIONSTORE</
 <tr>
 <td><code>HGETALL key</code></td>
 <td>Returns interleaved field/value pairs, sorted by field</td>
+</tr>
+<tr>
+<td><code>HSTRLEN key field</code></td>
+<td>Byte length of one field's value, <code>0</code> when either is absent</td>
 </tr>
 <tr>
 <td><code>HINCRBYFLOAT key field increment</code></td>

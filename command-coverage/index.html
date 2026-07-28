@@ -707,6 +707,33 @@
   
 
     
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../PARITY/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Parity roadmap
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
   </ul>
 </nav>
                   </div>
@@ -1020,6 +1047,30 @@ repeated per command.</p>
 <td><code>INCRBYFLOAT</code></td>
 <td></td>
 </tr>
+<tr>
+<td><code>GETEX</code></td>
+<td>EX, PX, EXAT, PXAT and PERSIST</td>
+</tr>
+<tr>
+<td><code>SETRANGE</code></td>
+<td>Pads the gap with NUL bytes, as in Redis</td>
+</tr>
+<tr>
+<td><code>GETRANGE</code></td>
+<td><code>SUBSTR</code> is accepted as its older name</td>
+</tr>
+<tr>
+<td><code>SETBIT</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>GETBIT</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>BITCOUNT</code></td>
+<td>BYTE and BIT ranges; bits are numbered from the most significant</td>
+</tr>
 </tbody>
 </table>
 <h2 id="keys">Keys</h2>
@@ -1049,7 +1100,7 @@ repeated per command.</p>
 </tr>
 <tr>
 <td><code>KEYS</code></td>
-<td>Full scan, as in Redis. Glob matching is done in-process, not in SQL</td>
+<td>Full scan, as in Redis, over keys of every type. Glob matching is done in-process, not in SQL</td>
 </tr>
 <tr>
 <td><code>SCAN</code></td>
@@ -1057,15 +1108,35 @@ repeated per command.</p>
 </tr>
 <tr>
 <td><code>RANDOMKEY</code></td>
-<td></td>
+<td>Favours strings over collections; see IMPLEMENTATION.md</td>
 </tr>
 <tr>
 <td><code>RENAME</code></td>
 <td></td>
 </tr>
 <tr>
-<td><code>DBSIZE</code></td>
+<td><code>RENAMENX</code></td>
 <td></td>
+</tr>
+<tr>
+<td><code>COPY</code></td>
+<td><code>DB</code> may name a database on the other storage half</td>
+</tr>
+<tr>
+<td><code>OBJECT</code></td>
+<td><code>ENCODING</code> only; reports the encoding Redis would use</td>
+</tr>
+<tr>
+<td><code>DBSIZE</code></td>
+<td>Counts keys of every type</td>
+</tr>
+<tr>
+<td><code>FLUSHDB</code></td>
+<td>ASYNC and SYNC accepted and ignored</td>
+</tr>
+<tr>
+<td><code>FLUSHALL</code></td>
+<td>The same, over all sixteen databases — the durable half included</td>
 </tr>
 </tbody>
 </table>
@@ -1080,7 +1151,7 @@ repeated per command.</p>
 <tbody>
 <tr>
 <td><code>EXPIRE</code></td>
-<td>Expiry applies to string keys only, as in Redis before <code>HEXPIRE</code></td>
+<td>Applies to a key of any type; per-field TTLs (<code>HEXPIRE</code>) are not implemented</td>
 </tr>
 <tr>
 <td><code>PEXPIRE</code></td>
@@ -1173,6 +1244,14 @@ repeated per command.</p>
 <td><code>HINCRBY</code></td>
 <td></td>
 </tr>
+<tr>
+<td><code>HINCRBYFLOAT</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>HRANDFIELD</code></td>
+<td>A negative count repeats; WITHVALUES interleaves</td>
+</tr>
 </tbody>
 </table>
 <h2 id="lists">Lists</h2>
@@ -1244,6 +1323,10 @@ repeated per command.</p>
 <td><code>LMOVE</code></td>
 <td></td>
 </tr>
+<tr>
+<td><code>RPOPLPUSH</code></td>
+<td><code>LMOVE src dst RIGHT LEFT</code>, under its older name</td>
+</tr>
 </tbody>
 </table>
 <h2 id="sets">Sets</h2>
@@ -1314,6 +1397,10 @@ repeated per command.</p>
 <tr>
 <td><code>SDIFFSTORE</code></td>
 <td></td>
+</tr>
+<tr>
+<td><code>SINTERCARD</code></td>
+<td><code>LIMIT 0</code> means no limit</td>
 </tr>
 </tbody>
 </table>
@@ -1507,11 +1594,14 @@ repeated per command.</p>
 </tbody>
 </table>
 <h2 id="not-implemented">Not implemented</h2>
-<p>Notable absences, so you do not have to infer them from silence: <code>GETRANGE</code>,
-<code>SETRANGE</code>, <code>SETBIT</code>/<code>GETBIT</code> and the other bit operations, <code>HRANDFIELD</code>,
-<code>HSCAN</code>/<code>SSCAN</code>/<code>ZSCAN</code>, <code>SINTERCARD</code>, <code>OBJECT</code>, <code>SORT</code>, <code>DUMP</code>/<code>RESTORE</code>,
-<code>MIGRATE</code>, <code>BLPOP</code> and the other blocking list commands, <code>EVAL</code> and scripting,
-streams (<code>XADD</code> and friends), and cluster commands.</p>
+<p>Notable absences, so you do not have to infer them from silence: <code>BITOP</code>,
+<code>BITPOS</code>, <code>BITFIELD</code>, <code>HSCAN</code>, <code>SSCAN</code>, <code>ZSCAN</code>, <code>SORT</code>, <code>DUMP</code>, <code>RESTORE</code>,
+<code>MIGRATE</code>, <code>BLPOP</code> and the other blocking list commands, <code>HEXPIRE</code> and the
+per-field TTLs, <code>EVAL</code> and scripting, streams (<code>XADD</code> and friends), and cluster
+commands.</p>
+<p>A test asserts that every command named above is genuinely rejected, so this
+paragraph cannot quietly go stale — which it did once, naming as absent two
+commands that had since been implemented.</p>
 
 
 

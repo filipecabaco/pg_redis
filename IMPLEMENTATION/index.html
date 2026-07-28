@@ -16,6 +16,8 @@
         <link rel="prev" href="../command-coverage/">
       
       
+        <link rel="next" href="../PARITY/">
+      
       
         
       
@@ -687,6 +689,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#the-key-directory" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The key directory
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#key-hashing" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -702,6 +715,17 @@
     <span class="md-ellipsis">
       
         How a KV entry stores its key
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#how-a-collection-entry-stores-its-member" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How a collection entry stores its member
       
     </span>
   </a>
@@ -936,6 +960,17 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
+  <a href="#parity-against-a-real-redis" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Parity against a real Redis
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#running-the-e2e-suite-without-docker" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1030,10 +1065,22 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#max_member_len-is-still-128-bytes" class="md-nav__link">
+  <a href="#redis-parity" class="md-nav__link">
     <span class="md-ellipsis">
       
-        MAX_MEMBER_LEN is still 128 bytes
+        Redis parity
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Redis parity">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#the-plan" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The plan
       
     </span>
   </a>
@@ -1041,10 +1088,103 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#multi-key-writes-are-not-atomic-under-oom" class="md-nav__link">
+  <a href="#phase-0-broken-not-different" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Multi-key writes are not atomic under OOM
+        Phase 0: broken, not different
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-1-input-redis-refuses" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 1: input Redis refuses
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-2-ranges-shapes-and-ties" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 2: ranges, shapes and ties
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-3-error-wording" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 3: error wording
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-4-the-key-directory" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 4: the key directory
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-5-missing-commands" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 5: missing commands
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#an-expired-collection-outlives-its-own-expiry" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        An expired collection outlives its own expiry
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#randomkey-favours-strings" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        RANDOMKEY favours strings
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#zpopmin-is-oentries-in-the-database" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        ZPOPMIN is O(entries in the database)
       
     </span>
   </a>
@@ -1071,6 +1211,33 @@
   
 </nav>
       
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../PARITY/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Parity roadmap
+  
+
+    
+  </span>
+  
+  
+
+      </a>
     </li>
   
 
@@ -1214,6 +1381,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#the-key-directory" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The key directory
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#key-hashing" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1229,6 +1407,17 @@
     <span class="md-ellipsis">
       
         How a KV entry stores its key
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#how-a-collection-entry-stores-its-member" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How a collection entry stores its member
       
     </span>
   </a>
@@ -1463,6 +1652,17 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
+  <a href="#parity-against-a-real-redis" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Parity against a real Redis
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#running-the-e2e-suite-without-docker" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1557,10 +1757,22 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#max_member_len-is-still-128-bytes" class="md-nav__link">
+  <a href="#redis-parity" class="md-nav__link">
     <span class="md-ellipsis">
       
-        MAX_MEMBER_LEN is still 128 bytes
+        Redis parity
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Redis parity">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#the-plan" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The plan
       
     </span>
   </a>
@@ -1568,10 +1780,103 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#multi-key-writes-are-not-atomic-under-oom" class="md-nav__link">
+  <a href="#phase-0-broken-not-different" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Multi-key writes are not atomic under OOM
+        Phase 0: broken, not different
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-1-input-redis-refuses" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 1: input Redis refuses
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-2-ranges-shapes-and-ties" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 2: ranges, shapes and ties
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-3-error-wording" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 3: error wording
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-4-the-key-directory" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 4: the key directory
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-5-missing-commands" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 5: missing commands
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#an-expired-collection-outlives-its-own-expiry" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        An expired collection outlives its own expiry
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#randomkey-favours-strings" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        RANDOMKEY favours strings
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#zpopmin-is-oentries-in-the-database" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        ZPOPMIN is O(entries in the database)
       
     </span>
   </a>
@@ -1761,7 +2066,7 @@ GUC — changing it needs a restart). The durable half is always WAL-logged.</p>
 </tr>
 <tr>
 <td>Shared memory at the default</td>
-<td>~70 MiB, reserved at start</td>
+<td>~58 MiB, reserved at start</td>
 <td>None</td>
 <td>None</td>
 </tr>
@@ -1779,7 +2084,7 @@ GUC — changing it needs a restart). The durable half is always WAL-logged.</p>
 </tr>
 <tr>
 <td>Max hash field / set member</td>
-<td>128 bytes</td>
+<td>512 bytes</td>
 <td>Unlimited</td>
 <td>Unlimited</td>
 </tr>
@@ -1813,12 +2118,26 @@ and <code>ORDER BY member</code> agree with Redis rather than with a database co
 sweep; a unit test asserts it exists on all sixteen.</p>
 <hr />
 <h2 id="3-the-shared-memory-backend">3. The shared-memory backend</h2>
-<p>All of <code>src/mem.rs</code>. Eight databases, eight tables each, and five LWLocks per
-database — one per data type, with each meta table covered by its type's lock.
-So a write to db 0 never blocks a write to db 2, and the hash table never blocks
-the list table.</p>
+<p>All of <code>src/mem.rs</code>. Eight databases, ten tables each, and six LWLocks per
+database — one per data type, with each meta table covered by its type's lock,
+plus one for the key directory. So a write to db 0 never blocks a write to db 2,
+and the hash table never blocks the list table.</p>
+<p>Every one of them is taken through <code>htab::LockGuard</code>, which releases on the way
+out of scope. There were 226 hand-written acquire/release calls before, and
+twenty-six functions had between two and five release points each — one per way
+out. Missing one is not subtle: the worker wedges on its next command, which is
+what <code>HINCRBY</code> on a non-integer field used to do. Two rules the guard does not
+enforce, so they are written down instead:</p>
+<ul>
+<li><strong>The directory's lock is innermost</strong> — see <a href="#the-key-directory">The key
+  directory</a>.</li>
+<li><strong>A guard may not be held across a call that takes a lock</strong>, because an
+  LWLock is not re-entrant. <code>LPUSHX</code> checking the list exists and then calling
+  <code>mem_lpush</code> is the shape that bites; it scopes the check so the guard is gone
+  before the call. <code>KEYS</code> does the same before reading the four meta tables.</li>
+</ul>
 <h3 id="tables-and-entry-layouts">Tables and entry layouts</h3>
-<p>Eight HTABs per database, created with <code>ShmemInitHash</code> during
+<p>Ten HTABs per database, created with <code>ShmemInitHash</code> during
 <code>shmem_startup_hook</code>, all <code>HASH_BLOBS</code> and <code>HASH_FIXED_SIZE</code>.</p>
 <table>
 <thead>
@@ -1836,79 +2155,148 @@ the list table.</p>
 <td><code>mem_max_entries</code></td>
 <td style="text-align: right;"><code>KvEntry</code> 232 B</td>
 <td>16 B key hash</td>
-<td style="text-align: right;">18.19 MiB</td>
+<td style="text-align: right;">16.06 MiB</td>
+</tr>
+<tr>
+<td>Key directory</td>
+<td>see below</td>
+<td style="text-align: right;"><code>DirEntry</code> 32 B</td>
+<td>16 B key hash</td>
+<td style="text-align: right;">11.03 MiB</td>
 </tr>
 <tr>
 <td>Hash</td>
 <td>half</td>
-<td style="text-align: right;"><code>HashEntry</code> 216 B</td>
-<td>16 B hash + 128 B field</td>
-<td style="text-align: right;">8.50 MiB</td>
+<td style="text-align: right;"><code>HashEntry</code> 160 B</td>
+<td>16 B key hash + 16 B field hash</td>
+<td style="text-align: right;">5.83 MiB</td>
 </tr>
 <tr>
 <td>Zset</td>
 <td>half</td>
-<td style="text-align: right;"><code>ZsetEntry</code> 152 B</td>
-<td>16 B hash + 128 B member</td>
-<td style="text-align: right;">6.00 MiB</td>
-</tr>
-<tr>
-<td>Set</td>
-<td>half</td>
-<td style="text-align: right;"><code>SetEntry</code> 144 B</td>
-<td>16 B hash + 128 B member</td>
-<td style="text-align: right;">5.69 MiB</td>
+<td style="text-align: right;"><code>ZsetEntry</code> 96 B</td>
+<td>16 B key hash + 16 B member hash</td>
+<td style="text-align: right;">3.77 MiB</td>
 </tr>
 <tr>
 <td>List</td>
 <td>half</td>
 <td style="text-align: right;"><code>ListEntry</code> 96 B</td>
 <td>16 B hash + 8 B position</td>
-<td style="text-align: right;">3.81 MiB</td>
+<td style="text-align: right;">3.77 MiB</td>
+</tr>
+<tr>
+<td>Set</td>
+<td>half</td>
+<td style="text-align: right;"><code>SetEntry</code> 88 B</td>
+<td>16 B key hash + 16 B member hash</td>
+<td style="text-align: right;">3.55 MiB</td>
 </tr>
 <tr>
 <td>Zset meta</td>
 <td>half</td>
-<td style="text-align: right;"><code>ZsetMeta</code> 304 B</td>
+<td style="text-align: right;"><code>ZsetMeta</code> 120 B</td>
 <td>16 B key hash</td>
-<td style="text-align: right;">11.94 MiB</td>
+<td style="text-align: right;">4.56 MiB</td>
 </tr>
 <tr>
 <td>List meta</td>
 <td>half</td>
-<td style="text-align: right;"><code>ListMeta</code> 40 B</td>
+<td style="text-align: right;"><code>ListMeta</code> 88 B</td>
 <td>16 B key hash</td>
-<td style="text-align: right;">1.62 MiB</td>
+<td style="text-align: right;">3.55 MiB</td>
 </tr>
 <tr>
 <td>Set meta</td>
 <td>half</td>
-<td style="text-align: right;"><code>SetMeta</code> 24 B</td>
+<td style="text-align: right;"><code>CountMeta</code> 72 B</td>
 <td>16 B key hash</td>
-<td style="text-align: right;">1.00 MiB</td>
+<td style="text-align: right;">3.05 MiB</td>
+</tr>
+<tr>
+<td>Hash meta</td>
+<td>half</td>
+<td style="text-align: right;"><code>CountMeta</code> 72 B</td>
+<td>16 B key hash</td>
+<td style="text-align: right;">3.05 MiB</td>
 </tr>
 </tbody>
 </table>
-<p>"half" is <code>mem_max_entries / 2</code>, floored at 256. Sizes include dynahash's 5/4
-bucket overhead and are multiplied across eight databases. A unit test pins
+<p>"half" is <code>mem_max_entries / 2</code>, floored at 256. Sizes are dynahash's own
+<code>hash_estimate_size</code> — the bucket array, the segment directory and the
+per-element header — multiplied across eight databases. That call replaced a
+hand-rolled <code>× 5/4 + 8 KiB</code>, which was 20% short: the postmaster refused to
+start the first time a table wanted three times the entries. A unit test pins
 every entry size, because each one is multiplied by <code>mem_max_entries</code> across
 eight databases and requested <em>before</em> the postmaster starts — growing one
 carelessly turns "slower" into "does not boot".</p>
-<p>The meta tables exist so <code>ZCARD</code>, <code>SCARD</code>, <code>LLEN</code>, <code>ZPOPMIN</code>/<code>ZPOPMAX</code> and
-<code>LPUSH</code>/<code>RPUSH</code> are O(1) rather than a scan of the entry table.</p>
+<p>The meta tables exist so <code>ZCARD</code>, <code>SCARD</code>, <code>HLEN</code>, <code>LLEN</code>, <code>ZPOPMIN</code>/<code>ZPOPMAX</code>
+and <code>LPUSH</code>/<code>RPUSH</code> are O(1) rather than a scan of the entry table. The set and
+hash tables need nothing per key but a count, so they share one <code>CountMeta</code>.</p>
+<p>They also hold <strong>the key's own name</strong> — 40 bytes inline, the tail chained into
+that type's existing pool, the way a <code>KvEntry</code> holds its key. Nothing else here
+writes a collection's name down: the entry tables key on <code>(key hash, member)</code>
+and the directory on a hash alone, so before this <code>KEYS</code> and <code>SCAN</code> could see
+strings and nothing else while <code>DBSIZE</code> counted every type. One entry per key
+per type, so the four meta tables between them name every key that is not a
+string, and <code>KEYS</code> is a scan of those four plus the KV table.</p>
+<p>The name is written best-effort: it is not the only copy of anything, so a pool
+with no room costs the key its place in <code>KEYS</code> and nothing else, with a warning
+logged. Refusing the write instead would have to undo members already stored.
+<code>reserve_member_chunks</code> counts the name's chunks alongside the member's, so a
+pool that is not already exhausted has the room.</p>
+<p><strong>A meta entry owns that chain.</strong> Every removal — <code>remove_count_meta</code>,
+<code>remove_meta</code>, <code>remove_zset_meta</code>, and <code>remove_meta_of</code> on the <code>DEL</code> and
+eviction paths — hands it back before the entry goes. Missing one is not a leak
+that shows up later: the next occupant of that slot inherits a head pointing
+into the free list, and the worker aborts. Which is what it did, once.</p>
+<h3 id="the-key-directory">The key directory</h3>
+<p>The five tables that hold data are keyed independently and none of them asks the
+others, which is how one key came to hold a string and a list and a set at once,
+and why only a string could carry an expiry. The directory is the one table that knows
+what a key <em>is</em>: <code>(key hash) → {kind, expires_at}</code>, one entry per live key.</p>
+<ul>
+<li><code>TYPE</code>, <code>EXISTS</code> and <code>TTL</code> are one lookup in it, where <code>TYPE</code> used to probe
+  five tables under five locks in turn.</li>
+<li>A write to a key of another kind is refused with <code>WRONGTYPE</code>, and the handful
+  of commands Redis lets through — <code>SET</code> and the <code>*STORE</code> destinations — clear
+  what was there first.</li>
+<li>It holds every expiry, so a list, set, hash or sorted set can carry a TTL. A
+  string keeps a second copy in its <code>KvEntry</code>, which is what the <code>GET</code> path
+  reads without taking a second lock; every write of one goes through
+  <code>kv_write_full_value</code>, so the two cannot drift.</li>
+<li>The expiry sweep reads it rather than the KV table, and so reaches every type.</li>
+</ul>
+<p>It is sized <code>mem_max_entries + 4 × half</code> — every table can fill independently,
+and a member table's worst case is one key per entry — so the directory is never
+what runs out first. A refusal the operator cannot act on is worse than the
+2.5 MiB that sizing costs over one entry per KV slot.</p>
+<p><strong>Lock order: the directory's LWLock is the innermost one.</strong> A path already
+holding a table's lock may take it; nothing may take a table's lock while
+holding it. Every <code>dir_*</code> helper acquires and releases it, so callers hold
+nothing extra.</p>
+<p>The directory does not store key bytes — a hash is all it holds. That is why
+<code>KEYS</code> reads the four meta tables rather than this one: see <a href="#tables-and-entry-layouts">Tables and entry
+layouts</a>. Storing names here instead would have cost
+~22 MB against the metas' 6 MB, because the directory is sized for every table
+filling independently and a third of its entries are strings, whose names the KV
+table already holds.</p>
 <h3 id="key-hashing">Key hashing</h3>
 <p><strong>Every table indexes on a 128-bit keyed SipHash-2-4 of the Redis key</strong>, not on
-the key bytes. The key material is drawn from <code>pg_strong_random</code> once per
-postmaster, so a client cannot craft two keys that collide and merge their
-contents. Shared memory does not survive a restart, so neither does the key, and
-it never has to match anything on disk.</p>
-<p>The collection tables (hash, set, zset, list) keep <em>only</em> the hash. They store
-one entry per member, so a full copy of the key in each would dominate the entry
-— 512 bytes against a <code>SetEntry</code>'s 144, repeated for every member — and they
-never need the bytes: every access is a comparison against a key the caller
-already holds.</p>
-<p>The KV table is the exception, because <code>KEYS</code>, <code>SCAN</code> and <code>RANDOMKEY</code> hand real
-keys back to clients.</p>
+the key bytes, and the hash, set and zset tables hash their member the same way
+— their HTAB key is 32 bytes, <code>(key hash, member hash)</code>. The key material is
+drawn from <code>pg_strong_random</code> once per postmaster, so a client cannot craft two
+keys that collide and merge their contents. Shared memory does not survive a
+restart, so neither does the key, and it never has to match anything on disk.</p>
+<p>Nothing keys on the Redis key bytes. A full copy of the key in each entry would
+dominate a collection — 512 bytes against a <code>SetEntry</code>'s 88, repeated for every
+member — and the tables never need the bytes: every access is a comparison
+against a key the caller already holds.</p>
+<p>The bytes an entry <em>does</em> keep are the ones a client asks for back: the KV
+table's key, because <code>KEYS</code>, <code>SCAN</code> and <code>RANDOMKEY</code> return real keys, and the
+member of a hash, set or zset, because <code>HGETALL</code>, <code>SMEMBERS</code>, <code>SPOP</code> and
+<code>ZRANGE</code> do. Both are stored the same way — an inline prefix and a pooled tail,
+described below.</p>
 <p>No table is <code>HASH_STRINGS</code>, and none may become one: dynahash compares string
 keys with <code>strncmp</code>, which makes two keys agreeing up to their first NUL byte
 the same key.</p>
@@ -1958,42 +2346,68 @@ the pool and leave nothing for any value past its own 64-byte inline slot. At
 </tr>
 </tbody>
 </table>
+<h3 id="how-a-collection-entry-stores-its-member">How a collection entry stores its member</h3>
+<p>The same shape, at a different size:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>SetEntry  = key hash 16 | member hash 16 | member_inline 48 | member_len 4 | member_overflow 4
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>ZsetEntry = the same, plus score 8
+<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>HashEntry = key hash 16 | field hash 16 | field_inline 48 | value_inline 64
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>                        | field_len 4 | field_overflow 4 | value_len 4 | overflow 4
+</code></pre></div>
+<p><code>INLINE_MEMBER_LEN</code> is 48, not the key's 128, and the arithmetic behind it is
+different in both directions. These tables hold <code>mem_max_entries / 2</code> entries,
+so eight bytes of entry costs 320 KiB rather than the KV table's 640 KiB — but
+the cliff that forced the key prefix up to 128 does not exist here. That cliff
+was keys competing with values for one slab: a key past its prefix takes a chunk
+the values need. The set and zset pools hold <em>only</em> members and carry one chunk
+per entry slot, so a table entirely full of members of 49–112 bytes still fits —
+each takes exactly the chunk its own entry paid for. The hash pool carries two
+chunks per entry slot, so the same table of fields still leaves one chunk each
+for the values. 48 covers what members are: a UUID is 36 bytes.</p>
+<p>The set and zset tables had no pool before this; they have one each rather than
+one shared, because those two tables are covered by <em>different</em> LWLocks and a
+shared free list would have two writers that never exclude each other.</p>
 <h3 id="lookups-verify-the-key">Lookups verify the key</h3>
-<p>Because the KV entry holds the key bytes, <code>kv_find</code> and <code>kv_enter</code> compare the
-stored key against the one asked for. A mismatch reads as "absent" and refuses
-the write, so a hash collision cannot return or overwrite another key's value.
-It has its own error rather than an OOM, because raising <code>mem_max_entries</code> is
-the obvious response to an OOM and does nothing for a collision:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>ERR key hash collides with a different key already stored; rename the key, or use SELECT durable.
+<p>Because an entry holds the bytes it hashed, <code>kv_find</code> and <code>kv_enter</code> — and
+<code>member_find</code> and <code>member_enter</code> for the three collection tables — compare what
+is stored against what was asked for. A mismatch reads as "absent" and refuses
+the write, so a hash collision cannot return or overwrite another key's value or
+another member's. It has its own error rather than an OOM, because raising
+<code>mem_max_entries</code> is the obvious response to an OOM and does nothing for a
+collision:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>ERR key or member hash collides with a different one already stored; rename it, or use SELECT durable.
 </code></pre></div>
 <p>The cost is a length test plus, at most, a compare of the inline prefix against
-bytes the lookup has already pulled into cache; only a key over 128 bytes
-matching on both goes as far as walking the pool. Unreachable in practice at
-<code>mem_max_entries</code> keys per database — it exists because the alternative is to
-write over the key already there, silently. <strong>The collection tables cannot do
-this</strong>: they have nowhere to put the loser of a collision.</p>
+bytes the lookup has already pulled into cache; only a key or member longer than
+its prefix and matching on both goes as far as walking the pool. Unreachable in
+practice at <code>mem_max_entries</code> entries per database — it exists because the
+alternative is to write over what is already there, silently. The collection
+tables could not do this while the member <em>was</em> their HTAB key: two colliding
+members were one entry, with nowhere to put the loser.</p>
 <h3 id="the-chunk-pool">The chunk pool</h3>
-<p>One slab per KV, hash and list table per database — 24 in all — carved out of a
-single <code>ShmemInitStruct</code> allocation and indexed by stride.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>[ValPool header][next: u32 × capacity][data: u8 × capacity × 64]
+<p>One slab per KV, hash, list, set and zset table per database — 40 in all —
+carved out of a single <code>ShmemInitStruct</code> allocation and indexed by stride.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>[ValPool header][next: u32 × capacity][data: u8 × capacity × 64]
 </code></pre></div>
-<p><code>capacity</code> is <code>mem_max_entries</code> chunks of <code>CHUNK_LEN</code> = 64 bytes. The <code>next</code>
-array doubles as the free list <em>and</em> as the chain of a stored value, so a chunk
-is on exactly one of the two at any moment and no separate bitmap has to be kept
-in step. Allocating <em>n</em> chunks takes a prefix of the free list — one pointer
-moved, not <em>n</em>. Freeing returns a chain in one splice.</p>
+<p><code>capacity</code> is <code>mem_max_entries</code> chunks of <code>CHUNK_LEN</code> = 64 bytes for the three
+pools values spill into, and half that — one chunk per entry slot — for the two
+that hold members and nothing else. The <code>next</code> array doubles as the free list
+<em>and</em> as the chain of a stored value, so a chunk is on exactly one of the two at
+any moment and no separate bitmap has to be kept in step. Allocating <em>n</em> chunks
+takes a prefix of the free list — one pointer moved, not <em>n</em>. Freeing returns a
+chain in one splice.</p>
 <p>A byte string of length <em>n</em> occupies <code>ceil((n - inline) / 64)</code> chunks, where
-<code>inline</code> is 64 for a value and 128 for a KV key. Anything shorter than its
-inline slot costs no chunk at all — which covers most of what a cache holds;
-<code>redis-benchmark</code> writes 3-byte values.</p>
+<code>inline</code> is 64 for a value, 128 for a KV key and 48 for a member. Anything
+shorter than its inline slot costs no chunk at all — which covers most of what a
+cache holds; <code>redis-benchmark</code> writes 3-byte values.</p>
 <p><strong>Chunk lifecycle is the easiest thing here to get wrong.</strong> The chain head lives
 in the entry, so the release must happen while the entry is still there. Every
-removal goes through <code>remove_valued</code> (or <code>list_remove_at</code>, its bare-HTAB twin).
-A <code>KvEntry</code> owns <em>two</em> chains, so its <code>kv_free</code> releases the value chain and the
-key chain. A path that calls <code>hash_search(HASH_REMOVE)</code> on the KV, hash or list
-table directly leaks silently until the pool runs dry.</p>
+removal goes through <code>remove_valued</code> (or <code>list_remove_at</code> and <code>zset_remove_at</code>,
+its bare-HTAB twins). A <code>KvEntry</code> owns <em>two</em> chains, so its <code>kv_free</code> releases
+the value chain and the key chain; a <code>HashEntry</code> owns two as well, its value's
+and its field's. A path that calls <code>hash_search(HASH_REMOVE)</code> on any of the five
+tables directly leaks silently until the pool runs dry.</p>
 <h3 id="value-and-key-size-limits">Value and key size limits</h3>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>max value = min(64 KiB, 64 + (redis.mem_max_entries / 8) × 64 bytes)
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>max value = min(64 KiB, 64 + (redis.mem_max_entries / 8) × 64 bytes)
 </code></pre></div>
 <p>which is <strong>65,536 bytes</strong> at the default, where the two bounds meet:</p>
 <ul>
@@ -2004,17 +2418,25 @@ table directly leaks silently until the pool runs dry.</p>
   for the length of one memcpy. That ceiling holds however large the pool is
   configured, so raising <code>mem_max_entries</code> buys capacity, not longer values.</li>
 </ul>
-<p>Keys are capped at 512 bytes for the same kind of reason — how much of the
-shared pool one key may take — and hash fields and set members at 128 because
-those still live in fixed-size arrays.</p>
+<p>Keys, hash fields and set members are capped at 512 bytes for the same kind of
+reason — how much of the shared pool one of them may take. At the cap a member
+is eight chunks of a pool holding nothing but members, so it can never claim
+more of it than a value may claim of its own.</p>
 <p>Anything over a limit is <strong>rejected, never truncated</strong>, and the check runs
 before the command executes so a refusal never leaves a partial write behind:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>ERR key exceeds redis.storage_mode=&#39;memory&#39; limit of 512 bytes (use SELECT durable for unbounded values)
-<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>ERR value exceeds redis.storage_mode=&#39;memory&#39; limit of 65536 bytes (use SELECT durable for unbounded values)
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>ERR key exceeds redis.storage_mode=&#39;memory&#39; limit of 512 bytes (use SELECT durable for unbounded values)
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>ERR hash field or set member exceeds redis.storage_mode=&#39;memory&#39; limit of 512 bytes (use SELECT durable for unbounded values)
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>ERR value exceeds redis.storage_mode=&#39;memory&#39; limit of 65536 bytes (use SELECT durable for unbounded values)
 </code></pre></div>
-<p>Truncation is the one failure mode worse than an error: two members sharing a
-128-byte prefix would collapse onto one entry, so an <code>HGET</code> returns another
-field's value and an <code>HDEL</code> removes it.</p>
+<p>Truncation is the one failure mode worse than an error, and it is what the fixed
+member arrays actually did. Storage was never the problem — the composite key
+NUL-padded the member and dynahash compared all 128 bytes, so <code>SADD s "a\0one"</code>
+and <code>SADD s "a\0two"</code> were two entries. The <em>readback</em> truncated: five sites
+scanned the array for its first NUL, so <code>SMEMBERS</code> returned <code>"a"</code> twice, and
+<code>SPOP</code> returned a string that was not in the set. <code>HGETALL</code> and <code>ZRANGE</code> did the
+same to fields and zset members. Length-prefixing removed the failure mode along
+with the array; db 8 never had it, which is why the end-to-end suite could not
+see it from the durable half.</p>
 <h3 id="when-a-table-fills">When a table fills</h3>
 <p><code>redis.maxmemory_policy</code>, named after Redis's setting:</p>
 <table>
@@ -2027,7 +2449,7 @@ field's value and an <code>HDEL</code> removes it.</p>
 <tbody>
 <tr>
 <td><code>noeviction</code> (default, as in Redis)</td>
-<td>The write is refused with <code>OOM command not allowed when used memory &gt; 'maxmemory'</code>. Nothing already stored is lost.</td>
+<td>The write is refused with <code>OOM command not allowed when used memory &gt; 'maxmemory'</code>. Nothing already stored is lost, and a multi-key write stores nothing at all — see below.</td>
 </tr>
 <tr>
 <td><code>allkeys-random</code></td>
@@ -2053,6 +2475,17 @@ OOM, and <code>reserve_chunks</code> (<code>kv_reserve</code> for the KV table, 
 the key as well as the value) asks eviction for room the same way. It has to run
 <em>before</em> the entry exists, because eviction may remove any entry in the table
 including the one about to be written.</p>
+<p><strong>A multi-key write is priced before any of it runs.</strong> <code>MSET</code>, <code>SADD</code>,
+<code>HSET</code>, <code>ZADD</code> and the pushes ask <code>mem_room_for_*</code> whether the table and its
+pool can take the whole command; a table that cannot refuses it outright, where
+storing the first few keys and then reporting OOM is what Redis does not do.
+Whether a <em>single</em> key fits is still only knowable at the insert, and a
+single-key command has nothing to be partial about. The check costs one lookup
+per key, so it runs only for commands carrying more than one, and only under
+<code>noeviction</code> — under the other policies the insert path makes room as it goes
+and a refusal here would reject a command that would have succeeded. It counts
+only the keys actually absent, so a full table still takes an <code>MSET</code> that
+overwrites.</p>
 <p>A refused write records <em>why</em> in a single thread-local <code>Refusal</code>, read once per
 command by <code>execute_mem</code> and turned into either the OOM reply or the collision
 one. Threading a result out through all 68 <code>mem_*</code> entry points — whose return
@@ -2088,41 +2521,41 @@ shared_memory_size</code> on PostgreSQL 17 at otherwise default settings:</p>
 <tbody>
 <tr>
 <td>256</td>
-<td>214 MB</td>
+<td>215 MB</td>
 </tr>
 <tr>
 <td>4,096</td>
-<td>245 MB</td>
+<td>248 MB</td>
 </tr>
 <tr>
 <td><strong>8,192 (default)</strong></td>
-<td><strong>280 MB</strong></td>
+<td><strong>286 MB</strong></td>
 </tr>
 <tr>
 <td>10,240</td>
-<td>297 MB</td>
+<td>306 MB</td>
 </tr>
 <tr>
 <td>12,288</td>
-<td>314 MB</td>
+<td>325 MB</td>
 </tr>
 <tr>
 <td>16,384</td>
-<td>349 MB</td>
+<td>360 MB</td>
 </tr>
 <tr>
 <td>32,768</td>
-<td>487 MB</td>
+<td>510 MB</td>
 </tr>
 </tbody>
 </table>
 <p>PostgreSQL's own share is roughly the 214 MB floor; the rest is the extension.
-It also sets the size of each pool, and with it the value cap above.</p>
+It also sets the size of each pool, and with it the value and member caps above.</p>
 <p>The default was halved from 16,384 when the key limit grew to 512 bytes, and
-three rounds of shrinking the entries have not yet paid that back: hashing the
-key out of the KV table freed 28 MB, where doubling the setting costs 69 MB.
-Raising it is supported — it buys pool capacity as well as key capacity — but it
-is a memory-budget decision, not something the entry layout funds.</p>
+four rounds of shrinking the entries have not paid that back: the last two
+freed 28 MB and 11 MB, where doubling the setting costs 74 MB. Raising it is
+supported — it buys pool capacity as well as key capacity — but it is a
+memory-budget decision, not something the entry layout funds.</p>
 <h3 id="how-the-reservation-got-here">How the reservation got here</h3>
 <table>
 <thead>
@@ -2145,8 +2578,23 @@ is a memory-budget decision, not something the entry layout funds.</p>
 </tr>
 <tr>
 <td>KV key hashing</td>
-<td>308 → <strong>280 MB</strong></td>
+<td>308 → 280 MB</td>
 <td>The last table storing keys verbatim; <code>KvEntry</code> 592 → 232 bytes</td>
+</tr>
+<tr>
+<td>Member hashing</td>
+<td>280 → 269 MB</td>
+<td>The five fixed member arrays: <code>ZsetMeta</code> 304 → 72 bytes, <code>HashEntry</code> 216 → 160, <code>SetEntry</code> 144 → 88, <code>ZsetEntry</code> 152 → 96, against 4.25 MiB of new pools for the set and zset tables</td>
+</tr>
+<tr>
+<td>The key directory</td>
+<td>269 → 280 MB</td>
+<td>Two tables added — the directory at 11.03 MiB and a hash meta at 1.53 MiB — against about 2 MiB the exact <code>hash_estimate_size</code> reclaimed from the old 5/4 guess</td>
+</tr>
+<tr>
+<td>Collection names</td>
+<td>280 → <strong>286 MB</strong></td>
+<td>40 bytes of name in each of the four meta entries, so <code>KEYS</code> can see a key that is not a string. In the directory instead it would have been ~22 MB: that table is sized for 24,576 keys per database against the metas' 16,384, and ~8,192 of those are strings whose names the KV table already holds</td>
 </tr>
 </tbody>
 </table>
@@ -2223,10 +2671,10 @@ allocated at server start whether or not pub/sub is used.</p>
 <a href="https://supabase.com/docs/guides/realtime/broadcast">Supabase Realtime broadcast from database</a>
 or any trigger-based integration. The extension is decoupled from Supabase; it
 just INSERTs rows.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">create_pubsub_table</span><span class="p">(</span><span class="s1">&#39;public&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;chat_messages&#39;</span><span class="p">);</span>
-<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">route_publish</span><span class="p">(</span><span class="s1">&#39;chat&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;public&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;chat_messages&#39;</span><span class="p">);</span>
-<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="c1">-- redis-cli&gt; PUBLISH chat &quot;hello&quot;</span>
-<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">channel</span><span class="p">,</span><span class="w"> </span><span class="n">payload</span><span class="p">,</span><span class="w"> </span><span class="n">inserted_at</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="k">public</span><span class="p">.</span><span class="n">chat_messages</span><span class="p">;</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">create_pubsub_table</span><span class="p">(</span><span class="s1">&#39;public&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;chat_messages&#39;</span><span class="p">);</span>
+<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">redis</span><span class="p">.</span><span class="n">route_publish</span><span class="p">(</span><span class="s1">&#39;chat&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;public&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;chat_messages&#39;</span><span class="p">);</span>
+<a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a><span class="c1">-- redis-cli&gt; PUBLISH chat &quot;hello&quot;</span>
+<a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">channel</span><span class="p">,</span><span class="w"> </span><span class="n">payload</span><span class="p">,</span><span class="w"> </span><span class="n">inserted_at</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="k">public</span><span class="p">.</span><span class="n">chat_messages</span><span class="p">;</span>
 </code></pre></div>
 <table>
 <thead>
@@ -2344,8 +2792,8 @@ shared-memory ones.</p>
 </tr>
 <tr>
 <td>Hash field / set member</td>
-<td>128 bytes</td>
-<td>Fixed array in the entry</td>
+<td>512 bytes</td>
+<td>Share of the chunk pool</td>
 </tr>
 <tr>
 <td>Keys per type per database</td>
@@ -2601,6 +3049,11 @@ better than the absolute numbers. <code>mise run bench-report</code> runs it loc
 <td><code>mise run e2e</code></td>
 <td>Everything, in whichever storage mode the server runs</td>
 </tr>
+<tr>
+<td>Parity</td>
+<td><code>mise run parity</code></td>
+<td>Every reply, diffed against a real Redis, on both halves</td>
+</tr>
 </tbody>
 </table>
 <p><strong>The gap in the middle is the important one.</strong> <code>cargo pgrx test</code> starts its own
@@ -2608,35 +3061,65 @@ throwaway cluster <em>without</em> <code>shared_preload_libraries</code>, so mem
 default storage mode, and all of <code>mem.rs</code> — is invisible to it. Four bugs
 reached a branch that way. Run both storage modes for anything touching
 <code>mem.rs</code>; CI does:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>mise<span class="w"> </span>run<span class="w"> </span>e2e<span class="w">                              </span><span class="c1"># storage_mode=auto</span>
-<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="nv">PG_REDIS_STORAGE_MODE</span><span class="o">=</span>memory<span class="w"> </span>mise<span class="w"> </span>run<span class="w"> </span>e2e<span class="w"> </span><span class="c1"># the shared-memory backend</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>mise<span class="w"> </span>run<span class="w"> </span>e2e<span class="w">                              </span><span class="c1"># storage_mode=auto</span>
+<a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="nv">PG_REDIS_STORAGE_MODE</span><span class="o">=</span>memory<span class="w"> </span>mise<span class="w"> </span>run<span class="w"> </span>e2e<span class="w"> </span><span class="c1"># the shared-memory backend</span>
 </code></pre></div>
+<h3 id="parity-against-a-real-redis">Parity against a real Redis</h3>
+<p>The three layers above assert against expectations written by hand, so they can
+only catch what someone already knew to expect. <code>docker/e2e/parity.ts</code> asks
+Redis instead: the same commands to pg_redis and to <code>redis:7</code>, replies compared
+byte for byte, on the shared-memory half and the SQL half in the same run.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>mise<span class="w"> </span>run<span class="w"> </span>parity<span class="w">           </span><span class="c1"># gate: fails on a difference not already recorded</span>
+<a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a>mise<span class="w"> </span>run<span class="w"> </span>parity-update<span class="w">    </span><span class="c1"># re-record after fixing or accepting one</span>
+</code></pre></div>
+<p>66 cases, 1,394 replies a run, covering every command the parser accepts, the
+corner cases the community trips on (empty collections vanishing, duplicate
+arguments, source equal to destination, score and float formatting, what counts
+as an integer, which operations keep a TTL), and the patterns people actually
+deploy (rate limiter, session, <code>SET NX PX</code> lock, leaderboard, work queue, dedup,
+cache-aside, tag intersection, hash-as-object, time index).</p>
+<p>Three things it has to normalise, and nothing else:</p>
+<ul>
+<li><strong>Unordered replies.</strong> <code>SMEMBERS</code>, <code>HGETALL</code>, <code>KEYS</code> and the set-algebra
+  commands have no defined order in Redis, so comparing them verbatim measures
+  two hash-table iteration orders. Sorted before comparison.</li>
+<li><strong>Draws and clocks.</strong> <code>SPOP</code> without a count, <code>RANDOMKEY</code>, <code>TTL</code>, <code>INFO</code>,
+  <code>SCAN</code> cursors. Only the reply <em>shape</em> is compared — the type byte, and an
+  array's length.</li>
+<li><strong>A dropped connection.</strong> A command that kills the server it was sent to never
+  replies; the harness records <code>NO REPLY</code> and reconnects rather than waiting
+  forever. That is how the <code>INCR</code> overflow below was found.</li>
+</ul>
+<p>Differences are classified — <code>value</code>, <code>error-vs-value</code>, <code>error-code</code>,
+<code>error-text</code> — and the known ones live in <code>docker/e2e/parity-baseline.json</code>.
+<strong>CI gates on new differences only.</strong> A gate on zero differences would fail on
+every run today, and one that failed always would be turned off.</p>
 <h3 id="running-the-e2e-suite-without-docker">Running the e2e suite without Docker</h3>
 <p><code>docker compose --profile e2e up</code> is the supported path, but <code>bun</code> runs the same
 suite against any live server:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="c1"># 1. A cluster with the extension preloaded. Run as an unprivileged user —</span>
-<a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="c1">#    initdb refuses to run as root, and a long $HOME breaks the socket path.</span>
-<a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a>initdb<span class="w"> </span>-D<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PGDATA</span><span class="s2">&quot;</span><span class="w"> </span>-U<span class="w"> </span>postgres<span class="w"> </span>-A<span class="w"> </span>trust
-<a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a>cat<span class="w"> </span>&gt;&gt;<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PGDATA</span><span class="s2">/postgresql.conf&quot;</span><span class="w"> </span><span class="s">&lt;&lt;&#39;CONF&#39;</span>
-<a id="__codelineno-10-5" name="__codelineno-10-5" href="#__codelineno-10-5"></a><span class="s">listen_addresses = &#39;localhost&#39;</span>
-<a id="__codelineno-10-6" name="__codelineno-10-6" href="#__codelineno-10-6"></a><span class="s">shared_preload_libraries = &#39;pg_redis&#39;</span>
-<a id="__codelineno-10-7" name="__codelineno-10-7" href="#__codelineno-10-7"></a><span class="s">redis.storage_mode = &#39;memory&#39;      # or &#39;auto&#39; — run both</span>
-<a id="__codelineno-10-8" name="__codelineno-10-8" href="#__codelineno-10-8"></a><span class="s">redis.port = 6379</span>
-<a id="__codelineno-10-9" name="__codelineno-10-9" href="#__codelineno-10-9"></a><span class="s">redis.database = &#39;postgres&#39;</span>
-<a id="__codelineno-10-10" name="__codelineno-10-10" href="#__codelineno-10-10"></a><span class="s">redis.default_db = 8</span>
-<a id="__codelineno-10-11" name="__codelineno-10-11" href="#__codelineno-10-11"></a><span class="s">redis.password = &#39;testpass&#39;</span>
-<a id="__codelineno-10-12" name="__codelineno-10-12" href="#__codelineno-10-12"></a><span class="s">CONF</span>
-<a id="__codelineno-10-13" name="__codelineno-10-13" href="#__codelineno-10-13"></a>
-<a id="__codelineno-10-14" name="__codelineno-10-14" href="#__codelineno-10-14"></a><span class="c1"># 2. Install the extension into that PostgreSQL, then start it.</span>
-<a id="__codelineno-10-15" name="__codelineno-10-15" href="#__codelineno-10-15"></a>cargo<span class="w"> </span>pgrx<span class="w"> </span>install<span class="w"> </span>--release<span class="w"> </span>--pg-config<span class="w"> </span>/usr/lib/postgresql/17/bin/pg_config
-<a id="__codelineno-10-16" name="__codelineno-10-16" href="#__codelineno-10-16"></a>pg_ctl<span class="w"> </span>-D<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PGDATA</span><span class="s2">&quot;</span><span class="w"> </span>-o<span class="w"> </span><span class="s1">&#39;-k /tmp&#39;</span><span class="w"> </span>start
-<a id="__codelineno-10-17" name="__codelineno-10-17" href="#__codelineno-10-17"></a>psql<span class="w"> </span>-h<span class="w"> </span><span class="m">127</span>.0.0.1<span class="w"> </span>-U<span class="w"> </span>postgres<span class="w"> </span>-c<span class="w"> </span><span class="s1">&#39;CREATE EXTENSION pg_redis;&#39;</span>
-<a id="__codelineno-10-18" name="__codelineno-10-18" href="#__codelineno-10-18"></a>
-<a id="__codelineno-10-19" name="__codelineno-10-19" href="#__codelineno-10-19"></a><span class="c1"># 3. The suite.</span>
-<a id="__codelineno-10-20" name="__codelineno-10-20" href="#__codelineno-10-20"></a><span class="nb">cd</span><span class="w"> </span>docker/e2e<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>bun<span class="w"> </span>install
-<a id="__codelineno-10-21" name="__codelineno-10-21" href="#__codelineno-10-21"></a><span class="nv">DATABASE_URL</span><span class="o">=</span><span class="s2">&quot;postgres://postgres@localhost:5432/postgres&quot;</span><span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-10-22" name="__codelineno-10-22" href="#__codelineno-10-22"></a><span class="nv">REDIS_HOST</span><span class="o">=</span>localhost<span class="w"> </span><span class="nv">REDIS_PORT</span><span class="o">=</span><span class="m">6379</span><span class="w"> </span><span class="nv">REDIS_PASSWORD</span><span class="o">=</span>testpass<span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-10-23" name="__codelineno-10-23" href="#__codelineno-10-23"></a><span class="w">  </span>bun<span class="w"> </span><span class="nb">test</span><span class="w"> </span>index.test.ts
+<div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="c1"># 1. A cluster with the extension preloaded. Run as an unprivileged user —</span>
+<a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a><span class="c1">#    initdb refuses to run as root, and a long $HOME breaks the socket path.</span>
+<a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a>initdb<span class="w"> </span>-D<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PGDATA</span><span class="s2">&quot;</span><span class="w"> </span>-U<span class="w"> </span>postgres<span class="w"> </span>-A<span class="w"> </span>trust
+<a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a>cat<span class="w"> </span>&gt;&gt;<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PGDATA</span><span class="s2">/postgresql.conf&quot;</span><span class="w"> </span><span class="s">&lt;&lt;&#39;CONF&#39;</span>
+<a id="__codelineno-12-5" name="__codelineno-12-5" href="#__codelineno-12-5"></a><span class="s">listen_addresses = &#39;localhost&#39;</span>
+<a id="__codelineno-12-6" name="__codelineno-12-6" href="#__codelineno-12-6"></a><span class="s">shared_preload_libraries = &#39;pg_redis&#39;</span>
+<a id="__codelineno-12-7" name="__codelineno-12-7" href="#__codelineno-12-7"></a><span class="s">redis.storage_mode = &#39;memory&#39;      # or &#39;auto&#39; — run both</span>
+<a id="__codelineno-12-8" name="__codelineno-12-8" href="#__codelineno-12-8"></a><span class="s">redis.port = 6379</span>
+<a id="__codelineno-12-9" name="__codelineno-12-9" href="#__codelineno-12-9"></a><span class="s">redis.database = &#39;postgres&#39;</span>
+<a id="__codelineno-12-10" name="__codelineno-12-10" href="#__codelineno-12-10"></a><span class="s">redis.default_db = 8</span>
+<a id="__codelineno-12-11" name="__codelineno-12-11" href="#__codelineno-12-11"></a><span class="s">redis.password = &#39;testpass&#39;</span>
+<a id="__codelineno-12-12" name="__codelineno-12-12" href="#__codelineno-12-12"></a><span class="s">CONF</span>
+<a id="__codelineno-12-13" name="__codelineno-12-13" href="#__codelineno-12-13"></a>
+<a id="__codelineno-12-14" name="__codelineno-12-14" href="#__codelineno-12-14"></a><span class="c1"># 2. Install the extension into that PostgreSQL, then start it.</span>
+<a id="__codelineno-12-15" name="__codelineno-12-15" href="#__codelineno-12-15"></a>cargo<span class="w"> </span>pgrx<span class="w"> </span>install<span class="w"> </span>--release<span class="w"> </span>--pg-config<span class="w"> </span>/usr/lib/postgresql/17/bin/pg_config
+<a id="__codelineno-12-16" name="__codelineno-12-16" href="#__codelineno-12-16"></a>pg_ctl<span class="w"> </span>-D<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PGDATA</span><span class="s2">&quot;</span><span class="w"> </span>-o<span class="w"> </span><span class="s1">&#39;-k /tmp&#39;</span><span class="w"> </span>start
+<a id="__codelineno-12-17" name="__codelineno-12-17" href="#__codelineno-12-17"></a>psql<span class="w"> </span>-h<span class="w"> </span><span class="m">127</span>.0.0.1<span class="w"> </span>-U<span class="w"> </span>postgres<span class="w"> </span>-c<span class="w"> </span><span class="s1">&#39;CREATE EXTENSION pg_redis;&#39;</span>
+<a id="__codelineno-12-18" name="__codelineno-12-18" href="#__codelineno-12-18"></a>
+<a id="__codelineno-12-19" name="__codelineno-12-19" href="#__codelineno-12-19"></a><span class="c1"># 3. The suite.</span>
+<a id="__codelineno-12-20" name="__codelineno-12-20" href="#__codelineno-12-20"></a><span class="nb">cd</span><span class="w"> </span>docker/e2e<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>bun<span class="w"> </span>install
+<a id="__codelineno-12-21" name="__codelineno-12-21" href="#__codelineno-12-21"></a><span class="nv">DATABASE_URL</span><span class="o">=</span><span class="s2">&quot;postgres://postgres@localhost:5432/postgres&quot;</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-12-22" name="__codelineno-12-22" href="#__codelineno-12-22"></a><span class="nv">REDIS_HOST</span><span class="o">=</span>localhost<span class="w"> </span><span class="nv">REDIS_PORT</span><span class="o">=</span><span class="m">6379</span><span class="w"> </span><span class="nv">REDIS_PASSWORD</span><span class="o">=</span>testpass<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-12-23" name="__codelineno-12-23" href="#__codelineno-12-23"></a><span class="w">  </span>bun<span class="w"> </span><span class="nb">test</span><span class="w"> </span>index.test.ts
 </code></pre></div>
 <p>Re-run step 2 after every code change — the running server holds the old <code>.so</code>
 until it restarts.</p>
@@ -2649,19 +3132,19 @@ in CI and passes locally, suspect this first.</p>
 <p>Not hypothetical: <code>UpdateActiveSnapshotCommandId</code> asserts the active snapshot
 has <code>active_count == 1</code> and <code>regd_count == 0</code>, which the snapshot SPI has
 already pushed satisfies neither. It passed locally and failed every CI leg.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="c1"># ftp.postgresql.org may be unreachable; the Debian source package works.</span>
-<a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;deb-src [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \</span>
-<a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a><span class="s2">  https://apt.postgresql.org/pub/repos/apt noble-pgdg main&quot;</span><span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a><span class="w">  </span>&gt;<span class="w"> </span>/etc/apt/sources.list.d/pgdg-src.list
-<a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a>apt-get<span class="w"> </span>update<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>apt-get<span class="w"> </span>install<span class="w"> </span>-y<span class="w"> </span>flex<span class="w"> </span>bison<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>apt-get<span class="w"> </span><span class="nb">source</span><span class="w"> </span>postgresql-17
-<a id="__codelineno-11-6" name="__codelineno-11-6" href="#__codelineno-11-6"></a>
-<a id="__codelineno-11-7" name="__codelineno-11-7" href="#__codelineno-11-7"></a><span class="nb">cd</span><span class="w"> </span>postgresql-17-*/
-<a id="__codelineno-11-8" name="__codelineno-11-8" href="#__codelineno-11-8"></a>./configure<span class="w"> </span>--prefix<span class="o">=</span><span class="nv">$HOME</span>/pgassert<span class="w"> </span>--enable-cassert<span class="w"> </span>--enable-debug<span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-11-9" name="__codelineno-11-9" href="#__codelineno-11-9"></a><span class="w">  </span>--without-icu<span class="w"> </span>--without-readline<span class="w"> </span>--without-zlib<span class="w"> </span>--with-openssl
-<a id="__codelineno-11-10" name="__codelineno-11-10" href="#__codelineno-11-10"></a>make<span class="w"> </span>-j<span class="s2">&quot;</span><span class="k">$(</span>nproc<span class="k">)</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>make<span class="w"> </span>install
-<a id="__codelineno-11-11" name="__codelineno-11-11" href="#__codelineno-11-11"></a>
-<a id="__codelineno-11-12" name="__codelineno-11-12" href="#__codelineno-11-12"></a><span class="nv">PGRX_HOME</span><span class="o">=</span><span class="nv">$HOME</span>/pgrxassert<span class="w"> </span>cargo<span class="w"> </span>pgrx<span class="w"> </span>init<span class="w"> </span>--pg17<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$HOME</span><span class="s2">/pgassert/bin/pg_config&quot;</span>
-<a id="__codelineno-11-13" name="__codelineno-11-13" href="#__codelineno-11-13"></a><span class="nv">PGRX_HOME</span><span class="o">=</span><span class="nv">$HOME</span>/pgrxassert<span class="w"> </span>cargo<span class="w"> </span>pgrx<span class="w"> </span><span class="nb">test</span><span class="w"> </span>pg17
+<div class="highlight"><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a><span class="c1"># ftp.postgresql.org may be unreachable; the Debian source package works.</span>
+<a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;deb-src [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \</span>
+<a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a><span class="s2">  https://apt.postgresql.org/pub/repos/apt noble-pgdg main&quot;</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a><span class="w">  </span>&gt;<span class="w"> </span>/etc/apt/sources.list.d/pgdg-src.list
+<a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a>apt-get<span class="w"> </span>update<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>apt-get<span class="w"> </span>install<span class="w"> </span>-y<span class="w"> </span>flex<span class="w"> </span>bison<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>apt-get<span class="w"> </span><span class="nb">source</span><span class="w"> </span>postgresql-17
+<a id="__codelineno-13-6" name="__codelineno-13-6" href="#__codelineno-13-6"></a>
+<a id="__codelineno-13-7" name="__codelineno-13-7" href="#__codelineno-13-7"></a><span class="nb">cd</span><span class="w"> </span>postgresql-17-*/
+<a id="__codelineno-13-8" name="__codelineno-13-8" href="#__codelineno-13-8"></a>./configure<span class="w"> </span>--prefix<span class="o">=</span><span class="nv">$HOME</span>/pgassert<span class="w"> </span>--enable-cassert<span class="w"> </span>--enable-debug<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-13-9" name="__codelineno-13-9" href="#__codelineno-13-9"></a><span class="w">  </span>--without-icu<span class="w"> </span>--without-readline<span class="w"> </span>--without-zlib<span class="w"> </span>--with-openssl
+<a id="__codelineno-13-10" name="__codelineno-13-10" href="#__codelineno-13-10"></a>make<span class="w"> </span>-j<span class="s2">&quot;</span><span class="k">$(</span>nproc<span class="k">)</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>make<span class="w"> </span>install
+<a id="__codelineno-13-11" name="__codelineno-13-11" href="#__codelineno-13-11"></a>
+<a id="__codelineno-13-12" name="__codelineno-13-12" href="#__codelineno-13-12"></a><span class="nv">PGRX_HOME</span><span class="o">=</span><span class="nv">$HOME</span>/pgrxassert<span class="w"> </span>cargo<span class="w"> </span>pgrx<span class="w"> </span>init<span class="w"> </span>--pg17<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$HOME</span><span class="s2">/pgassert/bin/pg_config&quot;</span>
+<a id="__codelineno-13-13" name="__codelineno-13-13" href="#__codelineno-13-13"></a><span class="nv">PGRX_HOME</span><span class="o">=</span><span class="nv">$HOME</span>/pgrxassert<span class="w"> </span>cargo<span class="w"> </span>pgrx<span class="w"> </span><span class="nb">test</span><span class="w"> </span>pg17
 </code></pre></div>
 <p>Keep it under its own <code>PGRX_HOME</code> so the fast system-PostgreSQL config stays
 intact, and give it its own <code>CARGO_TARGET_DIR</code> — the bindings differ, so sharing
@@ -2675,12 +3158,12 @@ ordinary build before benchmarking anything.</p>
 <p>It runs <code>initdb</code>, which refuses to run as root. The failure is a wall of "Could
 not obtain test mutex" from every test after the first, with the real message
 only in the first one's output.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>useradd<span class="w"> </span>-m<span class="w"> </span>pgu
-<a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a>cp<span class="w"> </span>-a<span class="w"> </span>~/.cargo<span class="w"> </span>~/.pgrx<span class="w"> </span>/home/pgu/<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>chown<span class="w"> </span>-R<span class="w"> </span>pgu<span class="w"> </span>/home/pgu
-<a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a>chown<span class="w"> </span>-R<span class="w"> </span>pgu<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PWD</span><span class="s2">&quot;</span><span class="w">                                   </span><span class="c1"># target/ is written during the run</span>
-<a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a>chown<span class="w"> </span>-R<span class="w"> </span>pgu<span class="w"> </span>/usr/lib/postgresql/*/lib<span class="w"> </span>/usr/share/postgresql/*/extension
-<a id="__codelineno-12-5" name="__codelineno-12-5" href="#__codelineno-12-5"></a>sudo<span class="w"> </span>-u<span class="w"> </span>pgu<span class="w"> </span>env<span class="w"> </span><span class="nv">HOME</span><span class="o">=</span>/home/pgu<span class="w"> </span><span class="nv">PATH</span><span class="o">=</span>/home/pgu/.cargo/bin:<span class="nv">$PATH</span><span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-12-6" name="__codelineno-12-6" href="#__codelineno-12-6"></a><span class="w">  </span><span class="nv">RUSTUP_HOME</span><span class="o">=</span><span class="nv">$HOME</span>/.rustup<span class="w"> </span><span class="nv">CARGO_HOME</span><span class="o">=</span>/home/pgu/.cargo<span class="w"> </span>cargo<span class="w"> </span>pgrx<span class="w"> </span><span class="nb">test</span><span class="w"> </span>pg17
+<div class="highlight"><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a>useradd<span class="w"> </span>-m<span class="w"> </span>pgu
+<a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a>cp<span class="w"> </span>-a<span class="w"> </span>~/.cargo<span class="w"> </span>~/.pgrx<span class="w"> </span>/home/pgu/<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>chown<span class="w"> </span>-R<span class="w"> </span>pgu<span class="w"> </span>/home/pgu
+<a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a>chown<span class="w"> </span>-R<span class="w"> </span>pgu<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PWD</span><span class="s2">&quot;</span><span class="w">                                   </span><span class="c1"># target/ is written during the run</span>
+<a id="__codelineno-14-4" name="__codelineno-14-4" href="#__codelineno-14-4"></a>chown<span class="w"> </span>-R<span class="w"> </span>pgu<span class="w"> </span>/usr/lib/postgresql/*/lib<span class="w"> </span>/usr/share/postgresql/*/extension
+<a id="__codelineno-14-5" name="__codelineno-14-5" href="#__codelineno-14-5"></a>sudo<span class="w"> </span>-u<span class="w"> </span>pgu<span class="w"> </span>env<span class="w"> </span><span class="nv">HOME</span><span class="o">=</span>/home/pgu<span class="w"> </span><span class="nv">PATH</span><span class="o">=</span>/home/pgu/.cargo/bin:<span class="nv">$PATH</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-14-6" name="__codelineno-14-6" href="#__codelineno-14-6"></a><span class="w">  </span><span class="nv">RUSTUP_HOME</span><span class="o">=</span><span class="nv">$HOME</span>/.rustup<span class="w"> </span><span class="nv">CARGO_HOME</span><span class="o">=</span>/home/pgu/.cargo<span class="w"> </span>cargo<span class="w"> </span>pgrx<span class="w"> </span><span class="nb">test</span><span class="w"> </span>pg17
 </code></pre></div>
 <p><code>cargo pgrx init --pgN download</code> fetches from <code>ftp.postgresql.org</code>, not always
 reachable. Pointing pgrx at the PGDG packages
@@ -2708,6 +3191,12 @@ running; only the assert-enabled build has to be compiled.</p>
 <li><strong>A rejected <code>client.send()</code> leaves the pooled client's replies out of step</strong>
   for later tests. Where an error reply is the expected outcome, use <code>RawRedis</code>,
   which returns the frame as data.</li>
+<li><strong>The parity harness resets with <code>FLUSHDB</code>, before every case, on both
+  servers.</strong> It used to delete only the tokens its own cases name, so keys left
+  by an e2e run showed up as two <code>KEYS *</code> differences and the gate failed on
+  work that was fine. That is why <code>FLUSHDB</code> was built first in phase 5, out of
+  order. A run no longer needs a private server — but it does empty whatever
+  database it is pointed at, on the reference too.</li>
 <li><strong><code>SHOW redis.foo</code> names the result column <code>redis.foo</code></strong>, dot included.
   Destructuring by <code>foo</code> yields <code>undefined</code> with no error. Use
   <code>SELECT current_setting('redis.foo') AS mode</code>.</li>
@@ -2716,11 +3205,11 @@ running; only the assert-enabled build has to be compiled.</p>
 <h2 id="10-continuous-integration">10. Continuous integration</h2>
 <p><code>.github/workflows/ci.yml</code> is seven jobs. Two are trivial and gate the rest, so
 a formatting mistake costs seconds rather than a full matrix:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>Workflows ─┐
-<a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a>Format    ─┴─&gt; Clippy
-<a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a>               Test (pg15, pg16, pg17)
-<a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a>               Build image ──&gt; E2E (auto), E2E (memory)
-<a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a>                           └─&gt; Benchmarks (pull requests only)
+<div class="highlight"><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a>Workflows ─┐
+<a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a>Format    ─┴─&gt; Clippy
+<a id="__codelineno-15-3" name="__codelineno-15-3" href="#__codelineno-15-3"></a>               Test (pg15, pg16, pg17)
+<a id="__codelineno-15-4" name="__codelineno-15-4" href="#__codelineno-15-4"></a>               Build image ──&gt; E2E (auto), E2E (memory)
+<a id="__codelineno-15-5" name="__codelineno-15-5" href="#__codelineno-15-5"></a>                           └─&gt; Benchmarks (pull requests only)
 </code></pre></div>
 <p><code>Build image</code> exists because the end-to-end legs and the benchmark need the same
 container. When they each built it they started together, so none could reuse
@@ -2730,112 +3219,403 @@ keeping its own copy, because the auto-update workflow's token is not allowed to
 rewrite a workflow file.</p>
 <hr />
 <h2 id="11-local-development">11. Local development</h2>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a>mise<span class="w"> </span>run<span class="w"> </span>run<span class="w">     </span><span class="c1"># cargo pgrx run pg17, extension hot-reloaded</span>
-<a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a><span class="c1"># then, in psql:  CREATE EXTENSION pg_redis;</span>
-<a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a><span class="c1"># and elsewhere:  redis-cli -p 6379 ping</span>
-<a id="__codelineno-14-4" name="__codelineno-14-4" href="#__codelineno-14-4"></a>
-<a id="__codelineno-14-5" name="__codelineno-14-5" href="#__codelineno-14-5"></a>mise<span class="w"> </span>run<span class="w"> </span>fmt<span class="w">     </span><span class="c1"># cargo fmt</span>
-<a id="__codelineno-14-6" name="__codelineno-14-6" href="#__codelineno-14-6"></a>mise<span class="w"> </span>run<span class="w"> </span>lint<span class="w">    </span><span class="c1"># cargo clippy -D warnings</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a>mise<span class="w"> </span>run<span class="w"> </span>run<span class="w">     </span><span class="c1"># cargo pgrx run pg17, extension hot-reloaded</span>
+<a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a><span class="c1"># then, in psql:  CREATE EXTENSION pg_redis;</span>
+<a id="__codelineno-16-3" name="__codelineno-16-3" href="#__codelineno-16-3"></a><span class="c1"># and elsewhere:  redis-cli -p 6379 ping</span>
+<a id="__codelineno-16-4" name="__codelineno-16-4" href="#__codelineno-16-4"></a>
+<a id="__codelineno-16-5" name="__codelineno-16-5" href="#__codelineno-16-5"></a>mise<span class="w"> </span>run<span class="w"> </span>fmt<span class="w">     </span><span class="c1"># cargo fmt</span>
+<a id="__codelineno-16-6" name="__codelineno-16-6" href="#__codelineno-16-6"></a>mise<span class="w"> </span>run<span class="w"> </span>lint<span class="w">    </span><span class="c1"># cargo clippy -D warnings</span>
 </code></pre></div>
 <hr />
 <h2 id="12-open-work">12. Open work</h2>
+<p>What is <em>left</em> between pg_redis and Redis — the 97 commands we do not implement,
+the introspection that answers wrongly, and the two architectural blockers in
+front of the rest — is measured in <a href="../PARITY/">Parity roadmap</a>. This section
+records what is done and what is known-open in the surface we already have.</p>
 <h3 id="the-dispatch-handoff">The dispatch handoff</h3>
 <p>See <a href="#where-the-ceiling-is">Where the ceiling is</a>. Closing it needs a design,
 not a patch.</p>
-<h3 id="max_member_len-is-still-128-bytes"><code>MAX_MEMBER_LEN</code> is still 128 bytes</h3>
-<p>Redis has no limit on hash fields or set members. Memory mode caps them because
-five fixed <code>[u8; MAX_MEMBER_LEN]</code> arrays remain — <code>HashEntry::field</code>,
-<code>SetEntry::member</code>, <code>ZsetEntry::member</code>, and <code>ZsetMeta</code>'s <code>min_member</code> and
-<code>max_member</code>. They are what is left of the pattern the last three changes have
-been removing, and they are <strong>25 MiB</strong> at the default:</p>
+<h3 id="redis-parity">Redis parity</h3>
+<p>Done, and the thing everything else waited on. The audit has a machine behind
+it — see <a href="#parity-against-a-real-redis">Parity against a real Redis</a> — and what
+it reports is recorded in <code>docker/e2e/parity-baseline.json</code>. Performance work
+comes after this and is bounded by it: a change that buys throughput by
+widening a parity or security gap is not a change worth making.</p>
+<p><strong>2 differences over 1,394 replies</strong>, down from 189. Every phase is done — 197
+closed, and a sharper harness added 10 along the way. Both survivors are the
+same accepted one, once per half: <code>INCRBYFLOAT</code> is <code>f64</code> where Redis uses
+<code>long double</code> (see <a href="#phase-2-ranges-shapes-and-ties">phase 2</a>).</p>
+<p>The gate fails on a <em>new</em> difference, not on these two.</p>
+<h4 id="the-plan">The plan</h4>
+<p>Six phases, ordered by what a client loses, not by effort. Every difference in
+the baseline belongs to exactly one of them.</p>
 <table>
 <thead>
 <tr>
-<th>Array</th>
-<th style="text-align: right;">Bytes per entry</th>
-<th style="text-align: right;">Cost</th>
+<th>#</th>
+<th>Phase</th>
+<th style="text-align: right;">Closes</th>
+<th>Needs a decision</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><code>ZsetMeta::min_member</code> + <code>max_member</code></td>
-<td style="text-align: right;">256</td>
-<td style="text-align: right;">10.00 MiB</td>
+<td>0</td>
+<td><a href="#phase-0-broken-not-different">Broken, not different</a></td>
+<td style="text-align: right;"><strong>done</strong> — 24</td>
+<td>no</td>
 </tr>
 <tr>
-<td><code>HashEntry::field</code></td>
-<td style="text-align: right;">128</td>
-<td style="text-align: right;">5.00 MiB</td>
+<td>1</td>
+<td><a href="#phase-1-input-redis-refuses">Input Redis refuses</a></td>
+<td style="text-align: right;"><strong>done</strong></td>
+<td>no</td>
 </tr>
 <tr>
-<td><code>ZsetEntry::member</code></td>
-<td style="text-align: right;">128</td>
-<td style="text-align: right;">5.00 MiB</td>
+<td>2</td>
+<td><a href="#phase-2-ranges-shapes-and-ties">Ranges, shapes and ties</a></td>
+<td style="text-align: right;"><strong>done</strong></td>
+<td>no</td>
 </tr>
 <tr>
-<td><code>SetEntry::member</code></td>
-<td style="text-align: right;">128</td>
-<td style="text-align: right;">5.00 MiB</td>
+<td>3</td>
+<td><a href="#phase-3-error-wording">Error wording</a></td>
+<td style="text-align: right;"><strong>done</strong></td>
+<td>taken</td>
+</tr>
+<tr>
+<td>4</td>
+<td><a href="#phase-4-the-key-directory">The key directory</a></td>
+<td style="text-align: right;"><strong>done</strong> — 40</td>
+<td>taken</td>
+</tr>
+<tr>
+<td>5</td>
+<td><a href="#phase-5-missing-commands">Missing commands</a></td>
+<td style="text-align: right;"><strong>done</strong> — 38</td>
+<td>taken</td>
 </tr>
 </tbody>
 </table>
-<p><strong>Do not just copy what the KV table did.</strong> Priced out, the same move gives
-three different answers, and the obvious one is the worst:</p>
+<p>Phases 0–3 are independent of each other and of 4; 5 is last because a command
+that does not exist costs a client less than one that answers wrongly. Phase 4
+was the only one that changed a data structure.</p>
+<p>Each phase ends the same way: <code>mise run parity-update</code>, the baseline shrinks by
+the stated count and by nothing else, and every behaviour it changes gains an
+end-to-end test on <strong>both</strong> halves.</p>
+<h4 id="phase-0-broken-not-different">Phase 0: broken, not different</h4>
+<p><strong>Done.</strong> Not parity gaps — things that could not work at all, every one on the
+SQL half, and every one a worker kill before <code>in_subtransaction</code> learned to
+catch. They went first because the harness reached them by accident and a client
+would reach them on a Tuesday.</p>
 <table>
 <thead>
 <tr>
-<th></th>
-<th>Change</th>
-<th style="text-align: right;">Saves</th>
-<th>Costs</th>
+<th>What</th>
+<th>Why it failed</th>
+<th>Fix</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><code>HashEntry</code></td>
-<td>field → hash + 48 inline + pooled tail (216 → 160)</td>
-<td style="text-align: right;">2.19 MiB</td>
-<td>nothing — the hash table already has a pool</td>
+<td><code>HINCRBY</code> — <strong>every call</strong></td>
+<td>The statement inserted <code>$3::text</code> into a <code>bytea</code> column and cast <code>bytea</code> to <code>bigint</code> without <code>encode</code>, so it raised at analysis time. It had never run, and nothing tested it.</td>
+<td><code>convert_to</code>/<code>encode</code>, as the KV counters use</td>
 </tr>
 <tr>
-<td><code>SetEntry</code>, <code>ZsetEntry</code></td>
-<td>same (144 → 88, 152 → 96)</td>
-<td style="text-align: right;">4.38 MiB</td>
-<td><strong>8.50 MiB</strong> — neither table has a pool, and one costs 4.25 MiB across eight databases</td>
+<td><code>MSET k v1 k v2</code>, <code>HSET h f v1 f v2</code>, <code>ZADD z 1 a 2 a</code></td>
+<td><code>ON CONFLICT DO UPDATE</code> cannot touch a row twice in one statement</td>
+<td><code>dedup_last</code> before binding, which is Redis's last-wins</td>
 </tr>
 <tr>
-<td><code>ZsetMeta</code></td>
-<td>keep member <em>hashes</em>, not bytes (304 → 72)</td>
-<td style="text-align: right;"><strong>9.06 MiB</strong></td>
-<td>no pool at all, but <code>ZPOPMIN</code>/<code>ZPOPMAX</code> stop reading the member straight out of the meta</td>
+<td><code>RENAME</code> onto an existing key</td>
+<td>Primary-key violation; a CTE that deletes the destination is not visible to the update beside it</td>
+<td>The destination is cleared in its own statement, and only when the source is there, so a <code>no such key</code> leaves it alone</td>
+</tr>
+<tr>
+<td><code>LINDEX key &lt;large negative&gt;</code></td>
+<td><code>OFFSET</code> is evaluated even when the <code>WHERE</code> excludes every row, and a negative one raises</td>
+<td><code>GREATEST(…, 0)</code></td>
+</tr>
+<tr>
+<td><code>HSET</code> returned fields written</td>
+<td>Redis returns fields <em>added</em></td>
+<td><code>RETURNING (xmax = 0)</code>, counted</td>
+</tr>
+<tr>
+<td><code>SUNIONSTORE</code>/<code>SINTERSTORE</code>/<code>SDIFFSTORE</code> onto an overlapping destination lost the overlap</td>
+<td>The insert's uniqueness check still sees rows the same statement deleted, so <code>ON CONFLICT DO NOTHING</code> skipped them and the delete kept them</td>
+<td>Delete only what is <em>not</em> in the result, as the sorted-set stores already did, and return the result's cardinality</td>
+</tr>
+<tr>
+<td><code>EXISTS k k</code> counted 1</td>
+<td><code>count(DISTINCT key)</code></td>
+<td>One row per argument</td>
+</tr>
+<tr>
+<td><code>RENAME</code> dropped the expiry (shared memory)</td>
+<td>The value moved, the expiry did not</td>
+<td>Read <code>mem_ttl_raw</code> before the value is taken</td>
+</tr>
+<tr>
+<td><code>GETSET</code> kept the expiry (SQL)</td>
+<td>Redis discards it with the value</td>
+<td><code>expires_at = NULL</code>, as <code>SET</code></td>
 </tr>
 </tbody>
 </table>
-<p>So the set and zset entries do not pay for themselves as a straight copy — the
-two new pools cost about twice what the smaller entries save. Options worth
-pricing first: one pool shared by both tables, a pool sized below one chunk per
-entry, or leaving those two alone.</p>
-<p><code>ZsetMeta</code> is the opposite. At 304 bytes it is the <strong>largest entry in the
-extension</strong>, bigger than <code>KvEntry</code>, and 256 of those bytes are two copies of a
-member it stores only to name the current min and max. Replacing them with
-hashes is the single biggest win left and needs no new shared memory — the
-question is what <code>ZPOPMIN</code> pays, since it reads the member from the meta in O(1)
-today and would have to find it by hash in the entry table instead.</p>
-<p>One number that does not carry over: these tables hold <code>mem_max_entries / 2</code>
-entries, so 8 bytes of entry costs 320 KiB rather than the KV table's 640 KiB.
-Real members are also shorter than real keys, so the inline prefix probably
-wants to be smaller than 128 — price it against pool pressure the way
-<code>INLINE_KEY_LEN</code> is priced rather than reusing that number.</p>
-<h3 id="multi-key-writes-are-not-atomic-under-oom">Multi-key writes are not atomic under OOM</h3>
-<p>An <code>MSET</code> or multi-member <code>SADD</code> that fills a table part-way through stores the
-earlier keys and then errors, where Redis rejects the command whole. Whether
-there is room is only knowable at the insert, so this needs a capacity pre-check
-against the command's key count. Commented at the check site in <code>execute_mem</code>.</p>
+<p>The last two came out of the harness itself: <code>TTL</code> was compared by reply <em>shape</em>,
+so <code>-1</code> and <code>100</code> looked alike and every expiry bug was invisible. It compares
+the class now — gone, no expiry, or some expiry — which cost nothing and
+immediately showed both, plus five more that belong to phase 4.</p>
+<p><strong>Also here:</strong> a caught SQL error is logged with its message and SQLSTATE
+(<code>pg_redis: command failed: …</code>). Catching it stops PostgreSQL reporting it, so
+without this the operator got nothing at all — which is how <code>HINCRBY</code> had been
+failing unnoticed.</p>
+<h4 id="phase-1-input-redis-refuses">Phase 1: input Redis refuses</h4>
+<p><strong>Done.</strong> All in the parser, which is what makes it one fix per behaviour rather
+than two: both backends read the same <code>Command</code>.</p>
+<ul>
+<li><strong>Expiry validation.</strong> <code>check_expire</code> refuses a non-positive expiry and one
+  whose deadline could not be represented, so <code>SET k v EX 0</code>, <code>SETEX k 0 v</code> and
+  <code>EXPIRE k 9999999999999999</code> are errors rather than a delete or a date in the
+  far future. <code>check_expire_deadline</code> allows a past deadline, since <code>EXPIRE k -1</code>
+  legitimately deletes the key.</li>
+<li><strong>Count validation.</strong> <code>check_count</code> on <code>SPOP</code>, <code>LPOP</code>, <code>RPOP</code>, <code>ZPOPMIN</code> and
+  <code>ZPOPMAX</code>. Not on <code>SRANDMEMBER</code> or <code>ZRANDMEMBER</code>, where a negative count means
+  "with repeats".</li>
+<li><strong>Integer canonicality.</strong> <code>mem::parse_stored_int</code> reads a counter the way
+  Redis does — no <code>+1</code>, no <code>007</code>, no <code>-0</code> — and the SQL guard was widened to
+  match, including a <code>numeric</code> range check so a stored value too large for
+  <code>bigint</code> reads as "not an integer" rather than raising an overflow.</li>
+<li><strong>Float validation.</strong> A score literal that overflows to infinity is out of
+  range rather than infinite, so <code>ZADD z 1e400 m</code> is refused; only the spelled
+  forms mean infinity. A <code>ZINCRBY</code> landing on NaN is refused without storing it,
+  and so is an <code>INCRBYFLOAT</code> whose <em>result</em> is not finite — Redis draws that line
+  at the result, not the argument, and takes an infinite increment happily.</li>
+</ul>
+<h4 id="phase-2-ranges-shapes-and-ties">Phase 2: ranges, shapes and ties</h4>
+<p><strong>Done.</strong></p>
+<ul>
+<li><strong>Range clamping.</strong> <code>range_bounds</code> replaced four copies of the same
+  arithmetic, three of which wrapped: <code>(stop + len) as usize</code> on a stop past the
+  start is enormous, clamps to the last element and selects everything, which is
+  how <code>ZREMRANGEBYRANK key -100 -100</code> emptied a sorted set.</li>
+<li><strong>Reply shape.</strong> <code>Response::NullArray</code> exists now, so <code>LPOP key 1</code> on a
+  missing key answers <code>*-1</code> and <code>LPOP key 0</code> on a live list answers <code>*0</code>. A
+  client asking for a list back no longer gets a nil string.</li>
+<li><strong>Tie-break.</strong> <code>zset_meta_member_added</code> compares members when scores are
+  equal, which costs one <code>hash_search</code> on the tie and nothing otherwise.</li>
+<li><strong>Float precision — accepted, not fixed.</strong> <code>INCRBYFLOAT</code> is <code>f64</code> where Redis
+  uses <code>long double</code>, so <code>3 + 1.000000000000000005</code> is <code>4</code> here and
+  <code>4.00000000000000001</code> there. 80-bit arithmetic is not available in stable Rust
+  without a dependency, and <code>float8</code> is what the SQL half stores. The two
+  differences stay in the baseline as a record.</li>
+</ul>
+<h4 id="phase-3-error-wording">Phase 3: error wording</h4>
+<p><strong>Done</strong>, and the decision taken: Redis's strings verbatim. <code>wrong_arity</code>,
+<code>NOT_AN_INTEGER</code>, <code>NOT_A_FLOAT</code> and <code>invalid_expire</code> name them once each, which
+replaced about sixty hand-written variants — <code>GET missing argument at position 0</code>
+became <code>wrong number of arguments for 'get' command</code>, and every <code>X requires
+integer</code> became <code>value is not an integer or out of range</code>.</p>
+<p>Not every message came from a table: <code>LSET</code> on a missing key says <code>no such key</code>
+rather than <code>index out of range</code>, <code>HINCRBY</code> names the hash, <code>SELECT 99</code> is out
+of range rather than unparseable, and <code>DECRBY key -9223372036854775808</code> gets
+Redis's own <code>decrement would overflow</code>.</p>
+<h4 id="phase-4-the-key-directory">Phase 4: the key directory</h4>
+<p><strong>Done</strong>, and the decision taken: one directory per database, not a probe of the
+other tables per write. It closed two things that looked separate:</p>
+<ul>
+<li><strong>A key could hold every type at once (30).</strong> <code>SET k v</code> then <code>LPUSH k a</code>,
+  <code>SADD k m</code>, <code>HSET k f v</code> and <code>ZADD k 1 m</code> all succeeded; <code>TYPE</code> said <code>string</code>,
+  and each accessor returned its own data. <code>SINTERSTORE</code> onto a key holding a
+  string was the same bug from the other side: the set appeared and the string
+  stayed.</li>
+<li><strong>Collections could not expire (4).</strong> <code>EXPIRE</code> on a list, set, hash or sorted
+  set returned 0 and set nothing, so every cache-with-a-TTL pattern over a
+  collection kept its data forever.</li>
+</ul>
+<p>Both were the same missing object: nothing knew what a key was. Each type had
+its own table, keyed independently, and no one asked the others.</p>
+<p><strong>The shared-memory half</strong> gained a tenth HTAB — see <a href="#the-key-directory">the key
+directory</a> for its layout, its sizing and the lock order it
+imposes. The hash table also gained the count meta the set table already had,
+which is what tells the directory its last field has gone, and makes <code>HLEN</code> a
+lookup rather than a scan of the whole database's hash table.</p>
+<p><strong>The durable half</strong> derives the type instead of storing it: the five tables are
+already keyed by <code>key</code>, so one query answers "what holds this" for every key a
+command names, in a single round trip before the command runs. Nothing to keep
+in step, at the cost of that query. Only the expiry needed somewhere to live —
+<code>redis.expiry_N</code>, one row per collection carrying a TTL — because a string's
+<code>expires_at</code> column is the only one in the schema.</p>
+<p>Three things fell out of building it that the parity harness had not asked for:</p>
+<ul>
+<li><code>SET k v NX</code> over a list said OK on the durable half, because the <code>NX</code> test
+  looked at <code>redis.kv_N</code> alone and a list is invisible there. So did <code>SETNX</code> and
+  <code>MSETNX</code>. All three ask the whole directory now, and <code>XX</code> — whose condition a
+  collection satisfies — replaces it rather than doing nothing.</li>
+<li>Redis discards a key's TTL whenever its value is replaced, <code>SUNIONSTORE</code> onto
+  a live set included. Only the type change was clearing it.</li>
+<li>An expired collection has to be gone, not merely untyped: <code>TYPE</code>, <code>EXISTS</code>,
+  <code>TTL</code> and <code>DBSIZE</code> on the durable half read <code>redis.expiry_N</code> and treat a
+  passed deadline as absent, the way they already treat an expired string.</li>
+</ul>
+<p><strong>What it costs the durable half.</strong> The type query is a round trip the SQL
+backend did not make before, so where it lands matters:</p>
+<ul>
+<li>A <strong>write</strong> is checked up front — it cannot be allowed to land and then be
+  refused — so <code>LPUSH</code>, <code>SADD</code>, <code>HSET</code> and friends pay one lookup each.</li>
+<li>A <strong>read</strong> runs first and asks only when it came back empty: a key holding
+  another type finds nothing, and so does a key that is not there. Every
+  successful <code>GET</code>, <code>HGET</code> and <code>LRANGE</code> is unchanged.</li>
+<li>The commands that only <strong>replace</strong> a key — <code>SET</code>, <code>SETEX</code>, <code>PSETEX</code>, <code>MSET</code> —
+  ask nothing at all. They clear the other tables from inside their own
+  statement, as four extra index probes. Doing it as a lookup first halved
+  <code>SET</code> throughput on the durable half in the first measurement, which is what
+  prompted folding it in.</li>
+</ul>
+<p>The benchmark numbers themselves are not worth quoting from this container: the
+spread between identical rounds is two to three times, which rules out a
+collapse and nothing finer.</p>
+<p>Still open, and not part of the 40: <code>KEYS</code>, <code>SCAN</code> and <code>RANDOMKEY</code> see only the
+KV table. The directory holds a key's hash, not its bytes, and no other table
+stores a collection's name — so there is nothing to list them from. Fixing it
+means either an inline key prefix in the directory entry (32 bytes becomes 80,
+plus a sixth chunk pool) or a per-key table on each side. Neither is free, and
+neither is what phase 4 was for.</p>
+<h4 id="phase-5-missing-commands">Phase 5: missing commands</h4>
+<p><strong>Done.</strong> Every command the harness asked for and did not get, plus <code>GETBIT</code>
+and <code>FLUSHALL</code>, which it never asked for because neither can be tested against
+a shared reference server without wrecking it.</p>
+<p><code>FLUSHDB</code> went first, out of the documented order, and paid for itself
+immediately: the harness used to reset by deleting the tokens its own cases
+mention, so anything an e2e run had written was still there and <code>KEYS *</code>
+reported it as a difference on work that was fine. It cost two false failures
+in one session. The harness flushes now, and its cases no longer have to
+declare their keys.</p>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SETRANGE</code>, <code>GETRANGE</code></td>
+<td><code>SETRANGE</code> pads the gap with NUL bytes, which <code>chr(0)</code> cannot express in PostgreSQL text — the SQL half builds the padding as hex</td>
+</tr>
+<tr>
+<td><code>SETBIT</code>, <code>GETBIT</code>, <code>BITCOUNT</code></td>
+<td>Redis numbers bits from the most significant of byte 0; PostgreSQL's <code>get_bit</code> counts from the least, so both halves compute in Rust and agree by construction</td>
+</tr>
+<tr>
+<td><code>HINCRBYFLOAT</code>, <code>HRANDFIELD</code></td>
+<td>A field entered for an increment that turns out to be invalid is removed again, rather than left behind empty</td>
+</tr>
+<tr>
+<td><code>RPOPLPUSH</code></td>
+<td>Parses straight to <code>LMove { src_left: false, dst_left: true }</code> — one command, not two implementations</td>
+</tr>
+<tr>
+<td><code>RENAMENX</code>, <code>GETEX</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>SINTERCARD</code></td>
+<td><code>LIMIT 0</code> means no limit, which is Redis's reading and not the obvious one</td>
+</tr>
+<tr>
+<td><code>COPY</code></td>
+<td>See below</td>
+</tr>
+<tr>
+<td><code>OBJECT ENCODING</code></td>
+<td>See below</td>
+</tr>
+<tr>
+<td><code>FLUSHDB</code>, <code>FLUSHALL</code></td>
+<td>See below</td>
+</tr>
+</tbody>
+</table>
+<p>Three of them needed a decision rather than an implementation.</p>
+<p><strong><code>COPY</code> crosses the two halves.</strong> <code>COPY k k DB 8</code> promotes a shared-memory
+cache entry to a durable row, and <code>DB 0</code> brings one back. That is the one place
+<code>COPY</code> does more here than in Redis, which has no such split. It reads through
+<code>dump_key</code> into a form neither backend stores and writes through <code>restore_key</code>
+into whichever the destination names — the only command that has to, which is
+why the pair exists at all and why <code>COPY</code> is routed to the SPI path whatever
+the storage mode.</p>
+<p><strong><code>OBJECT ENCODING</code> reports Redis's representation, not ours.</strong> <code>int</code>,
+<code>embstr</code>, <code>raw</code>, <code>listpack</code>, <code>quicklist</code>, <code>intset</code>, <code>hashtable</code>, <code>skiplist</code>,
+derived from the value's shape against Redis's default thresholds. pg_redis has
+an inline slot and a chunk pool, or a <code>bytea</code> column, and none of those names
+describes it. Reporting our own would be truthful and would break every client
+that branches on Redis's — the decision was to satisfy the client. A missing
+key answers nil, which is Redis's own reply here rather than the error nearly
+every other command gives.</p>
+<p><strong><code>FLUSHALL</code> empties all sixteen databases, the durable half included.</strong> Redis's
+own reach, taken deliberately over a safer default: databases 8–15 are
+WAL-backed, and the Redis port bypasses PostgreSQL authentication, so any client
+that can reach the port can erase them. <code>redis.listen_address</code> defaults to
+loopback and <code>redis.password</code> exists; both matter more now than they did.
+<code>FLUSHALL</code> is routed to the SPI path for the same reason <code>COPY</code> is — it is the
+only other command that touches both halves.</p>
+<p>Two things fell out that the harness had not asked for. <code>DBSIZE</code> on the
+shared-memory half counted strings alone, reporting 1 for a database holding a
+string, a list, a hash, a set and a sorted set; it reads the key directory now.
+And a flush writes to keys it cannot name, so <code>WATCH</code> needs every counter
+bumped rather than the ones <code>write_keys</code> returns — <code>watch::bump_all</code> aborts
+watches on databases the flush did not touch, which is the direction that table
+is allowed to err in.</p>
+<h3 id="an-expired-collection-outlives-its-own-expiry">An expired collection outlives its own expiry</h3>
+<p>Key-level reads are exact the moment the deadline passes: <code>TTL</code>, <code>TYPE</code>,
+<code>EXISTS</code> and <code>DBSIZE</code> go through the key directory on the shared-memory half and
+<code>redis.expiry_N</code> on the durable one, and both read a passed expiry as absent.</p>
+<p>The type-specific reads do not. <code>LLEN</code> reads the list's own meta, <code>SCARD</code> the
+set's, <code>LRANGE</code> the entries — none consults the directory — so for up to a
+second, until the sweep runs, <code>TYPE</code> answers <code>none</code> while <code>LLEN</code> still reports
+the old count. Redis expires lazily on every access and has no such window.</p>
+<p>The fix is not a lookup on each of those paths, which would put a directory
+probe on the hot read path for a case that almost never happens. It is for the
+type gate to <em>reap</em> rather than merely ignore: <code>mem_type_error</code> already looks
+the key up before every typed command, so an expired one could be dropped there
+and the command would then find nothing, which is what Redis does. That needs
+<code>dir_lookup</code> to distinguish "absent" from "expired", which it currently does
+not.</p>
+<h3 id="randomkey-favours-strings"><code>RANDOMKEY</code> favours strings</h3>
+<p>It returns the first live key the KV table's scan reaches, and only looks at the
+collection metas when there is none. Redis draws from the whole keyspace. The
+reply is a valid key either way, which is why the parity harness compares
+<code>RANDOMKEY</code> by shape and not by value — but a caller sampling a database of
+mostly collections will see the strings far more often than it should.</p>
+<h3 id="zpopmin-is-oentries-in-the-database"><code>ZPOPMIN</code> is O(entries in the database)</h3>
+<p>Not the meta lookup, which is O(1) — the <em>refresh</em> after it. Removing the
+minimum leaves the meta unable to name the new one without looking, so
+<code>refresh_zset_meta</code> scans the whole zset table of that database once per element
+popped. <code>ZREM</code> and every <code>ZREMRANGEBY*</code> pay it too. <code>redis-benchmark</code>'s
+<code>zpopmin</code> runs against a nearly empty table and never shows it. A skip list or a
+score-ordered index is the fix, and it is a data-structure change rather than a
+patch.</p>
 <h3 id="settled-so-not-on-this-list">Settled, so not on this list</h3>
 <ul>
 <li><strong><code>redis.mem_max_entries</code> stays at 8192</strong> — see
   <a href="#sizing-redismem_max_entries">Sizing</a>. Measured, not assumed.</li>
 <li><strong>Sharding the shared-memory LWLocks</strong>, for the reason above.</li>
+<li><strong>The five fixed member arrays</strong> — gone; members are length-prefixed like
+  keys. See <a href="#how-a-collection-entry-stores-its-member">How a collection entry stores its member</a>.</li>
+<li><strong>Multi-key writes under OOM</strong> — priced whole before they run. See
+  <a href="#when-a-table-fills">When a table fills</a>.</li>
+<li><strong>A SQL error killing the worker</strong> — <code>INCR</code> past <code>bigint</code>'s ceiling raised
+  out of the dispatcher and ended the process; four of those ended the Redis
+  endpoint. <code>in_subtransaction</code> catches now, and the reply matches Redis.</li>
+<li><strong>Where a collection's name is stored</strong> — in the four meta tables, not the key
+  directory. Priced both ways: 6 MB against 22 MB.</li>
+<li><strong>What <code>OBJECT ENCODING</code> reports</strong> — Redis's representation names, not ours.
+  See <a href="#phase-5-missing-commands">phase 5</a>.</li>
+<li><strong>How far <code>FLUSHALL</code> reaches</strong> — all sixteen databases, as in Redis, the
+  durable half included. Also <a href="#phase-5-missing-commands">phase 5</a>.</li>
 </ul>
 
 

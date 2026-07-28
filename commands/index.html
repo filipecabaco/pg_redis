@@ -535,6 +535,34 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Key–value">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#copy-across-the-two-halves" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        COPY across the two halves
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#object-encoding" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        OBJECT ENCODING
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -564,6 +592,17 @@
     <span class="md-ellipsis">
       
         Lists
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#sets" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sets
       
     </span>
   </a>
@@ -663,6 +702,33 @@
   
 
     
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../PARITY/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Parity roadmap
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
   </ul>
 </nav>
                   </div>
@@ -709,6 +775,34 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Key–value">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#copy-across-the-two-halves" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        COPY across the two halves
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#object-encoding" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        OBJECT ENCODING
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -738,6 +832,17 @@
     <span class="md-ellipsis">
       
         Lists
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#sets" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sets
       
     </span>
   </a>
@@ -872,8 +977,83 @@
 <td><code>EXISTS key [key ...]</code></td>
 <td>Returns count of existing keys</td>
 </tr>
+<tr>
+<td><code>SETRANGE key offset value</code></td>
+<td>Overwrite from <code>offset</code>, padding the gap with NUL bytes; returns the new length</td>
+</tr>
+<tr>
+<td><code>GETRANGE key start end</code></td>
+<td>Substring; negative indices count from the end, and both clamp</td>
+</tr>
+<tr>
+<td><code>SETBIT key offset 0\|1</code></td>
+<td>Set a bit, growing the value to reach it; returns the bit as it was</td>
+</tr>
+<tr>
+<td><code>GETBIT key offset</code></td>
+<td>The bit, or <code>0</code> past the end</td>
+</tr>
+<tr>
+<td><code>BITCOUNT key [start end [BYTE\|BIT]]</code></td>
+<td>Bits set, over the whole value or a range</td>
+</tr>
+<tr>
+<td><code>RENAME key newkey</code></td>
+<td>Rename, replacing <code>newkey</code>; errors if <code>key</code> is missing</td>
+</tr>
+<tr>
+<td><code>RENAMENX key newkey</code></td>
+<td>The same, but <code>0</code> rather than replacing an occupied <code>newkey</code></td>
+</tr>
+<tr>
+<td><code>COPY src dst [DB n] [REPLACE]</code></td>
+<td>Duplicate a key of any type — see below</td>
+</tr>
+<tr>
+<td><code>OBJECT ENCODING key</code></td>
+<td>Redis's name for the representation — see below</td>
+</tr>
+<tr>
+<td><code>FLUSHDB [ASYNC\|SYNC]</code></td>
+<td>Empty the current database</td>
+</tr>
+<tr>
+<td><code>FLUSHALL [ASYNC\|SYNC]</code></td>
+<td>Empty <strong>all sixteen</strong>, the durable half included — see below</td>
+</tr>
 </tbody>
 </table>
+<p>Bits are numbered from the most significant of byte 0, as in Redis. <code>ASYNC</code> and
+<code>SYNC</code> are accepted and ignored: nothing here defers the work, so both spellings
+describe what already happens.</p>
+<blockquote>
+<p><strong><code>FLUSHALL</code> destroys the durable half.</strong> Databases 8–15 are WAL-backed and
+survive a restart, and the Redis port bypasses PostgreSQL authentication — so
+any client that can reach it can erase them, with no confirmation and nothing
+to roll back to but your own backups. This matches Redis, deliberately. If
+that reach is wider than you want, bind <code>redis.listen_address</code> to loopback
+(the default) and set <code>redis.password</code>.</p>
+</blockquote>
+<h3 id="copy-across-the-two-halves"><code>COPY</code> across the two halves</h3>
+<p><code>COPY src dst DB n</code> may name a database on the other storage half, which is how
+a shared-memory cache entry becomes a durable row, or the reverse:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>SELECT cache
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>SET session:42 &#39;{&quot;user&quot;:7}&#39;
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>COPY session:42 session:42 DB 8    -- now WAL-backed
+</code></pre></div>
+<p>It copies every type, not just strings. Redis has no such split, so this is the
+one place <code>COPY</code> does more here than there. The read and the write land in one
+transaction, but they are two different storage engines: a crash between them
+cannot leave the destination half-written, though the value must also pass every
+limit of the half it is going to.</p>
+<h3 id="object-encoding"><code>OBJECT ENCODING</code></h3>
+<p>Reports the encoding <strong>Redis</strong> would use — <code>int</code>, <code>embstr</code>, <code>raw</code>, <code>listpack</code>,
+<code>quicklist</code>, <code>intset</code>, <code>hashtable</code>, <code>skiplist</code> — derived from the value's shape
+against Redis's default thresholds. pg_redis stores none of those
+representations; it has an inline slot and a chunk pool, or a <code>bytea</code> column.
+The name is reported for the benefit of clients that branch on it, and says
+nothing about how this server stores anything. A missing key answers nil, which
+is Redis's own reply here and not the error most commands give.</p>
 <h2 id="expiry">Expiry</h2>
 <table>
 <thead>
@@ -919,8 +1099,15 @@
 <td><code>PEXPIRETIME key</code></td>
 <td>Absolute expiry as unix timestamp (milliseconds)</td>
 </tr>
+<tr>
+<td><code>GETEX key [EX s\|PX ms\|EXAT ts\|PXAT ts\|PERSIST]</code></td>
+<td>Read the value and, optionally, change what happens to it next</td>
+</tr>
 </tbody>
 </table>
+<p>Every type carries an expiry, not just strings: a list, set, hash or sorted set
+takes a TTL and is deleted whole when it passes. Replacing a key's value clears
+its TTL, as in Redis — <code>SET</code> over a string, and <code>SUNIONSTORE</code> over a set alike.</p>
 <h2 id="hashes">Hashes</h2>
 <table>
 <thead>
@@ -946,10 +1133,19 @@
 <td><code>HGETALL key</code></td>
 <td>Returns interleaved field/value pairs, sorted by field</td>
 </tr>
+<tr>
+<td><code>HINCRBYFLOAT key field increment</code></td>
+<td>Increment a field as a float; returns the new value</td>
+</tr>
+<tr>
+<td><code>HRANDFIELD key [count [WITHVALUES]]</code></td>
+<td>One field, <code>count</code> distinct ones, or <code>-count</code> with repeats</td>
+</tr>
 </tbody>
 </table>
 <blockquote>
-<p>Expiry is not supported on hash keys (same behaviour as Redis hash TTLs without <code>HEXPIRE</code>).</p>
+<p><code>EXPIRE</code> applies to the hash as a whole, as it does in Redis. Per-field TTLs
+(<code>HEXPIRE</code> and friends) are not implemented.</p>
 </blockquote>
 <h2 id="lists">Lists</h2>
 <table>
@@ -984,11 +1180,66 @@
 <td><code>LPOS key element [RANK r] [COUNT n]</code></td>
 <td>Negative <code>RANK</code> searches from the tail; <code>COUNT 0</code> returns every match</td>
 </tr>
+<tr>
+<td><code>LMOVE src dst LEFT\|RIGHT LEFT\|RIGHT</code></td>
+<td>Pop from one end of <code>src</code> and push onto one end of <code>dst</code></td>
+</tr>
+<tr>
+<td><code>RPOPLPUSH src dst</code></td>
+<td><code>LMOVE src dst RIGHT LEFT</code>, under its older name</td>
+</tr>
 </tbody>
 </table>
 <p><code>LINSERT</code> and <code>LREM</code> rewrite the list so its positions stay contiguous, which
 makes them O(n). Removing in place would leave a gap, and every reader walks
 positions in order — the list would silently end at the first gap.</p>
+<h2 id="sets">Sets</h2>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Behaviour</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SADD</code>/<code>SREM key member [member ...]</code></td>
+<td>Add or remove, returns the count that changed</td>
+</tr>
+<tr>
+<td><code>SMEMBERS key</code></td>
+<td>Every member, in no particular order</td>
+</tr>
+<tr>
+<td><code>SCARD key</code></td>
+<td>Cardinality</td>
+</tr>
+<tr>
+<td><code>SISMEMBER</code>/<code>SMISMEMBER key member [member ...]</code></td>
+<td>Membership, as <code>1</code>/<code>0</code></td>
+</tr>
+<tr>
+<td><code>SPOP</code>/<code>SRANDMEMBER key [count]</code></td>
+<td><code>SPOP</code> removes what it returns; <code>SRANDMEMBER</code> does not</td>
+</tr>
+<tr>
+<td><code>SUNION</code>/<code>SINTER</code>/<code>SDIFF key [key ...]</code></td>
+<td>The combined set</td>
+</tr>
+<tr>
+<td><code>SUNIONSTORE</code>/<code>SINTERSTORE</code>/<code>SDIFFSTORE dst key [key ...]</code></td>
+<td>The same, stored, returning its cardinality</td>
+</tr>
+<tr>
+<td><code>SINTERCARD numkeys key [key ...] [LIMIT n]</code></td>
+<td>The intersection's size without building it; <code>LIMIT 0</code> means no limit</td>
+</tr>
+<tr>
+<td><code>SMOVE src dst member</code></td>
+<td>Move one member between sets</td>
+</tr>
+</tbody>
+</table>
 <h2 id="errors-and-limits">Errors and limits</h2>
 <p>Errors carry a Redis error code, so client-side handling that matches on one
 works unchanged:</p>
@@ -1005,6 +1256,10 @@ works unchanged:</p>
 <td>The general case</td>
 </tr>
 <tr>
+<td><code>-WRONGTYPE Operation against a key holding the wrong kind of value</code></td>
+<td>The key holds another type. A key holds exactly one — see <a href="../IMPLEMENTATION/#the-key-directory">the key directory</a></td>
+</tr>
+<tr>
 <td><code>-OOM command not allowed when used memory &gt; 'maxmemory'</code></td>
 <td>A shared-memory table is full and <code>redis.maxmemory_policy</code> is <code>noeviction</code>. See <a href="../IMPLEMENTATION/#when-a-table-fills">When a table fills</a></td>
 </tr>
@@ -1013,15 +1268,18 @@ works unchanged:</p>
 <td>The key, hash field, set member or value is larger than memory mode accepts</td>
 </tr>
 <tr>
-<td><code>-ERR key hash collides with a different key already stored ...</code></td>
-<td>Two keys shared a 128-bit keyed hash. Refused rather than merged — see <a href="../IMPLEMENTATION/#lookups-verify-the-key">how keys are stored</a></td>
+<td><code>-ERR key or member hash collides with a different one already stored ...</code></td>
+<td>Two keys, or two members of one collection, shared a 128-bit keyed hash. Refused rather than merged — see <a href="../IMPLEMENTATION/#lookups-verify-the-key">how keys are stored</a></td>
 </tr>
 </tbody>
 </table>
-<p>All of those are specific to <code>storage_mode = 'memory'</code>; the durable half is
+<p><code>WRONGTYPE</code> applies to both halves. The rest are specific to
+<code>storage_mode = 'memory'</code>; the durable half is
 bounded only by disk. Size limits are checked before the command runs, so a
 refusal never leaves a partial write — no half-stored value and no entry under
-a truncated key.</p>
+a truncated key. A multi-key write is priced the same way: <code>MSET</code>, <code>SADD</code>,
+<code>HSET</code>, <code>ZADD</code> and the pushes are refused whole rather than storing the keys
+that fit.</p>
 <h2 id="transactions">Transactions</h2>
 <table>
 <thead>

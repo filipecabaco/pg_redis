@@ -40,12 +40,9 @@ pub fn route_ctl_size() -> usize {
     std::mem::size_of::<RouteCtl>()
 }
 
-/// RAII guard for the cross-process `AtomicU8` spinlocks in this module.
-///
-/// Releasing in `Drop` rather than at each exit point matters for more than
-/// tidiness: these locks are plain shared-memory bytes with no owner tracking,
-/// so a thread that unwound while holding one would wedge every pub/sub
-/// operation in every worker process, permanently, at 100% CPU.
+/// RAII guard for this module's cross-process `AtomicU8` spinlocks. Releasing
+/// in `Drop` is not tidiness: these are shared-memory bytes with no owner
+/// tracking, so unwinding while holding one wedges pub/sub in every process.
 struct SpinGuard<'a>(&'a AtomicU8);
 
 impl<'a> SpinGuard<'a> {
@@ -204,11 +201,9 @@ fn entry_len(entry: &[u8; CHAN_LEN]) -> usize {
     entry.iter().position(|&b| b == 0).unwrap_or(CHAN_LEN)
 }
 
-/// Compare a NUL-terminated slot entry against `value`.
-///
-/// Deliberately avoids locating the terminator first: PUBLISH runs this against
-/// every subscription of every slot, and the overwhelmingly common case
-/// mismatches on the first byte.
+/// Compare a NUL-terminated slot entry against `value`, without locating the
+/// terminator first: PUBLISH runs this against every subscription of every
+/// slot, and almost all of them mismatch on the first byte.
 fn entry_eq(entry: &[u8; CHAN_LEN], value: &[u8]) -> bool {
     value.len() < CHAN_LEN && entry[..value.len()] == *value && entry[value.len()] == 0
 }
@@ -500,17 +495,11 @@ pub unsafe fn current_tail(slots: *mut PubsubSlot, idx: usize) -> u32 {
     unsafe { (*slots.add(idx)).tail.load(Ordering::Acquire) }
 }
 
-/// Block until this slot's ring advances past `seen_tail`, or `timeout` elapses.
-///
-/// Waiting on the tail counter rather than polling the socket is what makes
-/// delivery immediate: a subscriber that discovered messages by letting a 5 ms
-/// read time out would cost ~200 wakeups per second while idle and still delay
-/// delivery by up to 5 ms. Here the timeout does nothing but bound how long a
-/// client command sits unread.
-///
-/// The futex lives in PostgreSQL's shared memory segment, so the shared (not
-/// `PRIVATE`) operations are required: the waiter and the waker are different
-/// processes. A missed wakeup only costs one `timeout`, never a hang.
+/// Block until this slot's ring advances past `seen_tail`, or `timeout`
+/// elapses. Waiting on the counter rather than polling the socket is what makes
+/// delivery immediate; the timeout only bounds how long a client command sits
+/// unread. Shared rather than `PRIVATE` futex operations, because the waiter
+/// and waker are different processes. A missed wakeup costs one timeout.
 ///
 /// # Safety
 /// `slots` must point at the initialised slot array and `idx` be in range.
@@ -655,11 +644,9 @@ pub unsafe fn pubsub_numpat(ctl: *mut PubsubCtl, slots: *mut PubsubSlot) -> i64 
     }
 }
 
-/// Redis-compatible glob match over `*`, `?` and `[...]` classes.
-///
-/// Iterative O(n×m) backtracking — no recursion, and indices rather than
-/// reslicing so no input can drive a slice out of bounds. A panic here would be
-/// fatal: `publish` calls this while holding the pub/sub spinlock.
+/// Redis-compatible glob match over `*`, `?` and `[...]`. Iterative and
+/// index-based, so no input can drive a slice out of bounds: `publish` calls
+/// this holding the pub/sub spinlock, where a panic would be fatal.
 pub fn glob_match(pattern: &[u8], string: &[u8]) -> bool {
     let (mut p, mut s) = (0usize, 0usize);
     // Position of the last `*` seen, and how much of `string` it currently absorbs.
@@ -802,11 +789,9 @@ mod tests {
             "pub/sub slots would request {} MiB of shared memory",
             bytes / 1024 / 1024
         );
-        // The pub/sub payload limit is its own, deliberately not memory
-        // mode's value cap: every slot in this ring reserves its payload
-        // whether or not anyone publishes, so tracking a 64 KiB cap would cost
-        // the ring 128× this. An over-long PUBLISH is refused in `worker.rs`,
-        // naming this limit.
+        // Its own limit, not memory mode's value cap: every slot reserves its
+        // payload whether or not anyone publishes, so a 64 KiB cap would cost
+        // the ring 128× this.
         assert_eq!(PUBSUB_MSG_LEN, 512);
         // One byte of every channel slot is reserved for the terminator.
         assert_eq!(MAX_CHANNEL_LEN, CHAN_LEN - 1);

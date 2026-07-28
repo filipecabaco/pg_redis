@@ -24,6 +24,55 @@
 | `MSET key value [key value ...]` | Bulk upsert |
 | `DEL key [key ...]` | Delete keys, returns count deleted |
 | `EXISTS key [key ...]` | Returns count of existing keys |
+| `SETRANGE key offset value` | Overwrite from `offset`, padding the gap with NUL bytes; returns the new length |
+| `GETRANGE key start end` | Substring; negative indices count from the end, and both clamp |
+| `SETBIT key offset 0\|1` | Set a bit, growing the value to reach it; returns the bit as it was |
+| `GETBIT key offset` | The bit, or `0` past the end |
+| `BITCOUNT key [start end [BYTE\|BIT]]` | Bits set, over the whole value or a range |
+| `RENAME key newkey` | Rename, replacing `newkey`; errors if `key` is missing |
+| `RENAMENX key newkey` | The same, but `0` rather than replacing an occupied `newkey` |
+| `COPY src dst [DB n] [REPLACE]` | Duplicate a key of any type — see below |
+| `OBJECT ENCODING key` | Redis's name for the representation — see below |
+| `FLUSHDB [ASYNC\|SYNC]` | Empty the current database |
+| `FLUSHALL [ASYNC\|SYNC]` | Empty **all sixteen**, the durable half included — see below |
+
+Bits are numbered from the most significant of byte 0, as in Redis. `ASYNC` and
+`SYNC` are accepted and ignored: nothing here defers the work, so both spellings
+describe what already happens.
+
+> **`FLUSHALL` destroys the durable half.** Databases 8–15 are WAL-backed and
+> survive a restart, and the Redis port bypasses PostgreSQL authentication — so
+> any client that can reach it can erase them, with no confirmation and nothing
+> to roll back to but your own backups. This matches Redis, deliberately. If
+> that reach is wider than you want, bind `redis.listen_address` to loopback
+> (the default) and set `redis.password`.
+
+### `COPY` across the two halves
+
+`COPY src dst DB n` may name a database on the other storage half, which is how
+a shared-memory cache entry becomes a durable row, or the reverse:
+
+```
+SELECT cache
+SET session:42 '{"user":7}'
+COPY session:42 session:42 DB 8    -- now WAL-backed
+```
+
+It copies every type, not just strings. Redis has no such split, so this is the
+one place `COPY` does more here than there. The read and the write land in one
+transaction, but they are two different storage engines: a crash between them
+cannot leave the destination half-written, though the value must also pass every
+limit of the half it is going to.
+
+### `OBJECT ENCODING`
+
+Reports the encoding **Redis** would use — `int`, `embstr`, `raw`, `listpack`,
+`quicklist`, `intset`, `hashtable`, `skiplist` — derived from the value's shape
+against Redis's default thresholds. pg_redis stores none of those
+representations; it has an inline slot and a chunk pool, or a `bytea` column.
+The name is reported for the benefit of clients that branch on it, and says
+nothing about how this server stores anything. A missing key answers nil, which
+is Redis's own reply here and not the error most commands give.
 
 ## Expiry
 
@@ -38,6 +87,11 @@
 | `PERSIST key` | Remove TTL |
 | `EXPIRETIME key` | Absolute expiry as unix timestamp (seconds) |
 | `PEXPIRETIME key` | Absolute expiry as unix timestamp (milliseconds) |
+| `GETEX key [EX s\|PX ms\|EXAT ts\|PXAT ts\|PERSIST]` | Read the value and, optionally, change what happens to it next |
+
+Every type carries an expiry, not just strings: a list, set, hash or sorted set
+takes a TTL and is deleted whole when it passes. Replacing a key's value clears
+its TTL, as in Redis — `SET` over a string, and `SUNIONSTORE` over a set alike.
 
 ## Hashes
 
@@ -47,8 +101,11 @@
 | `HSET key field value [field value ...]` | Upsert one or more fields, returns new field count |
 | `HDEL key field [field ...]` | Delete fields, returns count deleted |
 | `HGETALL key` | Returns interleaved field/value pairs, sorted by field |
+| `HINCRBYFLOAT key field increment` | Increment a field as a float; returns the new value |
+| `HRANDFIELD key [count [WITHVALUES]]` | One field, `count` distinct ones, or `-count` with repeats |
 
-> Expiry is not supported on hash keys (same behaviour as Redis hash TTLs without `HEXPIRE`).
+> `EXPIRE` applies to the hash as a whole, as it does in Redis. Per-field TTLs
+> (`HEXPIRE` and friends) are not implemented.
 
 ## Lists
 
@@ -60,10 +117,26 @@
 | `LINSERT key BEFORE\|AFTER pivot value` | Returns the new length, `-1` if the pivot is absent, `0` if the key is |
 | `LREM key count value` | `count > 0` from the head, `< 0` from the tail, `0` removes every match |
 | `LPOS key element [RANK r] [COUNT n]` | Negative `RANK` searches from the tail; `COUNT 0` returns every match |
+| `LMOVE src dst LEFT\|RIGHT LEFT\|RIGHT` | Pop from one end of `src` and push onto one end of `dst` |
+| `RPOPLPUSH src dst` | `LMOVE src dst RIGHT LEFT`, under its older name |
 
 `LINSERT` and `LREM` rewrite the list so its positions stay contiguous, which
 makes them O(n). Removing in place would leave a gap, and every reader walks
 positions in order — the list would silently end at the first gap.
+
+## Sets
+
+| Command | Behaviour |
+|---------|-----------|
+| `SADD`/`SREM key member [member ...]` | Add or remove, returns the count that changed |
+| `SMEMBERS key` | Every member, in no particular order |
+| `SCARD key` | Cardinality |
+| `SISMEMBER`/`SMISMEMBER key member [member ...]` | Membership, as `1`/`0` |
+| `SPOP`/`SRANDMEMBER key [count]` | `SPOP` removes what it returns; `SRANDMEMBER` does not |
+| `SUNION`/`SINTER`/`SDIFF key [key ...]` | The combined set |
+| `SUNIONSTORE`/`SINTERSTORE`/`SDIFFSTORE dst key [key ...]` | The same, stored, returning its cardinality |
+| `SINTERCARD numkeys key [key ...] [LIMIT n]` | The intersection's size without building it; `LIMIT 0` means no limit |
+| `SMOVE src dst member` | Move one member between sets |
 
 ## Errors and limits
 
@@ -73,14 +146,18 @@ works unchanged:
 | Reply | Meaning |
 |---|---|
 | `-ERR ...` | The general case |
+| `-WRONGTYPE Operation against a key holding the wrong kind of value` | The key holds another type. A key holds exactly one — see [the key directory](IMPLEMENTATION.md#the-key-directory) |
 | `-OOM command not allowed when used memory > 'maxmemory'` | A shared-memory table is full and `redis.maxmemory_policy` is `noeviction`. See [When a table fills](IMPLEMENTATION.md#when-a-table-fills) |
 | `-ERR key exceeds redis.storage_mode='memory' limit of 512 bytes ...` | The key, hash field, set member or value is larger than memory mode accepts |
-| `-ERR key hash collides with a different key already stored ...` | Two keys shared a 128-bit keyed hash. Refused rather than merged — see [how keys are stored](IMPLEMENTATION.md#lookups-verify-the-key) |
+| `-ERR key or member hash collides with a different one already stored ...` | Two keys, or two members of one collection, shared a 128-bit keyed hash. Refused rather than merged — see [how keys are stored](IMPLEMENTATION.md#lookups-verify-the-key) |
 
-All of those are specific to `storage_mode = 'memory'`; the durable half is
+`WRONGTYPE` applies to both halves. The rest are specific to
+`storage_mode = 'memory'`; the durable half is
 bounded only by disk. Size limits are checked before the command runs, so a
 refusal never leaves a partial write — no half-stored value and no entry under
-a truncated key.
+a truncated key. A multi-key write is priced the same way: `MSET`, `SADD`,
+`HSET`, `ZADD` and the pushes are refused whole rather than storing the keys
+that fit.
 
 ## Transactions
 

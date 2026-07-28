@@ -2,6 +2,40 @@ use pgrx::pg_sys;
 use std::ffi::c_void;
 use std::marker::PhantomData;
 
+/// Holds an LWLock for a scope, releasing it on the way out.
+///
+/// Every early return used to need its own `LWLockRelease`, and the one that
+/// forgot it wedged the worker on its next command — `HINCRBY` on a non-integer
+/// field returned through `?` with the hash lock still held. Twenty-six
+/// functions had between two and five release points each, one per way out.
+///
+/// A PostgreSQL error longjmps past `Drop` exactly as it longjmps past a manual
+/// release, so nothing changes on that path: either way the lock is released
+/// when the transaction aborts.
+pub struct LockGuard(*mut pg_sys::LWLock);
+
+impl LockGuard {
+    /// # Safety
+    /// `lock` must be a valid LWLock this backend does not already hold.
+    pub unsafe fn shared(lock: *mut pg_sys::LWLock) -> Self {
+        unsafe { pg_sys::LWLockAcquire(lock, pg_sys::LWLockMode::LW_SHARED) };
+        LockGuard(lock)
+    }
+
+    /// # Safety
+    /// As `shared`.
+    pub unsafe fn exclusive(lock: *mut pg_sys::LWLock) -> Self {
+        unsafe { pg_sys::LWLockAcquire(lock, pg_sys::LWLockMode::LW_EXCLUSIVE) };
+        LockGuard(lock)
+    }
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        unsafe { pg_sys::LWLockRelease(self.0) };
+    }
+}
+
 /// Typed wrapper around a PostgreSQL shared-memory HTAB.
 ///
 /// Every method is `unsafe fn` — callers must:
@@ -43,16 +77,13 @@ impl<E> SharedTable<E> {
         }
     }
 
-    /// HASH_ENTER_NULL: returns (entry_ptr, was_already_present), or `None` when
-    /// the table is full.
+    /// `HASH_ENTER_NULL`: `(entry, was_present)`, or `None` when the table is
+    /// full.
     ///
-    /// Deliberately not `HASH_ENTER`. These tables are created `HASH_FIXED_SIZE`,
-    /// and dynahash answers a full fixed-size table by raising
-    /// `out of shared memory` — an `ereport(ERROR)`, which unwinds by longjmp.
-    /// The shared-memory command path exists precisely to avoid opening a
-    /// transaction, so there is no subtransaction in scope to catch it. Getting
-    /// a null back and reporting it is the difference between a full cache and
-    /// a worker that dies.
+    /// Not `HASH_ENTER`. These tables are `HASH_FIXED_SIZE`, and dynahash
+    /// answers a full one by raising — which unwinds by longjmp with no
+    /// subtransaction in scope on this path, so a full cache would be a dead
+    /// worker.
     pub unsafe fn enter(&self, key_ptr: *const c_void) -> Option<(*mut E, bool)> {
         unsafe {
             let mut found = false;

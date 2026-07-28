@@ -39,12 +39,9 @@ const QUEUE_LIMIT: usize = 10_000;
 /// How long a subscribed connection blocks on the socket each time round the
 /// loop before going back to waiting for published messages.
 const SUBSCRIBE_POLL: Duration = Duration::from_millis(5);
-/// Bounds on how long a subscriber sleeps between socket polls. This is not
-/// message-delivery latency — a publish wakes the sleeper immediately — only how
-/// long a *command* sent by an already-quiet subscriber can sit unread. It backs
-/// off from the first to the second while the connection stays silent, so an
-/// interactive client keeps millisecond acks and a parked one costs ~4 wakeups
-/// per second instead of 200.
+/// How long a subscriber sleeps between socket polls, backing off from the
+/// first to the second while it stays silent. Not delivery latency — a publish
+/// wakes the sleeper — only how long a command from a quiet subscriber waits.
 const SUBSCRIBE_WAIT_MIN: Duration = Duration::from_millis(5);
 const SUBSCRIBE_WAIT_MAX: Duration = Duration::from_millis(250);
 
@@ -215,12 +212,9 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
 
         if last_expiry_scan.elapsed() >= Duration::from_secs(1) {
             last_expiry_scan = Instant::now();
-            // The SQL sweep targets redis.kv_*, which only exist once someone has
-            // run CREATE EXTENSION in *this* database. Under
-            // shared_preload_libraries the worker connects to redis.database —
-            // commonly 'postgres', where the extension is usually absent — and a
-            // missing relation raises an error that kills the worker. It then
-            // restarts and dies again a second later, forever. Check first.
+            // redis.kv_* only exist where CREATE EXTENSION has run, and the
+            // worker connects to redis.database, which commonly has not. A
+            // missing relation raises, which killed the worker on a loop.
             let sql_tables_exist = kv_tables_exist();
             for db in 0u8..16 {
                 if mem_mode && crate::commands::is_ephemeral(db) {
@@ -233,10 +227,7 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                         Spi::connect_mut(|client| {
                             client
                                 .update(
-                                    &format!(
-                                        "DELETE FROM redis.kv_{db} \
-                                         WHERE expires_at IS NOT NULL AND expires_at <= now()"
-                                    ),
+                                    &crate::commands::sql::sweep_expired(db as usize),
                                     None,
                                     &[],
                                 )
@@ -267,16 +258,37 @@ pub(crate) fn kv_tables_present() -> bool {
         .unwrap_or(false)
 }
 
-/// Run `body` in its own subtransaction, keeping its writes only if it succeeded.
-///
-/// A batch coalesces commands from unrelated connections into one transaction,
-/// so one client's failing command must not roll back another's write. These
-/// are the subtransaction primitives `SAVEPOINT` / `ROLLBACK TO` / `RELEASE`
-/// reach through SQL, called directly: the same guarantee without three
-/// statements parsed, planned and executed through SPI for every command in the
-/// batch, which for a plain SET costs more than the SET.
-///
-/// Mirrors the save/restore dance PL/pgSQL performs around its EXCEPTION blocks.
+/// The reply for a PostgreSQL error raised while running a command, and the
+/// line to log for it. Overflow gets Redis's wording; anything else is a bug in
+/// a statement, so the client is told only that the command failed. Catching
+/// the error stops PostgreSQL reporting it, so nothing else writes it down.
+fn sql_error_response(caught: &pg_sys::panic::CaughtError) -> (Response, String) {
+    let (code, message) = match caught {
+        pg_sys::panic::CaughtError::PostgresError(e)
+        | pg_sys::panic::CaughtError::ErrorReport(e)
+        | pg_sys::panic::CaughtError::RustPanic { ereport: e, .. } => {
+            (e.sql_error_code(), e.message().to_string())
+        }
+    };
+    let log = format!("command failed: {message} (SQLSTATE {code:?})");
+    match code {
+        pg_sys::errcodes::PgSqlErrorCode::ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE => (
+            Response::Error("ERR increment or decrement would overflow".to_string()),
+            log,
+        ),
+        _ => (
+            Response::Error("ERR internal error executing the command".to_string()),
+            log,
+        ),
+    }
+}
+
+/// Run `body` in its own subtransaction, keeping its writes only if it
+/// succeeded: a batch holds commands from unrelated connections, so one
+/// client's failure must not roll back another's write. The primitives
+/// `SAVEPOINT` reaches through SQL, called directly. Mirrors PL/pgSQL's
+/// EXCEPTION dance, catch included — a raise inside `body` becomes a reply
+/// rather than a dead worker.
 ///
 /// # Safety
 /// Must run on the background worker's main thread, inside a transaction.
@@ -290,33 +302,43 @@ pub(crate) unsafe fn in_subtransaction<F: FnOnce() -> Response>(body: F) -> Resp
         // run the command in the caller's so its allocations outlive the release.
         pg_sys::MemoryContextSwitchTo(outer_context);
 
-        // Give this command its own snapshot, the way a new statement gets one.
+        // Its own snapshot, the way a new statement gets one: SPI reads reuse
+        // whatever is active, so a GET queued after a SET in the same MULTI
+        // would see the pre-SET world.
         //
-        // A batch runs many commands inside one transaction, and SPI reads run
-        // read-only — they reuse whatever snapshot is already active instead of
-        // taking a fresh one. So without this, a GET queued after a SET in the
-        // same MULTI still sees the pre-SET world.
-        //
-        // Deliberately push/pop rather than `UpdateActiveSnapshotCommandId`,
-        // which is the other way to do it: that function asserts the active
-        // snapshot has `active_count == 1` and `regd_count == 0`, and the
-        // snapshot SPI has already pushed satisfies neither. Distribution
-        // builds compile assertions out and it appears to work; pgrx builds
-        // PostgreSQL with --enable-cassert, so it fails there and only there.
+        // Push/pop rather than `UpdateActiveSnapshotCommandId`, which asserts
+        // `active_count == 1` and `regd_count == 0` — neither true of the
+        // snapshot SPI pushed. Only an assert-enabled build shows it.
         let pushed = pg_sys::ActiveSnapshotSet();
         if pushed {
             pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
         }
 
-        let response = body();
+        // The log line rides in the return value: the handler must be
+        // `UnwindSafe`, and a `&mut String` is not. It is emitted after the
+        // abort below, once the error state has been flushed.
+        let (response, raised) =
+            pg_sys::PgTryBuilder::new(std::panic::AssertUnwindSafe(|| (body(), None)))
+                .catch_others(|caught| {
+                    let (response, log) = sql_error_response(&caught);
+                    (response, Some(log))
+                })
+                .execute();
 
-        if pushed {
-            pg_sys::PopActiveSnapshot();
-        }
-        if matches!(response, Response::Error(_)) {
+        if raised.is_some() {
+            // `execute` flushed the error state already — flush then abort, as
+            // PL/pgSQL does. The abort pops the subtransaction's snapshot, so
+            // `PopActiveSnapshot` here would pop somebody else's.
             pg_sys::RollbackAndReleaseCurrentSubTransaction();
         } else {
-            pg_sys::ReleaseCurrentSubTransaction();
+            if pushed {
+                pg_sys::PopActiveSnapshot();
+            }
+            if matches!(response, Response::Error(_)) {
+                pg_sys::RollbackAndReleaseCurrentSubTransaction();
+            } else {
+                pg_sys::ReleaseCurrentSubTransaction();
+            }
         }
         pg_sys::MemoryContextSwitchTo(outer_context);
         pg_sys::CurrentResourceOwner = outer_owner;
@@ -325,14 +347,24 @@ pub(crate) unsafe fn in_subtransaction<F: FnOnce() -> Response>(body: F) -> Resp
         // what this one wrote.
         pg_sys::CommandCounterIncrement();
 
+        if let Some(log) = raised {
+            pgrx::warning!("pg_redis: {log}");
+        }
+
         response
     }
 }
 
 fn run_dispatch_batch(cmds: &[(Command, u8)], mem_mode: bool) -> Vec<Response> {
+    // `FLUSHALL` reaches both halves, `COPY` may, and the routed-table INSERT
+    // reaches user tables — none can be served from shared memory alone.
     let all_mem = mem_mode
         && cmds.iter().all(|(cmd, db)| {
-            crate::commands::is_ephemeral(*db) && !matches!(cmd, Command::TablePublish { .. })
+            crate::commands::is_ephemeral(*db)
+                && !matches!(
+                    cmd,
+                    Command::TablePublish { .. } | Command::FlushAll | Command::Copy { .. }
+                )
         });
     let responses: Vec<Response> = if all_mem {
         unsafe {
@@ -340,13 +372,10 @@ fn run_dispatch_batch(cmds: &[(Command, u8)], mem_mode: bool) -> Vec<Response> {
         }
         cmds.iter().map(|(cmd, db)| cmd.execute_mem(*db)).collect()
     } else if cmds.len() == 1 {
-        // Still a subtransaction, even though there is no sibling command to
-        // protect. An SPI error inside `execute` unwinds by longjmp, straight
-        // past the `Err` arms that look like they handle it, and kills the
-        // worker — which takes the listener down for every connection. The
-        // routed-table INSERT reaches user-created tables whose columns this
-        // extension never validated, so that is a reachable path, not a
-        // theoretical one.
+        // Still a subtransaction with no sibling to protect: an SPI error
+        // unwinds by longjmp past the `Err` arms that look like they handle it
+        // and kills the worker. The routed-table INSERT reaches user tables
+        // this extension never validated, so it is a reachable path.
         let (cmd, db) = &cmds[0];
         vec![BackgroundWorker::transaction(|| {
             Spi::connect_mut(|client| unsafe { in_subtransaction(|| cmd.execute(client, *db)) })
@@ -364,6 +393,11 @@ fn run_dispatch_batch(cmds: &[(Command, u8)], mem_mode: bool) -> Vec<Response> {
     // pass, not two — it allocates a Vec per command.
     if let Some(watch_ctl) = crate::watch_state() {
         for (cmd, db) in cmds {
+            // A flush writes to keys it cannot name, so every counter moves.
+            if matches!(cmd, Command::FlushDb | Command::FlushAll) {
+                unsafe { crate::watch::bump_all(watch_ctl) };
+                continue;
+            }
             for key in cmd.write_keys() {
                 unsafe { crate::watch::bump(watch_ctl, *db, key) };
             }
@@ -1244,6 +1278,7 @@ fn write_response(w: &mut impl std::io::Write, response: Response) -> std::io::R
         Response::Pong(None) => write_simple_string(w, "PONG"),
         Response::Pong(Some(msg)) => write_bulk_string(w, &msg),
         Response::Null => write_null_bulk(w),
+        Response::NullArray => write_null_array(w),
         Response::Ok => write_simple_string(w, "OK"),
         Response::Integer(n) => write_integer(w, n),
         Response::BulkString(data) => write_bulk_string(w, &data),
@@ -1458,11 +1493,9 @@ mod tests {
         }
     }
 
-    /// WATCH needs the shared-memory counters, which only exist when the
-    /// extension is in shared_preload_libraries. Refusing is the safe answer:
-    /// replying +OK would let the following EXEC commit over a conflicting
-    /// write it had no way to observe. These tests run outside Postgres, so
-    /// the counters are absent and the refusal is the expected reply.
+    /// WATCH needs the shared-memory counters, which exist only under
+    /// `shared_preload_libraries`. Refusing is the safe answer: a +OK would let
+    /// EXEC commit over a conflict it could not observe.
     #[test]
     fn watch_refuses_when_shared_memory_is_unavailable() {
         let mut c = Conn::open(1);

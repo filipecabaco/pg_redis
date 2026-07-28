@@ -41,15 +41,10 @@ pub(crate) static STORAGE_MODE: GucSetting<Option<std::ffi::CString>> =
 pub(crate) static MAXMEMORY_POLICY: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(Some(c"noeviction"));
 
-/// Boot value of `redis.mem_max_entries`, and the sizing memory mode assumes
-/// when it is asked about its limits without shared memory attached.
-///
-/// This one number scales the whole shared-memory request, so it is the only
-/// knob that decides how much the extension reserves. Doubling it costs about
-/// 69 MB of `shared_memory_size`; `docs/IMPLEMENTATION.md` prices each step.
-///
-/// It also sets the size of each chunk pool, and with it the largest value
-/// memory mode accepts — see `mem::max_total_val_len`.
+/// Boot value of `redis.mem_max_entries`, and the sizing assumed when memory
+/// mode is asked about its limits with no shared memory attached. The one knob
+/// that scales the whole reservation — doubling it costs about 74 MB — and it
+/// sizes each chunk pool, with it the largest value accepted.
 pub(crate) const MEM_MAX_ENTRIES_DEFAULT: i32 = 8192;
 pub(crate) static MEM_MAX_ENTRIES: GucSetting<i32> =
     GucSetting::<i32>::new(MEM_MAX_ENTRIES_DEFAULT);
@@ -99,10 +94,12 @@ unsafe extern "C-unwind" fn pg_redis_shmem_request() {
             pg_sys::RequestAddinShmemSpace(mem::mem_list_meta_htab_total_size());
             pg_sys::RequestAddinShmemSpace(mem::mem_zset_meta_htab_total_size());
             pg_sys::RequestAddinShmemSpace(mem::mem_set_meta_htab_total_size());
+            pg_sys::RequestAddinShmemSpace(mem::mem_hash_meta_htab_total_size());
+            pg_sys::RequestAddinShmemSpace(mem::mem_dir_htab_total_size());
             pg_sys::RequestAddinShmemSpace(mem::mem_val_pool_total_size());
             pg_sys::RequestNamedLWLockTranche(
                 c"pg_redis_mem".as_ptr(),
-                (mem::NUM_MEM_DBS * 5) as i32,
+                (mem::NUM_MEM_DBS * 6) as i32,
             );
         }
     }
@@ -171,6 +168,8 @@ unsafe extern "C-unwind" fn pg_redis_shmem_startup() {
                     std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS * 3 + i)).lock);
                 (*ctl).list_lwlock[i] =
                     std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS * 4 + i)).lock);
+                (*ctl).dir_lwlock[i] =
+                    std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS * 5 + i)).lock);
             }
 
             if !mem_found {
@@ -519,11 +518,9 @@ mod tests {
         })
     }
 
-    /// Clear a database's string and hash tables between assertions.
-    ///
-    /// DELETE rather than TRUNCATE on purpose: pgrx runs these tests against one
-    /// shared server, and TRUNCATE's ACCESS EXCLUSIVE lock deadlocks against
-    /// whichever other test is reading the same table.
+    /// Clear a database's string and hash tables between assertions. DELETE
+    /// rather than TRUNCATE: these tests share one server, and TRUNCATE's
+    /// ACCESS EXCLUSIVE lock deadlocks against whatever else is reading.
     fn truncate(db: usize) {
         for tbl in ["kv", "hash"] {
             Spi::run(&format!("DELETE FROM redis.{tbl}_{db}")).unwrap();
@@ -828,11 +825,9 @@ mod tests {
 
     // ─────────────────────────── Worker resilience ───────────────────────────
 
-    /// Under `shared_preload_libraries` a worker connects to `redis.database`,
-    /// which usually has no `CREATE EXTENSION` and therefore no `redis.kv_*`.
-    /// The expiry sweep must notice that instead of raising `relation does not
-    /// exist`, which killed the worker and left it restarting once a second
-    /// forever. The guard also has to re-enable itself once the tables appear.
+    /// A worker connects to `redis.database`, which usually has no
+    /// `CREATE EXTENSION` and so no `redis.kv_*`. The sweep must notice rather
+    /// than raise, and re-enable itself once the tables appear.
     #[pg_test]
     fn expiry_sweep_tolerates_a_database_without_the_extension() {
         assert!(
@@ -896,6 +891,55 @@ mod tests {
         );
 
         Spi::run("DROP TABLE batch_iso").unwrap();
+    }
+
+    /// A PostgreSQL error raised while running a command has to come back as
+    /// an error reply: uncaught it ends the worker process, and `INCR` past
+    /// `bigint` is one command from any client. The surrounding transaction has
+    /// to survive it.
+    #[pg_test]
+    fn a_sql_error_becomes_a_reply_rather_than_ending_the_worker() {
+        use crate::commands::Response;
+
+        Spi::run("CREATE TEMP TABLE raise_iso (n int)").unwrap();
+
+        let overflowed = unsafe {
+            crate::worker::in_subtransaction(|| {
+                Spi::run("INSERT INTO raise_iso VALUES (1)").unwrap();
+                Spi::run("SELECT 9223372036854775807::bigint + 1").unwrap();
+                Response::Ok
+            })
+        };
+        match overflowed {
+            Response::Error(e) => assert!(
+                e.contains("overflow"),
+                "an overflow should name itself, got {e:?}"
+            ),
+            _ => panic!("expected an error reply from an overflowing command"),
+        }
+
+        // The subtransaction was rolled back, not merely abandoned...
+        let survived = unsafe {
+            crate::worker::in_subtransaction(|| {
+                Spi::run("INSERT INTO raise_iso VALUES (2)").unwrap();
+                Response::Ok
+            })
+        };
+        assert!(matches!(survived, Response::Ok));
+
+        let rows: Vec<Option<i32>> = Spi::connect(|c| {
+            c.select("SELECT n FROM raise_iso ORDER BY n", None, &[])
+                .unwrap()
+                .map(|r| r.get::<i32>(1).unwrap())
+                .collect()
+        });
+        assert_eq!(
+            rows,
+            vec![Some(2)],
+            "the raising command's write should have been discarded, and only it"
+        );
+
+        Spi::run("DROP TABLE raise_iso").unwrap();
     }
 
     // ──────────────────────────── WATCH counters ─────────────────────────────

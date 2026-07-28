@@ -40,6 +40,23 @@ services:
     network_mode: "service:postgres"
     profiles: ["e2e"]
 
+  parity:
+    build: ./docker/e2e
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      PG_REDIS_HOST: postgres
+      PG_REDIS_PORT: "6379"
+      PG_REDIS_PASSWORD: testpass
+      REDIS_REF_HOST: redis
+      REDIS_REF_PORT: "6379"
+      REDIS_REF_PASSWORD: testpass
+    command: ["bun", "run", "parity.ts"]
+    profiles: ["parity"]
+
   clients:
     build: ./docker/clients
     depends_on:
@@ -61,4 +78,4 @@ services:
       interval: 2s
       timeout: 5s
       retries: 15
-    profiles: ["bench"]
+    profiles: ["bench", "parity"]

@@ -49,6 +49,12 @@ repeated per command.
 | `INCRBY` |  |
 | `DECRBY` |  |
 | `INCRBYFLOAT` |  |
+| `GETEX` | EX, PX, EXAT, PXAT and PERSIST |
+| `SETRANGE` | Pads the gap with NUL bytes, as in Redis |
+| `GETRANGE` | `SUBSTR` is accepted as its older name |
+| `SETBIT` |  |
+| `GETBIT` |  |
+| `BITCOUNT` | BYTE and BIT ranges; bits are numbered from the most significant |
 
 ## Keys
 
@@ -58,17 +64,22 @@ repeated per command.
 | `UNLINK` |  |
 | `EXISTS` |  |
 | `TYPE` |  |
-| `KEYS` | Full scan, as in Redis. Glob matching is done in-process, not in SQL |
+| `KEYS` | Full scan, as in Redis, over keys of every type. Glob matching is done in-process, not in SQL |
 | `SCAN` | Cursor is always 0 — one full pass, no incremental guarantee |
-| `RANDOMKEY` |  |
+| `RANDOMKEY` | Favours strings over collections; see IMPLEMENTATION.md |
 | `RENAME` |  |
-| `DBSIZE` |  |
+| `RENAMENX` |  |
+| `COPY` | `DB` may name a database on the other storage half |
+| `OBJECT` | `ENCODING` only; reports the encoding Redis would use |
+| `DBSIZE` | Counts keys of every type |
+| `FLUSHDB` | ASYNC and SYNC accepted and ignored |
+| `FLUSHALL` | The same, over all sixteen databases — the durable half included |
 
 ## Expiry
 
 | Command | Notes |
 |---------|-------|
-| `EXPIRE` | Expiry applies to string keys only, as in Redis before `HEXPIRE` |
+| `EXPIRE` | Applies to a key of any type; per-field TTLs (`HEXPIRE`) are not implemented |
 | `PEXPIRE` |  |
 | `EXPIREAT` |  |
 | `PEXPIREAT` |  |
@@ -94,6 +105,8 @@ repeated per command.
 | `HLEN` |  |
 | `HEXISTS` |  |
 | `HINCRBY` |  |
+| `HINCRBYFLOAT` |  |
+| `HRANDFIELD` | A negative count repeats; WITHVALUES interleaves |
 
 ## Lists
 
@@ -114,6 +127,7 @@ repeated per command.
 | `LTRIM` |  |
 | `LPOS` | RANK and COUNT supported, including negative RANK |
 | `LMOVE` |  |
+| `RPOPLPUSH` | `LMOVE src dst RIGHT LEFT`, under its older name |
 
 ## Sets
 
@@ -134,6 +148,7 @@ repeated per command.
 | `SUNIONSTORE` |  |
 | `SINTERSTORE` |  |
 | `SDIFFSTORE` |  |
+| `SINTERCARD` | `LIMIT 0` means no limit |
 
 ## Sorted sets
 
@@ -191,9 +206,13 @@ repeated per command.
 
 ## Not implemented
 
-Notable absences, so you do not have to infer them from silence: `GETRANGE`,
-`SETRANGE`, `SETBIT`/`GETBIT` and the other bit operations, `HRANDFIELD`,
-`HSCAN`/`SSCAN`/`ZSCAN`, `SINTERCARD`, `OBJECT`, `SORT`, `DUMP`/`RESTORE`,
-`MIGRATE`, `BLPOP` and the other blocking list commands, `EVAL` and scripting,
-streams (`XADD` and friends), and cluster commands.
+Notable absences, so you do not have to infer them from silence: `BITOP`,
+`BITPOS`, `BITFIELD`, `HSCAN`, `SSCAN`, `ZSCAN`, `SORT`, `DUMP`, `RESTORE`,
+`MIGRATE`, `BLPOP` and the other blocking list commands, `HEXPIRE` and the
+per-field TTLs, `EVAL` and scripting, streams (`XADD` and friends), and cluster
+commands.
+
+A test asserts that every command named above is genuinely rejected, so this
+paragraph cannot quietly go stale — which it did once, naming as absent two
+commands that had since been implemented.
 

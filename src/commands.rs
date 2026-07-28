@@ -3,11 +3,9 @@ use pgrx::spi::SpiClient;
 
 pub const NUM_DBS: usize = 16;
 
-/// The databases are split into two contiguous halves rather than interleaved
-/// by parity: `0..DURABLE_FROM` are ephemeral, `DURABLE_FROM..NUM_DBS` are
-/// WAL-logged. Halves are what clients can hold in their head — "anything under
-/// 8 is a cache" survives a code review in a way "even numbers are a cache"
-/// does not.
+/// Two contiguous halves rather than interleaved by parity: `0..DURABLE_FROM`
+/// are ephemeral, the rest WAL-logged. "Anything under 8 is a cache" is a rule
+/// a client can hold in its head.
 pub const DURABLE_FROM: u8 = 8;
 
 /// Lowest ephemeral database — what `SELECT cache` resolves to.
@@ -56,58 +54,71 @@ pub mod sql {
         })
     });
 
+    /// Whether any collection table holds the key named by the `k` CTE. The
+    /// four are keyed independently, so "does this key exist" is the same
+    /// four-way question wherever it is asked.
+    pub fn collection_exists(db: usize) -> String {
+        ["list", "set", "hash", "zset"]
+            .iter()
+            .map(|t| format!("EXISTS (SELECT 1 FROM redis.{t}_{db} c, k WHERE c.key = k.key)"))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    }
+
+    /// `TTL`, `PTTL`, `EXPIRETIME` and `PEXPIRETIME` differ only in how they
+    /// render the deadline. Everything ahead of that — is the key there, and
+    /// does it carry an expiry — is one question for all five types: a string
+    /// keeps its expiry in its own row, a collection in `redis.expiry_N`.
+    fn ttl_like(db: usize, render: &str) -> String {
+        let collection = collection_exists(db);
+        format!(
+            "WITH k AS (SELECT $1::bytea AS key), \
+                  s AS (SELECT t.expires_at FROM redis.kv_{db} t, k \
+                         WHERE t.key = k.key \
+                           AND (t.expires_at IS NULL OR t.expires_at > now())), \
+                  c AS (SELECT e.expires_at FROM k \
+                        LEFT JOIN redis.expiry_{db} e ON e.key = k.key \
+                         WHERE ({collection}) \
+                           AND (e.expires_at IS NULL OR e.expires_at > now())), \
+                  live AS (SELECT expires_at FROM s UNION ALL SELECT expires_at FROM c) \
+             SELECT CASE \
+                      WHEN NOT EXISTS (SELECT 1 FROM live) THEN -2::bigint \
+                      WHEN (SELECT expires_at FROM live LIMIT 1) IS NULL THEN -1::bigint \
+                      ELSE {render} \
+                    END"
+        )
+    }
+
+    /// The deadline as `ttl_like` will have bound it.
+    const DEADLINE: &str = "(SELECT expires_at FROM live LIMIT 1)";
+
     pub static TTL: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| {
-            format!(
-                "SELECT CASE \
-           WHEN r.key IS NULL THEN -2::bigint \
-           WHEN r.expires_at IS NULL THEN -1::bigint \
-           ELSE GREATEST(-1, EXTRACT(EPOCH FROM (r.expires_at - now()))::bigint) \
-         END \
-         FROM (VALUES ($1::bytea)) AS dummy(k) \
-         LEFT JOIN redis.kv_{db} r ON r.key = dummy.k"
+            ttl_like(
+                db,
+                &format!("GREATEST(-1, EXTRACT(EPOCH FROM ({DEADLINE} - now()))::bigint)"),
             )
         })
     });
 
     pub static PTTL: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| {
-            format!(
-                "SELECT CASE \
-           WHEN r.key IS NULL THEN -2::bigint \
-           WHEN r.expires_at IS NULL THEN -1::bigint \
-           ELSE GREATEST(-1, (EXTRACT(EPOCH FROM (r.expires_at - now())) * 1000)::bigint) \
-         END \
-         FROM (VALUES ($1::bytea)) AS dummy(k) \
-         LEFT JOIN redis.kv_{db} r ON r.key = dummy.k"
+            ttl_like(
+                db,
+                &format!("GREATEST(-1, (EXTRACT(EPOCH FROM ({DEADLINE} - now())) * 1000)::bigint)"),
             )
         })
     });
 
     pub static EXPIRETIME: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
-        arr(|db| {
-            format!(
-                "SELECT CASE \
-           WHEN r.key IS NULL THEN -2::bigint \
-           WHEN r.expires_at IS NULL THEN -1::bigint \
-           ELSE EXTRACT(EPOCH FROM r.expires_at)::bigint \
-         END \
-         FROM (VALUES ($1::bytea)) AS dummy(k) \
-         LEFT JOIN redis.kv_{db} r ON r.key = dummy.k"
-            )
-        })
+        arr(|db| ttl_like(db, &format!("EXTRACT(EPOCH FROM {DEADLINE})::bigint")))
     });
 
     pub static PEXPIRETIME: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| {
-            format!(
-                "SELECT CASE \
-           WHEN r.key IS NULL THEN -2::bigint \
-           WHEN r.expires_at IS NULL THEN -1::bigint \
-           ELSE (EXTRACT(EPOCH FROM r.expires_at) * 1000)::bigint \
-         END \
-         FROM (VALUES ($1::bytea)) AS dummy(k) \
-         LEFT JOIN redis.kv_{db} r ON r.key = dummy.k"
+            ttl_like(
+                db,
+                &format!("(EXTRACT(EPOCH FROM {DEADLINE}) * 1000)::bigint"),
             )
         })
     });
@@ -118,7 +129,9 @@ pub mod sql {
                 "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, convert_to('1', 'UTF8')) \
          ON CONFLICT (key) DO UPDATE \
          SET value = convert_to((CAST(encode(redis.kv_{db}.value, 'escape') AS bigint) + 1)::text, 'UTF8') \
-         WHERE encode(redis.kv_{db}.value, 'escape') ~ '^-?[0-9]+$' \
+         WHERE encode(redis.kv_{db}.value, 'escape') ~ '^(0|-?[1-9][0-9]*)$' \
+           AND encode(redis.kv_{db}.value, 'escape')::numeric \
+               BETWEEN -9223372036854775808 AND 9223372036854775807 \
          RETURNING CAST(encode(value, 'escape') AS bigint)"
             )
         })
@@ -130,7 +143,9 @@ pub mod sql {
                 "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, convert_to('-1', 'UTF8')) \
          ON CONFLICT (key) DO UPDATE \
          SET value = convert_to((CAST(encode(redis.kv_{db}.value, 'escape') AS bigint) - 1)::text, 'UTF8') \
-         WHERE encode(redis.kv_{db}.value, 'escape') ~ '^-?[0-9]+$' \
+         WHERE encode(redis.kv_{db}.value, 'escape') ~ '^(0|-?[1-9][0-9]*)$' \
+           AND encode(redis.kv_{db}.value, 'escape')::numeric \
+               BETWEEN -9223372036854775808 AND 9223372036854775807 \
          RETURNING CAST(encode(value, 'escape') AS bigint)"
             )
         })
@@ -142,7 +157,9 @@ pub mod sql {
                 "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, convert_to($2::text, 'UTF8')) \
          ON CONFLICT (key) DO UPDATE \
          SET value = convert_to((CAST(encode(redis.kv_{db}.value, 'escape') AS bigint) + $3)::text, 'UTF8') \
-         WHERE encode(redis.kv_{db}.value, 'escape') ~ '^-?[0-9]+$' \
+         WHERE encode(redis.kv_{db}.value, 'escape') ~ '^(0|-?[1-9][0-9]*)$' \
+           AND encode(redis.kv_{db}.value, 'escape')::numeric \
+               BETWEEN -9223372036854775808 AND 9223372036854775807 \
          RETURNING CAST(encode(value, 'escape') AS bigint)"
             )
         })
@@ -154,7 +171,9 @@ pub mod sql {
                 "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, convert_to((-$2::bigint)::text, 'UTF8')) \
          ON CONFLICT (key) DO UPDATE \
          SET value = convert_to((CAST(encode(redis.kv_{db}.value, 'escape') AS bigint) - $3)::text, 'UTF8') \
-         WHERE encode(redis.kv_{db}.value, 'escape') ~ '^-?[0-9]+$' \
+         WHERE encode(redis.kv_{db}.value, 'escape') ~ '^(0|-?[1-9][0-9]*)$' \
+           AND encode(redis.kv_{db}.value, 'escape')::numeric \
+               BETWEEN -9223372036854775808 AND 9223372036854775807 \
          RETURNING CAST(encode(value, 'escape') AS bigint)"
             )
         })
@@ -175,11 +194,94 @@ pub mod sql {
     pub static PERSIST: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| {
             format!(
-                "UPDATE redis.kv_{db} SET expires_at = NULL \
-         WHERE key=$1 AND expires_at IS NOT NULL"
+                "WITH k AS (SELECT $1::bytea AS key), \
+                      s AS (UPDATE redis.kv_{db} t SET expires_at = NULL FROM k \
+                             WHERE t.key = k.key AND t.expires_at IS NOT NULL \
+                               AND t.expires_at > now() RETURNING 1), \
+                      c AS (DELETE FROM redis.expiry_{db} e USING k \
+                             WHERE e.key = k.key AND e.expires_at > now() \
+                               AND NOT EXISTS (SELECT 1 FROM s) RETURNING 1) \
+                 SELECT 1 WHERE EXISTS (SELECT 1 FROM s) OR EXISTS (SELECT 1 FROM c)"
             )
         })
     });
+
+    /// CTEs that clear whatever else held `$1`, for a statement that is about to
+    /// write a string there. Redis lets `SET` land on a key that held a list;
+    /// the list goes, and so does any expiry, since replacing a value discards
+    /// its TTL. Inline rather than a lookup first: on the common path there is
+    /// nothing to clear, and asking cost more than the four index probes.
+    pub fn clear_for_string(db: usize) -> String {
+        let mut ctes: Vec<String> = ["hash", "list", "set", "zset"]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| format!("clr{i} AS (DELETE FROM redis.{t}_{db} WHERE key = $1)"))
+            .collect();
+        ctes.push(format!(
+            "clr4 AS (DELETE FROM redis.expiry_{db} WHERE key = $1)"
+        ));
+        format!("{}, ", ctes.join(", "))
+    }
+
+    /// Empty every table of the named databases. `TRUNCATE` rather than
+    /// `DELETE`: it does not build a dead tuple per row, and these tables are
+    /// being emptied whole.
+    pub fn flush_dbs(dbs: &[usize]) -> String {
+        let tables: Vec<String> = dbs
+            .iter()
+            .flat_map(|db| {
+                ["kv", "hash", "list", "set", "zset", "expiry"]
+                    .iter()
+                    .map(move |t| format!("redis.{t}_{db}"))
+            })
+            .collect();
+        format!("TRUNCATE {}", tables.join(", "))
+    }
+
+    /// One statement per database for the background sweep: the strings whose
+    /// own column has passed, and every table's rows for a collection whose
+    /// `redis.expiry_N` row has. A collection's data lives in four tables and
+    /// its expiry in a fifth, so the sweep has to name all of them.
+    pub fn sweep_expired(db: usize) -> String {
+        let drops = ["hash", "list", "set", "zset"]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                format!(
+                    "d{i} AS (DELETE FROM redis.{t}_{db} t \
+                              WHERE t.key IN (SELECT key FROM dead))"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "WITH dead AS (DELETE FROM redis.expiry_{db} \
+                            WHERE expires_at <= now() RETURNING key), \
+                  {drops}, \
+                  s AS (DELETE FROM redis.kv_{db} \
+                         WHERE expires_at IS NOT NULL AND expires_at <= now()) \
+             SELECT 1"
+        )
+    }
+
+    /// `EXPIRE` and its three siblings differ only in how they spell the
+    /// deadline. A string's goes in its own row; a collection's has nowhere to
+    /// go but `redis.expiry_N`, and only when the key is actually there.
+    pub fn set_expiry(db: usize, deadline: &str) -> String {
+        let collection = collection_exists(db);
+        format!(
+            "WITH k AS (SELECT $1::bytea AS key, {deadline} AS at), \
+                  s AS (UPDATE redis.kv_{db} t SET expires_at = k.at FROM k \
+                         WHERE t.key = k.key \
+                           AND (t.expires_at IS NULL OR t.expires_at > now()) RETURNING 1), \
+                  c AS (INSERT INTO redis.expiry_{db} (key, expires_at) \
+                        SELECT k.key, k.at FROM k \
+                         WHERE NOT EXISTS (SELECT 1 FROM s) AND ({collection}) \
+                        ON CONFLICT (key) DO UPDATE SET expires_at = EXCLUDED.expires_at \
+                        RETURNING 1) \
+             SELECT 1 WHERE EXISTS (SELECT 1 FROM s) OR EXISTS (SELECT 1 FROM c)"
+        )
+    }
 
     pub static GETDEL: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| {
@@ -432,6 +534,70 @@ pub enum Command {
         pattern: Vec<u8>,
     },
     DbSize,
+    /// `FLUSHDB [ASYNC|SYNC]` — empty the current database.
+    FlushDb,
+    /// `FLUSHALL [ASYNC|SYNC]` — empty all sixteen, the durable half included.
+    FlushAll,
+    SetRange {
+        key: Vec<u8>,
+        offset: i64,
+        value: Vec<u8>,
+    },
+    GetRange {
+        key: Vec<u8>,
+        start: i64,
+        end: i64,
+    },
+    HIncrByFloat {
+        key: Vec<u8>,
+        field: Vec<u8>,
+        delta: f64,
+    },
+    RenameNx {
+        key: Vec<u8>,
+        newkey: Vec<u8>,
+    },
+    /// `GETEX key [EX s|PX ms|EXAT ts|PXAT ts|PERSIST]` — read the value and,
+    /// optionally, change what happens to it next.
+    GetEx {
+        key: Vec<u8>,
+        expiry: GetExExpiry,
+    },
+    /// `COPY src dst [DB n] [REPLACE]`. `db` may name the other storage half,
+    /// which is how a cache entry is promoted to a durable one.
+    Copy {
+        src: Vec<u8>,
+        dst: Vec<u8>,
+        db: Option<u8>,
+        replace: bool,
+    },
+    HRandField {
+        key: Vec<u8>,
+        count: Option<i64>,
+        withvalues: bool,
+    },
+    SInterCard {
+        keys: Vec<Vec<u8>>,
+        limit: Option<i64>,
+    },
+    ObjectEncoding {
+        key: Vec<u8>,
+    },
+    /// Any other `OBJECT` subcommand, which is answered rather than refused.
+    ObjectOther,
+    SetBit {
+        key: Vec<u8>,
+        offset: i64,
+        value: bool,
+    },
+    GetBit {
+        key: Vec<u8>,
+        offset: i64,
+    },
+    BitCount {
+        key: Vec<u8>,
+        range: Option<(i64, i64, bool)>,
+    },
     Unlink {
         keys: Vec<Vec<u8>>,
     },
@@ -791,14 +957,66 @@ pub enum Command {
 pub enum Response {
     Pong(Option<Vec<u8>>),
     Null,
+    /// `*-1`, which a count-taking command answers for a key that is not there.
+    /// Distinct from `Null`: a client asking for a list back gets a nil list,
+    /// not a nil string.
+    NullArray,
     Ok,
     Integer(i64),
     BulkString(Vec<u8>),
     SimpleString(String),
     Array(Vec<Option<Vec<u8>>>),
     IntegerArray(Vec<i64>),
-    ScanResult { keys: Vec<Option<Vec<u8>>> },
+    ScanResult {
+        keys: Vec<Option<Vec<u8>>>,
+    },
     Error(String),
+}
+
+/// One row of a collection as `dump_key` reads it back: the member or field,
+/// a score if the type has one, and a value if the type has one.
+type DumpRow = (Vec<u8>, Option<f64>, Option<Vec<u8>>);
+
+/// Everything one key holds, in a form neither backend stores — see `dump_key`.
+enum KeyDump {
+    String(Vec<u8>),
+    List(Vec<Vec<u8>>),
+    Set(Vec<Vec<u8>>),
+    Hash(Vec<(Vec<u8>, Vec<u8>)>),
+    Zset(Vec<(Vec<u8>, f64)>),
+}
+
+/// Whether this database is served from shared memory rather than SQL. Both
+/// halves are reachable from one command only for `COPY`, which is the only one
+/// that has to ask.
+fn uses_shared_memory(db: u8) -> bool {
+    crate::storage_mode() == crate::StorageMode::Memory && is_ephemeral(db)
+}
+
+/// What `GETEX` does to the key's expiry once it has read the value.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GetExExpiry {
+    /// No option given: the expiry is left exactly as it was.
+    Keep,
+    /// `PERSIST`.
+    Clear,
+    /// `EX`/`PX`/`EXAT`/`PXAT`, resolved to microseconds since the epoch.
+    At(i64),
+}
+
+impl Response {
+    /// Whether this reply is the one a command gives for a key that is not
+    /// there — which is also what it gives for a key holding another type, and
+    /// so the only case where a read has to ask which of the two happened.
+    fn found_nothing(&self) -> bool {
+        match self {
+            Response::Null | Response::NullArray | Response::Integer(0) => true,
+            Response::Array(v) => v.is_empty(),
+            Response::IntegerArray(v) => v.is_empty(),
+            Response::BulkString(v) => v.is_empty(),
+            _ => false,
+        }
+    }
 }
 
 impl Command {
@@ -814,7 +1032,7 @@ impl Command {
                 msg: args.first().cloned(),
             }),
             "ECHO" => {
-                let msg = args.first().cloned().ok_or("ECHO requires argument")?;
+                let msg = args.first().cloned().ok_or_else(|| wrong_arity("ECHO"))?;
                 Ok(Command::Echo { msg })
             }
             "SELECT" => {
@@ -826,8 +1044,11 @@ impl Command {
                     "cache" => CACHE_DB,
                     "durable" => DURABLE_DB,
                     n => n
-                        .parse::<u8>()
-                        .map_err(|_| "SELECT requires integer db".to_string())?,
+                        .parse::<i64>()
+                        .map_err(|_| NOT_AN_INTEGER.to_string())
+                        .and_then(|n| {
+                            u8::try_from(n).map_err(|_| "DB index is out of range".to_string())
+                        })?,
                 };
                 if db as usize >= NUM_DBS {
                     return Err("ERR DB index is out of range".to_string());
@@ -941,23 +1162,23 @@ impl Command {
                         "EX" => {
                             let secs: i64 = str_arg(args, i + 1, "SET EX")?
                                 .parse()
-                                .map_err(|_| "EX requires integer".to_string())?;
-                            ex_ms = Some(secs * 1000);
+                                .map_err(|_| NOT_AN_INTEGER.to_string())?;
+                            ex_ms = Some(check_expire(secs, 1000, "SET")?);
                             ttl_set = true;
                             i += 2;
                         }
                         "PX" => {
                             let ms: i64 = str_arg(args, i + 1, "SET PX")?
                                 .parse()
-                                .map_err(|_| "PX requires integer".to_string())?;
-                            ex_ms = Some(ms);
+                                .map_err(|_| NOT_AN_INTEGER.to_string())?;
+                            ex_ms = Some(check_expire(ms, 1, "SET")?);
                             ttl_set = true;
                             i += 2;
                         }
                         "EXAT" => {
                             let secs: i64 = str_arg(args, i + 1, "SET EXAT")?
                                 .parse()
-                                .map_err(|_| "EXAT requires integer".to_string())?;
+                                .map_err(|_| NOT_AN_INTEGER.to_string())?;
                             ex_ms = Some(secs.saturating_mul(1000) - now_ms());
                             ttl_set = true;
                             i += 2;
@@ -965,7 +1186,7 @@ impl Command {
                         "PXAT" => {
                             let ms: i64 = str_arg(args, i + 1, "SET PXAT")?
                                 .parse()
-                                .map_err(|_| "PXAT requires integer".to_string())?;
+                                .map_err(|_| NOT_AN_INTEGER.to_string())?;
                             ex_ms = Some(ms - now_ms());
                             ttl_set = true;
                             i += 2;
@@ -1009,21 +1230,29 @@ impl Command {
             }
             "SETEX" => Ok(Command::SetEx {
                 key: bytes_arg(args, 0, "SETEX")?,
-                ex_secs: str_arg(args, 1, "SETEX")?
-                    .parse()
-                    .map_err(|_| "SETEX requires integer seconds".to_string())?,
+                ex_secs: check_expire(
+                    str_arg(args, 1, "SETEX")?
+                        .parse()
+                        .map_err(|_| NOT_AN_INTEGER.to_string())?,
+                    1,
+                    "SETEX",
+                )?,
                 value: bytes_arg(args, 2, "SETEX")?,
             }),
             "PSETEX" => Ok(Command::PSetEx {
                 key: bytes_arg(args, 0, "PSETEX")?,
-                ex_ms: str_arg(args, 1, "PSETEX")?
-                    .parse()
-                    .map_err(|_| "PSETEX requires integer ms".to_string())?,
+                ex_ms: check_expire(
+                    str_arg(args, 1, "PSETEX")?
+                        .parse()
+                        .map_err(|_| NOT_AN_INTEGER.to_string())?,
+                    1,
+                    "PSETEX",
+                )?,
                 value: bytes_arg(args, 2, "PSETEX")?,
             }),
             "MGET" => {
                 if args.is_empty() {
-                    return Err("MGET requires at least one key".to_string());
+                    return Err(wrong_arity("MGET"));
                 }
                 Ok(Command::MGet {
                     keys: args.iter().map(|a| a.to_vec()).collect(),
@@ -1031,7 +1260,7 @@ impl Command {
             }
             "MSET" => {
                 if args.len() < 2 || !args.len().is_multiple_of(2) {
-                    return Err("MSET requires pairs of key value".to_string());
+                    return Err(wrong_arity("MSET"));
                 }
                 let pairs = args
                     .chunks(2)
@@ -1041,7 +1270,7 @@ impl Command {
             }
             "DEL" => {
                 if args.is_empty() {
-                    return Err("DEL requires at least one key".to_string());
+                    return Err(wrong_arity("DEL"));
                 }
                 Ok(Command::Del {
                     keys: args.iter().map(|a| a.to_vec()).collect(),
@@ -1049,7 +1278,7 @@ impl Command {
             }
             "EXISTS" => {
                 if args.is_empty() {
-                    return Err("EXISTS requires at least one key".to_string());
+                    return Err(wrong_arity("EXISTS"));
                 }
                 Ok(Command::Exists {
                     keys: args.iter().map(|a| a.to_vec()).collect(),
@@ -1057,27 +1286,35 @@ impl Command {
             }
             "EXPIRE" => Ok(Command::Expire {
                 key: bytes_arg(args, 0, "EXPIRE")?,
-                secs: str_arg(args, 1, "EXPIRE")?
-                    .parse()
-                    .map_err(|_| "EXPIRE requires integer".to_string())?,
+                secs: {
+                    let secs: i64 = str_arg(args, 1, "EXPIRE")?
+                        .parse()
+                        .map_err(|_| NOT_AN_INTEGER.to_string())?;
+                    check_expire_deadline(secs, 1000, "EXPIRE")?;
+                    secs
+                },
             }),
             "PEXPIRE" => Ok(Command::PExpire {
                 key: bytes_arg(args, 0, "PEXPIRE")?,
-                ms: str_arg(args, 1, "PEXPIRE")?
-                    .parse()
-                    .map_err(|_| "PEXPIRE requires integer".to_string())?,
+                ms: {
+                    let ms: i64 = str_arg(args, 1, "PEXPIRE")?
+                        .parse()
+                        .map_err(|_| NOT_AN_INTEGER.to_string())?;
+                    check_expire_deadline(ms, 1, "PEXPIRE")?;
+                    ms
+                },
             }),
             "EXPIREAT" => Ok(Command::ExpireAt {
                 key: bytes_arg(args, 0, "EXPIREAT")?,
                 unix_secs: str_arg(args, 1, "EXPIREAT")?
                     .parse()
-                    .map_err(|_| "EXPIREAT requires integer".to_string())?,
+                    .map_err(|_| NOT_AN_INTEGER.to_string())?,
             }),
             "PEXPIREAT" => Ok(Command::PExpireAt {
                 key: bytes_arg(args, 0, "PEXPIREAT")?,
                 unix_ms: str_arg(args, 1, "PEXPIREAT")?
                     .parse()
-                    .map_err(|_| "PEXPIREAT requires integer".to_string())?,
+                    .map_err(|_| NOT_AN_INTEGER.to_string())?,
             }),
             "TTL" => Ok(Command::Ttl {
                 key: bytes_arg(args, 0, "TTL")?,
@@ -1104,19 +1341,30 @@ impl Command {
                 key: bytes_arg(args, 0, "INCRBY")?,
                 delta: str_arg(args, 1, "INCRBY")?
                     .parse()
-                    .map_err(|_| "INCRBY requires integer".to_string())?,
+                    .map_err(|_| NOT_AN_INTEGER.to_string())?,
             }),
             "DECRBY" => Ok(Command::DecrBy {
                 key: bytes_arg(args, 0, "DECRBY")?,
                 delta: str_arg(args, 1, "DECRBY")?
-                    .parse()
-                    .map_err(|_| "DECRBY requires integer".to_string())?,
+                    .parse::<i64>()
+                    .map_err(|_| NOT_AN_INTEGER.to_string())
+                    .and_then(|d| {
+                        // The command negates its argument, and `i64::MIN` has
+                        // no positive counterpart.
+                        d.checked_neg()
+                            .map(|_| d)
+                            .ok_or_else(|| "decrement would overflow".to_string())
+                    })?,
             }),
             "INCRBYFLOAT" => Ok(Command::IncrByFloat {
                 key: bytes_arg(args, 0, "INCRBYFLOAT")?,
+                // NaN is refused as an argument; an infinite increment parses
+                // and fails on the result, which is where Redis draws the line.
                 delta: str_arg(args, 1, "INCRBYFLOAT")?
-                    .parse()
-                    .map_err(|_| "INCRBYFLOAT requires float".to_string())?,
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|d| !d.is_nan())
+                    .ok_or_else(|| NOT_A_FLOAT.to_string())?,
             }),
             "APPEND" => Ok(Command::Append {
                 key: bytes_arg(args, 0, "APPEND")?,
@@ -1138,7 +1386,7 @@ impl Command {
             }),
             "MSETNX" => {
                 if args.len() < 2 || !args.len().is_multiple_of(2) {
-                    return Err("MSETNX requires pairs of key value".to_string());
+                    return Err(wrong_arity("MSETNX"));
                 }
                 let pairs = args
                     .chunks(2)
@@ -1153,9 +1401,26 @@ impl Command {
                 pattern: bytes_arg(args, 0, "KEYS")?,
             }),
             "DBSIZE" => Ok(Command::DbSize),
+            // ASYNC and SYNC are accepted and ignored: nothing here defers the
+            // work, so both spellings describe what already happens.
+            "FLUSHDB" | "FLUSHALL" => {
+                if let Some(mode) = args.first() {
+                    let mode = String::from_utf8_lossy(mode).to_uppercase();
+                    if mode != "ASYNC" && mode != "SYNC" {
+                        return Err("ERR syntax error".to_string());
+                    }
+                }
+                if args.len() > 1 {
+                    return Err(wrong_arity(&cmd));
+                }
+                Ok(match cmd.as_str() {
+                    "FLUSHDB" => Command::FlushDb,
+                    _ => Command::FlushAll,
+                })
+            }
             "UNLINK" => {
                 if args.is_empty() {
-                    return Err("UNLINK requires at least one key".to_string());
+                    return Err(wrong_arity("UNLINK"));
                 }
                 Ok(Command::Unlink {
                     keys: args.iter().map(|a| a.to_vec()).collect(),
@@ -1165,11 +1430,218 @@ impl Command {
                 key: bytes_arg(args, 0, "RENAME")?,
                 newkey: bytes_arg(args, 1, "RENAME")?,
             }),
+            "RENAMENX" => Ok(Command::RenameNx {
+                key: bytes_arg(args, 0, "RENAMENX")?,
+                newkey: bytes_arg(args, 1, "RENAMENX")?,
+            }),
+            "SETRANGE" => {
+                let key = bytes_arg(args, 0, "SETRANGE")?;
+                let offset: i64 = str_arg(args, 1, "SETRANGE")?
+                    .parse()
+                    .map_err(|_| NOT_AN_INTEGER.to_string())?;
+                if offset < 0 {
+                    return Err("offset is out of range".to_string());
+                }
+                Ok(Command::SetRange {
+                    key,
+                    offset,
+                    value: bytes_arg(args, 2, "SETRANGE")?,
+                })
+            }
+            "GETRANGE" | "SUBSTR" => Ok(Command::GetRange {
+                key: bytes_arg(args, 0, "GETRANGE")?,
+                start: str_arg(args, 1, "GETRANGE")?
+                    .parse()
+                    .map_err(|_| NOT_AN_INTEGER.to_string())?,
+                end: str_arg(args, 2, "GETRANGE")?
+                    .parse()
+                    .map_err(|_| NOT_AN_INTEGER.to_string())?,
+            }),
+            "HINCRBYFLOAT" => {
+                let key = bytes_arg(args, 0, "HINCRBYFLOAT")?;
+                let field = bytes_arg(args, 1, "HINCRBYFLOAT")?;
+                let delta: f64 = str_arg(args, 2, "HINCRBYFLOAT")?
+                    .parse()
+                    .map_err(|_| NOT_A_FLOAT.to_string())?;
+                // As `INCRBYFLOAT`: Redis takes an infinite increment happily
+                // and draws the line at the result, but never parses a NaN.
+                if delta.is_nan() {
+                    return Err(NOT_A_FLOAT.to_string());
+                }
+                Ok(Command::HIncrByFloat { key, field, delta })
+            }
+            // `LMOVE src dst RIGHT LEFT`, under the name it had before LMOVE.
+            "RPOPLPUSH" => Ok(Command::LMove {
+                src: bytes_arg(args, 0, "RPOPLPUSH")?,
+                dst: bytes_arg(args, 1, "RPOPLPUSH")?,
+                src_left: false,
+                dst_left: true,
+            }),
+            "GETEX" => {
+                let key = bytes_arg(args, 0, "GETEX")?;
+                let expiry = match args.get(1) {
+                    None => GetExExpiry::Keep,
+                    Some(opt) => {
+                        let opt = String::from_utf8_lossy(opt).to_uppercase();
+                        if opt == "PERSIST" {
+                            if args.len() > 2 {
+                                return Err("ERR syntax error".to_string());
+                            }
+                            GetExExpiry::Clear
+                        } else {
+                            let n: i64 = str_arg(args, 2, "GETEX")?
+                                .parse()
+                                .map_err(|_| NOT_AN_INTEGER.to_string())?;
+                            if args.len() > 3 {
+                                return Err("ERR syntax error".to_string());
+                            }
+                            let now_ms = now_micros() / 1000;
+                            let ms = match opt.as_str() {
+                                "EX" => check_expire(n, 1000, "getex")? + now_ms,
+                                "PX" => check_expire(n, 1, "getex")? + now_ms,
+                                "EXAT" => check_expire_deadline(n, 1000, "getex")?,
+                                "PXAT" => check_expire_deadline(n, 1, "getex")?,
+                                _ => return Err("ERR syntax error".to_string()),
+                            };
+                            GetExExpiry::At(ms * 1000)
+                        }
+                    }
+                };
+                Ok(Command::GetEx { key, expiry })
+            }
+            "COPY" => {
+                let src = bytes_arg(args, 0, "COPY")?;
+                let dst = bytes_arg(args, 1, "COPY")?;
+                let (mut db, mut replace) = (None, false);
+                let mut i = 2;
+                while i < args.len() {
+                    match String::from_utf8_lossy(&args[i]).to_uppercase().as_str() {
+                        "REPLACE" => {
+                            replace = true;
+                            i += 1;
+                        }
+                        "DB" => {
+                            let n: i64 = str_arg(args, i + 1, "COPY")?
+                                .parse()
+                                .map_err(|_| NOT_AN_INTEGER.to_string())?;
+                            if !(0..NUM_DBS as i64).contains(&n) {
+                                return Err("ERR DB index is out of range".to_string());
+                            }
+                            db = Some(n as u8);
+                            i += 2;
+                        }
+                        _ => return Err("ERR syntax error".to_string()),
+                    }
+                }
+                Ok(Command::Copy {
+                    src,
+                    dst,
+                    db,
+                    replace,
+                })
+            }
+            "HRANDFIELD" => {
+                let key = bytes_arg(args, 0, "HRANDFIELD")?;
+                let count = match args.get(1) {
+                    None => None,
+                    Some(_) => Some(
+                        str_arg(args, 1, "HRANDFIELD")?
+                            .parse::<i64>()
+                            .map_err(|_| NOT_AN_INTEGER.to_string())?,
+                    ),
+                };
+                let withvalues = match args.get(2) {
+                    None => false,
+                    Some(a) if a.eq_ignore_ascii_case(b"WITHVALUES") => true,
+                    Some(_) => return Err("ERR syntax error".to_string()),
+                };
+                if args.len() > 3 {
+                    return Err("ERR syntax error".to_string());
+                }
+                Ok(Command::HRandField {
+                    key,
+                    count,
+                    withvalues,
+                })
+            }
+            "SINTERCARD" => {
+                let numkeys: i64 = str_arg(args, 0, "SINTERCARD")?
+                    .parse()
+                    .map_err(|_| "ERR numkeys should be greater than 0".to_string())?;
+                if numkeys <= 0 {
+                    return Err("ERR numkeys should be greater than 0".to_string());
+                }
+                let numkeys = numkeys as usize;
+                if args.len() < 1 + numkeys {
+                    return Err(
+                        "ERR Number of keys can't be greater than number of args".to_string()
+                    );
+                }
+                let keys: Vec<Vec<u8>> = args[1..1 + numkeys].to_vec();
+                let limit = match args.get(1 + numkeys) {
+                    None => None,
+                    Some(a) if a.eq_ignore_ascii_case(b"LIMIT") => {
+                        let n: i64 = str_arg(args, 2 + numkeys, "SINTERCARD")?
+                            .parse()
+                            .map_err(|_| "ERR LIMIT can't be negative".to_string())?;
+                        if n < 0 {
+                            return Err("ERR LIMIT can't be negative".to_string());
+                        }
+                        // Redis reads 0 as "no limit".
+                        (n > 0).then_some(n)
+                    }
+                    Some(_) => return Err("ERR syntax error".to_string()),
+                };
+                Ok(Command::SInterCard { keys, limit })
+            }
+            "OBJECT" => match str_arg(args, 0, "OBJECT")?.to_uppercase().as_str() {
+                "ENCODING" => Ok(Command::ObjectEncoding {
+                    key: bytes_arg(args, 1, "OBJECT")?,
+                }),
+                _ => Ok(Command::ObjectOther),
+            },
+            "SETBIT" => {
+                let key = bytes_arg(args, 0, "SETBIT")?;
+                let offset = bit_offset(args, 1)?;
+                let value = match str_arg(args, 2, "SETBIT")?.as_str() {
+                    "0" => false,
+                    "1" => true,
+                    _ => return Err("ERR bit is not an integer or out of range".to_string()),
+                };
+                Ok(Command::SetBit { key, offset, value })
+            }
+            "GETBIT" => Ok(Command::GetBit {
+                key: bytes_arg(args, 0, "GETBIT")?,
+                offset: bit_offset(args, 1)?,
+            }),
+            "BITCOUNT" => {
+                let key = bytes_arg(args, 0, "BITCOUNT")?;
+                let range = match args.len() {
+                    1 => None,
+                    3 | 4 => {
+                        let start: i64 = str_arg(args, 1, "BITCOUNT")?
+                            .parse()
+                            .map_err(|_| NOT_AN_INTEGER.to_string())?;
+                        let end: i64 = str_arg(args, 2, "BITCOUNT")?
+                            .parse()
+                            .map_err(|_| NOT_AN_INTEGER.to_string())?;
+                        let by_bit = match args.get(3) {
+                            None => false,
+                            Some(a) if a.eq_ignore_ascii_case(b"BIT") => true,
+                            Some(a) if a.eq_ignore_ascii_case(b"BYTE") => false,
+                            Some(_) => return Err("ERR syntax error".to_string()),
+                        };
+                        Some((start, end, by_bit))
+                    }
+                    _ => return Err("ERR syntax error".to_string()),
+                };
+                Ok(Command::BitCount { key, range })
+            }
             "RANDOMKEY" => Ok(Command::RandomKey),
             "SCAN" => {
                 let cursor: u64 = str_arg(args, 0, "SCAN")?
                     .parse()
-                    .map_err(|_| "SCAN requires integer cursor".to_string())?;
+                    .map_err(|_| NOT_AN_INTEGER.to_string())?;
                 let mut pattern: Option<Vec<u8>> = None;
                 let mut count: Option<i64> = None;
                 let mut i = 1;
@@ -1184,7 +1656,7 @@ impl Command {
                             count = Some(
                                 str_arg(args, i + 1, "SCAN COUNT")?
                                     .parse()
-                                    .map_err(|_| "SCAN COUNT requires integer".to_string())?,
+                                    .map_err(|_| NOT_AN_INTEGER.to_string())?,
                             );
                             i += 2;
                         }
@@ -1205,7 +1677,7 @@ impl Command {
             }),
             "HSET" => {
                 if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
-                    return Err("HSET requires key field value [field value ...]".to_string());
+                    return Err(wrong_arity("HSET"));
                 }
                 let key = bytes_arg(args, 0, "HSET")?;
                 let pairs = args[1..]
@@ -1216,7 +1688,7 @@ impl Command {
             }
             "HDEL" => {
                 if args.len() < 2 {
-                    return Err("HDEL requires key and at least one field".to_string());
+                    return Err(wrong_arity("HDEL"));
                 }
                 Ok(Command::HDel {
                     key: bytes_arg(args, 0, "HDEL")?,
@@ -1228,7 +1700,7 @@ impl Command {
             }),
             "HMGET" => {
                 if args.len() < 2 {
-                    return Err("HMGET requires key and at least one field".to_string());
+                    return Err(wrong_arity("HMGET"));
                 }
                 Ok(Command::HMGet {
                     key: bytes_arg(args, 0, "HMGET")?,
@@ -1237,7 +1709,7 @@ impl Command {
             }
             "HMSET" => {
                 if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
-                    return Err("HMSET requires key field value [field value ...]".to_string());
+                    return Err(wrong_arity("HMSET"));
                 }
                 let key = bytes_arg(args, 0, "HMSET")?;
                 let pairs = args[1..]
@@ -1264,7 +1736,7 @@ impl Command {
                 field: bytes_arg(args, 1, "HINCRBY")?,
                 delta: str_arg(args, 2, "HINCRBY")?
                     .parse()
-                    .map_err(|_| "HINCRBY requires integer".to_string())?,
+                    .map_err(|_| NOT_AN_INTEGER.to_string())?,
             }),
             "HSETNX" => Ok(Command::HSetNx {
                 key: bytes_arg(args, 0, "HSETNX")?,
@@ -1274,52 +1746,44 @@ impl Command {
 
             "LPUSH" => {
                 if args.len() < 2 {
-                    return Err("LPUSH requires key value [value ...]".to_string());
+                    return Err(wrong_arity("LPUSH"));
                 }
                 let key = bytes_arg(args, 0, "LPUSH")?;
-                let values = (1..args.len())
-                    .map(|i| bytes_arg(args, i, "LPUSH"))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let values = key_args(args, 1, "LPUSH")?;
                 Ok(Command::LPush { key, values })
             }
             "RPUSH" => {
                 if args.len() < 2 {
-                    return Err("RPUSH requires key value [value ...]".to_string());
+                    return Err(wrong_arity("RPUSH"));
                 }
                 let key = bytes_arg(args, 0, "RPUSH")?;
-                let values = (1..args.len())
-                    .map(|i| bytes_arg(args, i, "RPUSH"))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let values = key_args(args, 1, "RPUSH")?;
                 Ok(Command::RPush { key, values })
             }
             "LPUSHX" => {
                 if args.len() < 2 {
-                    return Err("LPUSHX requires key value [value ...]".to_string());
+                    return Err(wrong_arity("LPUSHX"));
                 }
                 let key = bytes_arg(args, 0, "LPUSHX")?;
-                let values = (1..args.len())
-                    .map(|i| bytes_arg(args, i, "LPUSHX"))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let values = key_args(args, 1, "LPUSHX")?;
                 Ok(Command::LPushX { key, values })
             }
             "RPUSHX" => {
                 if args.len() < 2 {
-                    return Err("RPUSHX requires key value [value ...]".to_string());
+                    return Err(wrong_arity("RPUSHX"));
                 }
                 let key = bytes_arg(args, 0, "RPUSHX")?;
-                let values = (1..args.len())
-                    .map(|i| bytes_arg(args, i, "RPUSHX"))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let values = key_args(args, 1, "RPUSHX")?;
                 Ok(Command::RPushX { key, values })
             }
             "LPOP" => {
                 let key = bytes_arg(args, 0, "LPOP")?;
                 let count = if args.len() >= 2 {
-                    Some(
+                    Some(check_count(
                         str_arg(args, 1, "LPOP")?
                             .parse::<i64>()
-                            .map_err(|_| "LPOP count must be integer".to_string())?,
-                    )
+                            .map_err(|_| NOT_AN_INTEGER.to_string())?,
+                    )?)
                 } else {
                     None
                 };
@@ -1328,11 +1792,11 @@ impl Command {
             "RPOP" => {
                 let key = bytes_arg(args, 0, "RPOP")?;
                 let count = if args.len() >= 2 {
-                    Some(
+                    Some(check_count(
                         str_arg(args, 1, "RPOP")?
                             .parse::<i64>()
-                            .map_err(|_| "RPOP count must be integer".to_string())?,
-                    )
+                            .map_err(|_| NOT_AN_INTEGER.to_string())?,
+                    )?)
                 } else {
                     None
                 };
@@ -1345,24 +1809,24 @@ impl Command {
                 let key = bytes_arg(args, 0, "LRANGE")?;
                 let start: i64 = str_arg(args, 1, "LRANGE")?
                     .parse()
-                    .map_err(|_| "LRANGE start must be integer".to_string())?;
+                    .map_err(|_| NOT_AN_INTEGER.to_string())?;
                 let stop: i64 = str_arg(args, 2, "LRANGE")?
                     .parse()
-                    .map_err(|_| "LRANGE stop must be integer".to_string())?;
+                    .map_err(|_| NOT_AN_INTEGER.to_string())?;
                 Ok(Command::LRange { key, start, stop })
             }
             "LINDEX" => {
                 let key = bytes_arg(args, 0, "LINDEX")?;
                 let index: i64 = str_arg(args, 1, "LINDEX")?
                     .parse()
-                    .map_err(|_| "LINDEX index must be integer".to_string())?;
+                    .map_err(|_| NOT_AN_INTEGER.to_string())?;
                 Ok(Command::LIndex { key, index })
             }
             "LSET" => {
                 let key = bytes_arg(args, 0, "LSET")?;
                 let index: i64 = str_arg(args, 1, "LSET")?
                     .parse()
-                    .map_err(|_| "LSET index must be integer".to_string())?;
+                    .map_err(|_| NOT_AN_INTEGER.to_string())?;
                 let value = bytes_arg(args, 2, "LSET")?;
                 Ok(Command::LSet { key, index, value })
             }
@@ -1387,7 +1851,7 @@ impl Command {
                 let key = bytes_arg(args, 0, "LREM")?;
                 let count: i64 = str_arg(args, 1, "LREM")?
                     .parse()
-                    .map_err(|_| "LREM count must be integer".to_string())?;
+                    .map_err(|_| NOT_AN_INTEGER.to_string())?;
                 let value = bytes_arg(args, 2, "LREM")?;
                 Ok(Command::LRem { key, count, value })
             }
@@ -1424,7 +1888,7 @@ impl Command {
                             rank = Some(
                                 str_arg(args, i + 1, "LPOS RANK")?
                                     .parse()
-                                    .map_err(|_| "LPOS RANK must be integer".to_string())?,
+                                    .map_err(|_| NOT_AN_INTEGER.to_string())?,
                             );
                             i += 2;
                         }
@@ -1432,7 +1896,7 @@ impl Command {
                             count = Some(
                                 str_arg(args, i + 1, "LPOS COUNT")?
                                     .parse()
-                                    .map_err(|_| "LPOS COUNT must be integer".to_string())?,
+                                    .map_err(|_| NOT_AN_INTEGER.to_string())?,
                             );
                             i += 2;
                         }
@@ -1440,7 +1904,7 @@ impl Command {
                     }
                 }
                 if matches!(rank, Some(0)) {
-                    return Err("LPOS RANK can't be zero".to_string());
+                    return Err("RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative to start from the end of the list".to_string());
                 }
                 Ok(Command::LPos {
                     key,
@@ -1453,31 +1917,27 @@ impl Command {
                 let key = bytes_arg(args, 0, "LTRIM")?;
                 let start: i64 = str_arg(args, 1, "LTRIM")?
                     .parse()
-                    .map_err(|_| "LTRIM start must be integer".to_string())?;
+                    .map_err(|_| NOT_AN_INTEGER.to_string())?;
                 let stop: i64 = str_arg(args, 2, "LTRIM")?
                     .parse()
-                    .map_err(|_| "LTRIM stop must be integer".to_string())?;
+                    .map_err(|_| NOT_AN_INTEGER.to_string())?;
                 Ok(Command::LTrim { key, start, stop })
             }
 
             "SADD" => {
                 if args.len() < 2 {
-                    return Err("SADD requires key member [member ...]".to_string());
+                    return Err(wrong_arity("SADD"));
                 }
                 let key = bytes_arg(args, 0, "SADD")?;
-                let members = (1..args.len())
-                    .map(|i| bytes_arg(args, i, "SADD"))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let members = key_args(args, 1, "SADD")?;
                 Ok(Command::SAdd { key, members })
             }
             "SREM" => {
                 if args.len() < 2 {
-                    return Err("SREM requires key member [member ...]".to_string());
+                    return Err(wrong_arity("SREM"));
                 }
                 let key = bytes_arg(args, 0, "SREM")?;
-                let members = (1..args.len())
-                    .map(|i| bytes_arg(args, i, "SREM"))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let members = key_args(args, 1, "SREM")?;
                 Ok(Command::SRem { key, members })
             }
             "SMEMBERS" => Ok(Command::SMembers {
@@ -1492,22 +1952,20 @@ impl Command {
             }),
             "SMISMEMBER" => {
                 if args.len() < 2 {
-                    return Err("SMISMEMBER requires key member [member ...]".to_string());
+                    return Err(wrong_arity("SMISMEMBER"));
                 }
                 let key = bytes_arg(args, 0, "SMISMEMBER")?;
-                let members = (1..args.len())
-                    .map(|i| bytes_arg(args, i, "SMISMEMBER"))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let members = key_args(args, 1, "SMISMEMBER")?;
                 Ok(Command::SMisMember { key, members })
             }
             "SPOP" => {
                 let key = bytes_arg(args, 0, "SPOP")?;
                 let count = if args.len() >= 2 {
-                    Some(
+                    Some(check_count(
                         str_arg(args, 1, "SPOP")?
                             .parse::<i64>()
-                            .map_err(|_| "SPOP count must be integer".to_string())?,
-                    )
+                            .map_err(|_| NOT_AN_INTEGER.to_string())?,
+                    )?)
                 } else {
                     None
                 };
@@ -1519,7 +1977,7 @@ impl Command {
                     Some(
                         str_arg(args, 1, "SRANDMEMBER")?
                             .parse::<i64>()
-                            .map_err(|_| "SRANDMEMBER count must be integer".to_string())?,
+                            .map_err(|_| NOT_AN_INTEGER.to_string())?,
                     )
                 } else {
                     None
@@ -1528,59 +1986,47 @@ impl Command {
             }
             "SUNION" => {
                 if args.is_empty() {
-                    return Err("SUNION requires at least one key".to_string());
+                    return Err(wrong_arity("SUNION"));
                 }
-                let keys = (0..args.len())
-                    .map(|i| bytes_arg(args, i, "SUNION"))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let keys = key_args(args, 0, "SUNION")?;
                 Ok(Command::SUnion { keys })
             }
             "SINTER" => {
                 if args.is_empty() {
-                    return Err("SINTER requires at least one key".to_string());
+                    return Err(wrong_arity("SINTER"));
                 }
-                let keys = (0..args.len())
-                    .map(|i| bytes_arg(args, i, "SINTER"))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let keys = key_args(args, 0, "SINTER")?;
                 Ok(Command::SInter { keys })
             }
             "SDIFF" => {
                 if args.is_empty() {
-                    return Err("SDIFF requires at least one key".to_string());
+                    return Err(wrong_arity("SDIFF"));
                 }
-                let keys = (0..args.len())
-                    .map(|i| bytes_arg(args, i, "SDIFF"))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let keys = key_args(args, 0, "SDIFF")?;
                 Ok(Command::SDiff { keys })
             }
             "SUNIONSTORE" => {
                 if args.len() < 2 {
-                    return Err("SUNIONSTORE requires dst and at least one source key".to_string());
+                    return Err(wrong_arity("SUNIONSTORE"));
                 }
                 let dst = bytes_arg(args, 0, "SUNIONSTORE")?;
-                let keys = (1..args.len())
-                    .map(|i| bytes_arg(args, i, "SUNIONSTORE"))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let keys = key_args(args, 1, "SUNIONSTORE")?;
                 Ok(Command::SUnionStore { dst, keys })
             }
             "SINTERSTORE" => {
                 if args.len() < 2 {
-                    return Err("SINTERSTORE requires dst and at least one source key".to_string());
+                    return Err(wrong_arity("SINTERSTORE"));
                 }
                 let dst = bytes_arg(args, 0, "SINTERSTORE")?;
-                let keys = (1..args.len())
-                    .map(|i| bytes_arg(args, i, "SINTERSTORE"))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let keys = key_args(args, 1, "SINTERSTORE")?;
                 Ok(Command::SInterStore { dst, keys })
             }
             "SDIFFSTORE" => {
                 if args.len() < 2 {
-                    return Err("SDIFFSTORE requires dst and at least one source key".to_string());
+                    return Err(wrong_arity("SDIFFSTORE"));
                 }
                 let dst = bytes_arg(args, 0, "SDIFFSTORE")?;
-                let keys = (1..args.len())
-                    .map(|i| bytes_arg(args, i, "SDIFFSTORE"))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let keys = key_args(args, 1, "SDIFFSTORE")?;
                 Ok(Command::SDiffStore { dst, keys })
             }
             "SMOVE" => Ok(Command::SMove {
@@ -1592,12 +2038,10 @@ impl Command {
             "ZADD" => parse_zadd(args),
             "ZREM" => {
                 if args.len() < 2 {
-                    return Err("ZREM requires key member [member ...]".to_string());
+                    return Err(wrong_arity("ZREM"));
                 }
                 let key = bytes_arg(args, 0, "ZREM")?;
-                let members = (1..args.len())
-                    .map(|i| bytes_arg(args, i, "ZREM"))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let members = key_args(args, 1, "ZREM")?;
                 Ok(Command::ZRem { key, members })
             }
             "ZSCORE" => Ok(Command::ZScore {
@@ -1606,18 +2050,16 @@ impl Command {
             }),
             "ZMSCORE" => {
                 if args.len() < 2 {
-                    return Err("ZMSCORE requires key member [member ...]".to_string());
+                    return Err(wrong_arity("ZMSCORE"));
                 }
                 let key = bytes_arg(args, 0, "ZMSCORE")?;
-                let members = (1..args.len())
-                    .map(|i| bytes_arg(args, i, "ZMSCORE"))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let members = key_args(args, 1, "ZMSCORE")?;
                 Ok(Command::ZMScore { key, members })
             }
             "ZINCRBY" => {
                 let key = bytes_arg(args, 0, "ZINCRBY")?;
                 let increment = parse_score_value(&bytes_arg(args, 1, "ZINCRBY")?)
-                    .ok_or_else(|| "ZINCRBY increment is not a valid float".to_string())?;
+                    .ok_or_else(|| NOT_A_FLOAT.to_string())?;
                 let member = bytes_arg(args, 2, "ZINCRBY")?;
                 Ok(Command::ZIncrBy {
                     key,
@@ -1631,17 +2073,17 @@ impl Command {
             "ZCOUNT" => {
                 let key = bytes_arg(args, 0, "ZCOUNT")?;
                 let min = parse_score_bound(&bytes_arg(args, 1, "ZCOUNT")?)
-                    .ok_or_else(|| "ZCOUNT min is not a valid float".to_string())?;
+                    .ok_or_else(|| "min or max is not a float".to_string())?;
                 let max = parse_score_bound(&bytes_arg(args, 2, "ZCOUNT")?)
-                    .ok_or_else(|| "ZCOUNT max is not a valid float".to_string())?;
+                    .ok_or_else(|| "min or max is not a float".to_string())?;
                 Ok(Command::ZCount { key, min, max })
             }
             "ZLEXCOUNT" => {
                 let key = bytes_arg(args, 0, "ZLEXCOUNT")?;
                 let min = parse_lex_bound(&bytes_arg(args, 1, "ZLEXCOUNT")?)
-                    .ok_or_else(|| "ZLEXCOUNT min is invalid".to_string())?;
+                    .ok_or_else(|| "min or max not valid string range item".to_string())?;
                 let max = parse_lex_bound(&bytes_arg(args, 2, "ZLEXCOUNT")?)
-                    .ok_or_else(|| "ZLEXCOUNT max is invalid".to_string())?;
+                    .ok_or_else(|| "min or max not valid string range item".to_string())?;
                 Ok(Command::ZLexCount { key, min, max })
             }
             "ZRANK" => parse_zrank(args, false),
@@ -1661,11 +2103,11 @@ impl Command {
             "ZPOPMIN" => {
                 let key = bytes_arg(args, 0, "ZPOPMIN")?;
                 let count = if args.len() >= 2 {
-                    Some(
+                    Some(check_count(
                         str_arg(args, 1, "ZPOPMIN")?
                             .parse::<i64>()
-                            .map_err(|_| "ZPOPMIN count must be integer".to_string())?,
-                    )
+                            .map_err(|_| NOT_AN_INTEGER.to_string())?,
+                    )?)
                 } else {
                     None
                 };
@@ -1674,11 +2116,11 @@ impl Command {
             "ZPOPMAX" => {
                 let key = bytes_arg(args, 0, "ZPOPMAX")?;
                 let count = if args.len() >= 2 {
-                    Some(
+                    Some(check_count(
                         str_arg(args, 1, "ZPOPMAX")?
                             .parse::<i64>()
-                            .map_err(|_| "ZPOPMAX count must be integer".to_string())?,
-                    )
+                            .map_err(|_| NOT_AN_INTEGER.to_string())?,
+                    )?)
                 } else {
                     None
                 };
@@ -1689,7 +2131,7 @@ impl Command {
                 let (count, with_scores) = if args.len() >= 2 {
                     let n = str_arg(args, 1, "ZRANDMEMBER")?
                         .parse::<i64>()
-                        .map_err(|_| "ZRANDMEMBER count must be integer".to_string())?;
+                        .map_err(|_| NOT_AN_INTEGER.to_string())?;
                     let ws = args
                         .get(2)
                         .map(|a| String::from_utf8_lossy(a).to_uppercase() == "WITHSCORES")
@@ -1708,26 +2150,26 @@ impl Command {
                 let key = bytes_arg(args, 0, "ZREMRANGEBYRANK")?;
                 let start: i64 = str_arg(args, 1, "ZREMRANGEBYRANK")?
                     .parse()
-                    .map_err(|_| "ZREMRANGEBYRANK start must be integer".to_string())?;
+                    .map_err(|_| NOT_AN_INTEGER.to_string())?;
                 let stop: i64 = str_arg(args, 2, "ZREMRANGEBYRANK")?
                     .parse()
-                    .map_err(|_| "ZREMRANGEBYRANK stop must be integer".to_string())?;
+                    .map_err(|_| NOT_AN_INTEGER.to_string())?;
                 Ok(Command::ZRemRangeByRank { key, start, stop })
             }
             "ZREMRANGEBYSCORE" => {
                 let key = bytes_arg(args, 0, "ZREMRANGEBYSCORE")?;
                 let min = parse_score_bound(&bytes_arg(args, 1, "ZREMRANGEBYSCORE")?)
-                    .ok_or_else(|| "ZREMRANGEBYSCORE min is not a valid float".to_string())?;
+                    .ok_or_else(|| "min or max is not a float".to_string())?;
                 let max = parse_score_bound(&bytes_arg(args, 2, "ZREMRANGEBYSCORE")?)
-                    .ok_or_else(|| "ZREMRANGEBYSCORE max is not a valid float".to_string())?;
+                    .ok_or_else(|| "min or max is not a float".to_string())?;
                 Ok(Command::ZRemRangeByScore { key, min, max })
             }
             "ZREMRANGEBYLEX" => {
                 let key = bytes_arg(args, 0, "ZREMRANGEBYLEX")?;
                 let min = parse_lex_bound(&bytes_arg(args, 1, "ZREMRANGEBYLEX")?)
-                    .ok_or_else(|| "ZREMRANGEBYLEX min is invalid".to_string())?;
+                    .ok_or_else(|| "min or max not valid string range item".to_string())?;
                 let max = parse_lex_bound(&bytes_arg(args, 2, "ZREMRANGEBYLEX")?)
-                    .ok_or_else(|| "ZREMRANGEBYLEX max is invalid".to_string())?;
+                    .ok_or_else(|| "min or max not valid string range item".to_string())?;
                 Ok(Command::ZRemRangeByLex { key, min, max })
             }
             "ZUNION" => parse_zaggregate(args, false, false),
@@ -1737,12 +2179,12 @@ impl Command {
             "ZINTERSTORE" => parse_zaggregate_store(args, true),
             "ZDIFFSTORE" => {
                 if args.len() < 3 {
-                    return Err("ZDIFFSTORE requires destination numkeys key [key ...]".to_string());
+                    return Err(wrong_arity("ZDIFFSTORE"));
                 }
                 let dst = bytes_arg(args, 0, "ZDIFFSTORE")?;
                 let numkeys: usize = str_arg(args, 1, "ZDIFFSTORE")?
                     .parse()
-                    .map_err(|_| "ZDIFFSTORE numkeys must be integer".to_string())?;
+                    .map_err(|_| NOT_AN_INTEGER.to_string())?;
                 if numkeys == 0 {
                     return Err("ZDIFFSTORE numkeys must be positive".to_string());
                 }
@@ -1757,7 +2199,7 @@ impl Command {
 
             "SUBSCRIBE" => {
                 if args.is_empty() {
-                    return Err("SUBSCRIBE requires at least one channel".to_string());
+                    return Err(wrong_arity("SUBSCRIBE"));
                 }
                 Ok(Command::Subscribe {
                     channels: args.to_vec(),
@@ -1766,7 +2208,7 @@ impl Command {
             "UNSUBSCRIBE" => Ok(Command::Unsubscribe),
             "PSUBSCRIBE" => {
                 if args.is_empty() {
-                    return Err("PSUBSCRIBE requires at least one pattern".to_string());
+                    return Err(wrong_arity("PSUBSCRIBE"));
                 }
                 Ok(Command::PSubscribe {
                     patterns: args.to_vec(),
@@ -1775,7 +2217,7 @@ impl Command {
             "PUNSUBSCRIBE" => Ok(Command::PUnsubscribe),
             "PUBLISH" => {
                 if args.len() != 2 {
-                    return Err("PUBLISH requires channel and message".to_string());
+                    return Err(wrong_arity("PUBLISH"));
                 }
                 Ok(Command::Publish {
                     channel: args[0].clone(),
@@ -1804,7 +2246,7 @@ impl Command {
             "DISCARD" => Ok(Command::Discard),
             "WATCH" => {
                 if args.is_empty() {
-                    return Err("WATCH requires at least one key".to_string());
+                    return Err(wrong_arity("WATCH"));
                 }
                 Ok(Command::Watch {
                     keys: args.iter().map(|a| a.to_vec()).collect(),
@@ -1812,11 +2254,368 @@ impl Command {
             }
             "UNWATCH" => Ok(Command::Unwatch),
 
-            _ => Err(format!("unknown command '{}'", cmd)),
+            // Redis names the command and then quotes each argument, one
+            // space apart, with a trailing space — the whole of it, that
+            // space included, is what a client's error handling matches on.
+            _ => Err(format!(
+                "unknown command '{cmd}', with args beginning with: {}",
+                args.iter()
+                    .map(|a| format!("'{}' ", String::from_utf8_lossy(a)))
+                    .collect::<String>()
+            )),
         }
     }
 
     pub fn execute(&self, client: &mut SpiClient<'_>, db: u8) -> Response {
+        // A write has to be refused before it lands, so its keys are checked up
+        // front. A read cannot damage anything, and a read of a key holding
+        // another type finds nothing — so it runs first and only asks what the
+        // key holds when it came back empty. That keeps the extra round trip
+        // off every successful `GET`, `HGET` and `LRANGE`.
+        let writes = !self.write_keys().is_empty();
+        if writes && let Some(err) = self.sql_type_error(client, db) {
+            return err;
+        }
+        let response = self.execute_inner(client, db);
+        if !writes
+            && response.found_nothing()
+            && let Some(err) = self.sql_type_error(client, db)
+        {
+            return err;
+        }
+        response
+    }
+
+    /// Everything one key holds, whatever type holds it. `COPY` is the only
+    /// command that has to move a whole key between two backends, so it is the
+    /// only one that needs the value in a form neither of them stores.
+    fn dump_key(client: &mut SpiClient<'_>, db: u8, key: &[u8]) -> Option<(KeyDump, i64)> {
+        use crate::mem::KeyKind;
+        let mem = uses_shared_memory(db);
+        let kind = match mem {
+            true => unsafe { crate::mem::mem_key_kind(db as usize, key) }?,
+            false => Self::sql_key_kinds(client, db, &[key])
+                .first()
+                .map(|(_, k)| *k)?,
+        };
+        let idx = db as usize;
+        let dump = match (kind, mem) {
+            (KeyKind::String, true) => KeyDump::String(unsafe { crate::mem::mem_get(idx, key) }?),
+            (KeyKind::List, true) => {
+                KeyDump::List(unsafe { crate::mem::mem_lrange(idx, key, 0, -1) })
+            }
+            (KeyKind::Set, true) => KeyDump::Set(unsafe { crate::mem::mem_smembers(idx, key) }),
+            (KeyKind::Hash, true) => KeyDump::Hash(unsafe { crate::mem::mem_hgetall(idx, key) }),
+            (KeyKind::Zset, true) => {
+                KeyDump::Zset(unsafe { crate::mem::mem_zset_collect_all(idx, key) })
+            }
+            (KeyKind::String, false) => KeyDump::String(
+                client
+                    .select(&sql::GET[idx], None, &[key.into()])
+                    .ok()?
+                    .first()
+                    .get(1)
+                    .ok()
+                    .flatten()?,
+            ),
+            (kind, false) => {
+                let sql = match kind {
+                    KeyKind::List => format!(
+                        "SELECT value, NULL::float8 FROM redis.list_{db} \
+                         WHERE key = $1 ORDER BY pos"
+                    ),
+                    KeyKind::Set => {
+                        format!("SELECT member, NULL::float8 FROM redis.set_{db} WHERE key = $1")
+                    }
+                    KeyKind::Zset => {
+                        format!("SELECT member, score FROM redis.zset_{db} WHERE key = $1")
+                    }
+                    _ => format!(
+                        "SELECT field, NULL::float8, value FROM redis.hash_{db} WHERE key = $1"
+                    ),
+                };
+                let tbl = client.select(&sql, None, &[key.into()]).ok()?;
+                let mut items: Vec<DumpRow> = Vec::new();
+                for row in tbl {
+                    let Ok(Some(a)) = row.get::<Vec<u8>>(1) else {
+                        continue;
+                    };
+                    let score = row.get::<f64>(2).ok().flatten();
+                    let value = row.get::<Vec<u8>>(3).ok().flatten();
+                    items.push((a, score, value));
+                }
+                match kind {
+                    KeyKind::List => KeyDump::List(items.into_iter().map(|(a, _, _)| a).collect()),
+                    KeyKind::Set => KeyDump::Set(items.into_iter().map(|(a, _, _)| a).collect()),
+                    KeyKind::Zset => KeyDump::Zset(
+                        items
+                            .into_iter()
+                            .map(|(a, s, _)| (a, s.unwrap_or(0.0)))
+                            .collect(),
+                    ),
+                    _ => KeyDump::Hash(
+                        items
+                            .into_iter()
+                            .map(|(a, _, v)| (a, v.unwrap_or_default()))
+                            .collect(),
+                    ),
+                }
+            }
+        };
+        let (_, expires_at) = match mem {
+            true => unsafe { crate::mem::mem_ttl_raw(idx, key) },
+            false => (true, 0),
+        };
+        Some((dump, expires_at))
+    }
+
+    /// Write back what `dump_key` read, into whichever backend `db` names.
+    fn restore_key(client: &mut SpiClient<'_>, db: u8, key: &[u8], dump: &KeyDump) {
+        let idx = db as usize;
+        if uses_shared_memory(db) {
+            unsafe {
+                match dump {
+                    KeyDump::String(v) => {
+                        crate::mem::mem_set(idx, key, v, 0);
+                    }
+                    KeyDump::List(items) => {
+                        let refs: Vec<&[u8]> = items.iter().map(Vec::as_slice).collect();
+                        crate::mem::mem_rpush(idx, key, &refs);
+                    }
+                    KeyDump::Set(items) => {
+                        let refs: Vec<&[u8]> = items.iter().map(Vec::as_slice).collect();
+                        crate::mem::mem_sadd(idx, key, &refs);
+                    }
+                    KeyDump::Hash(pairs) => {
+                        for (f, v) in pairs {
+                            crate::mem::mem_hset(idx, key, f, v);
+                        }
+                    }
+                    KeyDump::Zset(pairs) => {
+                        let scored: Vec<(f64, &[u8])> =
+                            pairs.iter().map(|(m, s)| (*s, m.as_slice())).collect();
+                        crate::mem::mem_zadd(idx, key, &scored, false, false, false, false, false);
+                    }
+                }
+            }
+            return;
+        }
+        match dump {
+            KeyDump::String(v) => {
+                let sql = format!(
+                    "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, $2) \
+                     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+                );
+                let _ = client.update(&sql, None, &[key.into(), v.clone().into()]);
+            }
+            KeyDump::List(items) => {
+                let sql = format!(
+                    "INSERT INTO redis.list_{db} (key, pos, value) \
+                     SELECT $1, i - 1, v FROM unnest($2::bytea[]) WITH ORDINALITY AS t(v, i)"
+                );
+                let vals: Vec<Option<Vec<u8>>> = items.iter().map(|v| Some(v.clone())).collect();
+                let _ = client.update(&sql, None, &[key.into(), vals.into()]);
+            }
+            KeyDump::Set(items) => {
+                let sql = format!(
+                    "INSERT INTO redis.set_{db} (key, member) \
+                     SELECT $1, m FROM unnest($2::bytea[]) AS t(m) \
+                     ON CONFLICT DO NOTHING"
+                );
+                let vals: Vec<Option<Vec<u8>>> = items.iter().map(|v| Some(v.clone())).collect();
+                let _ = client.update(&sql, None, &[key.into(), vals.into()]);
+            }
+            KeyDump::Hash(pairs) => {
+                let sql = format!(
+                    "INSERT INTO redis.hash_{db} (key, field, value) \
+                     SELECT $1, f, v FROM unnest($2::bytea[], $3::bytea[]) AS t(f, v) \
+                     ON CONFLICT (key, field) DO UPDATE SET value = EXCLUDED.value"
+                );
+                let fs: Vec<Option<Vec<u8>>> = pairs.iter().map(|(f, _)| Some(f.clone())).collect();
+                let vs: Vec<Option<Vec<u8>>> = pairs.iter().map(|(_, v)| Some(v.clone())).collect();
+                let _ = client.update(&sql, None, &[key.into(), fs.into(), vs.into()]);
+            }
+            KeyDump::Zset(pairs) => {
+                let sql = format!(
+                    "INSERT INTO redis.zset_{db} (key, member, score) \
+                     SELECT $1, m, s FROM unnest($2::bytea[], $3::float8[]) AS t(m, s) \
+                     ON CONFLICT (key, member) DO UPDATE SET score = EXCLUDED.score"
+                );
+                let ms: Vec<Option<Vec<u8>>> = pairs.iter().map(|(m, _)| Some(m.clone())).collect();
+                let ss: Vec<Option<f64>> = pairs.iter().map(|(_, s)| Some(*s)).collect();
+                let _ = client.update(&sql, None, &[key.into(), ms.into(), ss.into()]);
+            }
+        }
+    }
+
+    /// `rename_to`, for the shared-memory half.
+    fn mem_rename(&self, db_idx: usize, key: &[u8], newkey: &[u8]) -> Response {
+        use crate::mem;
+        // The expiry travels with the key: read it before the value is taken,
+        // since the entry is gone afterwards.
+        let (_, expires_at) = unsafe { mem::mem_ttl_raw(db_idx, key) };
+        match unsafe { mem::mem_getdel(db_idx, key) } {
+            Some(v) => {
+                // Only now that the source is known to be there: a rename that
+                // fails must leave the destination alone.
+                mem_clear_other_type(db_idx, newkey, mem::KeyKind::String);
+                unsafe { mem::mem_set(db_idx, newkey, &v, expires_at) };
+                Response::Ok
+            }
+            None => Response::Error("ERR no such key".to_string()),
+        }
+    }
+
+    /// Move a string from `key` to `newkey`, clearing the destination first.
+    /// `RENAME` answers `+OK`; `RENAMENX` turns that into `1` once it has
+    /// established the destination was free.
+    fn rename_to(client: &mut SpiClient<'_>, db: u8, key: &[u8], newkey: &[u8]) -> Response {
+        // The destination goes first, in its own statement: renaming
+        // onto an existing key is a primary-key violation otherwise,
+        // and a CTE that deletes it is not visible to the update in the
+        // same statement. Renaming a key to itself must not delete it.
+        if key != newkey {
+            // Only when the source is there: a RENAME that answers "no
+            // such key" must leave the destination alone.
+            let del = format!(
+                "DELETE FROM redis.kv_{db} WHERE key = $1 \
+                     AND EXISTS (SELECT 1 FROM redis.kv_{db} s WHERE s.key = $2)"
+            );
+            if let Err(e) = client.update(&del, None, &[newkey.into(), key.into()]) {
+                pgrx::warning!("pg_redis: RENAME could not clear the destination: {e}");
+                return Response::Error("ERR internal error".to_string());
+            }
+        }
+        let sql = format!(
+            "WITH r AS ( \
+                     UPDATE redis.kv_{db} SET key = $2 WHERE key = $1 RETURNING 1 \
+                 ) \
+                 SELECT (SELECT count(*) FROM r) > 0 AS renamed"
+        );
+        match client.update(&sql, None, &[key.into(), newkey.into()]) {
+            Ok(tbl) => {
+                let renamed = tbl.first().get::<bool>(1).ok().flatten().unwrap_or(false);
+                if renamed {
+                    Response::Ok
+                } else {
+                    Response::Error("ERR no such key".to_string())
+                }
+            }
+            Err(e) => spi_failed("RENAME", e),
+        }
+    }
+
+    /// What each of `keys` holds, in one round trip. The five tables are keyed
+    /// independently, so this is the durable half's key directory: derived on
+    /// demand rather than stored, which is a query per typed command and no
+    /// second copy of the truth to keep in step.
+    fn sql_key_kinds(
+        client: &mut SpiClient<'_>,
+        db: u8,
+        keys: &[&[u8]],
+    ) -> Vec<(Vec<u8>, crate::mem::KeyKind)> {
+        use crate::mem::KeyKind;
+        let sql = format!(
+            "SELECT a.key, \
+                    CASE \
+                      WHEN EXISTS (SELECT 1 FROM redis.kv_{db} t WHERE t.key = a.key \
+                                     AND (t.expires_at IS NULL OR t.expires_at > now())) THEN 'string' \
+                      WHEN EXISTS (SELECT 1 FROM redis.expiry_{db} e WHERE e.key = a.key \
+                                     AND e.expires_at <= now()) THEN NULL \
+                      WHEN EXISTS (SELECT 1 FROM redis.list_{db} t WHERE t.key = a.key) THEN 'list' \
+                      WHEN EXISTS (SELECT 1 FROM redis.set_{db}  t WHERE t.key = a.key) THEN 'set' \
+                      WHEN EXISTS (SELECT 1 FROM redis.hash_{db} t WHERE t.key = a.key) THEN 'hash' \
+                      WHEN EXISTS (SELECT 1 FROM redis.zset_{db} t WHERE t.key = a.key) THEN 'zset' \
+                    END AS kind \
+             FROM unnest($1::bytea[]) AS a(key)"
+        );
+        let args: Vec<Option<Vec<u8>>> = keys.iter().map(|k| Some(k.to_vec())).collect();
+        let Ok(tbl) = client.select(&sql, None, &[args.into()]) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for row in tbl {
+            let (Ok(Some(key)), Ok(Some(kind))) = (row.get::<Vec<u8>>(1), row.get::<String>(2))
+            else {
+                continue;
+            };
+            let kind = match kind.as_str() {
+                "string" => KeyKind::String,
+                "list" => KeyKind::List,
+                "set" => KeyKind::Set,
+                "hash" => KeyKind::Hash,
+                "zset" => KeyKind::Zset,
+                _ => continue,
+            };
+            out.push((key, kind));
+        }
+        out
+    }
+
+    /// Delete everything every table holds for `key`. What `SET` does to a key
+    /// that was a list: Redis replaces the value rather than refusing.
+    fn sql_drop_key(client: &mut SpiClient<'_>, db: u8, key: &[u8]) {
+        let sql = format!(
+            "WITH d1 AS (DELETE FROM redis.kv_{db}     WHERE key = $1), \
+                  d2 AS (DELETE FROM redis.hash_{db}   WHERE key = $1), \
+                  d3 AS (DELETE FROM redis.list_{db}   WHERE key = $1), \
+                  d4 AS (DELETE FROM redis.set_{db}    WHERE key = $1), \
+                  d5 AS (DELETE FROM redis.zset_{db}   WHERE key = $1), \
+                  d6 AS (DELETE FROM redis.expiry_{db} WHERE key = $1) \
+             SELECT 1"
+        );
+        let _ = client.update(&sql, None, &[key.into()]);
+    }
+
+    /// The durable half's `mem_type_error`: refuse a command whose key holds
+    /// another type, and clear a key the command is about to replace.
+    fn sql_type_error(&self, client: &mut SpiClient<'_>, db: u8) -> Option<Response> {
+        let typed = self.typed_keys();
+        if typed.is_empty() {
+            // Nothing to refuse, so nothing to look up. The commands that only
+            // replace a key — `SET` and its kin — clear what was there from
+            // inside their own statement rather than paying a round trip to
+            // find out there was nothing to clear, which is the common case and
+            // halved their throughput when they did.
+            return None;
+        }
+        let overwrites = self.overwritten_keys();
+        let lookup: Vec<&[u8]> = typed
+            .iter()
+            .map(|(k, _)| *k)
+            .chain(overwrites.iter().map(|(k, _)| *k))
+            .collect();
+        let kinds = Self::sql_key_kinds(client, db, &lookup);
+        let kind_of = |key: &[u8]| {
+            kinds
+                .iter()
+                .find(|(k, _)| k.as_slice() == key)
+                .map(|(_, kind)| *kind)
+        };
+        for (key, accepted) in &typed {
+            if let Some(kind) = kind_of(key)
+                && !accepted.contains(&kind)
+            {
+                return Some(wrong_type());
+            }
+        }
+        for (key, becomes) in &overwrites {
+            match kind_of(key) {
+                Some(kind) if kind != *becomes => Self::sql_drop_key(client, db, key),
+                // Replacing a collection with one of its own type keeps the
+                // rows the command is about to rewrite, but not the expiry:
+                // Redis discards a key's TTL whenever its value is replaced.
+                Some(_) => {
+                    let sql = format!("DELETE FROM redis.expiry_{db} WHERE key = $1");
+                    let _ = client.update(&sql, None, &[(*key).into()]);
+                }
+                None => {}
+            }
+        }
+        None
+    }
+
+    fn execute_inner(&self, client: &mut SpiClient<'_>, db: u8) -> Response {
         match self {
             Command::Ping { msg } => Response::Pong(msg.clone()),
             Command::Echo { msg } => Response::BulkString(msg.clone()),
@@ -1861,16 +2660,7 @@ impl Command {
             Command::ConfigOther => Response::Ok,
 
             Command::Get { key } => {
-                match client.select(&sql::GET[db as usize], None, &[key.as_slice().into()]) {
-                    Ok(tbl) => match tbl.first().get::<Vec<u8>>(1) {
-                        Ok(Some(v)) => Response::BulkString(v),
-                        _ => Response::Null,
-                    },
-                    Err(e) => {
-                        eprintln!("pg_redis: GET error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
-                }
+                bulk_query(client, Spi::Reads, "GET", &sql::GET[db as usize], &[key.as_slice().into()])
             }
 
             Command::Set {
@@ -1884,6 +2674,27 @@ impl Command {
             } => {
                 // Expiry expression for the inserted/updated row.
                 // $3 is ex_ms (Option<i64>); when NULL, no expiry.
+                // The NX and XX branches below test `redis.kv_N` alone, which
+                // cannot see a list or a set holding the key. Settle that here,
+                // where the whole key directory is in reach: `NX` declines, and
+                // `XX` — whose condition the collection satisfies — replaces it
+                // and writes unconditionally.
+                let (nx, xx) = {
+                    let held = (*nx || *xx)
+                        .then(|| Self::sql_key_kinds(client, db, &[key.as_slice()]))
+                        .and_then(|k| k.first().map(|(_, kind)| *kind))
+                        .filter(|k| *k != crate::mem::KeyKind::String);
+                    match held {
+                        Some(_) if *nx => return Response::Null,
+                        Some(_) => {
+                            Self::sql_drop_key(client, db, key);
+                            (false, false)
+                        }
+                        None => (*nx, *xx),
+                    }
+                };
+                let (nx, xx) = (&nx, &xx);
+
                 let new_expires =
                     "CASE WHEN $3::bigint IS NULL THEN NULL \
                      ELSE now() + ($3::bigint * interval '1 millisecond') END";
@@ -1945,8 +2756,16 @@ impl Command {
                 } else {
                     (String::new(), "NULL AS old_value,".to_string())
                 };
+                // An unconditional write replaces whatever held the key. The
+                // conditional forms have already settled that above, and `GET`
+                // demands a string, so neither needs the clearing CTEs.
+                let clear = if *nx || *xx || *get {
+                    String::new()
+                } else {
+                    sql::clear_for_string(db as usize)
+                };
                 let sql = format!(
-                    "WITH {old_cte}{write_cte} \
+                    "WITH {clear}{old_cte}{write_cte} \
                      SELECT {old_select} \
                             EXISTS (SELECT 1 FROM wrote) AS wrote"
                 );
@@ -1978,52 +2797,48 @@ impl Command {
                             Response::Ok
                         }
                     }
-                    Err(e) => {
-                        eprintln!("pg_redis: SET error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("SET", e),
                 }
             }
 
             Command::SetEx { key, value, ex_secs } => {
+                let clear = sql::clear_for_string(db as usize);
                 let sql = format!(
-                    "INSERT INTO redis.kv_{db} (key, value, expires_at) \
-                     VALUES ($1, $2, now() + ($3::bigint * interval '1 second')) \
-                     ON CONFLICT (key) DO UPDATE \
-                     SET value = EXCLUDED.value, expires_at = EXCLUDED.expires_at"
+                    "WITH {clear}w AS ( \
+                         INSERT INTO redis.kv_{db} (key, value, expires_at) \
+                         VALUES ($1, $2, now() + ($3::bigint * interval '1 second')) \
+                         ON CONFLICT (key) DO UPDATE \
+                         SET value = EXCLUDED.value, expires_at = EXCLUDED.expires_at) \
+                     SELECT 1"
                 );
                 let args: &[DatumWithOid] =
                     &[key.as_slice().into(), value.as_slice().into(), (*ex_secs).into()];
                 match client.update(&sql, None, args) {
                     Ok(_) => Response::Ok,
-                    Err(e) => {
-                        eprintln!("pg_redis: SETEX error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("SETEX", e),
                 }
             }
 
             Command::PSetEx { key, value, ex_ms } => {
+                let clear = sql::clear_for_string(db as usize);
                 let sql = format!(
-                    "INSERT INTO redis.kv_{db} (key, value, expires_at) \
-                     VALUES ($1, $2, now() + ($3::bigint * interval '1 millisecond')) \
-                     ON CONFLICT (key) DO UPDATE \
-                     SET value = EXCLUDED.value, expires_at = EXCLUDED.expires_at"
+                    "WITH {clear}w AS ( \
+                         INSERT INTO redis.kv_{db} (key, value, expires_at) \
+                         VALUES ($1, $2, now() + ($3::bigint * interval '1 millisecond')) \
+                         ON CONFLICT (key) DO UPDATE \
+                         SET value = EXCLUDED.value, expires_at = EXCLUDED.expires_at) \
+                     SELECT 1"
                 );
                 let args: &[DatumWithOid] =
                     &[key.as_slice().into(), value.as_slice().into(), (*ex_ms).into()];
                 match client.update(&sql, None, args) {
                     Ok(_) => Response::Ok,
-                    Err(e) => {
-                        eprintln!("pg_redis: PSETEX error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("PSETEX", e),
                 }
             }
 
             Command::MGet { keys } => {
-                let keys_vec: Vec<Option<Vec<u8>>> =
-                    keys.iter().map(|k| Some(k.clone())).collect();
+                let keys_vec = key_array(keys);
                 match client.select(&sql::MGET[db as usize], None, &[keys_vec.into()]) {
                     Ok(tbl) => {
                         let mut map = std::collections::HashMap::new();
@@ -2040,30 +2855,36 @@ impl Command {
                             .collect();
                         Response::Array(result)
                     }
-                    Err(e) => {
-                        eprintln!("pg_redis: MGET error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("MGET", e),
                 }
             }
 
             Command::MSet { pairs } => {
+                // As `SET`, for every key at once.
+                let clear = ["hash", "list", "set", "zset", "expiry"]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        format!("clr{i} AS (DELETE FROM redis.{t}_{db} WHERE key = ANY($1::bytea[]))")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 let sql = format!(
-                    "INSERT INTO redis.kv_{db} (key, value, expires_at) \
-                     SELECT unnest($1::bytea[]), unnest($2::bytea[]), NULL \
-                     ON CONFLICT (key) DO UPDATE \
-                     SET value = EXCLUDED.value, expires_at = EXCLUDED.expires_at"
+                    "WITH {clear}, w AS ( \
+                         INSERT INTO redis.kv_{db} (key, value, expires_at) \
+                         SELECT unnest($1::bytea[]), unnest($2::bytea[]), NULL \
+                         ON CONFLICT (key) DO UPDATE \
+                         SET value = EXCLUDED.value, expires_at = EXCLUDED.expires_at) \
+                     SELECT 1"
                 );
+                let deduped = dedup_last(pairs, |(k, _)| k.as_slice());
                 let keys: Vec<Option<Vec<u8>>> =
-                    pairs.iter().map(|(k, _)| Some(k.clone())).collect();
+                    deduped.iter().map(|(k, _)| Some(k.clone())).collect();
                 let vals: Vec<Option<Vec<u8>>> =
-                    pairs.iter().map(|(_, v)| Some(v.clone())).collect();
+                    deduped.iter().map(|(_, v)| Some(v.clone())).collect();
                 match client.update(&sql, None, &[keys.into(), vals.into()]) {
                     Ok(_) => Response::Ok,
-                    Err(e) => {
-                        eprintln!("pg_redis: MSET error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("MSET", e),
                 }
             }
 
@@ -2082,67 +2903,40 @@ impl Command {
                          SELECT key FROM d5 \
                      ) u"
                 );
-                let keys_vec: Vec<Option<Vec<u8>>> =
-                    keys.iter().map(|k| Some(k.clone())).collect();
-                match client.update(&sql, None, &[keys_vec.into()]) {
-                    Ok(tbl) => match tbl.first().get::<i64>(1) {
-                        Ok(Some(n)) => Response::Integer(n),
-                        _ => Response::Integer(0),
-                    },
-                    Err(e) => {
-                        eprintln!("pg_redis: DEL error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
-                }
+                let keys_vec = key_array(keys);
+                integer_query(client, Spi::Writes, "DEL", &sql, &[keys_vec.into()], 0)
             }
 
             Command::Exists { keys } => {
+                // Once per argument, duplicates included: `EXISTS k k` is 2 in
+                // Redis when k is there.
                 let sql = format!(
-                    "SELECT count(DISTINCT key)::bigint FROM ( \
-                         SELECT key FROM redis.kv_{db} \
-                         WHERE key = ANY($1::bytea[]) \
-                           AND (expires_at IS NULL OR expires_at > now()) \
-                         UNION ALL \
-                         SELECT key FROM redis.hash_{db} WHERE key = ANY($1::bytea[]) \
-                         UNION ALL \
-                         SELECT key FROM redis.list_{db} WHERE key = ANY($1::bytea[]) \
-                         UNION ALL \
-                         SELECT key FROM redis.set_{db}  WHERE key = ANY($1::bytea[]) \
-                         UNION ALL \
-                         SELECT key FROM redis.zset_{db} WHERE key = ANY($1::bytea[]) \
-                     ) u"
+                    "SELECT count(*)::bigint FROM unnest($1::bytea[]) AS a(key) \
+                     WHERE EXISTS (SELECT 1 FROM redis.kv_{db} t WHERE t.key = a.key \
+                                     AND (t.expires_at IS NULL OR t.expires_at > now())) \
+                        OR (NOT EXISTS (SELECT 1 FROM redis.expiry_{db} e \
+                                          WHERE e.key = a.key AND e.expires_at <= now()) \
+                            AND (EXISTS (SELECT 1 FROM redis.hash_{db} t WHERE t.key = a.key) \
+                              OR EXISTS (SELECT 1 FROM redis.list_{db} t WHERE t.key = a.key) \
+                              OR EXISTS (SELECT 1 FROM redis.set_{db}  t WHERE t.key = a.key) \
+                              OR EXISTS (SELECT 1 FROM redis.zset_{db} t WHERE t.key = a.key)))"
                 );
-                let keys_vec: Vec<Option<Vec<u8>>> =
-                    keys.iter().map(|k| Some(k.clone())).collect();
-                match client.select(&sql, None, &[keys_vec.into()]) {
-                    Ok(tbl) => match tbl.first().get::<i64>(1) {
-                        Ok(Some(n)) => Response::Integer(n),
-                        _ => Response::Integer(0),
-                    },
-                    Err(e) => {
-                        eprintln!("pg_redis: EXISTS error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
-                }
+                let keys_vec = key_array(keys);
+                integer_query(client, Spi::Reads, "EXISTS", &sql, &[keys_vec.into()], 0)
             }
 
             Command::Expire { key, secs } => update_expiry(
                 client,
-                &format!(
-                    "UPDATE redis.kv_{db} \
-                     SET expires_at = now() + ($2::bigint * interval '1 second') \
-                     WHERE key = $1"
-                ),
+                &sql::set_expiry(db as usize, "now() + ($2::bigint * interval '1 second')"),
                 key,
                 *secs,
             ),
 
             Command::PExpire { key, ms } => update_expiry(
                 client,
-                &format!(
-                    "UPDATE redis.kv_{db} \
-                     SET expires_at = now() + ($2::bigint * interval '1 millisecond') \
-                     WHERE key = $1"
+                &sql::set_expiry(
+                    db as usize,
+                    "now() + ($2::bigint * interval '1 millisecond')",
                 ),
                 key,
                 *ms,
@@ -2150,26 +2944,17 @@ impl Command {
 
             Command::ExpireAt { key, unix_secs } => update_expiry(
                 client,
-                &format!(
-                    "UPDATE redis.kv_{db} \
-                     SET expires_at = to_timestamp($2::bigint) WHERE key = $1"
-                ),
+                &sql::set_expiry(db as usize, "to_timestamp($2::bigint)"),
                 key,
                 *unix_secs,
             ),
 
             Command::PExpireAt { key, unix_ms } => {
-                let sql = format!(
-                    "UPDATE redis.kv_{db} \
-                     SET expires_at = to_timestamp($2::float8 / 1000.0) WHERE key = $1"
-                );
+                let sql = sql::set_expiry(db as usize, "to_timestamp($2::float8 / 1000.0)");
                 let ms_f = *unix_ms as f64;
                 match client.update(&sql, None, &[key.as_slice().into(), ms_f.into()]) {
                     Ok(tbl) => Response::Integer(if !tbl.is_empty() { 1 } else { 0 }),
-                    Err(e) => {
-                        eprintln!("pg_redis: PEXPIREAT error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("PEXPIREAT", e),
                 }
             }
 
@@ -2190,10 +2975,7 @@ impl Command {
             Command::Persist { key } => {
                 match client.update(&sql::PERSIST[db as usize], None, &[key.as_slice().into()]) {
                     Ok(tbl) => Response::Integer(if !tbl.is_empty() { 1 } else { 0 }),
-                    Err(e) => {
-                        eprintln!("pg_redis: PERSIST error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("PERSIST", e),
                 }
             }
 
@@ -2216,7 +2998,7 @@ impl Command {
                         _ => Response::Error("ERR value is not an integer or out of range".to_string()),
                     },
                     Err(e) => {
-                        eprintln!("pg_redis: INCR error: {}", e);
+                        pgrx::warning!("pg_redis: INCR failed: {e}");
                         Response::Error("ERR value is not an integer or out of range".to_string())
                     }
                 }
@@ -2229,7 +3011,7 @@ impl Command {
                         _ => Response::Error("ERR value is not an integer or out of range".to_string()),
                     },
                     Err(e) => {
-                        eprintln!("pg_redis: DECR error: {}", e);
+                        pgrx::warning!("pg_redis: DECR failed: {e}");
                         Response::Error("ERR value is not an integer or out of range".to_string())
                     }
                 }
@@ -2242,7 +3024,7 @@ impl Command {
                         _ => Response::Error("ERR value is not an integer or out of range".to_string()),
                     },
                     Err(e) => {
-                        eprintln!("pg_redis: INCRBY error: {}", e);
+                        pgrx::warning!("pg_redis: INCRBY failed: {e}");
                         Response::Error("ERR value is not an integer or out of range".to_string())
                     }
                 }
@@ -2255,7 +3037,7 @@ impl Command {
                         _ => Response::Error("ERR value is not an integer or out of range".to_string()),
                     },
                     Err(e) => {
-                        eprintln!("pg_redis: DECRBY error: {}", e);
+                        pgrx::warning!("pg_redis: DECRBY failed: {e}");
                         Response::Error("ERR value is not an integer or out of range".to_string())
                     }
                 }
@@ -2264,11 +3046,16 @@ impl Command {
             Command::IncrByFloat { key, delta } => {
                 match client.update(&sql::INCRBYFLOAT[db as usize], None, &[key.as_slice().into(), (*delta).into(), (*delta).into()]) {
                     Ok(tbl) => match tbl.first().get::<Vec<u8>>(1) {
-                        Ok(Some(v)) => Response::BulkString(v),
+                        // An error rolls the write back, so a result that is
+                        // not a number is refused rather than stored.
+                        Ok(Some(v)) if is_finite_number(&v) => Response::BulkString(v),
+                        Ok(Some(_)) => Response::Error(
+                            "ERR increment would produce NaN or Infinity".to_string(),
+                        ),
                         _ => Response::Error("ERR value is not a valid float".to_string()),
                     },
                     Err(e) => {
-                        eprintln!("pg_redis: INCRBYFLOAT error: {}", e);
+                        pgrx::warning!("pg_redis: INCRBYFLOAT failed: {e}");
                         Response::Error("ERR value is not a valid float".to_string())
                     }
                 }
@@ -2286,24 +3073,12 @@ impl Command {
                         Ok(Some(n)) => Response::Integer(n),
                         _ => Response::Integer(value.len() as i64),
                     },
-                    Err(e) => {
-                        eprintln!("pg_redis: APPEND error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("APPEND", e),
                 }
             }
 
             Command::Strlen { key } => {
-                match client.select(&sql::STRLEN[db as usize], None, &[key.as_slice().into()]) {
-                    Ok(tbl) => match tbl.first().get::<i64>(1) {
-                        Ok(Some(n)) => Response::Integer(n),
-                        _ => Response::Integer(0),
-                    },
-                    Err(e) => {
-                        eprintln!("pg_redis: STRLEN error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
-                }
+                integer_query(client, Spi::Reads, "STRLEN", &sql::STRLEN[db as usize], &[key.as_slice().into()], 0)
             }
 
             Command::GetDel { key } => {
@@ -2312,17 +3087,16 @@ impl Command {
                         Ok(Some(v)) => Response::BulkString(v),
                         _ => Response::Null,
                     },
-                    Err(e) => {
-                        eprintln!("pg_redis: GETDEL error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("GETDEL", e),
                 }
             }
 
             Command::GetSet { key, value } => {
+                // The expiry goes with the value it replaces, as SET does.
                 let sql = format!(
-                    "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, $2) \
-                     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value \
+                    "INSERT INTO redis.kv_{db} (key, value, expires_at) VALUES ($1, $2, NULL) \
+                     ON CONFLICT (key) DO UPDATE \
+                     SET value = EXCLUDED.value, expires_at = NULL \
                      RETURNING (SELECT value FROM redis.kv_{db} WHERE key = $1)"
                 );
                 match client.update(&sql, None, &[key.as_slice().into(), value.as_slice().into()]) {
@@ -2330,41 +3104,31 @@ impl Command {
                         Ok(Some(v)) => Response::BulkString(v),
                         _ => Response::Null,
                     },
-                    Err(e) => {
-                        eprintln!("pg_redis: GETSET error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("GETSET", e),
                 }
             }
 
             Command::SetNx { key, value } => {
+                // "The key does not exist" is a question about every table, not
+                // just the KV one: `SETNX` over a list is 0, not a second value.
+                if !Self::sql_key_kinds(client, db, &[key.as_slice()]).is_empty() {
+                    return Response::Integer(0);
+                }
                 let sql = format!(
                     "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, $2) \
                      ON CONFLICT (key) DO NOTHING"
                 );
                 match client.update(&sql, None, &[key.as_slice().into(), value.as_slice().into()]) {
                     Ok(tbl) => Response::Integer(if !tbl.is_empty() { 1 } else { 0 }),
-                    Err(e) => {
-                        eprintln!("pg_redis: SETNX error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("SETNX", e),
                 }
             }
 
             Command::MSetNx { pairs } => {
                 let keys: Vec<Option<Vec<u8>>> =
                     pairs.iter().map(|(k, _)| Some(k.clone())).collect();
-                let check_sql = format!(
-                    "SELECT count(*) FROM redis.kv_{db} \
-                     WHERE key = ANY($1::bytea[]) \
-                     AND (expires_at IS NULL OR expires_at > now())"
-                );
-                let existing = client.select(&check_sql, None, &[keys.clone().into()]);
-                let any_exist = match existing {
-                    Ok(tbl) => matches!(tbl.first().get::<i64>(1), Ok(Some(n)) if n > 0),
-                    Err(_) => false,
-                };
-                if any_exist {
+                let named: Vec<&[u8]> = pairs.iter().map(|(k, _)| k.as_slice()).collect();
+                if !Self::sql_key_kinds(client, db, &named).is_empty() {
                     return Response::Integer(0);
                 }
                 let vals: Vec<Option<Vec<u8>>> =
@@ -2376,10 +3140,7 @@ impl Command {
                 );
                 match client.update(&insert_sql, None, &[keys.into(), vals.into()]) {
                     Ok(_) => Response::Integer(1),
-                    Err(e) => {
-                        eprintln!("pg_redis: MSETNX error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("MSETNX", e),
                 }
             }
 
@@ -2389,10 +3150,15 @@ impl Command {
                          SELECT 1 FROM redis.kv_{db} \
                          WHERE key = $1 AND (expires_at IS NULL OR expires_at > now()) \
                      ) \
-                     UNION ALL SELECT 'list'   WHERE EXISTS (SELECT 1 FROM redis.list_{db} WHERE key = $1) \
-                     UNION ALL SELECT 'set'    WHERE EXISTS (SELECT 1 FROM redis.set_{db}  WHERE key = $1) \
-                     UNION ALL SELECT 'hash'   WHERE EXISTS (SELECT 1 FROM redis.hash_{db} WHERE key = $1) \
-                     UNION ALL SELECT 'zset'   WHERE EXISTS (SELECT 1 FROM redis.zset_{db} WHERE key = $1) \
+                     UNION ALL SELECT v.t FROM (VALUES ('list'), ('set'), ('hash'), ('zset')) v(t) \
+                      WHERE NOT EXISTS (SELECT 1 FROM redis.expiry_{db} \
+                                         WHERE key = $1 AND expires_at <= now()) \
+                        AND CASE v.t \
+                              WHEN 'list' THEN EXISTS (SELECT 1 FROM redis.list_{db} WHERE key = $1) \
+                              WHEN 'set'  THEN EXISTS (SELECT 1 FROM redis.set_{db}  WHERE key = $1) \
+                              WHEN 'hash' THEN EXISTS (SELECT 1 FROM redis.hash_{db} WHERE key = $1) \
+                              ELSE             EXISTS (SELECT 1 FROM redis.zset_{db} WHERE key = $1) \
+                            END \
                      LIMIT 1"
                 );
                 // The column is a SQL text literal ('string', 'list', ...), not
@@ -2404,10 +3170,7 @@ impl Command {
                         Ok(Some(t)) => Response::SimpleString(t),
                         _ => Response::SimpleString("none".to_string()),
                     },
-                    Err(e) => {
-                        eprintln!("pg_redis: TYPE error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("TYPE", e),
                 }
             }
 
@@ -2421,24 +3184,351 @@ impl Command {
                          SELECT key FROM redis.kv_{db} \
                          WHERE (expires_at IS NULL OR expires_at > now()) \
                          UNION ALL \
-                         SELECT DISTINCT key FROM redis.hash_{db} \
-                         UNION ALL \
-                         SELECT DISTINCT key FROM redis.list_{db} \
-                         UNION ALL \
-                         SELECT DISTINCT key FROM redis.set_{db} \
-                         UNION ALL \
-                         SELECT DISTINCT key FROM redis.zset_{db} \
+                         SELECT c.key FROM ( \
+                             SELECT DISTINCT key FROM redis.hash_{db} \
+                             UNION SELECT DISTINCT key FROM redis.list_{db} \
+                             UNION SELECT DISTINCT key FROM redis.set_{db} \
+                             UNION SELECT DISTINCT key FROM redis.zset_{db} \
+                         ) c \
+                          WHERE NOT EXISTS (SELECT 1 FROM redis.expiry_{db} e \
+                                             WHERE e.key = c.key AND e.expires_at <= now()) \
                      ) u"
                 );
-                match client.select(&sql, None, &[]) {
-                    Ok(tbl) => match tbl.first().get::<i64>(1) {
-                        Ok(Some(n)) => Response::Integer(n),
-                        _ => Response::Integer(0),
-                    },
-                    Err(e) => {
-                        eprintln!("pg_redis: DBSIZE error: {}", e);
-                        Response::Error("internal error".to_string())
+                integer_query(client, Spi::Reads, "DBSIZE", &sql, &[], 0)
+            }
+
+            // Redis pads the gap with NUL bytes, so an offset past the end is
+            // not an error but a hole. `overlay` cannot do that on its own.
+            Command::SetRange { key, offset, value } => {
+                if value.is_empty() {
+                    // Redis writes nothing and reports the length as it stands.
+                    return match client.select(&sql::STRLEN[db as usize], None, &[key.as_slice().into()]) {
+                        Ok(tbl) => Response::Integer(
+                            tbl.first().get::<i64>(1).ok().flatten().unwrap_or(0),
+                        ),
+                        Err(e) => spi_failed("SETRANGE", e),
+                    };
+                }
+                // `chr(0)` is not a legal text character in PostgreSQL, so the
+                // gap is built as hex rather than repeated text.
+                let sql = format!(
+                    "WITH old AS (SELECT value FROM redis.kv_{db} \
+                                   WHERE key = $1 \
+                                     AND (expires_at IS NULL OR expires_at > now())), \
+                          padded AS ( \
+                              SELECT coalesce((SELECT value FROM old), '') \
+                                     || decode(repeat('00', GREATEST(0, $2::int \
+                                          - coalesce(length((SELECT value FROM old)), 0))), \
+                                        'hex') AS v) \
+                     INSERT INTO redis.kv_{db} (key, value) \
+                     SELECT $1, \
+                            substring(v from 1 for $2::int) || $3 \
+                            || coalesce(substring(v from $2::int + length($3) + 1), '') \
+                     FROM padded \
+                     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value \
+                     RETURNING length(value)::bigint"
+                );
+                let args: &[DatumWithOid] =
+                    &[key.as_slice().into(), (*offset as i32).into(), value.as_slice().into()];
+                match client.update(&sql, None, args) {
+                    Ok(tbl) => {
+                        Response::Integer(tbl.first().get::<i64>(1).ok().flatten().unwrap_or(0))
                     }
+                    Err(e) => spi_failed("SETRANGE", e),
+                }
+            }
+
+            Command::GetRange { key, start, end } => {
+                let sql = format!(
+                    "SELECT substring(value from $2::int for $3::int) \
+                     FROM redis.kv_{db} \
+                     WHERE key = $1 AND (expires_at IS NULL OR expires_at > now())"
+                );
+                match client.select(&sql::GET[db as usize], None, &[key.as_slice().into()]) {
+                    Ok(tbl) => {
+                        let _ = sql;
+                        let v: Vec<u8> = tbl.first().get::<Vec<u8>>(1).ok().flatten().unwrap_or_default();
+                        Response::BulkString(byte_range(&v, *start, *end))
+                    }
+                    Err(e) => spi_failed("GETRANGE", e),
+                }
+            }
+
+            Command::HIncrByFloat { key, field, delta } => {
+                let sql = format!(
+                    "SELECT encode(value, 'escape') FROM redis.hash_{db} \
+                     WHERE key = $1 AND field = $2"
+                );
+                let cur = match client.select(&sql, None, &[key.as_slice().into(), field.as_slice().into()]) {
+                    Ok(tbl) => tbl.first().get::<String>(1).ok().flatten(),
+                    Err(e) => return spi_failed("HINCRBYFLOAT", e),
+                };
+                let base = match cur {
+                    None => 0.0,
+                    Some(text) => match text.trim().parse::<f64>() {
+                        Ok(v) if v.is_finite() => v,
+                        _ => return Response::Error(format!("ERR {NOT_A_FLOAT}")),
+                    },
+                };
+                let sum = base + delta;
+                if !sum.is_finite() {
+                    return Response::Error(
+                        "ERR increment would produce NaN or Infinity".to_string(),
+                    );
+                }
+                let text = crate::mem::format_float(sum);
+                let write = format!(
+                    "INSERT INTO redis.hash_{db} (key, field, value) \
+                     VALUES ($1, $2, $3) \
+                     ON CONFLICT (key, field) DO UPDATE SET value = EXCLUDED.value"
+                );
+                let args: &[DatumWithOid] =
+                    &[key.as_slice().into(), field.as_slice().into(), text.as_bytes().into()];
+                match client.update(&write, None, args) {
+                    Ok(_) => Response::BulkString(text.into_bytes()),
+                    Err(e) => spi_failed("HINCRBYFLOAT", e),
+                }
+            }
+
+            Command::RenameNx { key, newkey } => {
+                if !Self::sql_key_kinds(client, db, &[newkey.as_slice()]).is_empty() {
+                    // The source still has to exist, or Redis says so first.
+                    return match Self::sql_key_kinds(client, db, &[key.as_slice()]).is_empty() {
+                        true => Response::Error("ERR no such key".to_string()),
+                        false => Response::Integer(0),
+                    };
+                }
+                match Self::rename_to(client, db, key, newkey) {
+                    Response::Ok => Response::Integer(1),
+                    other => other,
+                }
+            }
+
+            Command::GetEx { key, expiry } => {
+                let value = match client.select(&sql::GET[db as usize], None, &[key.as_slice().into()]) {
+                    Ok(tbl) => tbl.first().get::<Vec<u8>>(1).ok().flatten(),
+                    Err(e) => return spi_failed("GETEX", e),
+                };
+                let Some(value) = value else {
+                    return Response::Null;
+                };
+                match expiry {
+                    GetExExpiry::Keep => {}
+                    GetExExpiry::Clear => {
+                        let _ = client.update(&sql::PERSIST[db as usize], None, &[key.as_slice().into()]);
+                    }
+                    GetExExpiry::At(us) => {
+                        let sql = sql::set_expiry(db as usize, "to_timestamp($2::float8 / 1000000.0)");
+                        let _ = client.update(&sql, None, &[key.as_slice().into(), (*us as f64).into()]);
+                    }
+                }
+                Response::BulkString(value)
+            }
+
+            // Routed here by `run_dispatch_batch` whatever the storage mode:
+            // the destination may be on the other half, which only this path
+            // can reach.
+            Command::Copy {
+                src,
+                dst,
+                db: dst_db,
+                replace,
+            } => {
+                let dst_db = dst_db.unwrap_or(db);
+                if src == dst && dst_db == db {
+                    return Response::Error(
+                        "ERR source and destination objects are the same".to_string(),
+                    );
+                }
+                let exists = match uses_shared_memory(dst_db) {
+                    true => unsafe { crate::mem::mem_key_kind(dst_db as usize, dst) }.is_some(),
+                    false => !Self::sql_key_kinds(client, dst_db, &[dst.as_slice()]).is_empty(),
+                };
+                if exists && !*replace {
+                    return Response::Integer(0);
+                }
+                let Some((dump, expires_at)) = Self::dump_key(client, db, src) else {
+                    return Response::Integer(0);
+                };
+                if exists {
+                    match uses_shared_memory(dst_db) {
+                        true => unsafe {
+                            if let Some(kind) = crate::mem::mem_key_kind(dst_db as usize, dst) {
+                                crate::mem::mem_drop_key_of(dst_db as usize, kind, dst);
+                            }
+                        },
+                        false => Self::sql_drop_key(client, dst_db, dst),
+                    }
+                }
+                Self::restore_key(client, dst_db, dst, &dump);
+                if expires_at != 0 && uses_shared_memory(dst_db) {
+                    unsafe { crate::mem::mem_set_expiry(dst_db as usize, dst, expires_at) };
+                }
+                Response::Integer(1)
+            }
+
+            Command::GetBit { key, offset } => {
+                match client.select(&sql::GET[db as usize], None, &[key.as_slice().into()]) {
+                    Ok(tbl) => {
+                        let v: Vec<u8> = tbl.first().get(1).ok().flatten().unwrap_or_default();
+                        Response::Integer(bit_at(&v, *offset) as i64)
+                    }
+                    Err(e) => spi_failed("GETBIT", e),
+                }
+            }
+
+            Command::BitCount { key, range } => {
+                match client.select(&sql::GET[db as usize], None, &[key.as_slice().into()]) {
+                    Ok(tbl) => {
+                        let v: Vec<u8> = tbl.first().get(1).ok().flatten().unwrap_or_default();
+                        Response::Integer(count_bits(&v, *range))
+                    }
+                    Err(e) => spi_failed("BITCOUNT", e),
+                }
+            }
+
+            // Read, edit and write back. Both statements are in the batch's
+            // transaction, so nothing else sees the value between them.
+            Command::SetBit { key, offset, value } => {
+                let mut v: Vec<u8> =
+                    match client.select(&sql::GET[db as usize], None, &[key.as_slice().into()]) {
+                        Ok(tbl) => tbl.first().get(1).ok().flatten().unwrap_or_default(),
+                        Err(e) => return spi_failed("SETBIT", e),
+                    };
+                let was = set_bit_at(&mut v, *offset, *value);
+                let write = format!(
+                    "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, $2) \
+                     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+                );
+                match client.update(&write, None, &[key.as_slice().into(), v.into()]) {
+                    Ok(_) => Response::Integer(was as i64),
+                    Err(e) => spi_failed("SETBIT", e),
+                }
+            }
+
+            Command::HRandField {
+                key,
+                count,
+                withvalues,
+            } => {
+                let sql = format!(
+                    "SELECT field, value FROM redis.hash_{db} WHERE key = $1 ORDER BY field"
+                );
+                match client.select(&sql, None, &[key.as_slice().into()]) {
+                    Ok(tbl) => {
+                        let pairs: Vec<(Vec<u8>, Vec<u8>)> = tbl
+                            .filter_map(|row| {
+                                match (row.get::<Vec<u8>>(1), row.get::<Vec<u8>>(2)) {
+                                    (Ok(Some(f)), Ok(Some(v))) => Some((f, v)),
+                                    _ => None,
+                                }
+                            })
+                            .collect();
+                        random_fields(&pairs, *count, *withvalues)
+                    }
+                    Err(e) => spi_failed("HRANDFIELD", e),
+                }
+            }
+
+            Command::SInterCard { keys, limit } => {
+                let sql = format!(
+                    "SELECT count(*)::bigint FROM ( \
+                         SELECT member FROM redis.set_{db} WHERE key = $1 \
+                          AND member IN (SELECT member FROM redis.set_{db} \
+                                          WHERE key = ANY($2::bytea[]) \
+                                       GROUP BY member \
+                                         HAVING count(DISTINCT key) = $3::bigint) \
+                          LIMIT $4::bigint \
+                     ) c"
+                );
+                let rest = key_array(keys);
+                let want = keys.len() as i64;
+                let cap = limit.unwrap_or(i64::MAX);
+                let args: &[DatumWithOid] = &[
+                    keys[0].as_slice().into(),
+                    rest.into(),
+                    want.into(),
+                    cap.into(),
+                ];
+                match client.select(&sql, None, args) {
+                    Ok(tbl) => Response::Integer(tbl.first().get(1).ok().flatten().unwrap_or(0)),
+                    Err(e) => spi_failed("SINTERCARD", e),
+                }
+            }
+
+            Command::ObjectEncoding { key } => {
+                // As the shared-memory arm: nil, not an error.
+                let Some(kind) = Self::sql_key_kinds(client, db, &[key.as_slice()])
+                    .first()
+                    .map(|(_, k)| *k)
+                else {
+                    return Response::Null;
+                };
+                let name = match kind {
+                    crate::mem::KeyKind::String => {
+                        match client.select(&sql::GET[db as usize], None, &[key.as_slice().into()]) {
+                            Ok(tbl) => {
+                                let v: Vec<u8> =
+                                    tbl.first().get(1).ok().flatten().unwrap_or_default();
+                                string_encoding(&v)
+                            }
+                            Err(e) => return spi_failed("OBJECT", e),
+                        }
+                    }
+                    other => {
+                        let sql = match other {
+                            crate::mem::KeyKind::List => {
+                                format!("SELECT value FROM redis.list_{db} WHERE key = $1")
+                            }
+                            crate::mem::KeyKind::Set => {
+                                format!("SELECT member FROM redis.set_{db} WHERE key = $1")
+                            }
+                            crate::mem::KeyKind::Zset => {
+                                format!("SELECT member FROM redis.zset_{db} WHERE key = $1")
+                            }
+                            // Fields and values both, which is what Redis measures.
+                            _ => format!(
+                                "SELECT field FROM redis.hash_{db} WHERE key = $1 \
+                                 UNION ALL SELECT value FROM redis.hash_{db} WHERE key = $1"
+                            ),
+                        };
+                        match column_query(
+                            client,
+                            Spi::Reads,
+                            "OBJECT",
+                            &sql,
+                            &[key.as_slice().into()],
+                        ) {
+                            Ok(items) => collection_encoding(other, &items),
+                            Err(e) => return e,
+                        }
+                    }
+                };
+                Response::SimpleString(name.to_string())
+            }
+
+            Command::ObjectOther => Response::Null,
+
+            Command::FlushDb => {
+                match client.update(&sql::flush_dbs(&[db as usize]), None, &[]) {
+                    Ok(_) => Response::Ok,
+                    Err(e) => spi_failed("FLUSHDB", e),
+                }
+            }
+
+            // Every database, the durable half included — Redis's own reach,
+            // and the reason the Redis port should not be exposed past
+            // loopback without a password.
+            Command::FlushAll => {
+                if crate::storage_mode() == crate::StorageMode::Memory {
+                    for db_idx in 0..crate::mem::NUM_MEM_DBS {
+                        unsafe { crate::mem::mem_flush_db(db_idx) };
+                    }
+                }
+                let all: Vec<usize> = (0..NUM_DBS).collect();
+                match client.update(&sql::flush_dbs(&all), None, &[]) {
+                    Ok(_) => Response::Ok,
+                    Err(e) => spi_failed("FLUSHALL", e),
                 }
             }
 
@@ -2457,42 +3547,11 @@ impl Command {
                          SELECT key FROM d5 \
                      ) u"
                 );
-                let keys_vec: Vec<Option<Vec<u8>>> =
-                    keys.iter().map(|k| Some(k.clone())).collect();
-                match client.update(&sql, None, &[keys_vec.into()]) {
-                    Ok(tbl) => match tbl.first().get::<i64>(1) {
-                        Ok(Some(n)) => Response::Integer(n),
-                        _ => Response::Integer(0),
-                    },
-                    Err(e) => {
-                        eprintln!("pg_redis: UNLINK error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
-                }
+                let keys_vec = key_array(keys);
+                integer_query(client, Spi::Writes, "UNLINK", &sql, &[keys_vec.into()], 0)
             }
 
-            Command::Rename { key, newkey } => {
-                let sql = format!(
-                    "WITH r AS ( \
-                         UPDATE redis.kv_{db} SET key = $2 WHERE key = $1 RETURNING 1 \
-                     ) \
-                     SELECT (SELECT count(*) FROM r) > 0 AS renamed"
-                );
-                match client.update(&sql, None, &[key.as_slice().into(), newkey.as_slice().into()]) {
-                    Ok(tbl) => {
-                        let renamed = tbl.first().get::<bool>(1).ok().flatten().unwrap_or(false);
-                        if renamed {
-                            Response::Ok
-                        } else {
-                            Response::Error("ERR no such key".to_string())
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("pg_redis: RENAME error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
-                }
-            }
+            Command::Rename { key, newkey } => Self::rename_to(client, db, key, newkey),
 
             Command::RandomKey => {
                 let sql = format!(
@@ -2500,16 +3559,7 @@ impl Command {
                      WHERE (expires_at IS NULL OR expires_at > now()) \
                      ORDER BY random() LIMIT 1"
                 );
-                match client.select(&sql, None, &[]) {
-                    Ok(tbl) => match tbl.first().get::<Vec<u8>>(1) {
-                        Ok(Some(k)) => Response::BulkString(k),
-                        _ => Response::Null,
-                    },
-                    Err(e) => {
-                        eprintln!("pg_redis: RANDOMKEY error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
-                }
+                bulk_query(client, Spi::Reads, "RANDOMKEY", &sql, &[])
             }
 
             Command::Scan { pattern, .. } => Response::ScanResult {
@@ -2517,38 +3567,35 @@ impl Command {
             },
 
             Command::HGet { key, field } => {
-                match client.select(&sql::HGET[db as usize], None, &[key.as_slice().into(), field.as_slice().into()]) {
-                    Ok(tbl) => match tbl.first().get::<Vec<u8>>(1) {
-                        Ok(Some(v)) => Response::BulkString(v),
-                        _ => Response::Null,
-                    },
-                    Err(e) => {
-                        eprintln!("pg_redis: HGET error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
-                }
+                bulk_query(client, Spi::Reads, "HGET", &sql::HGET[db as usize], &[key.as_slice().into(), field.as_slice().into()])
             }
 
             Command::HSet { key, pairs } => {
+                // `xmax = 0` marks a row this statement inserted rather than
+                // updated, which is the count Redis returns.
                 let sql = format!(
-                    "INSERT INTO redis.hash_{db} (key, field, value) \
-                     SELECT $1, unnest($2::bytea[]), unnest($3::bytea[]) \
-                     ON CONFLICT (key, field) DO UPDATE SET value = EXCLUDED.value"
+                    "WITH ins AS ( \
+                         INSERT INTO redis.hash_{db} (key, field, value) \
+                         SELECT $1, unnest($2::bytea[]), unnest($3::bytea[]) \
+                         ON CONFLICT (key, field) DO UPDATE SET value = EXCLUDED.value \
+                         RETURNING (xmax = 0) AS added \
+                     ) \
+                     SELECT count(*) FILTER (WHERE added)::bigint FROM ins"
                 );
+                let deduped = dedup_last(pairs, |(f, _)| f.as_slice());
                 let fields: Vec<Option<Vec<u8>>> =
-                    pairs.iter().map(|(f, _)| Some(f.clone())).collect();
+                    deduped.iter().map(|(f, _)| Some(f.clone())).collect();
                 let vals: Vec<Option<Vec<u8>>> =
-                    pairs.iter().map(|(_, v)| Some(v.clone())).collect();
+                    deduped.iter().map(|(_, v)| Some(v.clone())).collect();
                 match client.update(
                     &sql,
                     None,
                     &[key.as_slice().into(), fields.into(), vals.into()],
                 ) {
-                    Ok(tbl) => Response::Integer(tbl.len() as i64),
-                    Err(e) => {
-                        eprintln!("pg_redis: HSET error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Ok(tbl) => Response::Integer(
+                        tbl.first().get::<i64>(1).ok().flatten().unwrap_or(0),
+                    ),
+                    Err(e) => spi_failed("HSET", e),
                 }
             }
 
@@ -2561,10 +3608,7 @@ impl Command {
                     fields.iter().map(|f| Some(f.clone())).collect();
                 match client.update(&sql, None, &[key.as_slice().into(), fields_vec.into()]) {
                     Ok(tbl) => Response::Integer(tbl.len() as i64),
-                    Err(e) => {
-                        eprintln!("pg_redis: HDEL error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("HDEL", e),
                 }
             }
 
@@ -2582,10 +3626,7 @@ impl Command {
                         }
                         Response::Array(items)
                     }
-                    Err(e) => {
-                        eprintln!("pg_redis: HGETALL error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("HGETALL", e),
                 }
             }
 
@@ -2612,10 +3653,7 @@ impl Command {
                             .collect();
                         Response::Array(result)
                     }
-                    Err(e) => {
-                        eprintln!("pg_redis: HMGET error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("HMGET", e),
                 }
             }
 
@@ -2635,76 +3673,40 @@ impl Command {
                     &[key.as_slice().into(), fields.into(), vals.into()],
                 ) {
                     Ok(_) => Response::Ok,
-                    Err(e) => {
-                        eprintln!("pg_redis: HMSET error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("HMSET", e),
                 }
             }
 
             Command::HKeys { key } => {
-                match client.select(&sql::HKEYS[db as usize], None, &[key.as_slice().into()]) {
-                    Ok(tbl) => {
-                        let items = tbl
-                            .into_iter()
-                            .filter_map(|row| row.get::<Vec<u8>>(1).ok().flatten())
-                            .map(Some)
-                            .collect();
-                        Response::Array(items)
-                    }
-                    Err(e) => {
-                        eprintln!("pg_redis: HKEYS error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
-                }
+                array_query(client, Spi::Reads, "HKEYS", &sql::HKEYS[db as usize], &[key.as_slice().into()])
             }
 
             Command::HVals { key } => {
-                match client.select(&sql::HVALS[db as usize], None, &[key.as_slice().into()]) {
-                    Ok(tbl) => {
-                        let items = tbl
-                            .into_iter()
-                            .filter_map(|row| row.get::<Vec<u8>>(1).ok().flatten())
-                            .map(Some)
-                            .collect();
-                        Response::Array(items)
-                    }
-                    Err(e) => {
-                        eprintln!("pg_redis: HVALS error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
-                }
+                array_query(client, Spi::Reads, "HVALS", &sql::HVALS[db as usize], &[key.as_slice().into()])
             }
 
             Command::HExists { key, field } => {
                 match client.select(&sql::HEXISTS[db as usize], None, &[key.as_slice().into(), field.as_slice().into()]) {
                     Ok(tbl) => Response::Integer(if !tbl.is_empty() { 1 } else { 0 }),
-                    Err(e) => {
-                        eprintln!("pg_redis: HEXISTS error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("HEXISTS", e),
                 }
             }
 
             Command::HLen { key } => {
-                match client.select(&sql::HLEN[db as usize], None, &[key.as_slice().into()]) {
-                    Ok(tbl) => match tbl.first().get::<i64>(1) {
-                        Ok(Some(n)) => Response::Integer(n),
-                        _ => Response::Integer(0),
-                    },
-                    Err(e) => {
-                        eprintln!("pg_redis: HLEN error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
-                }
+                integer_query(client, Spi::Reads, "HLEN", &sql::HLEN[db as usize], &[key.as_slice().into()], 0)
             }
 
             Command::HIncrBy { key, field, delta } => {
                 let sql = format!(
-                    "INSERT INTO redis.hash_{db} (key, field, value) VALUES ($1, $2, $3::text) \
+                    "INSERT INTO redis.hash_{db} (key, field, value) \
+                     VALUES ($1, $2, convert_to($3::text, 'UTF8')) \
                      ON CONFLICT (key, field) DO UPDATE \
-                     SET value = (CAST(redis.hash_{db}.value AS bigint) + $4)::text \
-                     WHERE redis.hash_{db}.value ~ '^-?[0-9]+$' \
+                     SET value = convert_to( \
+                         (CAST(encode(redis.hash_{db}.value, 'escape') AS bigint) + $4)::text, \
+                         'UTF8') \
+                     WHERE encode(redis.hash_{db}.value, 'escape') ~ '^(0|-?[1-9][0-9]*)$' \
+           AND encode(redis.hash_{db}.value, 'escape')::numeric \
+               BETWEEN -9223372036854775808 AND 9223372036854775807 \
                      RETURNING CAST(encode(value, 'escape') AS bigint)"
                 );
                 match client.update(
@@ -2714,11 +3716,11 @@ impl Command {
                 ) {
                     Ok(tbl) => match tbl.first().get::<i64>(1) {
                         Ok(Some(n)) => Response::Integer(n),
-                        _ => Response::Error("ERR value is not an integer or out of range".to_string()),
+                        _ => Response::Error("ERR hash value is not an integer".to_string()),
                     },
                     Err(e) => {
-                        eprintln!("pg_redis: HINCRBY error: {}", e);
-                        Response::Error("ERR value is not an integer or out of range".to_string())
+                        pgrx::warning!("pg_redis: HINCRBY failed: {e}");
+                        Response::Error("ERR hash value is not an integer".to_string())
                     }
                 }
             }
@@ -2734,10 +3736,7 @@ impl Command {
                     &[key.as_slice().into(), field.as_slice().into(), value.as_slice().into()],
                 ) {
                     Ok(tbl) => Response::Integer(if !tbl.is_empty() { 1 } else { 0 }),
-                    Err(e) => {
-                        eprintln!("pg_redis: HSETNX error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("HSETNX", e),
                 }
             }
 
@@ -2750,16 +3749,7 @@ impl Command {
             Command::RPop { key, count } => list_pop(client, db, key, *count, false),
 
             Command::LLen { key } => {
-                match client.select(&sql::LLEN[db as usize], None, &[key.as_slice().into()]) {
-                    Ok(tbl) => match tbl.first().get::<i64>(1) {
-                        Ok(Some(n)) => Response::Integer(n),
-                        _ => Response::Integer(0),
-                    },
-                    Err(e) => {
-                        eprintln!("pg_redis: LLEN error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
-                }
+                integer_query(client, Spi::Reads, "LLEN", &sql::LLEN[db as usize], &[key.as_slice().into()], 0)
             }
 
             Command::LRange { key, start, stop } => {
@@ -2794,10 +3784,7 @@ impl Command {
                         }
                         Response::Array(out)
                     }
-                    Err(e) => {
-                        eprintln!("pg_redis: LRANGE error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("LRANGE", e),
                 }
             }
 
@@ -2814,19 +3801,10 @@ impl Command {
                        AND (SELECT i FROM idx) >= 0 \
                        AND (SELECT i FROM idx) < (SELECT n FROM cnt) \
                      ORDER BY l.pos ASC \
-                     OFFSET (SELECT i FROM idx) \
+                     OFFSET GREATEST((SELECT i FROM idx), 0) \
                      LIMIT 1"
                 );
-                match client.select(&sql, None, &[key.as_slice().into(), (*index).into()]) {
-                    Ok(tbl) => match tbl.first().get::<Vec<u8>>(1) {
-                        Ok(Some(v)) => Response::BulkString(v),
-                        _ => Response::Null,
-                    },
-                    Err(e) => {
-                        eprintln!("pg_redis: LINDEX error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
-                }
+                bulk_query(client, Spi::Reads, "LINDEX", &sql, &[key.as_slice().into(), (*index).into()])
             }
 
             Command::LSet { key, index, value } => {
@@ -2870,10 +3848,7 @@ impl Command {
                             Response::Ok
                         }
                     }
-                    Err(e) => {
-                        eprintln!("pg_redis: LSET error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("LSET", e),
                 }
             }
 
@@ -2910,10 +3885,7 @@ impl Command {
                         Ok(Some(n)) => Response::Integer(n),
                         _ => Response::Integer(0),
                     },
-                    Err(e) => {
-                        eprintln!("pg_redis: LREM error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("LREM", e),
                 }
             }
 
@@ -2954,10 +3926,7 @@ impl Command {
                         Ok(Some(v)) => Response::BulkString(v),
                         _ => Response::Null,
                     },
-                    Err(e) => {
-                        eprintln!("pg_redis: LMOVE error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("LMOVE", e),
                 }
             }
 
@@ -3003,10 +3972,7 @@ impl Command {
                             Response::IntegerArray(out)
                         }
                     }
-                    Err(e) => {
-                        eprintln!("pg_redis: LPOS error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("LPOS", e),
                 }
             }
 
@@ -3035,10 +4001,7 @@ impl Command {
                     &[key.as_slice().into(), (*start).into(), (*stop).into()],
                 ) {
                     Ok(_) => Response::Ok,
-                    Err(e) => {
-                        eprintln!("pg_redis: LTRIM error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("LTRIM", e),
                 }
             }
 
@@ -3053,16 +4016,7 @@ impl Command {
                 );
                 let members_vec: Vec<Option<Vec<u8>>> =
                     members.iter().map(|m| Some(m.clone())).collect();
-                match client.update(&sql, None, &[key.as_slice().into(), members_vec.into()]) {
-                    Ok(tbl) => match tbl.first().get::<i64>(1) {
-                        Ok(Some(n)) => Response::Integer(n),
-                        _ => Response::Integer(0),
-                    },
-                    Err(e) => {
-                        eprintln!("pg_redis: SADD error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
-                }
+                integer_query(client, Spi::Writes, "SADD", &sql, &[key.as_slice().into(), members_vec.into()], 0)
             }
 
             Command::SRem { key, members } => {
@@ -3076,55 +4030,21 @@ impl Command {
                 );
                 let members_vec: Vec<Option<Vec<u8>>> =
                     members.iter().map(|m| Some(m.clone())).collect();
-                match client.update(&sql, None, &[key.as_slice().into(), members_vec.into()]) {
-                    Ok(tbl) => match tbl.first().get::<i64>(1) {
-                        Ok(Some(n)) => Response::Integer(n),
-                        _ => Response::Integer(0),
-                    },
-                    Err(e) => {
-                        eprintln!("pg_redis: SREM error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
-                }
+                integer_query(client, Spi::Writes, "SREM", &sql, &[key.as_slice().into(), members_vec.into()], 0)
             }
 
             Command::SMembers { key } => {
-                match client.select(&sql::SMEMBERS[db as usize], None, &[key.as_slice().into()]) {
-                    Ok(tbl) => {
-                        let items = tbl
-                            .into_iter()
-                            .filter_map(|row| row.get::<Vec<u8>>(1).ok().flatten())
-                            .map(Some)
-                            .collect();
-                        Response::Array(items)
-                    }
-                    Err(e) => {
-                        eprintln!("pg_redis: SMEMBERS error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
-                }
+                array_query(client, Spi::Reads, "SMEMBERS", &sql::SMEMBERS[db as usize], &[key.as_slice().into()])
             }
 
             Command::SCard { key } => {
-                match client.select(&sql::SCARD[db as usize], None, &[key.as_slice().into()]) {
-                    Ok(tbl) => match tbl.first().get::<i64>(1) {
-                        Ok(Some(n)) => Response::Integer(n),
-                        _ => Response::Integer(0),
-                    },
-                    Err(e) => {
-                        eprintln!("pg_redis: SCARD error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
-                }
+                integer_query(client, Spi::Reads, "SCARD", &sql::SCARD[db as usize], &[key.as_slice().into()], 0)
             }
 
             Command::SIsMember { key, member } => {
                 match client.select(&sql::SISMEMBER[db as usize], None, &[key.as_slice().into(), member.as_slice().into()]) {
                     Ok(tbl) => Response::Integer(if !tbl.is_empty() { 1 } else { 0 }),
-                    Err(e) => {
-                        eprintln!("pg_redis: SISMEMBER error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("SISMEMBER", e),
                 }
             }
 
@@ -3147,10 +4067,7 @@ impl Command {
                         }
                         Response::IntegerArray(out)
                     }
-                    Err(e) => {
-                        eprintln!("pg_redis: SMISMEMBER error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("SMISMEMBER", e),
                 }
             }
 
@@ -3172,12 +4089,14 @@ impl Command {
                      WHERE t.ctid = picked.ctid \
                      RETURNING t.member"
                 );
-                match client.update(&sql, None, &[key.as_slice().into(), limit.into()]) {
-                    Ok(tbl) => {
-                        let members: Vec<Vec<u8>> = tbl
-                            .into_iter()
-                            .filter_map(|row| row.get::<Vec<u8>>(1).ok().flatten())
-                            .collect();
+                match column_query(
+                    client,
+                    Spi::Writes,
+                    "SPOP",
+                    &sql,
+                    &[key.as_slice().into(), limit.into()],
+                ) {
+                    Ok(members) => {
                         if want_array {
                             Response::Array(members.into_iter().map(Some).collect())
                         } else {
@@ -3187,10 +4106,7 @@ impl Command {
                             }
                         }
                     }
-                    Err(e) => {
-                        eprintln!("pg_redis: SPOP error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => e,
                 }
             }
 
@@ -3226,12 +4142,14 @@ impl Command {
                          ORDER BY random() LIMIT $2"
                     )
                 };
-                match client.select(&sql, None, &[key.as_slice().into(), limit.into()]) {
-                    Ok(tbl) => {
-                        let members: Vec<Vec<u8>> = tbl
-                            .into_iter()
-                            .filter_map(|row| row.get::<Vec<u8>>(1).ok().flatten())
-                            .collect();
+                match column_query(
+                    client,
+                    Spi::Reads,
+                    "SRANDMEMBER",
+                    &sql,
+                    &[key.as_slice().into(), limit.into()],
+                ) {
+                    Ok(members) => {
                         if want_array {
                             Response::Array(members.into_iter().map(Some).collect())
                         } else {
@@ -3241,33 +4159,16 @@ impl Command {
                             }
                         }
                     }
-                    Err(e) => {
-                        eprintln!("pg_redis: SRANDMEMBER error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => e,
                 }
             }
 
             Command::SUnion { keys } => {
-                let keys_vec: Vec<Option<Vec<u8>>> =
-                    keys.iter().map(|k| Some(k.clone())).collect();
+                let keys_vec = key_array(keys);
                 let sql = format!(
                     "SELECT DISTINCT member FROM redis.set_{db} WHERE key = ANY($1::bytea[])"
                 );
-                match client.select(&sql, None, &[keys_vec.into()]) {
-                    Ok(tbl) => {
-                        let items = tbl
-                            .into_iter()
-                            .filter_map(|row| row.get::<Vec<u8>>(1).ok().flatten())
-                            .map(Some)
-                            .collect();
-                        Response::Array(items)
-                    }
-                    Err(e) => {
-                        eprintln!("pg_redis: SUNION error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
-                }
+                array_query(client, Spi::Reads, "SUNION", &sql, &[keys_vec.into()])
             }
 
             Command::SInter { keys } => {
@@ -3277,20 +4178,7 @@ impl Command {
                 let sql = build_inter_sql(db, keys.len(), 1);
                 let args: Vec<DatumWithOid> =
                     keys.iter().map(|k| k.as_slice().into()).collect();
-                match client.select(&sql, None, &args) {
-                    Ok(tbl) => {
-                        let items = tbl
-                            .into_iter()
-                            .filter_map(|row| row.get::<Vec<u8>>(1).ok().flatten())
-                            .map(Some)
-                            .collect();
-                        Response::Array(items)
-                    }
-                    Err(e) => {
-                        eprintln!("pg_redis: SINTER error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
-                }
+                array_query(client, Spi::Reads, "SINTER", &sql, &args)
             }
 
             Command::SDiff { keys } => {
@@ -3302,18 +4190,7 @@ impl Command {
                     let sql = format!(
                         "SELECT DISTINCT member FROM redis.set_{db} WHERE key = $1"
                     );
-                    return match client.select(&sql, None, &[first.as_slice().into()]) {
-                        Ok(tbl) => Response::Array(
-                            tbl.into_iter()
-                                .filter_map(|row| row.get::<Vec<u8>>(1).ok().flatten())
-                                .map(Some)
-                                .collect(),
-                        ),
-                        Err(e) => {
-                            eprintln!("pg_redis: SDIFF error: {}", e);
-                            Response::Error("internal error".to_string())
-                        }
-                    };
+                    return array_query(client, Spi::Reads, "SDIFF", &sql, &[first.as_slice().into()]);
                 }
                 let rest: Vec<Option<Vec<u8>>> =
                     keys[1..].iter().map(|k| Some(k.clone())).collect();
@@ -3322,47 +4199,19 @@ impl Command {
                      EXCEPT \
                      SELECT member FROM redis.set_{db} WHERE key = ANY($2::bytea[])"
                 );
-                match client.select(&sql, None, &[first.as_slice().into(), rest.into()]) {
-                    Ok(tbl) => Response::Array(
-                        tbl.into_iter()
-                            .filter_map(|row| row.get::<Vec<u8>>(1).ok().flatten())
-                            .map(Some)
-                            .collect(),
-                    ),
-                    Err(e) => {
-                        eprintln!("pg_redis: SDIFF error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
-                }
+                array_query(client, Spi::Reads, "SDIFF", &sql, &[first.as_slice().into(), rest.into()])
             }
 
             Command::SUnionStore { dst, keys } => {
-                let keys_vec: Vec<Option<Vec<u8>>> =
-                    keys.iter().map(|k| Some(k.clone())).collect();
-                let sql = format!(
-                    "WITH new_data AS ( \
-                         SELECT DISTINCT member FROM redis.set_{db} \
-                         WHERE key = ANY($2::bytea[]) \
-                     ), \
-                     del AS (DELETE FROM redis.set_{db} WHERE key = $1 RETURNING 1), \
-                     ins AS ( \
-                         INSERT INTO redis.set_{db} (key, member) \
-                         SELECT $1, member FROM new_data \
-                         ON CONFLICT DO NOTHING \
-                         RETURNING 1 \
-                     ) \
-                     SELECT count(*)::bigint FROM ins"
+                let keys_vec = key_array(keys);
+                let sql = set_store_sql(
+                    db,
+                    &format!(
+                        "SELECT DISTINCT member FROM redis.set_{db} \
+                         WHERE key = ANY($2::bytea[])"
+                    ),
                 );
-                match client.update(&sql, None, &[dst.as_slice().into(), keys_vec.into()]) {
-                    Ok(tbl) => match tbl.first().get::<i64>(1) {
-                        Ok(Some(n)) => Response::Integer(n),
-                        _ => Response::Integer(0),
-                    },
-                    Err(e) => {
-                        eprintln!("pg_redis: SUNIONSTORE error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
-                }
+                integer_query(client, Spi::Writes, "SUNIONSTORE", &sql, &[dst.as_slice().into(), keys_vec.into()], 0)
             }
 
             Command::SInterStore { dst, keys } => {
@@ -3370,32 +4219,13 @@ impl Command {
                     return Response::Integer(0);
                 }
                 let inter_body = build_inter_sql(db, keys.len(), 2);
-                let sql = format!(
-                    "WITH new_data AS ({inter_body}), \
-                          del AS (DELETE FROM redis.set_{db} WHERE key = $1 RETURNING 1), \
-                          ins AS ( \
-                              INSERT INTO redis.set_{db} (key, member) \
-                              SELECT $1, member FROM new_data \
-                              ON CONFLICT DO NOTHING \
-                              RETURNING 1 \
-                          ) \
-                     SELECT count(*)::bigint FROM ins"
-                );
+                let sql = set_store_sql(db, &inter_body);
                 let mut args: Vec<DatumWithOid> = Vec::with_capacity(1 + keys.len());
                 args.push(dst.as_slice().into());
                 for k in keys {
                     args.push(k.as_slice().into());
                 }
-                match client.update(&sql, None, &args) {
-                    Ok(tbl) => match tbl.first().get::<i64>(1) {
-                        Ok(Some(n)) => Response::Integer(n),
-                        _ => Response::Integer(0),
-                    },
-                    Err(e) => {
-                        eprintln!("pg_redis: SINTERSTORE error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
-                }
+                integer_query(client, Spi::Writes, "SINTERSTORE", &sql, &args, 0)
             }
 
             Command::SDiffStore { dst, keys } => {
@@ -3422,17 +4252,7 @@ impl Command {
                         Some(rest),
                     )
                 };
-                let sql = format!(
-                    "WITH new_data AS ({body}), \
-                          del AS (DELETE FROM redis.set_{db} WHERE key = $1 RETURNING 1), \
-                          ins AS ( \
-                              INSERT INTO redis.set_{db} (key, member) \
-                              SELECT $1, member FROM new_data \
-                              ON CONFLICT DO NOTHING \
-                              RETURNING 1 \
-                          ) \
-                     SELECT count(*)::bigint FROM ins"
-                );
+                let sql = set_store_sql(db, &body);
                 let result = match rest_arg {
                     None => client.update(
                         &sql,
@@ -3450,10 +4270,7 @@ impl Command {
                         Ok(Some(n)) => Response::Integer(n),
                         _ => Response::Integer(0),
                     },
-                    Err(e) => {
-                        eprintln!("pg_redis: SDIFFSTORE error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("SDIFFSTORE", e),
                 }
             }
 
@@ -3485,10 +4302,7 @@ impl Command {
                         Ok(Some(n)) => Response::Integer(n),
                         _ => Response::Integer(0),
                     },
-                    Err(e) => {
-                        eprintln!("pg_redis: SMOVE error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("SMOVE", e),
                 }
             }
 
@@ -3512,10 +4326,7 @@ impl Command {
                         Ok(Some(s)) => Response::BulkString(format_score(s).into_bytes()),
                         _ => Response::Null,
                     },
-                    Err(e) => {
-                        eprintln!("pg_redis: ZSCORE error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("ZSCORE", e),
                 }
             }
             Command::ZMScore { key, members } => {
@@ -3538,10 +4349,7 @@ impl Command {
                         }
                         Response::Array(out)
                     }
-                    Err(e) => {
-                        eprintln!("pg_redis: ZMSCORE error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("ZMSCORE", e),
                 }
             }
             Command::ZIncrBy { key, increment, member } => {
@@ -3569,10 +4377,7 @@ impl Command {
                         }
                         _ => Response::Null,
                     },
-                    Err(e) => {
-                        eprintln!("pg_redis: ZINCRBY error: {}", e);
-                        Response::Error("internal error".to_string())
-                    }
+                    Err(e) => spi_failed("ZINCRBY", e),
                 }
             }
             Command::ZCard { key } => {
@@ -3748,20 +4553,27 @@ impl Command {
         // The ephemeral half maps one-to-one onto the shared-memory databases.
         debug_assert!(is_ephemeral(db), "execute_mem called for durable db {db}");
 
+        // Before the early returns below, so a flag raised by an earlier
+        // command cannot leak into this reply.
+        crate::mem::take_refusal();
+
         // Before anything is written, so a refusal cannot leave a partial write.
         if let Some(err) = self.mem_too_long_error() {
             return err;
         }
 
-        // Cleared up front so a flag raised by an earlier command cannot leak
-        // into this reply.
-        //
-        // Unlike the length check above this cannot run before execution —
-        // whether there is room is only knowable at the insert. For a multi-key
-        // write that fills the table part-way through (MSET, SADD with many
-        // members) the earlier keys are already stored when the error is
-        // reported, where Redis would have rejected the command whole.
-        crate::mem::take_refusal();
+        // Priced whole before any of it runs. A single-key write has nothing
+        // to be partial about and is left to the insert.
+        if let Some(err) = self.mem_full_error(db as usize) {
+            return err;
+        }
+
+        // After the room check and before any write: a refused type must leave
+        // the key exactly as it was.
+        if let Some(err) = self.mem_type_error(db as usize) {
+            return err;
+        }
+
         let response = self.execute_mem_inner(db as usize);
         match crate::mem::take_refusal() {
             crate::mem::Refusal::None => response,
@@ -3838,6 +4650,8 @@ impl Command {
                             return declined(db_idx, key);
                         }
                     }
+
+                    mem_clear_other_type(db_idx, key, mem::KeyKind::String);
 
                     if *keepttl {
                         let (exists, exp) = mem::mem_ttl_raw(db_idx, key);
@@ -3950,9 +4764,14 @@ impl Command {
                 Err(e) => Response::Error(e),
             },
 
-            Command::DecrBy { key, delta } => match unsafe { mem::mem_incr(db_idx, key, -delta) } {
-                Ok(n) => Response::Integer(n),
-                Err(e) => Response::Error(e),
+            // Negating i64::MIN overflows: it wraps in a release build and
+            // panics in a debug one.
+            Command::DecrBy { key, delta } => match delta.checked_neg() {
+                None => Response::Error("ERR decrement would overflow".to_string()),
+                Some(d) => match unsafe { mem::mem_incr(db_idx, key, d) } {
+                    Ok(n) => Response::Integer(n),
+                    Err(e) => Response::Error(e),
+                },
             },
 
             Command::IncrByFloat { key, delta } => {
@@ -4044,15 +4863,147 @@ impl Command {
                 Response::SimpleString(t.to_string())
             }
 
-            Command::Rename { key, newkey } => {
-                let val = unsafe { mem::mem_getdel(db_idx, key) };
-                match val {
-                    Some(v) => {
-                        unsafe { mem::mem_set(db_idx, newkey, &v, 0) };
-                        Response::Ok
-                    }
-                    None => Response::Error("ERR no such key".to_string()),
+            Command::Rename { key, newkey } => self.mem_rename(db_idx, key, newkey),
+
+            Command::SetRange { key, offset, value } => {
+                if value.is_empty() {
+                    // Redis writes nothing and reports the length as it stands.
+                    return Response::Integer(unsafe { mem::mem_strlen(db_idx, key) });
                 }
+                match unsafe { mem::mem_setrange(db_idx, key, *offset as usize, value) } {
+                    Some(len) => Response::Integer(len),
+                    None => mem_value_too_large(),
+                }
+            }
+
+            Command::GetRange { key, start, end } => {
+                let v = unsafe { mem::mem_get(db_idx, key) }.unwrap_or_default();
+                Response::BulkString(byte_range(&v, *start, *end))
+            }
+
+            Command::HIncrByFloat { key, field, delta } => {
+                match unsafe { mem::mem_hincrbyfloat(db_idx, key, field, *delta) } {
+                    Ok(text) => Response::BulkString(text.into_bytes()),
+                    Err(e) => Response::Error(e),
+                }
+            }
+
+            Command::RenameNx { key, newkey } => {
+                if unsafe { mem::mem_key_kind(db_idx, newkey) }.is_some() {
+                    // The source still has to exist, or Redis says so first.
+                    return match unsafe { mem::mem_key_kind(db_idx, key) } {
+                        None => Response::Error("ERR no such key".to_string()),
+                        Some(_) => Response::Integer(0),
+                    };
+                }
+                match self.mem_rename(db_idx, key, newkey) {
+                    Response::Ok => Response::Integer(1),
+                    other => other,
+                }
+            }
+
+            Command::GetEx { key, expiry } => {
+                let Some(value) = (unsafe { mem::mem_get(db_idx, key) }) else {
+                    return Response::Null;
+                };
+                match expiry {
+                    GetExExpiry::Keep => {}
+                    GetExExpiry::Clear => {
+                        unsafe { mem::mem_persist(db_idx, key) };
+                    }
+                    GetExExpiry::At(us) => {
+                        unsafe { mem::mem_set_expiry(db_idx, key, *us) };
+                    }
+                }
+                Response::BulkString(value)
+            }
+
+            Command::GetBit { key, offset } => {
+                let v = unsafe { mem::mem_get(db_idx, key) }.unwrap_or_default();
+                Response::Integer(bit_at(&v, *offset) as i64)
+            }
+
+            Command::SetBit { key, offset, value } => {
+                let on = *value;
+                match unsafe {
+                    mem::mem_setbit(db_idx, key, *offset, |buf| set_bit_at(buf, *offset, on))
+                } {
+                    Some(was) => Response::Integer(was as i64),
+                    None => mem_value_too_large(),
+                }
+            }
+
+            Command::BitCount { key, range } => {
+                let v = unsafe { mem::mem_get(db_idx, key) }.unwrap_or_default();
+                Response::Integer(count_bits(&v, *range))
+            }
+
+            Command::HRandField {
+                key,
+                count,
+                withvalues,
+            } => {
+                let pairs = unsafe { mem::mem_hgetall(db_idx, key) };
+                random_fields(&pairs, *count, *withvalues)
+            }
+
+            Command::SInterCard { keys, limit } => {
+                let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+                let n = unsafe { mem::mem_sinter(db_idx, &refs) }.len() as i64;
+                Response::Integer(limit.map_or(n, |l| n.min(l)))
+            }
+
+            Command::ObjectEncoding { key } => {
+                // Redis answers nil rather than erroring here, unlike every
+                // other command that names a key it cannot find.
+                let Some(kind) = (unsafe { mem::mem_key_kind(db_idx, key) }) else {
+                    return Response::Null;
+                };
+                let name = match kind {
+                    mem::KeyKind::String => {
+                        string_encoding(&unsafe { mem::mem_get(db_idx, key) }.unwrap_or_default())
+                    }
+                    mem::KeyKind::List => {
+                        let items = unsafe { mem::mem_lrange(db_idx, key, 0, -1) };
+                        collection_encoding(kind, &items)
+                    }
+                    mem::KeyKind::Set => {
+                        let items = unsafe { mem::mem_smembers(db_idx, key) };
+                        collection_encoding(kind, &items)
+                    }
+                    mem::KeyKind::Hash => {
+                        let items: Vec<Vec<u8>> = unsafe { mem::mem_hgetall(db_idx, key) }
+                            .into_iter()
+                            .flat_map(|(f, v)| [f, v])
+                            .collect();
+                        collection_encoding(kind, &items)
+                    }
+                    mem::KeyKind::Zset => {
+                        let items: Vec<Vec<u8>> = unsafe { mem::mem_zset_collect_all(db_idx, key) }
+                            .into_iter()
+                            .map(|(m, _)| m)
+                            .collect();
+                        collection_encoding(kind, &items)
+                    }
+                };
+                Response::SimpleString(name.to_string())
+            }
+
+            Command::ObjectOther => Response::Null,
+
+            Command::FlushDb => {
+                unsafe { mem::mem_flush_db(db_idx) };
+                Response::Ok
+            }
+
+            // Routed to the SQL path by `run_dispatch_batch`, which is where it
+            // can reach both halves. Unreachable here, and answered rather than
+            // ignored in case that routing ever changes.
+            Command::FlushAll => {
+                for idx in 0..mem::NUM_MEM_DBS {
+                    unsafe { mem::mem_flush_db(idx) };
+                }
+                Response::Ok
             }
 
             Command::RandomKey => match unsafe { mem::mem_random_key(db_idx) } {
@@ -4246,6 +5197,9 @@ impl Command {
                 member,
             } => {
                 let s = unsafe { mem::mem_zincrby(db_idx, key, *increment, member) };
+                if s.is_nan() {
+                    return Response::Error(NAN_SCORE.to_string());
+                }
                 Response::BulkString(format_score(s).into_bytes())
             }
             Command::ZCard { key } => Response::Integer(unsafe { mem::mem_zcard(db_idx, key) }),
@@ -4536,8 +5490,8 @@ impl Command {
                         Some(v) => Response::BulkString(v),
                         None => Response::Null,
                     }
-                } else if popped.is_empty() {
-                    Response::Null
+                } else if popped.is_empty() && unsafe { mem::mem_llen(db_idx, key) } == 0 {
+                    Response::NullArray
                 } else {
                     Response::Array(popped.into_iter().map(Some).collect())
                 }
@@ -4549,8 +5503,8 @@ impl Command {
                         Some(v) => Response::BulkString(v),
                         None => Response::Null,
                     }
-                } else if popped.is_empty() {
-                    Response::Null
+                } else if popped.is_empty() && unsafe { mem::mem_llen(db_idx, key) } == 0 {
+                    Response::NullArray
                 } else {
                     Response::Array(popped.into_iter().map(Some).collect())
                 }
@@ -4568,6 +5522,8 @@ impl Command {
             Command::LSet { key, index, value } => {
                 if unsafe { mem::mem_lset(db_idx, key, *index, value) } {
                     Response::Ok
+                } else if unsafe { mem::mem_llen(db_idx, key) } == 0 {
+                    Response::Error("ERR no such key".to_string())
                 } else {
                     Response::Error("ERR index out of range".to_string())
                 }
@@ -4642,25 +5598,11 @@ impl Command {
         }
     }
 
-    /// Refuse anything the shared-memory backend would have to truncate to
-    /// store.
+    /// Refuse anything the shared-memory backend would have to truncate.
     ///
-    /// Hash fields and set members live in fixed-size arrays, so the only
-    /// alternative to refusing is to copy as much as fits — the one failure
-    /// mode worse than an error. Two members sharing a `MEM_MAX_MEMBER`-byte
-    /// prefix would collapse onto the same entry, so an `HGET` returns another
-    /// field's value and an `HDEL` removes it. Redis has no length limit at
-    /// all, so the closest a fixed-size region gets is to refuse and name the
-    /// database that has no limit.
-    ///
-    /// Keys and values are bounded for a different reason: they spill into a
-    /// chunk pool rather than a fixed slot, so the limit is what one of them
-    /// may claim of that pool — see `mem::max_total_val_len` and `MEM_MAX_KEY`.
-    /// Over it is still a refusal, never a truncation.
-    ///
-    /// Runs before the command executes, so a refusal never leaves a partial
-    /// write behind. Allocation-free — the arms borrow and the iterators are
-    /// lazy, because this sits on the hot path.
+    /// Every limit is a share of a chunk pool. Runs before the command, so a
+    /// refusal leaves no partial write, and allocation-free because it sits on
+    /// the hot path.
     fn mem_too_long_error(&self) -> Option<Response> {
         fn slices(v: &[Vec<u8>]) -> impl Iterator<Item = &[u8]> {
             v.iter().map(Vec::as_slice)
@@ -4805,6 +5747,222 @@ impl Command {
         over.map(mem_too_long)
     }
 
+    /// Refuse a multi-key write the shared-memory backend cannot take whole.
+    /// Single-key commands are not checked — they are already all or nothing,
+    /// and this costs a lookup per key.
+    fn mem_full_error(&self, db_idx: usize) -> Option<Response> {
+        fn lens(vs: &[Vec<u8>]) -> Vec<usize> {
+            vs.iter().map(Vec::len).collect()
+        }
+        fn pairs(ps: &[(Vec<u8>, Vec<u8>)]) -> Vec<(&[u8], usize)> {
+            ps.iter().map(|(a, b)| (a.as_slice(), b.len())).collect()
+        }
+        fn slices(vs: &[Vec<u8>]) -> Vec<&[u8]> {
+            vs.iter().map(Vec::as_slice).collect()
+        }
+        let room = match self {
+            Command::MSet { pairs: ps } | Command::MSetNx { pairs: ps } if ps.len() > 1 => unsafe {
+                crate::mem::mem_room_for_kv(db_idx, &pairs(ps))
+            },
+            Command::HSet { key, pairs: ps } | Command::HMSet { key, pairs: ps }
+                if ps.len() > 1 =>
+            unsafe { crate::mem::mem_room_for_hash(db_idx, key, &pairs(ps)) },
+            Command::SAdd { key, members } if members.len() > 1 => unsafe {
+                crate::mem::mem_room_for_members(db_idx, false, key, &slices(members))
+            },
+            Command::ZAdd { key, pairs: ps, .. } if ps.len() > 1 => unsafe {
+                let members: Vec<&[u8]> = ps.iter().map(|(_, m)| m.as_slice()).collect();
+                crate::mem::mem_room_for_members(db_idx, true, key, &members)
+            },
+            Command::LPush { values, .. }
+            | Command::RPush { values, .. }
+            | Command::LPushX { values, .. }
+            | Command::RPushX { values, .. }
+                if values.len() > 1 =>
+            unsafe { crate::mem::mem_room_for_list(db_idx, &lens(values)) },
+            _ => true,
+        };
+        (!room).then(mem_out_of_memory)
+    }
+
+    /// The keys this command touches, each with the types it will accept. A key
+    /// holding anything else is a `WRONGTYPE` — which is the whole of Redis's
+    /// type discipline, since a key holds exactly one thing.
+    ///
+    /// Commands that replace a key whatever it held are not here but in
+    /// `overwritten_keys`, and the ones that answer nil rather than erroring on
+    /// the wrong type — `MGET`, `SETNX`, `MSETNX` — are in neither.
+    fn typed_keys(&self) -> Vec<(&[u8], &'static [crate::mem::KeyKind])> {
+        use crate::mem::KeyKind::{Hash, List, Set, String as Str, Zset};
+        const STRING: &[crate::mem::KeyKind] = &[Str];
+        const HASH: &[crate::mem::KeyKind] = &[Hash];
+        const LIST: &[crate::mem::KeyKind] = &[List];
+        const SET: &[crate::mem::KeyKind] = &[Set];
+        const ZSET: &[crate::mem::KeyKind] = &[Zset];
+        /// `ZUNIONSTORE` and friends read a plain set as a sorted set whose
+        /// every score is 1, so a set source is not an error.
+        const ZSET_OR_SET: &[crate::mem::KeyKind] = &[Zset, Set];
+
+        fn one<'a>(
+            key: &'a [u8],
+            kinds: &'static [crate::mem::KeyKind],
+        ) -> Vec<(&'a [u8], &'static [crate::mem::KeyKind])> {
+            vec![(key, kinds)]
+        }
+        fn many<'a>(
+            keys: &'a [Vec<u8>],
+            kinds: &'static [crate::mem::KeyKind],
+        ) -> Vec<(&'a [u8], &'static [crate::mem::KeyKind])> {
+            keys.iter().map(|k| (k.as_slice(), kinds)).collect()
+        }
+
+        match self {
+            Command::Set { key, get: true, .. }
+            | Command::SetRange { key, .. }
+            | Command::GetRange { key, .. }
+            | Command::GetEx { key, .. }
+            | Command::SetBit { key, .. }
+            | Command::GetBit { key, .. }
+            | Command::BitCount { key, .. }
+            | Command::Get { key }
+            | Command::GetDel { key }
+            | Command::GetSet { key, .. }
+            | Command::Append { key, .. }
+            | Command::Strlen { key }
+            | Command::Incr { key }
+            | Command::Decr { key }
+            | Command::IncrBy { key, .. }
+            | Command::DecrBy { key, .. }
+            | Command::IncrByFloat { key, .. } => one(key, STRING),
+
+            Command::HGet { key, .. }
+            | Command::HSet { key, .. }
+            | Command::HDel { key, .. }
+            | Command::HGetAll { key }
+            | Command::HMGet { key, .. }
+            | Command::HMSet { key, .. }
+            | Command::HKeys { key }
+            | Command::HVals { key }
+            | Command::HExists { key, .. }
+            | Command::HLen { key }
+            | Command::HIncrBy { key, .. }
+            | Command::HIncrByFloat { key, .. }
+            | Command::HRandField { key, .. }
+            | Command::HSetNx { key, .. } => one(key, HASH),
+
+            Command::LPush { key, .. }
+            | Command::RPush { key, .. }
+            | Command::LPushX { key, .. }
+            | Command::RPushX { key, .. }
+            | Command::LPop { key, .. }
+            | Command::RPop { key, .. }
+            | Command::LLen { key }
+            | Command::LRange { key, .. }
+            | Command::LIndex { key, .. }
+            | Command::LSet { key, .. }
+            | Command::LInsert { key, .. }
+            | Command::LRem { key, .. }
+            | Command::LPos { key, .. }
+            | Command::LTrim { key, .. } => one(key, LIST),
+            Command::LMove { src, dst, .. } => vec![(src, LIST), (dst, LIST)],
+
+            Command::SAdd { key, .. }
+            | Command::SRem { key, .. }
+            | Command::SMembers { key }
+            | Command::SCard { key }
+            | Command::SIsMember { key, .. }
+            | Command::SMisMember { key, .. }
+            | Command::SPop { key, .. }
+            | Command::SRandMember { key, .. } => one(key, SET),
+            Command::SUnion { keys }
+            | Command::SInter { keys }
+            | Command::SDiff { keys }
+            | Command::SInterCard { keys, .. } => many(keys, SET),
+            Command::SUnionStore { keys, .. }
+            | Command::SInterStore { keys, .. }
+            | Command::SDiffStore { keys, .. } => many(keys, SET),
+            Command::SMove { src, dst, .. } => vec![(src, SET), (dst, SET)],
+
+            Command::ZAdd { key, .. }
+            | Command::ZRem { key, .. }
+            | Command::ZScore { key, .. }
+            | Command::ZMScore { key, .. }
+            | Command::ZIncrBy { key, .. }
+            | Command::ZCard { key }
+            | Command::ZCount { key, .. }
+            | Command::ZLexCount { key, .. }
+            | Command::ZRank { key, .. }
+            | Command::ZRange { key, .. }
+            | Command::ZRangeByScore { key, .. }
+            | Command::ZRangeByLex { key, .. }
+            | Command::ZPopMin { key, .. }
+            | Command::ZPopMax { key, .. }
+            | Command::ZRandMember { key, .. }
+            | Command::ZRemRangeByRank { key, .. }
+            | Command::ZRemRangeByScore { key, .. }
+            | Command::ZRemRangeByLex { key, .. } => one(key, ZSET),
+            Command::ZUnion { keys, .. }
+            | Command::ZInter { keys, .. }
+            | Command::ZDiff { keys, .. }
+            | Command::ZUnionStore { keys, .. }
+            | Command::ZInterStore { keys, .. }
+            | Command::ZDiffStore { keys, .. } => many(keys, ZSET_OR_SET),
+
+            _ => vec![],
+        }
+    }
+
+    /// The keys this command replaces outright, with the type each becomes.
+    /// Redis lets `SET` land on a key that held a list; the list goes, rather
+    /// than the write being refused or the two sitting side by side.
+    fn overwritten_keys(&self) -> Vec<(&[u8], crate::mem::KeyKind)> {
+        match self {
+            // `SET k v GET` has to hand back the old string, so it is a typed
+            // read rather than a blind overwrite and lives in `typed_keys`. `NX`
+            // and `XX` decide on whether the key already exists, so clearing it
+            // here would answer their question for them; they clear it
+            // themselves, once the decision is made. So does `RENAME`, which
+            // must leave its destination alone when the source is not there.
+            Command::Set {
+                key,
+                get: false,
+                nx: false,
+                xx: false,
+                ..
+            }
+            | Command::SetEx { key, .. }
+            | Command::PSetEx { key, .. } => vec![(key.as_slice(), crate::mem::KeyKind::String)],
+            Command::MSet { pairs } => pairs
+                .iter()
+                .map(|(k, _)| (k.as_slice(), crate::mem::KeyKind::String))
+                .collect(),
+            Command::SUnionStore { dst, .. }
+            | Command::SInterStore { dst, .. }
+            | Command::SDiffStore { dst, .. } => vec![(dst.as_slice(), crate::mem::KeyKind::Set)],
+            Command::ZUnionStore { dst, .. }
+            | Command::ZInterStore { dst, .. }
+            | Command::ZDiffStore { dst, .. } => vec![(dst.as_slice(), crate::mem::KeyKind::Zset)],
+            _ => vec![],
+        }
+    }
+
+    /// Refuse a command whose key holds another type, and clear a key the
+    /// command is about to replace. Both walk the key directory, which is the
+    /// only structure that knows what a key holds.
+    fn mem_type_error(&self, db_idx: usize) -> Option<Response> {
+        for (key, kinds) in self.typed_keys() {
+            if let Some(kind) = unsafe { crate::mem::mem_key_kind(db_idx, key) }
+                && !kinds.contains(&kind)
+            {
+                return Some(wrong_type());
+            }
+        }
+        for (key, becomes) in self.overwritten_keys() {
+            mem_clear_other_type(db_idx, key, becomes);
+        }
+        None
+    }
+
     pub fn write_keys(&self) -> Vec<&[u8]> {
         match self {
             Command::Set { key, .. }
@@ -4828,7 +5986,11 @@ impl Command {
             | Command::HDel { key, .. }
             | Command::HMSet { key, .. }
             | Command::HIncrBy { key, .. }
+            | Command::HIncrByFloat { key, .. }
             | Command::HSetNx { key, .. }
+            | Command::SetRange { key, .. }
+            | Command::GetEx { key, .. }
+            | Command::SetBit { key, .. }
             | Command::LPush { key, .. }
             | Command::RPush { key, .. }
             | Command::LPushX { key, .. }
@@ -4857,7 +6019,10 @@ impl Command {
             Command::MSet { pairs } | Command::MSetNx { pairs } => {
                 pairs.iter().map(|(k, _)| k.as_slice()).collect()
             }
-            Command::Rename { key, newkey } => vec![key.as_slice(), newkey.as_slice()],
+            Command::Rename { key, newkey } | Command::RenameNx { key, newkey } => {
+                vec![key.as_slice(), newkey.as_slice()]
+            }
+            Command::Copy { dst, .. } => vec![dst.as_slice()],
             Command::LMove { src, dst, .. } => vec![src.as_slice(), dst.as_slice()],
             Command::SMove { src, dst, .. } => vec![src.as_slice(), dst.as_slice()],
             Command::SUnionStore { dst, .. }
@@ -4880,17 +6045,29 @@ fn mem_value_too_large() -> Response {
 
 /// Redis's own wording for a write refused because the store is full, so a
 /// client's existing OOM handling recognises it.
-/// Two distinct keys whose 128-bit keyed hashes agree.
-///
-/// Unreachable in practice at `redis.mem_max_entries` keys per database. It
-/// exists because the KV table keeps the key bytes and can therefore tell; the
-/// alternative is to write over the key already there, silently.
+/// Two keys, or two members of one collection, whose 128-bit keyed hashes
+/// agree. Unreachable in practice; the alternative is a silent overwrite.
 fn mem_key_collision() -> Response {
     Response::Error(
-        "ERR key hash collides with a different key already stored; \
-         rename the key, or use SELECT durable."
+        "ERR key or member hash collides with a different one already stored; \
+         rename it, or use SELECT durable."
             .to_string(),
     )
+}
+
+/// Clear whatever else held this key, so a write that replaces a value of
+/// another type does not leave the old one stranded beside the new one.
+fn mem_clear_other_type(db_idx: usize, key: &[u8], becomes: crate::mem::KeyKind) {
+    if let Some(kind) = unsafe { crate::mem::mem_key_kind(db_idx, key) }
+        && kind != becomes
+    {
+        unsafe { crate::mem::mem_drop_key_of(db_idx, kind, key) };
+    }
+}
+
+/// Redis's own wording, so a client's existing type handling recognises it.
+fn wrong_type() -> Response {
+    Response::Error("WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
 }
 
 fn mem_out_of_memory() -> Response {
@@ -5062,16 +6239,14 @@ fn list_push(
              SELECT (SELECT n FROM base) \
                   + (SELECT count(*)::bigint FROM ins)"
         );
-        match client.update(&sql, None, &[key.into(), values_vec.into()]) {
-            Ok(tbl) => match tbl.first().get::<i64>(1) {
-                Ok(Some(n)) => Response::Integer(n),
-                _ => Response::Integer(0),
-            },
-            Err(e) => {
-                eprintln!("pg_redis: list_push error: {}", e);
-                Response::Error("internal error".to_string())
-            }
-        }
+        integer_query(
+            client,
+            Spi::Writes,
+            "list_push",
+            &sql,
+            &[key.into(), values_vec.into()],
+            0,
+        )
     } else {
         let sql = format!(
             "WITH base AS ( \
@@ -5086,17 +6261,25 @@ fn list_push(
              SELECT (SELECT count(*)::bigint FROM redis.list_{db} WHERE key = $1) \
                   + (SELECT count(*)::bigint FROM ins)"
         );
-        match client.update(&sql, None, &[key.into(), values_vec.into()]) {
-            Ok(tbl) => match tbl.first().get::<i64>(1) {
-                Ok(Some(n)) => Response::Integer(n),
-                _ => Response::Integer(0),
-            },
-            Err(e) => {
-                eprintln!("pg_redis: list_push error: {}", e);
-                Response::Error("internal error".to_string())
-            }
-        }
+        integer_query(
+            client,
+            Spi::Writes,
+            "list_push",
+            &sql,
+            &[key.into(), values_vec.into()],
+            0,
+        )
     }
+}
+
+/// Whether the list has any elements. Only asked on the empty-reply path, to
+/// tell "nothing popped" from "no such key" — Redis answers those differently.
+fn list_exists(client: &mut SpiClient<'_>, db: u8, key: &[u8]) -> bool {
+    let sql = format!("SELECT 1 FROM redis.list_{db} WHERE key = $1 LIMIT 1");
+    client
+        .select(&sql, Some(1), &[key.into()])
+        .map(|t| !t.is_empty())
+        .unwrap_or(false)
 }
 
 fn list_pop(
@@ -5109,7 +6292,11 @@ fn list_pop(
     let order = if left { "ASC" } else { "DESC" };
     let limit = count.unwrap_or(1).max(0);
     if limit == 0 {
-        return Response::Array(vec![]);
+        return if list_exists(client, db, key) {
+            Response::Array(vec![])
+        } else {
+            Response::NullArray
+        };
     }
     let sql = format!(
         "WITH d AS ( \
@@ -5139,16 +6326,13 @@ fn list_pop(
                     Some((_, v)) => Response::BulkString(v),
                     None => Response::Null,
                 }
-            } else if rows.is_empty() {
-                Response::Null
+            } else if rows.is_empty() && !list_exists(client, db, key) {
+                Response::NullArray
             } else {
                 Response::Array(rows.into_iter().map(|(_, v)| Some(v)).collect())
             }
         }
-        Err(e) => {
-            eprintln!("pg_redis: POP error: {}", e);
-            Response::Error("internal error".to_string())
-        }
+        Err(e) => spi_failed("POP", e),
     }
 }
 
@@ -5180,7 +6364,7 @@ fn list_insert(
             }
         },
         Err(e) => {
-            eprintln!("pg_redis: LINSERT pivot lookup: {}", e);
+            pgrx::warning!("pg_redis: LINSERT pivot lookup: {e}");
             return Response::Error("internal error".to_string());
         }
     };
@@ -5216,7 +6400,7 @@ fn list_insert(
                 lo + (hi - lo) / 2
             } else {
                 if let Err(e) = renumber(client, db, key) {
-                    eprintln!("pg_redis: LINSERT renumber: {}", e);
+                    pgrx::warning!("pg_redis: LINSERT renumber: {e}");
                     return Response::Error("internal error".to_string());
                 }
                 return list_insert(client, db, key, before, pivot, value);
@@ -5226,7 +6410,7 @@ fn list_insert(
 
     let ins_sql = format!("INSERT INTO redis.list_{db} (key, pos, value) VALUES ($1, $2, $3)");
     if let Err(e) = client.update(&ins_sql, None, &[key.into(), new_pos.into(), value.into()]) {
-        eprintln!("pg_redis: LINSERT insert: {}", e);
+        pgrx::warning!("pg_redis: LINSERT insert: {e}");
         return Response::Error("internal error".to_string());
     }
 
@@ -5271,48 +6455,406 @@ fn int_from_bytes(b: &[u8]) -> Option<i64> {
     std::str::from_utf8(b).ok()?.trim().parse().ok()
 }
 
+/// Redis's wording for an argument-count error. Clients match on the code, but
+/// the text is what a person sees, and matching it costs a format string.
+/// Redis refuses a non-positive expiry outright, and one large enough that the
+/// deadline would overflow. `SET k v EX 0` is an error, not a delete.
+fn check_expire(value: i64, unit_ms: i64, cmd: &str) -> Result<i64, String> {
+    let ms = value
+        .checked_mul(unit_ms)
+        .filter(|ms| ms.checked_add(now_micros() / 1000).is_some())
+        .ok_or_else(|| invalid_expire(cmd))?;
+    if value <= 0 {
+        return Err(invalid_expire(cmd));
+    }
+    Ok(ms)
+}
+
+/// The same rule for the commands that only set a deadline, where a past one is
+/// legal — `EXPIRE k -1` deletes the key — but an unrepresentable one is not.
+fn check_expire_deadline(value: i64, unit_ms: i64, cmd: &str) -> Result<i64, String> {
+    value
+        .checked_mul(unit_ms)
+        .filter(|ms| ms.checked_add(now_micros() / 1000).is_some())
+        .ok_or_else(|| invalid_expire(cmd))
+}
+
+/// A count argument Redis requires to be non-negative — `SPOP`, `LPOP`, `RPOP`
+/// and the `ZPOP*` pair. `SRANDMEMBER` and `ZRANDMEMBER` are not among them: a
+/// negative count there means "with repeats".
+fn check_count(n: i64) -> Result<i64, String> {
+    if n < 0 {
+        return Err("value is out of range, must be positive".to_string());
+    }
+    Ok(n)
+}
+
+fn invalid_expire(cmd: &str) -> String {
+    format!("invalid expire time in '{}' command", cmd.to_lowercase())
+}
+
+/// The bytes `GETRANGE` selects. Redis clamps rather than erroring: a negative
+/// index counts from the end, a start past the end is empty, and an end past
+/// the end is the end.
+fn byte_range(value: &[u8], start: i64, end: i64) -> Vec<u8> {
+    let len = value.len() as i64;
+    let s = if start < 0 { start + len } else { start }.max(0);
+    let e = if end < 0 { end + len } else { end }.min(len - 1);
+    if len == 0 || e < 0 || s > e {
+        return Vec::new();
+    }
+    value[s as usize..=(e as usize)].to_vec()
+}
+
+/// Redis's name for how it would store this string. pg_redis stores none of
+/// these representations — it has an inline slot and a chunk pool — but the
+/// name is what a client comparing against a stock server expects, and the
+/// thresholds are Redis's own defaults.
+fn string_encoding(value: &[u8]) -> &'static str {
+    /// `OBJ_ENCODING_EMBSTR_SIZE_LIMIT`.
+    const EMBSTR_LIMIT: usize = 44;
+    let is_int = std::str::from_utf8(value)
+        .ok()
+        .is_some_and(|t| crate::mem::parse_stored_int(t.as_bytes()).is_some());
+    match () {
+        _ if is_int => "int",
+        _ if value.len() <= EMBSTR_LIMIT => "embstr",
+        _ => "raw",
+    }
+}
+
+/// The same, for a collection: Redis packs a small one into a flat listpack and
+/// promotes it once it outgrows either threshold. `items` is every element —
+/// for a hash, fields and values alike, which is what Redis measures.
+fn collection_encoding(kind: crate::mem::KeyKind, items: &[Vec<u8>]) -> &'static str {
+    use crate::mem::KeyKind;
+    /// `*-max-listpack-entries`, which is 128 for every type that has one.
+    const MAX_ENTRIES: usize = 128;
+    /// `*-max-listpack-value`.
+    const MAX_VALUE: usize = 64;
+    /// `set-max-intset-entries`.
+    const MAX_INTSET: usize = 512;
+
+    let count = match kind {
+        // A hash's items arrive as field, value, field, value.
+        KeyKind::Hash => items.len() / 2,
+        _ => items.len(),
+    };
+    let all_ints = items.iter().all(|v| {
+        std::str::from_utf8(v)
+            .ok()
+            .is_some_and(|t| crate::mem::parse_stored_int(t.as_bytes()).is_some())
+    });
+    let packed = count <= MAX_ENTRIES && items.iter().all(|v| v.len() <= MAX_VALUE);
+    match kind {
+        KeyKind::Set if all_ints && count <= MAX_INTSET => "intset",
+        KeyKind::Set => {
+            if packed {
+                "listpack"
+            } else {
+                "hashtable"
+            }
+        }
+        KeyKind::Hash => {
+            if packed {
+                "listpack"
+            } else {
+                "hashtable"
+            }
+        }
+        KeyKind::Zset => {
+            if packed {
+                "listpack"
+            } else {
+                "skiplist"
+            }
+        }
+        KeyKind::List => {
+            if packed {
+                "listpack"
+            } else {
+                "quicklist"
+            }
+        }
+        KeyKind::String => "raw",
+    }
+}
+
+/// `HRANDFIELD`'s reply, from the hash's fields. No count is one field as a
+/// bulk string; a positive count is that many distinct fields; a negative one
+/// allows repeats, which is the only way to ask for more than the hash holds.
+fn random_fields(pairs: &[(Vec<u8>, Vec<u8>)], count: Option<i64>, withvalues: bool) -> Response {
+    let Some(count) = count else {
+        return match pairs.first() {
+            None => Response::Null,
+            Some((f, _)) => Response::BulkString(f.clone()),
+        };
+    };
+    if pairs.is_empty() {
+        return Response::Array(vec![]);
+    }
+    let push = |out: &mut Vec<Option<Vec<u8>>>, i: usize| {
+        out.push(Some(pairs[i].0.clone()));
+        if withvalues {
+            out.push(Some(pairs[i].1.clone()));
+        }
+    };
+    let mut out = Vec::new();
+    if count >= 0 {
+        for i in 0..(count as usize).min(pairs.len()) {
+            push(&mut out, i);
+        }
+    } else {
+        for i in 0..(-count) as usize {
+            push(&mut out, i % pairs.len());
+        }
+    }
+    Response::Array(out)
+}
+
+/// The bit `GETBIT` reads. Redis numbers bits from the *most* significant of
+/// byte 0, so bit 0 is `0x80` of the first byte — the opposite of PostgreSQL's
+/// `get_bit`, which counts from the least significant.
+fn bit_at(value: &[u8], offset: i64) -> bool {
+    let byte = (offset / 8) as usize;
+    match value.get(byte) {
+        None => false,
+        Some(b) => b & (0x80 >> (offset % 8)) != 0,
+    }
+}
+
+/// Set or clear a bit, growing the value with NUL bytes to reach it. Returns
+/// the bit as it was, which is what `SETBIT` answers with.
+fn set_bit_at(value: &mut Vec<u8>, offset: i64, on: bool) -> bool {
+    let byte = (offset / 8) as usize;
+    if value.len() <= byte {
+        value.resize(byte + 1, 0);
+    }
+    let mask = 0x80u8 >> (offset % 8);
+    let was = value[byte] & mask != 0;
+    if on {
+        value[byte] |= mask;
+    } else {
+        value[byte] &= !mask;
+    }
+    was
+}
+
+/// Bits set in `value`, or in the range `BITCOUNT` named. `by_bit` counts the
+/// range in bits rather than bytes; either way the indices clamp as `GETRANGE`
+/// does rather than erroring.
+fn count_bits(value: &[u8], range: Option<(i64, i64, bool)>) -> i64 {
+    let ones = |bytes: &[u8]| bytes.iter().map(|b| b.count_ones() as i64).sum::<i64>();
+    let Some((start, end, by_bit)) = range else {
+        return ones(value);
+    };
+    if !by_bit {
+        return ones(&byte_range(value, start, end));
+    }
+    let len = value.len() as i64 * 8;
+    let s = if start < 0 { start + len } else { start }.max(0);
+    let e = if end < 0 { end + len } else { end }.min(len - 1);
+    if len == 0 || e < 0 || s > e {
+        return 0;
+    }
+    (s..=e).filter(|i| bit_at(value, *i)).count() as i64
+}
+
+/// Whether stored bytes spell a finite number. `float8` prints `Infinity` and
+/// `NaN`, which are values Redis will not keep.
+/// The reply for an SPI call that failed. Logged through PostgreSQL rather than
+/// stderr, where an operator will find it.
+/// The statement all three set-store commands run; only `new_data` differs.
+/// `$1` is the destination, which loses only what the result does not contain:
+/// the insert's uniqueness check still sees rows the same statement deleted, so
+/// deleting everything first would drop the overlap.
+fn set_store_sql(db: u8, new_data: &str) -> String {
+    format!(
+        "WITH new_data AS ({new_data}), \
+              del AS ( \
+                  DELETE FROM redis.set_{db} \
+                  WHERE key = $1 AND member NOT IN (SELECT member FROM new_data) \
+                  RETURNING 1 \
+              ), \
+              ins AS ( \
+                  INSERT INTO redis.set_{db} (key, member) \
+                  SELECT $1, member FROM new_data \
+                  ON CONFLICT DO NOTHING \
+                  RETURNING 1 \
+              ) \
+         SELECT count(*)::bigint FROM new_data"
+    )
+}
+
+/// Whether a statement writes. `SpiClient::select` runs read-only and refuses a
+/// data-modifying statement outright, so a `DEL` built as
+/// `WITH d AS (DELETE …) SELECT count(…)` has to go through `update`. The
+/// distinction is not cosmetic — naming it keeps each call site honest about
+/// which it is.
+#[derive(Clone, Copy, PartialEq)]
+enum Spi {
+    Reads,
+    Writes,
+}
+
+fn spi_run<'a>(
+    client: &'a mut SpiClient<'_>,
+    how: Spi,
+    sql: &str,
+    args: &[DatumWithOid],
+) -> Result<pgrx::spi::SpiTupleTable<'a>, pgrx::spi::Error> {
+    match how {
+        Spi::Reads => client.select(sql, None, args),
+        Spi::Writes => client.update(sql, None, args),
+    }
+}
+
+/// A statement whose reply is one integer — `EXISTS`, `STRLEN`, `DEL` and a
+/// dozen more. `absent` is what Redis answers when it returns nothing.
+fn integer_query(
+    client: &mut SpiClient<'_>,
+    how: Spi,
+    cmd: &str,
+    sql: &str,
+    args: &[DatumWithOid],
+    absent: i64,
+) -> Response {
+    match spi_run(client, how, sql, args) {
+        Ok(tbl) => Response::Integer(tbl.first().get::<i64>(1).ok().flatten().unwrap_or(absent)),
+        Err(e) => spi_failed(cmd, e),
+    }
+}
+
+/// A statement whose reply is one value, or nil when the key is not there.
+fn bulk_query(
+    client: &mut SpiClient<'_>,
+    how: Spi,
+    cmd: &str,
+    sql: &str,
+    args: &[DatumWithOid],
+) -> Response {
+    match spi_run(client, how, sql, args) {
+        Ok(tbl) => match tbl.first().get::<Vec<u8>>(1).ok().flatten() {
+            Some(v) => Response::BulkString(v),
+            None => Response::Null,
+        },
+        Err(e) => spi_failed(cmd, e),
+    }
+}
+
+/// The first column of every row a statement returns, skipping any that is
+/// NULL or of another type — which is what each caller did by hand.
+fn column_query(
+    client: &mut SpiClient<'_>,
+    how: Spi,
+    cmd: &str,
+    sql: &str,
+    args: &[DatumWithOid],
+) -> Result<Vec<Vec<u8>>, Response> {
+    match spi_run(client, how, sql, args) {
+        Ok(tbl) => Ok(tbl
+            .filter_map(|row| row.get::<Vec<u8>>(1).ok().flatten())
+            .collect()),
+        Err(e) => Err(spi_failed(cmd, e)),
+    }
+}
+
+/// The same, as the array reply it almost always becomes — `SMEMBERS`,
+/// `HKEYS`, `HVALS`, `SUNION` and the rest.
+fn array_query(
+    client: &mut SpiClient<'_>,
+    how: Spi,
+    cmd: &str,
+    sql: &str,
+    args: &[DatumWithOid],
+) -> Response {
+    match column_query(client, how, cmd, sql, args) {
+        Ok(items) => Response::Array(items.into_iter().map(Some).collect()),
+        Err(e) => e,
+    }
+}
+
+/// Redis keys as a `bytea[]` parameter. Every multi-key statement binds one,
+/// and each was building it by hand.
+fn key_array(keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
+    keys.iter().map(|k| Some(k.clone())).collect()
+}
+
+fn spi_failed(cmd: &str, e: impl std::fmt::Display) -> Response {
+    pgrx::warning!("pg_redis: {cmd} failed: {e}");
+    Response::Error("ERR internal error executing the command".to_string())
+}
+
+fn is_finite_number(v: &[u8]) -> bool {
+    std::str::from_utf8(v)
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .is_some_and(f64::is_finite)
+}
+
+fn wrong_arity(cmd: &str) -> String {
+    format!(
+        "wrong number of arguments for '{}' command",
+        cmd.to_lowercase()
+    )
+}
+
+/// The two parse failures Redis names the same way everywhere.
+const NOT_AN_INTEGER: &str = "value is not an integer or out of range";
+const NOT_A_FLOAT: &str = "value is not a valid float";
+/// Adding infinities of opposite sign. Redis refuses rather than storing NaN,
+/// which would order unpredictably against every other score.
+const NAN_SCORE: &str = "ERR resulting score is not a number (NaN)";
+
+/// A `SETBIT`/`GETBIT` offset. Redis caps it at 4 GiB of bits and gives that
+/// ceiling its own message, distinct from a value that is not a number at all.
+fn bit_offset(args: &[Vec<u8>], idx: usize) -> Result<i64, String> {
+    const MAX_BIT_OFFSET: i64 = 4 * 1024 * 1024 * 1024 - 1;
+    let n: i64 = str_arg(args, idx, "SETBIT")?
+        .parse()
+        .map_err(|_| "ERR bit offset is not an integer or out of range".to_string())?;
+    if !(0..=MAX_BIT_OFFSET).contains(&n) {
+        return Err("ERR bit offset is not an integer or out of range".to_string());
+    }
+    Ok(n)
+}
+
+/// Every argument from `from` onward, as keys. Fifteen commands take a bare
+/// list of them — `SUNION` from the first, the `*STORE` pair from the second —
+/// and each was spelling out the same range-map-collect.
+fn key_args(args: &[Vec<u8>], from: usize, cmd: &str) -> Result<Vec<Vec<u8>>, String> {
+    (from..args.len())
+        .map(|i| bytes_arg(args, i, cmd))
+        .collect()
+}
+
 fn bytes_arg(args: &[Vec<u8>], idx: usize, cmd: &str) -> Result<Vec<u8>, String> {
     args.get(idx)
         .map(|a| a.to_vec())
-        .ok_or_else(|| format!("{} missing argument at position {}", cmd, idx))
+        .ok_or_else(|| wrong_arity(cmd))
 }
 
 /// Fetch an argument that is genuinely textual: a number, a flag, a config name.
 fn str_arg(args: &[Vec<u8>], idx: usize, cmd: &str) -> Result<String, String> {
     args.get(idx)
         .map(|a| String::from_utf8_lossy(a).into_owned())
-        .ok_or_else(|| format!("{} missing argument at position {}", cmd, idx))
+        .ok_or_else(|| wrong_arity(cmd))
 }
 
 fn update_expiry(client: &mut SpiClient<'_>, sql: &str, key: &[u8], n: i64) -> Response {
     match client.update(sql, None, &[key.into(), n.into()]) {
         Ok(tbl) => Response::Integer(if !tbl.is_empty() { 1 } else { 0 }),
-        Err(e) => {
-            eprintln!("pg_redis: expiry update error: {}", e);
-            Response::Error("internal error".to_string())
-        }
+        Err(e) => spi_failed("expiry update", e),
     }
 }
 
 fn get_ttl(client: &mut SpiClient<'_>, sql: &str, key: &[u8]) -> Response {
-    match client.select(sql, None, &[key.into()]) {
-        Ok(tbl) => match tbl.first().get::<i64>(1) {
-            Ok(Some(n)) => Response::Integer(n),
-            _ => Response::Integer(-2),
-        },
-        Err(e) => {
-            eprintln!("pg_redis: TTL error: {}", e);
-            Response::Error("internal error".to_string())
-        }
-    }
+    integer_query(client, Spi::Reads, "TTL", sql, &[key.into()], -2)
 }
 
-/// Every live key in `db`, optionally filtered by a Redis glob.
-///
-/// The glob is applied here rather than as a SQL `LIKE`: bytea has no `LIKE`
-/// operator, and the pattern is itself an arbitrary byte string. Reusing
-/// `glob_match` also means KEYS, SCAN and PSUBSCRIBE agree on what a pattern
-/// means, which the previous SQL translation could not guarantee.
+/// Every live key in `db`, optionally filtered by a Redis glob. Matched here
+/// rather than as SQL `LIKE` — bytea has no such operator — which also keeps
+/// KEYS, SCAN and PSUBSCRIBE agreeing on what a pattern means.
 fn matching_keys(
     client: &mut SpiClient<'_>,
     db: u8,
@@ -5321,10 +6863,15 @@ fn matching_keys(
     let sql = format!(
         "SELECT key FROM redis.kv_{db} \
            WHERE (expires_at IS NULL OR expires_at > now()) \
-         UNION SELECT DISTINCT key FROM redis.hash_{db} \
-         UNION SELECT DISTINCT key FROM redis.list_{db} \
-         UNION SELECT DISTINCT key FROM redis.set_{db} \
-         UNION SELECT DISTINCT key FROM redis.zset_{db}"
+         UNION \
+         SELECT c.key FROM ( \
+             SELECT DISTINCT key FROM redis.hash_{db} \
+             UNION SELECT DISTINCT key FROM redis.list_{db} \
+             UNION SELECT DISTINCT key FROM redis.set_{db} \
+             UNION SELECT DISTINCT key FROM redis.zset_{db} \
+         ) c \
+          WHERE NOT EXISTS (SELECT 1 FROM redis.expiry_{db} e \
+                             WHERE e.key = c.key AND e.expires_at <= now())"
     );
     let mut keys: Vec<Option<Vec<u8>>> = Vec::new();
     match client.select(&sql, None, &[]) {
@@ -5337,7 +6884,7 @@ fn matching_keys(
                 }
             }
         }
-        Err(e) => eprintln!("pg_redis: KEYS error: {e}"),
+        Err(e) => pgrx::warning!("pg_redis: KEYS failed: {e}"),
     }
     keys
 }
@@ -5352,7 +6899,9 @@ fn parse_score_value(b: &[u8]) -> Option<f64> {
         "-inf" | "-infinity" => Some(f64::NEG_INFINITY),
         _ => {
             let v: f64 = s.parse().ok()?;
-            if v.is_nan() { None } else { Some(v) }
+            // A literal that overflows to infinity is out of range, not
+            // infinite: only the spellings above mean infinity.
+            if v.is_finite() { Some(v) } else { None }
         }
     }
 }
@@ -5387,7 +6936,7 @@ fn parse_lex_bound(s: &[u8]) -> Option<LexBound> {
 
 fn parse_zadd(args: &[Vec<u8>]) -> Result<Command, String> {
     if args.len() < 3 {
-        return Err("ZADD requires key [options] score member [score member ...]".to_string());
+        return Err(wrong_arity("ZADD"));
     }
     let key = bytes_arg(args, 0, "ZADD")?;
     let mut nx = false;
@@ -5428,26 +6977,21 @@ fn parse_zadd(args: &[Vec<u8>]) -> Result<Command, String> {
         }
     }
     if nx && xx {
-        return Err("ZADD XX and NX options at the same time are not compatible".to_string());
+        return Err("XX and NX options at the same time are not compatible".to_string());
     }
     if gt && lt {
-        return Err(
-            "ZADD GT, LT, and/or NX options at the same time are not compatible".to_string(),
-        );
+        return Err("GT, LT, and/or NX options at the same time are not compatible".to_string());
     }
     if nx && (gt || lt) {
-        return Err(
-            "ZADD GT, LT, and/or NX options at the same time are not compatible".to_string(),
-        );
+        return Err("GT, LT, and/or NX options at the same time are not compatible".to_string());
     }
     let remaining = &args[i..];
     if remaining.is_empty() || !remaining.len().is_multiple_of(2) {
-        return Err("ZADD requires score/member pairs".to_string());
+        return Err(wrong_arity("ZADD"));
     }
     let mut pairs = Vec::with_capacity(remaining.len() / 2);
     for chunk in remaining.chunks(2) {
-        let score = parse_score_value(&chunk[0])
-            .ok_or_else(|| "ZADD score is not a valid float".to_string())?;
+        let score = parse_score_value(&chunk[0]).ok_or_else(|| NOT_A_FLOAT.to_string())?;
         let member = chunk[1].to_vec();
         pairs.push((score, member));
     }
@@ -5484,7 +7028,7 @@ fn parse_zrank(args: &[Vec<u8>], rev: bool) -> Result<Command, String> {
 
 fn parse_zrange(args: &[Vec<u8>], _rev_default: bool) -> Result<Command, String> {
     if args.len() < 3 {
-        return Err("ZRANGE requires key start stop".to_string());
+        return Err(wrong_arity("ZRANGE"));
     }
     let key = bytes_arg(args, 0, "ZRANGE")?;
     let start = bytes_arg(args, 1, "ZRANGE")?;
@@ -5516,10 +7060,10 @@ fn parse_zrange(args: &[Vec<u8>], _rev_default: bool) -> Result<Command, String>
             "LIMIT" => {
                 let off: i64 = str_arg(args, i + 1, "ZRANGE LIMIT")?
                     .parse()
-                    .map_err(|_| "ZRANGE LIMIT offset must be integer".to_string())?;
+                    .map_err(|_| NOT_AN_INTEGER.to_string())?;
                 let cnt: i64 = str_arg(args, i + 2, "ZRANGE LIMIT")?
                     .parse()
-                    .map_err(|_| "ZRANGE LIMIT count must be integer".to_string())?;
+                    .map_err(|_| NOT_AN_INTEGER.to_string())?;
                 limit = Some((off, cnt));
                 i += 3;
             }
@@ -5552,10 +7096,8 @@ fn parse_zrangebyscore(args: &[Vec<u8>], rev: bool) -> Result<Command, String> {
     } else {
         (bytes_arg(args, 1, cmd_name)?, bytes_arg(args, 2, cmd_name)?)
     };
-    let min = parse_score_bound(&min_raw)
-        .ok_or_else(|| format!("{} min is not a valid float", cmd_name))?;
-    let max = parse_score_bound(&max_raw)
-        .ok_or_else(|| format!("{} max is not a valid float", cmd_name))?;
+    let min = parse_score_bound(&min_raw).ok_or_else(|| "min or max is not a float".to_string())?;
+    let max = parse_score_bound(&max_raw).ok_or_else(|| "min or max is not a float".to_string())?;
     let mut with_scores = false;
     let mut limit: Option<(i64, i64)> = None;
     let mut i = 3;
@@ -5569,10 +7111,10 @@ fn parse_zrangebyscore(args: &[Vec<u8>], rev: bool) -> Result<Command, String> {
             "LIMIT" => {
                 let off: i64 = str_arg(args, i + 1, cmd_name)?
                     .parse()
-                    .map_err(|_| format!("{} LIMIT offset must be integer", cmd_name))?;
+                    .map_err(|_| NOT_AN_INTEGER.to_string())?;
                 let cnt: i64 = str_arg(args, i + 2, cmd_name)?
                     .parse()
-                    .map_err(|_| format!("{} LIMIT count must be integer", cmd_name))?;
+                    .map_err(|_| NOT_AN_INTEGER.to_string())?;
                 limit = Some((off, cnt));
                 i += 3;
             }
@@ -5597,8 +7139,10 @@ fn parse_zrangebylex(args: &[Vec<u8>], rev: bool) -> Result<Command, String> {
     } else {
         (bytes_arg(args, 1, cmd_name)?, bytes_arg(args, 2, cmd_name)?)
     };
-    let min = parse_lex_bound(&min_raw).ok_or_else(|| format!("{} min is invalid", cmd_name))?;
-    let max = parse_lex_bound(&max_raw).ok_or_else(|| format!("{} max is invalid", cmd_name))?;
+    let min = parse_lex_bound(&min_raw)
+        .ok_or_else(|| "min or max not valid string range item".to_string())?;
+    let max = parse_lex_bound(&max_raw)
+        .ok_or_else(|| "min or max not valid string range item".to_string())?;
     let mut limit: Option<(i64, i64)> = None;
     let mut i = 3;
     while i < args.len() {
@@ -5607,10 +7151,10 @@ fn parse_zrangebylex(args: &[Vec<u8>], rev: bool) -> Result<Command, String> {
             "LIMIT" => {
                 let off: i64 = str_arg(args, i + 1, cmd_name)?
                     .parse()
-                    .map_err(|_| format!("{} LIMIT offset must be integer", cmd_name))?;
+                    .map_err(|_| NOT_AN_INTEGER.to_string())?;
                 let cnt: i64 = str_arg(args, i + 2, cmd_name)?
                     .parse()
-                    .map_err(|_| format!("{} LIMIT count must be integer", cmd_name))?;
+                    .map_err(|_| NOT_AN_INTEGER.to_string())?;
                 limit = Some((off, cnt));
                 i += 3;
             }
@@ -5629,11 +7173,11 @@ fn parse_zrangebylex(args: &[Vec<u8>], rev: bool) -> Result<Command, String> {
 fn parse_zaggregate(args: &[Vec<u8>], is_inter: bool, _is_store: bool) -> Result<Command, String> {
     let cmd_name = if is_inter { "ZINTER" } else { "ZUNION" };
     if args.is_empty() {
-        return Err(format!("{} requires numkeys", cmd_name));
+        return Err(wrong_arity(cmd_name));
     }
     let numkeys: usize = str_arg(args, 0, cmd_name)?
         .parse()
-        .map_err(|_| format!("{} numkeys must be integer", cmd_name))?;
+        .map_err(|_| NOT_AN_INTEGER.to_string())?;
     if numkeys == 0 {
         return Err(format!("{} numkeys must be positive", cmd_name));
     }
@@ -5664,11 +7208,11 @@ fn parse_zaggregate(args: &[Vec<u8>], is_inter: bool, _is_store: bool) -> Result
 
 fn parse_zdiff(args: &[Vec<u8>], _is_store: bool) -> Result<Command, String> {
     if args.is_empty() {
-        return Err("ZDIFF requires numkeys".to_string());
+        return Err(wrong_arity("ZDIFF"));
     }
     let numkeys: usize = str_arg(args, 0, "ZDIFF")?
         .parse()
-        .map_err(|_| "ZDIFF numkeys must be integer".to_string())?;
+        .map_err(|_| NOT_AN_INTEGER.to_string())?;
     if numkeys == 0 {
         return Err("ZDIFF numkeys must be positive".to_string());
     }
@@ -5692,15 +7236,12 @@ fn parse_zaggregate_store(args: &[Vec<u8>], is_inter: bool) -> Result<Command, S
         "ZUNIONSTORE"
     };
     if args.len() < 3 {
-        return Err(format!(
-            "{} requires destination numkeys key [key ...]",
-            cmd_name
-        ));
+        return Err(wrong_arity(cmd_name));
     }
     let dst = bytes_arg(args, 0, cmd_name)?;
     let numkeys: usize = str_arg(args, 1, cmd_name)?
         .parse()
-        .map_err(|_| format!("{} numkeys must be integer", cmd_name))?;
+        .map_err(|_| NOT_AN_INTEGER.to_string())?;
     if numkeys == 0 {
         return Err(format!("{} numkeys must be positive", cmd_name));
     }
@@ -5743,13 +7284,12 @@ fn parse_aggregate_opts(
         match opt.as_str() {
             "WEIGHTS" => {
                 if i + numkeys >= args.len() {
-                    return Err(format!("{} WEIGHTS requires numkeys values", cmd_name));
+                    return Err(wrong_arity(cmd_name));
                 }
                 let mut w = Vec::with_capacity(numkeys);
                 for j in 0..numkeys {
-                    let v = parse_score_value(&args[i + 1 + j]).ok_or_else(|| {
-                        format!("{} WEIGHTS value is not a valid float", cmd_name)
-                    })?;
+                    let v = parse_score_value(&args[i + 1 + j])
+                        .ok_or_else(|| NOT_A_FLOAT.to_string())?;
                     w.push(v);
                 }
                 weights = Some(w);
@@ -5844,7 +7384,7 @@ fn run_count(client: &mut SpiClient<'_>, sql: &str, args: &[DatumWithOid], cmd: 
             _ => Response::Integer(0),
         },
         Err(e) => {
-            eprintln!("pg_redis: {} error: {}", cmd, e);
+            pgrx::warning!("pg_redis: {cmd} failed: {e}");
             Response::Error("internal error".to_string())
         }
     }
@@ -5857,6 +7397,21 @@ struct ZAddFlags {
     lt: bool,
     ch: bool,
     incr: bool,
+}
+
+/// The last occurrence of each key, in the order they first appear. `ON
+/// CONFLICT DO UPDATE` cannot touch a row twice in one statement, and Redis
+/// takes the last.
+fn dedup_last<T: Clone>(items: &[T], key: impl Fn(&T) -> &[u8]) -> Vec<T> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<T> = items
+        .iter()
+        .rev()
+        .filter(|it| seen.insert(key(it).to_vec()))
+        .cloned()
+        .collect();
+    out.reverse();
+    out
 }
 
 fn zadd_execute(
@@ -5885,8 +7440,9 @@ fn zadd_execute(
             ZAddIncrFlags { nx, xx, gt, lt },
         );
     }
-    let members: Vec<Option<Vec<u8>>> = pairs.iter().map(|(_, m)| Some(m.clone())).collect();
-    let scores: Vec<Option<f64>> = pairs.iter().map(|(s, _)| Some(*s)).collect();
+    let deduped = dedup_last(pairs, |(_, m)| m.as_slice());
+    let members: Vec<Option<Vec<u8>>> = deduped.iter().map(|(_, m)| Some(m.clone())).collect();
+    let scores: Vec<Option<f64>> = deduped.iter().map(|(s, _)| Some(*s)).collect();
     let sql = zadd_sql(
         db,
         &ZAddFlags {
@@ -5909,10 +7465,7 @@ fn zadd_execute(
                 Response::Integer(added)
             }
         }
-        Err(e) => {
-            eprintln!("pg_redis: ZADD error: {}", e);
-            Response::Error("internal error".to_string())
-        }
+        Err(e) => spi_failed("ZADD", e),
     }
 }
 
@@ -6009,7 +7562,7 @@ fn zadd_incr(
     let existing = match client.select(&existing_sql, None, &[key.into(), member.into()]) {
         Ok(tbl) => tbl.first().get::<f64>(1).ok().flatten(),
         Err(e) => {
-            eprintln!("pg_redis: ZADD INCR lookup error: {}", e);
+            pgrx::warning!("pg_redis: ZADD INCR lookup error: {e}");
             return Response::Error("internal error".to_string());
         }
     };
@@ -6041,10 +7594,7 @@ fn zadd_incr(
             Ok(Some(s)) => Response::BulkString(format_score(s).into_bytes()),
             _ => Response::Null,
         },
-        Err(e) => {
-            eprintln!("pg_redis: ZADD INCR error: {}", e);
-            Response::Error("internal error".to_string())
-        }
+        Err(e) => spi_failed("ZADD INCR", e),
     }
 }
 
@@ -6085,10 +7635,7 @@ fn zrank_execute(
                 Response::Integer(rank)
             }
         }
-        Err(e) => {
-            eprintln!("pg_redis: ZRANK error: {}", e);
-            Response::Error("internal error".to_string())
-        }
+        Err(e) => spi_failed("ZRANK", e),
     }
 }
 
@@ -6117,11 +7664,11 @@ fn zrange_execute(
         RangeBy::Index => {
             let s: i64 = match int_from_bytes(start) {
                 Some(v) => v,
-                None => return Response::Error("ZRANGE start must be integer".to_string()),
+                None => return Response::Error(NOT_AN_INTEGER.to_string()),
             };
             let e: i64 = match int_from_bytes(stop) {
                 Some(v) => v,
-                None => return Response::Error("ZRANGE stop must be integer".to_string()),
+                None => return Response::Error(NOT_AN_INTEGER.to_string()),
             };
             zrange_by_index(client, db, key, s, e, rev, with_scores)
         }
@@ -6129,11 +7676,11 @@ fn zrange_execute(
             let (min_raw, max_raw) = if rev { (stop, start) } else { (start, stop) };
             let min = match parse_score_bound(min_raw) {
                 Some(b) => b,
-                None => return Response::Error("min is not a valid float".to_string()),
+                None => return Response::Error("ERR min or max is not a float".to_string()),
             };
             let max = match parse_score_bound(max_raw) {
                 Some(b) => b,
-                None => return Response::Error("max is not a valid float".to_string()),
+                None => return Response::Error("ERR min or max is not a float".to_string()),
             };
             zrange_by_score_execute(
                 client,
@@ -6152,11 +7699,19 @@ fn zrange_execute(
             let (min_raw, max_raw) = if rev { (stop, start) } else { (start, stop) };
             let min = match parse_lex_bound(min_raw) {
                 Some(b) => b,
-                None => return Response::Error("min is invalid".to_string()),
+                None => {
+                    return Response::Error(
+                        "ERR min or max not valid string range item".to_string(),
+                    );
+                }
             };
             let max = match parse_lex_bound(max_raw) {
                 Some(b) => b,
-                None => return Response::Error("max is invalid".to_string()),
+                None => {
+                    return Response::Error(
+                        "ERR min or max not valid string range item".to_string(),
+                    );
+                }
             };
             zrange_by_lex_execute(client, db, key, &min, &max, rev, limit)
         }
@@ -6257,10 +7812,7 @@ fn zrange_by_score_execute(
     };
     match result {
         Ok(tbl) => collect_member_score(tbl, with_scores),
-        Err(e) => {
-            eprintln!("pg_redis: ZRANGEBYSCORE error: {}", e);
-            Response::Error("internal error".to_string())
-        }
+        Err(e) => spi_failed("ZRANGEBYSCORE", e),
     }
 }
 
@@ -6298,10 +7850,7 @@ fn zrange_by_lex_execute(
     );
     match client.select(&sql, None, &args) {
         Ok(tbl) => collect_member_score(tbl, false),
-        Err(e) => {
-            eprintln!("pg_redis: ZRANGEBYLEX error: {}", e);
-            Response::Error("internal error".to_string())
-        }
+        Err(e) => spi_failed("ZRANGEBYLEX", e),
     }
 }
 
@@ -6315,7 +7864,7 @@ fn zrange_collect(
     match client.select(sql, None, args) {
         Ok(tbl) => collect_member_score(tbl, with_scores),
         Err(e) => {
-            eprintln!("pg_redis: {} error: {}", cmd, e);
+            pgrx::warning!("pg_redis: {cmd} failed: {e}");
             Response::Error("internal error".to_string())
         }
     }
@@ -6385,10 +7934,7 @@ fn zpop_execute(
             }
             Response::Array(out)
         }
-        Err(e) => {
-            eprintln!("pg_redis: ZPOP error: {}", e);
-            Response::Error("internal error".to_string())
-        }
+        Err(e) => spi_failed("ZPOP", e),
     }
 }
 
@@ -6447,10 +7993,7 @@ fn zrandmember_execute(
                 }
             }
         }
-        Err(e) => {
-            eprintln!("pg_redis: ZRANDMEMBER error: {}", e);
-            Response::Error("internal error".to_string())
-        }
+        Err(e) => spi_failed("ZRANDMEMBER", e),
     }
 }
 
@@ -6527,16 +8070,13 @@ fn zaggregate_execute(
         ),
     };
 
-    let keys_vec: Vec<Option<Vec<u8>>> = keys.iter().map(|k| Some(k.clone())).collect();
+    let keys_vec = key_array(keys);
     let weights_opt: Vec<Option<f64>> = weights_vec.iter().map(|w| Some(*w)).collect();
 
     if let Some(dst) = store_into {
-        // DELETE targets old-only members (not in new_data); INSERT covers the
-        // new ones. Disjoint target sets eliminate CTE ordering hazards; the
-        // ON CONFLICT clause handles dst already containing members from the
-        // new result (e.g. when dst is also an input key). Data-modifying
-        // CTEs always execute to completion, so del and ins fire even though
-        // only ins is read back for the card count.
+        // Disjoint targets: the DELETE takes only old-only members, the INSERT
+        // only new ones, so the two CTEs cannot race over a row. Both run to
+        // completion even though only `ins` is read back.
         let sql = format!(
             "WITH new_data AS ({body}), \
                   del AS ( \
@@ -6565,10 +8105,7 @@ fn zaggregate_execute(
         );
         match client.select(&sql, None, &[keys_vec.into(), weights_opt.into()]) {
             Ok(tbl) => collect_member_score(tbl, with_scores),
-            Err(e) => {
-                eprintln!("pg_redis: ZUNION/ZINTER/ZDIFF error: {}", e);
-                Response::Error("internal error".to_string())
-            }
+            Err(e) => spi_failed("ZUNION/ZINTER/ZDIFF", e),
         }
     }
 }
@@ -6608,6 +8145,389 @@ mod tests {
                 );
             )*
         };
+    }
+
+    /// Redis numbers bits from the most significant of byte 0, which is the
+    /// opposite of PostgreSQL's `get_bit`. Getting it backwards passes every
+    /// symmetric test, so these pin the asymmetric ones.
+    #[test]
+    fn bits_are_numbered_from_the_most_significant() {
+        assert!(bit_at(&[0x80], 0));
+        assert!(!bit_at(&[0x80], 7));
+        assert!(bit_at(&[0x01], 7));
+        assert!(!bit_at(&[0x01], 0));
+        assert!(bit_at(&[0x00, 0x80], 8));
+        // Past the end reads zero rather than erroring.
+        assert!(!bit_at(&[0x80], 100));
+        assert!(!bit_at(&[], 0));
+
+        // Setting bit 0 of an empty value gives 0x80, as Redis does.
+        let mut v = Vec::new();
+        assert!(!set_bit_at(&mut v, 0, true));
+        assert_eq!(v, vec![0x80]);
+        // And setting it again reports the bit as it was.
+        assert!(set_bit_at(&mut v, 0, false));
+        assert_eq!(v, vec![0x00]);
+        // A far offset grows the value with NUL bytes.
+        let mut v = Vec::new();
+        set_bit_at(&mut v, 15, true);
+        assert_eq!(v, vec![0x00, 0x01]);
+    }
+
+    /// Redis's own documented `BITCOUNT` examples, which pin the byte and bit
+    /// ranges against a source that is not this implementation.
+    #[test]
+    fn bitcount_matches_the_documented_examples() {
+        let v = b"foobar";
+        assert_eq!(count_bits(v, None), 26);
+        assert_eq!(count_bits(v, Some((0, 0, false))), 4);
+        assert_eq!(count_bits(v, Some((1, 1, false))), 6);
+        assert_eq!(count_bits(v, Some((0, -5, false))), 10);
+        assert_eq!(count_bits(v, Some((5, 30, true))), 17);
+        assert_eq!(count_bits(v, Some((0, -5, true))), 25);
+        // An empty value has nothing to count, whatever range is named.
+        assert_eq!(count_bits(b"", None), 0);
+        assert_eq!(count_bits(b"", Some((0, -1, false))), 0);
+        assert_eq!(count_bits(b"", Some((0, -1, true))), 0);
+    }
+
+    /// `OBJECT ENCODING` reports Redis's representation, not ours. The names
+    /// and the thresholds are Redis's defaults; what pg_redis actually stores
+    /// is an inline slot and a chunk pool.
+    #[test]
+    fn object_encoding_names_redis_representations() {
+        use crate::mem::KeyKind::{Hash, List, Set, Zset};
+        assert_eq!(string_encoding(b"12345"), "int");
+        assert_eq!(string_encoding(b"-1"), "int");
+        // Not canonical, so not an int — `007` is a string to Redis.
+        assert_eq!(string_encoding(b"007"), "embstr");
+        assert_eq!(string_encoding(b"hello"), "embstr");
+        assert_eq!(string_encoding(&[b'x'; 44]), "embstr");
+        assert_eq!(string_encoding(&[b'x'; 45]), "raw");
+
+        let small: Vec<Vec<u8>> = vec![b"a".to_vec(), b"b".to_vec()];
+        assert_eq!(collection_encoding(List, &small), "listpack");
+        assert_eq!(collection_encoding(Zset, &small), "listpack");
+        assert_eq!(collection_encoding(Hash, &small), "listpack");
+        // All-integer members are an intset whatever their count, up to 512.
+        let ints: Vec<Vec<u8>> = vec![b"1".to_vec(), b"2".to_vec()];
+        assert_eq!(collection_encoding(Set, &ints), "intset");
+        assert_eq!(collection_encoding(Set, &small), "listpack");
+
+        // Either threshold promotes it: too many elements, or one too long.
+        let many: Vec<Vec<u8>> = (0..129).map(|i| format!("m{i}").into_bytes()).collect();
+        assert_eq!(collection_encoding(List, &many), "quicklist");
+        assert_eq!(collection_encoding(Zset, &many), "skiplist");
+        // A hash's items are field and value both, so 129 fields is 258 items —
+        // and 129 items is 64 fields, which still packs.
+        assert_eq!(collection_encoding(Hash, &many), "listpack");
+        let many_fields: Vec<Vec<u8>> = (0..258).map(|i| format!("m{i}").into_bytes()).collect();
+        assert_eq!(collection_encoding(Hash, &many_fields), "hashtable");
+        let long: Vec<Vec<u8>> = vec![vec![b'x'; 65]];
+        assert_eq!(collection_encoding(List, &long), "quicklist");
+        assert_eq!(collection_encoding(Set, &long), "hashtable");
+    }
+
+    /// `HRANDFIELD`'s three shapes. A negative count is the only way to ask for
+    /// more fields than the hash holds.
+    #[test]
+    fn hrandfield_takes_distinct_fields_unless_the_count_is_negative() {
+        let pairs = vec![
+            (b"a".to_vec(), b"1".to_vec()),
+            (b"b".to_vec(), b"2".to_vec()),
+        ];
+        let len = |r: &Response| match r {
+            Response::Array(v) => v.len(),
+            _ => panic!("expected an array reply"),
+        };
+        // No count is one field as a bulk string, not a one-element array.
+        assert!(matches!(
+            random_fields(&pairs, None, false),
+            Response::BulkString(ref f) if f == b"a"
+        ));
+        assert!(matches!(random_fields(&[], None, false), Response::Null));
+
+        assert_eq!(len(&random_fields(&pairs, Some(1), false)), 1);
+        // A positive count is capped at what the hash holds.
+        assert_eq!(len(&random_fields(&pairs, Some(5), false)), 2);
+        // A negative one repeats to reach the count asked for.
+        assert_eq!(len(&random_fields(&pairs, Some(-5), false)), 5);
+        // WITHVALUES interleaves, so every count doubles.
+        assert_eq!(len(&random_fields(&pairs, Some(5), true)), 4);
+        assert_eq!(len(&random_fields(&pairs, Some(-3), true)), 6);
+        // An empty hash is an empty array whatever the count.
+        assert_eq!(len(&random_fields(&[], Some(3), false)), 0);
+    }
+
+    /// `GETRANGE`'s clamping, which Redis does rather than erroring. Every case
+    /// here reads a value it does not have to bounds-check first.
+    #[test]
+    fn a_byte_range_clamps_rather_than_erroring() {
+        let v = b"Hello";
+        assert_eq!(byte_range(v, 0, -1), b"Hello");
+        assert_eq!(byte_range(v, 0, 4), b"Hello");
+        assert_eq!(byte_range(v, -3, -1), b"llo");
+        assert_eq!(byte_range(v, 1, 3), b"ell");
+        // Past either end, in both directions.
+        assert_eq!(byte_range(v, 0, 100), b"Hello");
+        assert_eq!(byte_range(v, -100, -1), b"Hello");
+        assert_eq!(byte_range(v, 10, 20), b"");
+        assert_eq!(byte_range(v, 3, 1), b"");
+        assert_eq!(byte_range(v, -1, -3), b"");
+        // An empty value has no range at all, whatever is asked for.
+        assert_eq!(byte_range(b"", 0, -1), b"");
+        assert_eq!(byte_range(b"", -5, 5), b"");
+        // Bytes, not characters: a NUL is a byte like any other.
+        assert_eq!(byte_range(b"a\0b", 1, 1), b"\0");
+    }
+
+    /// `RPOPLPUSH` is `LMOVE` under its older name, so it has to parse to the
+    /// same command rather than to a variant of its own.
+    #[test]
+    fn rpoplpush_is_lmove_right_to_left() {
+        let cmd = is_ok(Command::parse(parts(&["RPOPLPUSH", "a", "b"])));
+        assert!(matches!(
+            cmd,
+            Command::LMove {
+                ref src,
+                ref dst,
+                src_left: false,
+                dst_left: true,
+            } if src == b"a" && dst == b"b"
+        ));
+    }
+
+    /// The options `GETEX` takes, and the ones it refuses. Redis reads the
+    /// value either way; the option only decides what happens to the expiry.
+    #[test]
+    fn getex_resolves_every_expiry_option() {
+        use GetExExpiry::*;
+        let expiry = |argv: &[&str]| match is_ok(Command::parse(parts(argv))) {
+            Command::GetEx { expiry, .. } => expiry,
+            other => panic!("parsed as {other:?}"),
+        };
+        assert_eq!(expiry(&["GETEX", "k"]), Keep);
+        assert_eq!(expiry(&["GETEX", "k", "PERSIST"]), Clear);
+        assert!(matches!(expiry(&["GETEX", "k", "EX", "100"]), At(_)));
+        assert!(matches!(expiry(&["GETEX", "k", "PX", "100"]), At(_)));
+        assert!(matches!(expiry(&["GETEX", "k", "EXAT", "100"]), At(_)));
+        assert!(matches!(expiry(&["GETEX", "k", "PXAT", "100"]), At(_)));
+
+        assert_eq!(
+            is_err(Command::parse(parts(&["GETEX", "k", "NOPE", "1"]))),
+            "ERR syntax error"
+        );
+        assert_eq!(
+            is_err(Command::parse(parts(&["GETEX", "k", "PERSIST", "1"]))),
+            "ERR syntax error"
+        );
+        assert_eq!(
+            is_err(Command::parse(parts(&["GETEX", "k", "EX", "100", "x"]))),
+            "ERR syntax error"
+        );
+        // A non-positive expiry is refused, as it is for SET and EXPIRE.
+        assert_eq!(
+            is_err(Command::parse(parts(&["GETEX", "k", "EX", "0"]))),
+            invalid_expire("getex")
+        );
+    }
+
+    /// Redis quotes each argument after the command name, and the trailing
+    /// space is part of what a client matches on.
+    #[test]
+    fn an_unknown_command_names_the_arguments_it_was_given() {
+        assert_eq!(
+            is_err(Command::parse(parts(&["NOSUCHCOMMAND"]))),
+            "unknown command 'NOSUCHCOMMAND', with args beginning with: "
+        );
+        assert_eq!(
+            is_err(Command::parse(parts(&["NOSUCHCOMMAND", "arg"]))),
+            "unknown command 'NOSUCHCOMMAND', with args beginning with: 'arg' "
+        );
+        assert_eq!(
+            is_err(Command::parse(parts(&["NOSUCHCOMMAND", "a", "b"]))),
+            "unknown command 'NOSUCHCOMMAND', with args beginning with: 'a' 'b' "
+        );
+    }
+
+    /// A command missing from `typed_keys` is a silent `WRONGTYPE` hole: it
+    /// would happily read a hash as a list and answer empty. Every command that
+    /// names a key of a known type is listed here, against the type it demands.
+    #[test]
+    fn every_typed_command_declares_the_type_its_key_must_hold() {
+        use crate::mem::KeyKind::{Hash, List, Set, String as Str, Zset};
+
+        let cases: &[(&[&str], &[crate::mem::KeyKind])] = &[
+            (&["GET", "k"], &[Str]),
+            (&["GETDEL", "k"], &[Str]),
+            (&["GETSET", "k", "v"], &[Str]),
+            (&["APPEND", "k", "v"], &[Str]),
+            (&["STRLEN", "k"], &[Str]),
+            (&["INCR", "k"], &[Str]),
+            (&["DECR", "k"], &[Str]),
+            (&["INCRBY", "k", "1"], &[Str]),
+            (&["DECRBY", "k", "1"], &[Str]),
+            (&["INCRBYFLOAT", "k", "1.5"], &[Str]),
+            (&["SET", "k", "v", "GET"], &[Str]),
+            (&["HGET", "k", "f"], &[Hash]),
+            (&["HSET", "k", "f", "v"], &[Hash]),
+            (&["HDEL", "k", "f"], &[Hash]),
+            (&["HGETALL", "k"], &[Hash]),
+            (&["HMGET", "k", "f"], &[Hash]),
+            (&["HMSET", "k", "f", "v"], &[Hash]),
+            (&["HKEYS", "k"], &[Hash]),
+            (&["HVALS", "k"], &[Hash]),
+            (&["HEXISTS", "k", "f"], &[Hash]),
+            (&["HLEN", "k"], &[Hash]),
+            (&["HINCRBY", "k", "f", "1"], &[Hash]),
+            (&["HSETNX", "k", "f", "v"], &[Hash]),
+            (&["LPUSH", "k", "v"], &[List]),
+            (&["RPUSH", "k", "v"], &[List]),
+            (&["LPUSHX", "k", "v"], &[List]),
+            (&["RPUSHX", "k", "v"], &[List]),
+            (&["LPOP", "k"], &[List]),
+            (&["RPOP", "k"], &[List]),
+            (&["LLEN", "k"], &[List]),
+            (&["LRANGE", "k", "0", "-1"], &[List]),
+            (&["LINDEX", "k", "0"], &[List]),
+            (&["LSET", "k", "0", "v"], &[List]),
+            (&["LINSERT", "k", "BEFORE", "a", "b"], &[List]),
+            (&["LREM", "k", "0", "v"], &[List]),
+            (&["LPOS", "k", "v"], &[List]),
+            (&["LTRIM", "k", "0", "-1"], &[List]),
+            (&["SADD", "k", "m"], &[Set]),
+            (&["SREM", "k", "m"], &[Set]),
+            (&["SMEMBERS", "k"], &[Set]),
+            (&["SCARD", "k"], &[Set]),
+            (&["SISMEMBER", "k", "m"], &[Set]),
+            (&["SMISMEMBER", "k", "m"], &[Set]),
+            (&["SPOP", "k"], &[Set]),
+            (&["SRANDMEMBER", "k"], &[Set]),
+            (&["SUNION", "k"], &[Set]),
+            (&["SINTER", "k"], &[Set]),
+            (&["SDIFF", "k"], &[Set]),
+            (&["ZADD", "k", "1", "m"], &[Zset]),
+            (&["ZREM", "k", "m"], &[Zset]),
+            (&["ZSCORE", "k", "m"], &[Zset]),
+            (&["ZMSCORE", "k", "m"], &[Zset]),
+            (&["ZINCRBY", "k", "1", "m"], &[Zset]),
+            (&["ZCARD", "k"], &[Zset]),
+            (&["ZCOUNT", "k", "0", "1"], &[Zset]),
+            (&["ZLEXCOUNT", "k", "-", "+"], &[Zset]),
+            (&["ZRANK", "k", "m"], &[Zset]),
+            (&["ZRANGE", "k", "0", "-1"], &[Zset]),
+            (&["ZRANGEBYSCORE", "k", "0", "1"], &[Zset]),
+            (&["ZRANGEBYLEX", "k", "-", "+"], &[Zset]),
+            (&["ZPOPMIN", "k"], &[Zset]),
+            (&["ZPOPMAX", "k"], &[Zset]),
+            (&["ZRANDMEMBER", "k"], &[Zset]),
+            (&["ZREMRANGEBYRANK", "k", "0", "1"], &[Zset]),
+            (&["ZREMRANGEBYSCORE", "k", "0", "1"], &[Zset]),
+            (&["ZREMRANGEBYLEX", "k", "-", "+"], &[Zset]),
+            // A plain set reads as a sorted set whose scores are all 1.
+            (&["ZUNION", "1", "k"], &[Zset, Set]),
+            (&["ZINTER", "1", "k"], &[Zset, Set]),
+            (&["ZDIFF", "1", "k"], &[Zset, Set]),
+        ];
+
+        for (input, expected) in cases {
+            let cmd = is_ok(Command::parse(parts(input)));
+            let typed = cmd.typed_keys();
+            assert_eq!(
+                typed.len(),
+                1,
+                "{input:?} named {} typed keys, expected one",
+                typed.len()
+            );
+            assert_eq!(typed[0].0, b"k", "{input:?} named the wrong key");
+            assert_eq!(typed[0].1, *expected, "{input:?} demands the wrong type");
+        }
+    }
+
+    /// `(argv, expected typed keys)` — the shape both two-key tests below take.
+    type TypedCase<'a> = (&'a [&'a str], &'a [(&'a [u8], &'a [crate::mem::KeyKind])]);
+    /// `(argv, expected replaced keys)`.
+    type OverwriteCase<'a> = (&'a [&'a str], &'a [(&'a [u8], crate::mem::KeyKind)]);
+
+    /// The two-key commands name both sides, and the store commands type their
+    /// sources — the destination is replaced whatever it held, so it is not one
+    /// of these.
+    #[test]
+    fn two_key_commands_type_both_sides() {
+        use crate::mem::KeyKind::{List, Set, Zset};
+
+        let cases: &[TypedCase] = &[
+            (
+                &["LMOVE", "a", "b", "LEFT", "RIGHT"],
+                &[(b"a", &[List]), (b"b", &[List])],
+            ),
+            (&["SMOVE", "a", "b", "m"], &[(b"a", &[Set]), (b"b", &[Set])]),
+            (
+                &["SUNIONSTORE", "d", "a", "b"],
+                &[(b"a", &[Set]), (b"b", &[Set])],
+            ),
+            (
+                &["SINTERSTORE", "d", "a", "b"],
+                &[(b"a", &[Set]), (b"b", &[Set])],
+            ),
+            (
+                &["SDIFFSTORE", "d", "a", "b"],
+                &[(b"a", &[Set]), (b"b", &[Set])],
+            ),
+            (
+                &["ZUNIONSTORE", "d", "2", "a", "b"],
+                &[(b"a", &[Zset, Set]), (b"b", &[Zset, Set])],
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let cmd = is_ok(Command::parse(parts(input)));
+            let typed = cmd.typed_keys();
+            assert_eq!(typed.len(), expected.len(), "{input:?}");
+            for (got, want) in typed.iter().zip(expected.iter()) {
+                assert_eq!((got.0, got.1), (want.0, want.1), "{input:?}");
+            }
+        }
+    }
+
+    /// Redis lets these land on a key of any type, replacing what was there.
+    /// A command in both lists would be checked and then cleared, which is a
+    /// contradiction: one of the two is wrong.
+    #[test]
+    fn the_commands_that_replace_a_key_are_not_also_type_checked() {
+        use crate::mem::KeyKind::{Set, String as Str, Zset};
+
+        let cases: &[OverwriteCase] = &[
+            (&["SET", "k", "v"], &[(b"k", Str)]),
+            (&["SETEX", "k", "10", "v"], &[(b"k", Str)]),
+            (&["PSETEX", "k", "10", "v"], &[(b"k", Str)]),
+            (&["MSET", "a", "1", "b", "2"], &[(b"a", Str), (b"b", Str)]),
+            (&["SUNIONSTORE", "d", "a"], &[(b"d", Set)]),
+            (&["ZUNIONSTORE", "d", "1", "a"], &[(b"d", Zset)]),
+            // Conditional writes decide on whether the key is there, so they
+            // clear it themselves rather than up front.
+            (&["SET", "k", "v", "NX"], &[]),
+            (&["SET", "k", "v", "XX"], &[]),
+            (&["SET", "k", "v", "GET"], &[]),
+            (&["RENAME", "a", "b"], &[]),
+        ];
+
+        for (input, expected) in cases {
+            let cmd = is_ok(Command::parse(parts(input)));
+            let over = cmd.overwritten_keys();
+            assert_eq!(over.len(), expected.len(), "{input:?} -> {over:?}");
+            for (got, want) in over.iter().zip(expected.iter()) {
+                assert_eq!((got.0, got.1), (want.0, want.1), "{input:?}");
+            }
+            let typed: Vec<&[u8]> = cmd.typed_keys().into_iter().map(|(k, _)| k).collect();
+            for (key, _) in expected.iter() {
+                assert!(
+                    !typed.contains(key),
+                    "{input:?} both type-checks and replaces {:?}",
+                    std::str::from_utf8(key)
+                );
+            }
+        }
     }
 
     /// Every command name the server accepts, and the variant it maps to.
@@ -6741,13 +8661,9 @@ mod tests {
         }
     }
 
-    /// Every command listed in the coverage doc must parse, and every command
-    /// that parses must be listed.
-    ///
-    /// The doc had drifted badly enough to claim LPUSH, SADD, INCR and STRLEN
-    /// were unimplemented. Checking it against the parser is the only way it
-    /// stays true, so the page is data for this test rather than prose nobody
-    /// re-reads.
+    /// Every command in the coverage doc must parse, and every command that
+    /// parses must be listed. The page is data for this test, because prose
+    /// nobody re-reads drifts — it once claimed LPUSH was unimplemented.
     #[test]
     fn the_coverage_doc_lists_exactly_what_parses() {
         const DOC: &str = include_str!("../docs/command-coverage.md");
@@ -6778,6 +8694,34 @@ mod tests {
             }
         }
 
+        // Every command the page calls absent must actually be absent. This
+        // is the direction that drifts: a command gets implemented and the
+        // paragraph saying it is not keeps its word for another release.
+        let absent = DOC
+            .split("## Not implemented")
+            .nth(1)
+            .expect("the page must have a Not implemented section");
+        let named: Vec<&str> = absent
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|c| {
+                !c.is_empty()
+                    && c.chars()
+                        .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
+            })
+            .collect();
+        assert!(named.len() > 8, "only {} absences named", named.len());
+        for cmd in &named {
+            let err = Command::parse(vec![cmd.as_bytes().to_vec()])
+                .err()
+                .unwrap_or_default();
+            assert!(
+                err.contains("unknown command"),
+                "{cmd} is listed as not implemented but the parser accepts it"
+            );
+        }
+
         // ...and nothing the parser knows is missing from the page. COMMAND is
         // spelled differently in the dispatch, so compare on the doc side.
         for cmd in [
@@ -6801,6 +8745,21 @@ mod tests {
             "RANDOMKEY",
             "PUBSUB",
             "WATCH",
+            "SETRANGE",
+            "GETRANGE",
+            "SETBIT",
+            "GETBIT",
+            "BITCOUNT",
+            "GETEX",
+            "RENAMENX",
+            "COPY",
+            "OBJECT",
+            "HRANDFIELD",
+            "HINCRBYFLOAT",
+            "SINTERCARD",
+            "RPOPLPUSH",
+            "FLUSHDB",
+            "FLUSHALL",
         ] {
             assert!(
                 listed.contains(&cmd),
@@ -7258,6 +9217,55 @@ mod tests {
 
     // ─────────────────────────── Score / lex bounds ───────────────────────────
 
+    /// Redis's wording, in the shapes clients and people actually see.
+    #[test]
+    fn error_strings_match_redis() {
+        assert_eq!(
+            wrong_arity("GET"),
+            "wrong number of arguments for 'get' command"
+        );
+        assert_eq!(
+            invalid_expire("SETEX"),
+            "invalid expire time in 'setex' command"
+        );
+    }
+
+    /// A non-positive expiry is refused outright, and one whose deadline could
+    /// not be represented is refused rather than stored as something else.
+    #[test]
+    fn an_expiry_must_be_positive_and_representable() {
+        assert!(check_expire(1, 1000, "SET").is_ok());
+        assert!(check_expire(0, 1000, "SET").is_err());
+        assert!(check_expire(-1, 1000, "SET").is_err());
+        assert!(check_expire(i64::MAX, 1000, "SET").is_err());
+        // A deadline in the past is legal — `EXPIRE k -1` deletes the key —
+        // but an unrepresentable one is not.
+        assert!(check_expire_deadline(-1, 1000, "EXPIRE").is_ok());
+        assert!(check_expire_deadline(9_999_999_999_999_999, 1000, "EXPIRE").is_err());
+    }
+
+    /// `SPOP`, the pops and `ZPOP*` take no negative count; `SRANDMEMBER` and
+    /// `ZRANDMEMBER` do, where it means "with repeats", and never reach this.
+    #[test]
+    fn a_pop_count_may_not_be_negative() {
+        assert_eq!(check_count(0), Ok(0));
+        assert_eq!(check_count(5), Ok(5));
+        assert!(check_count(-1).is_err());
+    }
+
+    /// `ON CONFLICT DO UPDATE` cannot touch a row twice in one statement, and
+    /// Redis keeps the last of a repeated key.
+    #[test]
+    fn duplicate_arguments_collapse_to_the_last() {
+        let pairs = vec![(b"a".to_vec(), 1), (b"b".to_vec(), 2), (b"a".to_vec(), 3)];
+        let deduped = dedup_last(&pairs, |(k, _)| k.as_slice());
+        assert_eq!(deduped, vec![(b"b".to_vec(), 2), (b"a".to_vec(), 3)]);
+        assert_eq!(
+            dedup_last::<(Vec<u8>, i32)>(&[], |(k, _)| k.as_slice()),
+            vec![]
+        );
+    }
+
     #[test]
     fn parse_score_value_finite() {
         assert_eq!(parse_score_value(b"1"), Some(1.0));
@@ -7276,6 +9284,10 @@ mod tests {
     fn parse_score_value_rejects_nan_and_garbage() {
         assert_eq!(parse_score_value(b"nan"), None);
         assert_eq!(parse_score_value(b"abc"), None);
+        // A literal too large to represent is out of range, not infinity —
+        // only the spelled-out forms mean that.
+        assert_eq!(parse_score_value(b"1e400"), None);
+        assert_eq!(parse_score_value(b"-1e400"), None);
     }
 
     #[test]
@@ -7579,7 +9591,7 @@ mod tests {
     #[test]
     fn watch_requires_keys() {
         let err = Command::parse(vec![b"WATCH".to_vec()]).unwrap_err();
-        assert!(err.contains("WATCH requires"));
+        assert!(err.contains("wrong number of arguments"));
     }
 
     #[test]

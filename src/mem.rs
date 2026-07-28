@@ -397,6 +397,14 @@ unsafe fn pool_free_chunks(pool: *mut ValPool) -> usize {
 ///
 /// All or nothing: a pool that cannot supply every chunk hands back `None` with
 /// its free list untouched, so a refused write never strands chunks.
+///
+/// The walk is bounded by the capacity as well as by `free_count`, and the two
+/// are not the same check. `free_count` is a number kept alongside the list;
+/// the list is the truth. They agreed until a `FLUSHDB` left removed entries
+/// naming chunks it had just handed back — see `flush_table` — and the walk
+/// that trusted the count read `links[garbage]` and took the worker with it.
+/// The count is authoritative for *whether* to allocate; only the links say
+/// where to stop.
 unsafe fn pool_alloc(pool: *mut ValPool, n: usize) -> Option<u32> {
     if n == 0 {
         return Some(NIL_CHUNK);
@@ -409,12 +417,23 @@ unsafe fn pool_alloc(pool: *mut ValPool, n: usize) -> Option<u32> {
             return None;
         }
         let links = pool_links(pool);
+        let capacity = (*pool).capacity;
         let head = (*pool).free_head;
+        if head >= capacity {
+            return None;
+        }
         // The free list is already a chain; taking a prefix of it needs one
         // pointer moved, not `n`.
         let mut tail = head;
         for _ in 1..n {
-            tail = links.add(tail as usize).read();
+            let next = links.add(tail as usize).read();
+            // Short list against a count that says otherwise: refuse, and
+            // leave the list exactly as it was. A caller that double-freed is
+            // already wrong; reading past the pool would make it fatal.
+            if next >= capacity {
+                return None;
+            }
+            tail = next;
         }
         let next_free = links.add(tail as usize).read();
         links.add(tail as usize).write(NIL_CHUNK);
@@ -1551,6 +1570,20 @@ unsafe fn dir_forget(db_idx: usize, kh: &KeyHash) {
 /// What `key` holds and when it expires, or `None` when nothing holds it — an
 /// entry whose expiry has passed reads as absent, as an expired `KvEntry` does.
 unsafe fn dir_lookup(db_idx: usize, kh: &KeyHash) -> Option<(KeyKind, i64)> {
+    match unsafe { dir_lookup_raw(db_idx, kh) } {
+        Some((_, exp)) if exp != 0 && exp <= now_micros() => None,
+        other => other,
+    }
+}
+
+/// `dir_lookup` without the expiry applied: an entry whose deadline has passed
+/// comes back rather than reading as absent.
+///
+/// Every reader wants `dir_lookup` — a key past its expiry is gone, and that is
+/// the answer `TYPE` and `EXISTS` give. This is for the one caller that has to
+/// *make* it gone, which needs to know the kind in order to know which tables
+/// hold the rows.
+unsafe fn dir_lookup_raw(db_idx: usize, kh: &KeyHash) -> Option<(KeyKind, i64)> {
     let htab = dir_htab_for(db_idx);
     if htab.is_null() {
         return None;
@@ -1566,15 +1599,11 @@ unsafe fn dir_lookup(db_idx: usize, kh: &KeyHash) -> Option<(KeyKind, i64)> {
             &mut found,
         ) as *mut DirEntry
     };
-    let out = if entry.is_null() {
+    if entry.is_null() {
         None
     } else {
         let kind = KeyKind::from_u8(unsafe { (*entry).kind });
         kind.map(|k| (k, unsafe { (*entry).expires_at }))
-    };
-    match out {
-        Some((_, exp)) if exp != 0 && exp <= now_micros() => None,
-        other => other,
     }
 }
 
@@ -2800,6 +2829,34 @@ pub unsafe fn mem_key_kind(db_idx: usize, key: &[u8]) -> Option<KeyKind> {
     unsafe { dir_lookup(db_idx, &key_hash(key)) }.map(|(kind, _)| kind)
 }
 
+/// What `key` holds, reaping it first if its expiry has passed.
+///
+/// The sweep reclaims expired keys once a second, and until it runs a
+/// collection outlives its own expiry: the directory already reports the key
+/// gone, because `dir_lookup` folds a passed deadline onto absent, while the
+/// rows sit in the type's tables — which is where `LLEN`, `SMEMBERS`, `HGETALL`
+/// and every other collection read go. They never consult the directory, so for
+/// that window `TYPE` answered `none` and `LLEN` answered 3.
+///
+/// A string never had the problem: its expiry is in the `KvEntry` the `GET`
+/// path already reads.
+///
+/// This costs the same single directory lookup `mem_key_kind` did, and the drop
+/// only runs for a key that has actually expired.
+///
+/// # Safety
+/// As `mem_key_kind`, and no table lock may be held — the drop takes the type's
+/// lock and then the directory's.
+pub unsafe fn mem_key_kind_reaping(db_idx: usize, key: &[u8]) -> Option<KeyKind> {
+    let kh = key_hash(key);
+    let (kind, exp) = unsafe { dir_lookup_raw(db_idx, &kh) }?;
+    if exp != 0 && exp <= now_micros() {
+        unsafe { mem_drop_key(db_idx, kind, &kh) };
+        return None;
+    }
+    Some(kind)
+}
+
 /// Delete `key` and everything the type holding it stored for it. What `SET`
 /// does to a key that was a list: Redis replaces the value rather than refusing.
 ///
@@ -2827,26 +2884,49 @@ unsafe fn all_keys<E, const N: usize>(table: &SharedTable<E>) -> Vec<[u8; N]> {
 /// re-formatted rather than walked chunk by chunk: every chain in it belonged
 /// to an entry that is going, so there is nothing left to hand back to.
 ///
+/// **Every entry is zeroed before it goes**, past the key dynahash needs to
+/// find it by. Not for the pool's sake — `pool_init` rebuilds the free list
+/// underneath it — but for dynahash's: a removed element goes on its own free
+/// list holding the bytes it had, and the next key to land in that slot
+/// inherits them. A `value_len` past the inline slot is all `value_free` looks
+/// at, so the next write of that key releases a head that now indexes the
+/// freshly formatted free list. That splices the list into a cycle and inflates
+/// `free_count`, and the `pool_alloc` that trusts the count walks off the end
+/// of it. What reaches a client is a segfault in a later command, on another
+/// connection, with nothing left to connect it to `FLUSHDB`.
+///
+/// Zeroed rather than cleared field by field, and it is the shorter way as well
+/// as the safer one: all-zero is what `ShmemInitHash` hands out, so a recycled
+/// element becomes indistinguishable from a fresh one and no field added later
+/// can be forgotten here.
+///
 /// # Safety
 /// Caller holds `lk`, and `pool` is used by no table but this one.
-unsafe fn flush_table<E, const N: usize>(
+unsafe fn flush_table<E, M, const N: usize>(
     htab: *mut pg_sys::HTAB,
     meta_htab: *mut pg_sys::HTAB,
     pool: *mut ValPool,
     chunks: usize,
     lk: *mut pg_sys::LWLock,
 ) {
-    let _guard = unsafe { LockGuard::exclusive(lk) };
-    if let Some(table) = unsafe { SharedTable::<E>::from_raw(htab) } {
-        for k in unsafe { all_keys::<E, N>(&table) } {
+    /// Zero every entry past its key, then remove it. The key stays until the
+    /// removal, which looks it up.
+    unsafe fn empty<T, const K: usize>(htab: *mut pg_sys::HTAB) {
+        let Some(table) = (unsafe { SharedTable::<T>::from_raw(htab) }) else {
+            return;
+        };
+        for k in unsafe { all_keys::<T, K>(&table) } {
+            if let Some(entry) = unsafe { table.find(k.as_ptr().cast()) } {
+                let tail = size_of::<T>() - K;
+                unsafe { std::ptr::write_bytes(entry.cast::<u8>().add(K), 0, tail) };
+            }
             unsafe { table.remove(k.as_ptr().cast()) };
         }
     }
-    if let Some(meta) = unsafe { SharedTable::<u8>::from_raw(meta_htab) } {
-        for k in unsafe { all_keys::<u8, KEY_HASH_LEN>(&meta) } {
-            unsafe { meta.remove(k.as_ptr().cast()) };
-        }
-    }
+
+    let _guard = unsafe { LockGuard::exclusive(lk) };
+    unsafe { empty::<E, N>(htab) };
+    unsafe { empty::<M, KEY_HASH_LEN>(meta_htab) };
     if !pool.is_null() {
         unsafe { pool_init(pool, chunks) };
     }
@@ -2862,35 +2942,35 @@ pub unsafe fn mem_flush_db(db_idx: usize) {
     let chunks = pool_chunks();
     let member_chunks = member_pool_chunks();
     unsafe {
-        flush_table::<KvEntry, KEY_HASH_LEN>(
+        flush_table::<KvEntry, CountMeta, KEY_HASH_LEN>(
             htab_for(db_idx),
             std::ptr::null_mut(),
             kv_pool_for(db_idx),
             chunks,
             lwlock(db_idx),
         );
-        flush_table::<HashEntry, COMPOSITE_KEY_LEN>(
+        flush_table::<HashEntry, CountMeta, COMPOSITE_KEY_LEN>(
             hash_htab_for(db_idx),
             hash_meta_htab_for(db_idx),
             hash_pool_for(db_idx),
             chunks,
             hash_lwlock(db_idx),
         );
-        flush_table::<SetEntry, COMPOSITE_KEY_LEN>(
+        flush_table::<SetEntry, CountMeta, COMPOSITE_KEY_LEN>(
             set_htab_for(db_idx),
             set_meta_htab_for(db_idx),
             set_pool_for(db_idx),
             member_chunks,
             set_lwlock(db_idx),
         );
-        flush_table::<ZsetEntry, COMPOSITE_KEY_LEN>(
+        flush_table::<ZsetEntry, ZsetMeta, COMPOSITE_KEY_LEN>(
             zset_htab_for(db_idx),
             zset_meta_htab_for(db_idx),
             zset_pool_for(db_idx),
             member_chunks,
             zset_lwlock(db_idx),
         );
-        flush_table::<ListEntry, LIST_KEY_LEN>(
+        flush_table::<ListEntry, ListMeta, LIST_KEY_LEN>(
             list_htab_for(db_idx),
             list_meta_htab_for(db_idx),
             list_pool_for(db_idx),
@@ -2898,7 +2978,7 @@ pub unsafe fn mem_flush_db(db_idx: usize) {
             list_lwlock(db_idx),
         );
         // Last, so nothing is left naming a key whose data has gone.
-        flush_table::<DirEntry, KEY_HASH_LEN>(
+        flush_table::<DirEntry, CountMeta, KEY_HASH_LEN>(
             dir_htab_for(db_idx),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -3020,6 +3100,29 @@ pub fn mem_val_pool_total_size() -> usize {
     pools_stride_per_db() * NUM_MEM_DBS + 8192
 }
 
+/// One shared-memory table, named for its database. Ten of these differ only in
+/// how wide the key is, what the entry holds and how many entries there are —
+/// the flags and the `keysize`/`entrysize` pairing are the parts that must not
+/// drift, so they are written once.
+///
+/// # Safety
+/// As `mem_init_tables`: postmaster `shmem_startup_hook` only.
+unsafe fn shmem_htab<E>(
+    kind: &str,
+    db_idx: usize,
+    keylen: usize,
+    size: i64,
+    flags: i32,
+) -> *mut pg_sys::HTAB {
+    let name = format!("pg_redis_{}_{}\0", kind, db_idx * 2);
+    let mut info = pg_sys::HASHCTL {
+        keysize: keylen as pg_sys::Size,
+        entrysize: std::mem::size_of::<E>() as pg_sys::Size,
+        ..Default::default()
+    };
+    unsafe { pg_sys::ShmemInitHash(name.as_ptr().cast(), size, size, &mut info, flags) }
+}
+
 /// Create every table, from the postmaster's `shmem_startup_hook`. Never from a
 /// bgworker: `ShmemInitHash` is only valid while `ShmemAlloc` is open.
 ///
@@ -3056,144 +3159,76 @@ pub unsafe fn mem_init_tables(ctl: *mut MemControlBlock) {
 
     for i in 0..NUM_MEM_DBS {
         unsafe {
-            let name = format!("pg_redis_kv_{}\0", i * 2);
-            let mut info = pg_sys::HASHCTL {
-                keysize: KEY_HASH_LEN as pg_sys::Size,
-                entrysize: std::mem::size_of::<KvEntry>() as pg_sys::Size,
-                ..Default::default()
-            };
-            let htab = pg_sys::ShmemInitHash(name.as_ptr().cast(), sz, sz, &mut info, blob_flags);
-            std::ptr::addr_of_mut!((*ctl).htab[i]).write(htab);
-
-            let name = format!("pg_redis_hash_{}\0", i * 2);
-            let mut info = pg_sys::HASHCTL {
-                keysize: COMPOSITE_KEY_LEN as pg_sys::Size,
-                entrysize: std::mem::size_of::<HashEntry>() as pg_sys::Size,
-                ..Default::default()
-            };
-            let htab = pg_sys::ShmemInitHash(
-                name.as_ptr().cast(),
-                sz_small,
-                sz_small,
-                &mut info,
+            addr_of_mut!((*ctl).htab[i]).write(shmem_htab::<KvEntry>(
+                "kv",
+                i,
+                KEY_HASH_LEN,
+                sz,
                 blob_flags,
-            );
-            std::ptr::addr_of_mut!((*ctl).hash_htab[i]).write(htab);
-
-            let name = format!("pg_redis_set_{}\0", i * 2);
-            let mut info = pg_sys::HASHCTL {
-                keysize: COMPOSITE_KEY_LEN as pg_sys::Size,
-                entrysize: std::mem::size_of::<SetEntry>() as pg_sys::Size,
-                ..Default::default()
-            };
-            let htab = pg_sys::ShmemInitHash(
-                name.as_ptr().cast(),
+            ));
+            addr_of_mut!((*ctl).hash_htab[i]).write(shmem_htab::<HashEntry>(
+                "hash",
+                i,
+                COMPOSITE_KEY_LEN,
                 sz_small,
-                sz_small,
-                &mut info,
                 blob_flags,
-            );
-            std::ptr::addr_of_mut!((*ctl).set_htab[i]).write(htab);
-
-            let name = format!("pg_redis_zset_{}\0", i * 2);
-            let mut info = pg_sys::HASHCTL {
-                keysize: COMPOSITE_KEY_LEN as pg_sys::Size,
-                entrysize: std::mem::size_of::<ZsetEntry>() as pg_sys::Size,
-                ..Default::default()
-            };
-            let htab = pg_sys::ShmemInitHash(
-                name.as_ptr().cast(),
+            ));
+            addr_of_mut!((*ctl).set_htab[i]).write(shmem_htab::<SetEntry>(
+                "set",
+                i,
+                COMPOSITE_KEY_LEN,
                 sz_small,
-                sz_small,
-                &mut info,
                 blob_flags,
-            );
-            std::ptr::addr_of_mut!((*ctl).zset_htab[i]).write(htab);
-
-            let name = format!("pg_redis_list_{}\0", i * 2);
-            let mut info = pg_sys::HASHCTL {
-                keysize: LIST_KEY_LEN as pg_sys::Size,
-                entrysize: std::mem::size_of::<ListEntry>() as pg_sys::Size,
-                ..Default::default()
-            };
-            let htab = pg_sys::ShmemInitHash(
-                name.as_ptr().cast(),
+            ));
+            addr_of_mut!((*ctl).zset_htab[i]).write(shmem_htab::<ZsetEntry>(
+                "zset",
+                i,
+                COMPOSITE_KEY_LEN,
                 sz_small,
-                sz_small,
-                &mut info,
                 blob_flags,
-            );
-            std::ptr::addr_of_mut!((*ctl).list_htab[i]).write(htab);
-
-            let name = format!("pg_redis_list_meta_{}\0", i * 2);
-            let mut info = pg_sys::HASHCTL {
-                keysize: KEY_HASH_LEN as pg_sys::Size,
-                entrysize: std::mem::size_of::<ListMeta>() as pg_sys::Size,
-                ..Default::default()
-            };
-            let htab = pg_sys::ShmemInitHash(
-                name.as_ptr().cast(),
+            ));
+            addr_of_mut!((*ctl).list_htab[i]).write(shmem_htab::<ListEntry>(
+                "list",
+                i,
+                LIST_KEY_LEN,
                 sz_small,
-                sz_small,
-                &mut info,
                 blob_flags,
-            );
-            std::ptr::addr_of_mut!((*ctl).list_meta_htab[i]).write(htab);
-
-            let name = format!("pg_redis_zset_meta_{}\0", i * 2);
-            let mut info = pg_sys::HASHCTL {
-                keysize: KEY_HASH_LEN as pg_sys::Size,
-                entrysize: std::mem::size_of::<ZsetMeta>() as pg_sys::Size,
-                ..Default::default()
-            };
-            let htab = pg_sys::ShmemInitHash(
-                name.as_ptr().cast(),
+            ));
+            addr_of_mut!((*ctl).list_meta_htab[i]).write(shmem_htab::<ListMeta>(
+                "list_meta",
+                i,
+                KEY_HASH_LEN,
                 sz_small,
-                sz_small,
-                &mut info,
                 blob_flags,
-            );
-            std::ptr::addr_of_mut!((*ctl).zset_meta_htab[i]).write(htab);
-
-            let name = format!("pg_redis_set_meta_{}\0", i * 2);
-            let mut info = pg_sys::HASHCTL {
-                keysize: KEY_HASH_LEN as pg_sys::Size,
-                entrysize: std::mem::size_of::<CountMeta>() as pg_sys::Size,
-                ..Default::default()
-            };
-            let htab = pg_sys::ShmemInitHash(
-                name.as_ptr().cast(),
+            ));
+            addr_of_mut!((*ctl).zset_meta_htab[i]).write(shmem_htab::<ZsetMeta>(
+                "zset_meta",
+                i,
+                KEY_HASH_LEN,
                 sz_small,
-                sz_small,
-                &mut info,
                 blob_flags,
-            );
-            std::ptr::addr_of_mut!((*ctl).set_meta_htab[i]).write(htab);
-
-            let name = format!("pg_redis_hash_meta_{}\0", i * 2);
-            let mut info = pg_sys::HASHCTL {
-                keysize: KEY_HASH_LEN as pg_sys::Size,
-                entrysize: std::mem::size_of::<CountMeta>() as pg_sys::Size,
-                ..Default::default()
-            };
-            let htab = pg_sys::ShmemInitHash(
-                name.as_ptr().cast(),
+            ));
+            addr_of_mut!((*ctl).set_meta_htab[i]).write(shmem_htab::<CountMeta>(
+                "set_meta",
+                i,
+                KEY_HASH_LEN,
                 sz_small,
-                sz_small,
-                &mut info,
                 blob_flags,
-            );
-            std::ptr::addr_of_mut!((*ctl).hash_meta_htab[i]).write(htab);
-
-            let name = format!("pg_redis_dir_{}\0", i * 2);
-            let mut info = pg_sys::HASHCTL {
-                keysize: KEY_HASH_LEN as pg_sys::Size,
-                entrysize: std::mem::size_of::<DirEntry>() as pg_sys::Size,
-                ..Default::default()
-            };
-            let htab =
-                pg_sys::ShmemInitHash(name.as_ptr().cast(), sz_dir, sz_dir, &mut info, blob_flags);
-            std::ptr::addr_of_mut!((*ctl).dir_htab[i]).write(htab);
+            ));
+            addr_of_mut!((*ctl).hash_meta_htab[i]).write(shmem_htab::<CountMeta>(
+                "hash_meta",
+                i,
+                KEY_HASH_LEN,
+                sz_small,
+                blob_flags,
+            ));
+            addr_of_mut!((*ctl).dir_htab[i]).write(shmem_htab::<DirEntry>(
+                "dir",
+                i,
+                KEY_HASH_LEN,
+                sz_dir,
+                blob_flags,
+            ));
         }
     }
 
@@ -6509,9 +6544,16 @@ pub unsafe fn mem_del_all_types(db_idx: usize, key: &[u8]) -> i64 {
     }
 }
 
-#[cfg(test)]
+/// Unit tests and, at the end, the two that need a live backend.
+///
+/// The module has to be called `tests` and carry `#[pg_schema]`: pgrx resolves
+/// every `#[pg_test]` to a function in the `tests` schema, and PostgreSQL
+/// reserves the `pg_` prefix a name like `pg_tests` would ask for.
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
 mod tests {
     use super::*;
+    use pgrx::prelude::*;
 
     /// The victim picker keeps the lowest-ranked `EVICT_BATCH` candidates out of
     /// an arbitrarily long scan without sorting the table — expired entries
@@ -7123,6 +7165,184 @@ mod tests {
         assert_eq!(unsafe { (*s).member_overflow }, NIL_CHUNK);
     }
 
+    fn blank_list_meta() -> ListMeta {
+        ListMeta {
+            key: [0; KEY_HASH_LEN],
+            min_pos: 0,
+            max_pos: 0,
+            count: 0,
+            name_inline: [0; INLINE_META_KEY_LEN],
+            name_len: 0,
+            name_overflow: NIL_CHUNK,
+        }
+    }
+
+    fn blank_zset_meta() -> ZsetMeta {
+        ZsetMeta {
+            key: [0; KEY_HASH_LEN],
+            count: 0,
+            min_score: f64::INFINITY,
+            max_score: f64::NEG_INFINITY,
+            min_member: [0; KEY_HASH_LEN],
+            max_member: [0; KEY_HASH_LEN],
+            name_inline: [0; INLINE_META_KEY_LEN],
+            name_len: 0,
+            name_overflow: NIL_CHUNK,
+        }
+    }
+
+    fn blank_count_meta() -> CountMeta {
+        CountMeta {
+            key: [0; KEY_HASH_LEN],
+            count: 0,
+            name_inline: [0; INLINE_META_KEY_LEN],
+            name_len: 0,
+            name_overflow: NIL_CHUNK,
+        }
+    }
+
+    /// A meta entry owns its name's chain the way a KV entry owns its key's,
+    /// and the three structs reach it through three separately generated
+    /// accessors. One of them pointed at the wrong field would leak silently:
+    /// the name is written best-effort, so nothing downstream complains.
+    #[test]
+    fn a_meta_name_round_trips_through_the_pool_and_comes_back() {
+        let p = test_pool(64);
+        let name = payload(MAX_KEY_LEN);
+
+        let mut lmeta = blank_list_meta();
+        let l = &mut lmeta as *mut ListMeta;
+        assert!(unsafe { value_write(p.pool, list_meta_name_slot(l), &name) });
+        assert_eq!(unsafe { value_read(p.pool, list_meta_name_slot(l)) }, name);
+        assert!(free_chunks(&p) < 64);
+        unsafe { value_free(p.pool, list_meta_name_slot(l)) };
+        assert_eq!(free_chunks(&p), 64);
+        assert_eq!(unsafe { (*l).name_len }, 0);
+        assert_eq!(unsafe { (*l).name_overflow }, NIL_CHUNK);
+
+        let mut zmeta = blank_zset_meta();
+        let z = &mut zmeta as *mut ZsetMeta;
+        assert!(unsafe { value_write(p.pool, zset_meta_name_slot(z), &name) });
+        assert_eq!(unsafe { value_read(p.pool, zset_meta_name_slot(z)) }, name);
+        assert!(free_chunks(&p) < 64);
+        unsafe { value_free(p.pool, zset_meta_name_slot(z)) };
+        assert_eq!(free_chunks(&p), 64);
+        assert_eq!(unsafe { (*z).name_len }, 0);
+        assert_eq!(unsafe { (*z).name_overflow }, NIL_CHUNK);
+
+        let mut cmeta = blank_count_meta();
+        let c = &mut cmeta as *mut CountMeta;
+        assert!(unsafe { value_write(p.pool, count_meta_name_slot(c), &name) });
+        assert_eq!(unsafe { value_read(p.pool, count_meta_name_slot(c)) }, name);
+        assert!(free_chunks(&p) < 64);
+        unsafe { value_free(p.pool, count_meta_name_slot(c)) };
+        assert_eq!(free_chunks(&p), 64);
+        assert_eq!(unsafe { (*c).name_len }, 0);
+        assert_eq!(unsafe { (*c).name_overflow }, NIL_CHUNK);
+
+        // A name at the cap is the reason the cap is a cap: `meta_name_chunks`
+        // is what the member reservation adds it to.
+        assert_eq!(
+            meta_name_chunks(&name),
+            chunks_beyond(MAX_KEY_LEN, INLINE_META_KEY_LEN)
+        );
+        assert_eq!(meta_name_chunks(b"short"), 0);
+    }
+
+    /// The free list and `free_count` must agree after every operation.
+    ///
+    /// `pool_alloc` trusts `free_count` completely: it checks the count, then
+    /// walks that many links with no bound. A count that over-reports the list
+    /// walks off the end of it, which is a read of whatever `links[garbage]`
+    /// lands on rather than a refusal.
+    #[test]
+    fn the_free_list_and_its_count_agree_under_arbitrary_traffic() {
+        const CAP: usize = 256;
+        let p = test_pool(CAP);
+
+        /// Nodes reachable from `free_head`, and whether any repeats.
+        fn walk_free(p: &TestPool) -> (usize, bool) {
+            unsafe {
+                let pool = p.pool;
+                let links = pool_links(pool);
+                let capacity = (*pool).capacity;
+                let mut seen = std::collections::HashSet::new();
+                let mut idx = (*pool).free_head;
+                while idx != NIL_CHUNK {
+                    assert!(idx < capacity, "free list left the pool at {idx}");
+                    if !seen.insert(idx) {
+                        return (seen.len(), true);
+                    }
+                    idx = links.add(idx as usize).read();
+                }
+                (seen.len(), false)
+            }
+        }
+
+        /// Nodes in an allocated chain.
+        fn walk_chain(p: &TestPool, head: u32) -> Vec<u32> {
+            unsafe {
+                let links = pool_links(p.pool);
+                let capacity = (*p.pool).capacity;
+                let mut out = Vec::new();
+                let mut idx = head;
+                while idx != NIL_CHUNK {
+                    assert!(idx < capacity, "chain left the pool at {idx}");
+                    out.push(idx);
+                    idx = links.add(idx as usize).read();
+                }
+                out
+            }
+        }
+
+        // Deterministic pseudo-random traffic: a fixed sequence, so a failure
+        // reproduces exactly rather than one run in ten.
+        let mut state = 0x9E3779B97F4A7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let mut live: Vec<(u32, usize)> = Vec::new();
+        for step in 0..20_000 {
+            let held: usize = live.iter().map(|(_, n)| *n).sum();
+            let (free_len, cycle) = walk_free(&p);
+            assert!(!cycle, "step {step}: the free list contains a cycle");
+            assert_eq!(
+                free_chunks(&p),
+                free_len,
+                "step {step}: free_count disagrees with the free list"
+            );
+            assert_eq!(
+                held + free_len,
+                CAP,
+                "step {step}: chunks neither held nor free"
+            );
+
+            let r = next();
+            if !live.is_empty() && r % 3 == 0 {
+                let i = (r >> 8) as usize % live.len();
+                let (head, n) = live.swap_remove(i);
+                assert_eq!(walk_chain(&p, head).len(), n, "step {step}: chain length");
+                unsafe { pool_release(p.pool, head) };
+            } else {
+                let n = 1 + (r >> 8) as usize % 40;
+                if let Some(head) = unsafe { pool_alloc(p.pool, n) } {
+                    let chain = walk_chain(&p, head);
+                    assert_eq!(chain.len(), n, "step {step}: alloc({n}) chain length");
+                    live.push((head, n));
+                }
+            }
+        }
+
+        for (head, _) in live.drain(..) {
+            unsafe { pool_release(p.pool, head) };
+        }
+        assert_eq!(free_chunks(&p), CAP, "every chunk must come back");
+    }
+
     /// The HTAB key layouts must match the `keysize` values passed to
     /// `ShmemInitHash`, or lookups read past the end of the key.
     #[test]
@@ -7190,5 +7410,254 @@ mod tests {
         let list_key = make_list_key(b"mykey", -42);
         assert_eq!(&list_key[..KEY_HASH_LEN], &key_hash(b"mykey"));
         assert_eq!(&list_key[KEY_HASH_LEN..], &(-42i64).to_le_bytes());
+    }
+
+    /// The meta tables' removal paths, driven against real dynahash tables.
+    ///
+    /// `FLUSHDB` must not leave a removed entry naming chunks.
+    ///
+    /// dynahash puts a removed element on its own free list with the bytes it
+    /// had. `flush_table` re-formats the chunk pool underneath, so those bytes
+    /// name chunks that are free again — and the next key to land in that slot
+    /// releases them a second time. That splices the free list into a cycle and
+    /// inflates `free_count`, and the next `pool_alloc` large enough to trust
+    /// the count walks off the end of the list. It reaches a client as a
+    /// segfaulted worker several commands later, on another connection.
+    #[pg_test]
+    fn flushing_a_table_leaves_no_entry_naming_freed_chunks() {
+        unsafe extern "C-unwind" fn zeroing_alloc(size: pg_sys::Size) -> *mut std::ffi::c_void {
+            unsafe { pg_sys::palloc0(size) }
+        }
+
+        const CAP: usize = 512;
+        let mut buf = vec![0u64; val_pool_size(CAP).div_ceil(8)];
+        let pool = buf.as_mut_ptr().cast::<ValPool>();
+        unsafe { pool_init(pool, CAP) };
+
+        let info = pg_sys::HASHCTL {
+            keysize: KEY_HASH_LEN as pg_sys::Size,
+            entrysize: std::mem::size_of::<KvEntry>() as pg_sys::Size,
+            alloc: Some(zeroing_alloc),
+            hcxt: unsafe { pg_sys::CurrentMemoryContext },
+            ..Default::default()
+        };
+        let htab = unsafe {
+            pg_sys::hash_create(
+                c"pg_redis_test_flush_kv".as_ptr(),
+                16,
+                &info,
+                (pg_sys::HASH_ELEM | pg_sys::HASH_BLOBS | pg_sys::HASH_ALLOC | pg_sys::HASH_CONTEXT)
+                    as i32,
+            )
+        };
+        let table = unsafe { SharedTable::<KvEntry>::from_raw(htab) }.expect("table");
+
+        // Values well past the inline slot, so each entry owns a real chain.
+        let value = vec![b'v'; INLINE_VAL_LEN + CHUNK_LEN * 4];
+        let keys: Vec<Vec<u8>> = (0..6).map(|i| format!("flush:{i}").into_bytes()).collect();
+        for k in &keys {
+            let kh = key_hash(k);
+            let (entry, _) = unsafe { table.enter(kh.as_ptr().cast()) }.expect("room");
+            assert!(unsafe { value_write(pool, key_slot(entry), k) });
+            assert!(unsafe { value_write(pool, kv_slot(entry), &value) });
+        }
+        assert!(unsafe { pool_free_chunks(pool) } < CAP);
+
+        // Exactly what `flush_table` does to this table.
+        for k in &keys {
+            let kh = key_hash(k);
+            if let Some(entry) = unsafe { table.find(kh.as_ptr().cast()) } {
+                let tail = size_of::<KvEntry>() - KEY_HASH_LEN;
+                unsafe { std::ptr::write_bytes(entry.cast::<u8>().add(KEY_HASH_LEN), 0, tail) };
+            }
+            unsafe { table.remove(kh.as_ptr().cast()) };
+        }
+        unsafe { pool_init(pool, CAP) };
+        assert_eq!(unsafe { pool_free_chunks(pool) }, CAP);
+
+        // dynahash hands recycled elements back before fresh ones, so these
+        // land in the slots just vacated — carrying whatever was left in them.
+        for i in 0..keys.len() {
+            let k = format!("after:{i}").into_bytes();
+            let kh = key_hash(&k);
+            let (entry, found) = unsafe { table.enter(kh.as_ptr().cast()) }.expect("room");
+            assert!(!found);
+            assert!(unsafe { value_write(pool, key_slot(entry), &k) });
+            assert!(unsafe { value_write(pool, kv_slot(entry), &value) });
+        }
+
+        // The invariant the crash violated: every chunk is either held by a
+        // live chain or reachable exactly once from the free list.
+        let links = unsafe { pool_links(pool) };
+        let mut seen = std::collections::HashSet::new();
+        let mut idx = unsafe { (*pool).free_head };
+        while idx != NIL_CHUNK {
+            assert!(idx < CAP as u32, "the free list left the pool at {idx}");
+            assert!(seen.insert(idx), "the free list contains a cycle at {idx}");
+            idx = unsafe { links.add(idx as usize).read() };
+        }
+        assert_eq!(
+            seen.len(),
+            unsafe { pool_free_chunks(pool) },
+            "free_count disagrees with the free list after a flush"
+        );
+
+        // And the values written after the flush must read back whole.
+        for i in 0..keys.len() {
+            let k = format!("after:{i}").into_bytes();
+            let kh = key_hash(&k);
+            let entry = unsafe { table.find(kh.as_ptr().cast()) }.expect("present");
+            assert_eq!(
+                unsafe { value_read(pool, kv_slot(entry)) },
+                value,
+                "key {i}"
+            );
+        }
+    }
+
+    /// Every meta table's removal path has to hand the key's name chain back.
+    ///
+    /// Everything above this point runs without a postmaster, so it can reach
+    /// the pool but not an HTAB. This needs one: what it checks is that the
+    /// four removal functions free the chain, which is a property of the
+    /// functions rather than of the slot accessors the tests above cover.
+    ///
+    /// `remove_meta_of` shipped without doing so, and the symptom was not a
+    /// leak: the next occupant of the slot inherited a head pointing into the
+    /// free list, and the worker aborted. It was found by that crash and fixed
+    /// without a test, which is what this is.
+    #[pg_test]
+    fn removing_a_meta_entry_releases_its_name_chain() {
+        // Held inside the test rather than beside it: a helper at module scope
+        // is code-generated even when `pg_test` is off, and one calling into
+        // PostgreSQL then fails to link the plain `cargo test` binary.
+
+        /// A backend-local table with the same key and entry layout as the
+        /// shared one.
+        ///
+        /// `palloc0` rather than dynahash's default `palloc`, because the two
+        /// differ in what a *fresh* entry contains and the meta code depends on
+        /// it: `value_write` frees whatever chain the slot names before writing,
+        /// so a `name_len` of uninitialised memory releases a garbage chunk
+        /// index. `ShmemInitHash` hands out zeroed memory, so the shared tables
+        /// never see that; a local table has to be asked for the same.
+        unsafe extern "C-unwind" fn zeroing_alloc(size: pg_sys::Size) -> *mut std::ffi::c_void {
+            unsafe { pg_sys::palloc0(size) }
+        }
+
+        unsafe fn local_htab<E>(name: &str, nelem: i64) -> *mut pg_sys::HTAB {
+            let cname = format!("{name}\0");
+            let info = pg_sys::HASHCTL {
+                keysize: KEY_HASH_LEN as pg_sys::Size,
+                entrysize: std::mem::size_of::<E>() as pg_sys::Size,
+                alloc: Some(zeroing_alloc),
+                hcxt: unsafe { pg_sys::CurrentMemoryContext },
+                ..Default::default()
+            };
+            unsafe {
+                pg_sys::hash_create(
+                    cname.as_ptr().cast(),
+                    nelem as std::ffi::c_long,
+                    &info,
+                    (pg_sys::HASH_ELEM
+                        | pg_sys::HASH_BLOBS
+                        | pg_sys::HASH_ALLOC
+                        | pg_sys::HASH_CONTEXT) as i32,
+                )
+            }
+        }
+
+        /// A pool on the heap, as `mod tests` uses: the pool code only ever
+        /// touches the bytes it was handed. The buffer outlives every use.
+        fn pool(chunks: usize) -> (Vec<u64>, *mut ValPool) {
+            let mut buf = vec![0u64; val_pool_size(chunks).div_ceil(8)];
+            let ptr = buf.as_mut_ptr().cast::<ValPool>();
+            unsafe { pool_init(ptr, chunks) };
+            (buf, ptr)
+        }
+
+        /// Long enough to need the pool: a name inside `INLINE_META_KEY_LEN`
+        /// costs no chunk, so a leak of one would not show.
+        fn long_name(tag: u8) -> Vec<u8> {
+            (0..MAX_KEY_LEN)
+                .map(|i| (33 + ((i + tag as usize) % 90)) as u8)
+                .collect()
+        }
+
+        let (_buf, pool_ptr) = pool(64);
+        let full = unsafe { pool_free_chunks(pool_ptr) };
+        assert_eq!(full, 64);
+
+        let list = unsafe { local_htab::<ListMeta>("pg_redis_test_list_meta", 32) };
+        let zset = unsafe { local_htab::<ZsetMeta>("pg_redis_test_zset_meta", 32) };
+        let set = unsafe { local_htab::<CountMeta>("pg_redis_test_set_meta", 32) };
+        let hash = unsafe { local_htab::<CountMeta>("pg_redis_test_hash_meta", 32) };
+
+        // The type-specific removals: the last LPOP off a list, the last ZREM
+        // off a sorted set, the last SREM and HDEL off a set and a hash.
+        let name = long_name(1);
+        unsafe {
+            assert!(!get_or_create_meta(0, list, pool_ptr, &name, || false).is_null());
+            assert!(pool_free_chunks(pool_ptr) < full, "the name took no chunk");
+            remove_meta(0, list, pool_ptr, &name);
+        }
+        assert_eq!(unsafe { pool_free_chunks(pool_ptr) }, full, "list meta");
+
+        let name = long_name(2);
+        unsafe {
+            assert!(!get_or_create_zset_meta(0, zset, pool_ptr, &name, || false).is_null());
+            assert!(pool_free_chunks(pool_ptr) < full, "the name took no chunk");
+            remove_zset_meta(0, zset, pool_ptr, &name);
+        }
+        assert_eq!(unsafe { pool_free_chunks(pool_ptr) }, full, "zset meta");
+
+        for (htab, kind, label) in [
+            (set, KeyKind::Set, "set meta"),
+            (hash, KeyKind::Hash, "hash meta"),
+        ] {
+            let name = long_name(3);
+            unsafe {
+                let meta = get_or_create_count_meta(0, kind, htab, pool_ptr, &name, || false);
+                assert!(!meta.is_null());
+                assert!(pool_free_chunks(pool_ptr) < full, "the name took no chunk");
+                remove_count_meta(0, htab, pool_ptr, &name);
+            }
+            assert_eq!(unsafe { pool_free_chunks(pool_ptr) }, full, "{label}");
+        }
+
+        // The DEL and eviction path, which reaches all four meta tables through
+        // one generic function — the one that shipped without the free.
+        let name = long_name(4);
+        let kh = key_hash(&name);
+        unsafe {
+            assert!(!get_or_create_meta(0, list, pool_ptr, &name, || false).is_null());
+            assert!(!get_or_create_zset_meta(0, zset, pool_ptr, &name, || false).is_null());
+            let s = get_or_create_count_meta(0, KeyKind::Set, set, pool_ptr, &name, || false);
+            assert!(!s.is_null());
+            let h = get_or_create_count_meta(0, KeyKind::Hash, hash, pool_ptr, &name, || false);
+            assert!(!h.is_null());
+            assert!(pool_free_chunks(pool_ptr) < full);
+
+            remove_meta_of::<ListMeta>(list, pool_ptr, &kh, list_meta_name_slot);
+            remove_meta_of::<ZsetMeta>(zset, pool_ptr, &kh, zset_meta_name_slot);
+            remove_meta_of::<CountMeta>(set, pool_ptr, &kh, count_meta_name_slot);
+            remove_meta_of::<CountMeta>(hash, pool_ptr, &kh, count_meta_name_slot);
+        }
+        assert_eq!(
+            unsafe { pool_free_chunks(pool_ptr) },
+            full,
+            "remove_meta_of left a name chain behind"
+        );
+
+        // The slot has to be reusable, which is the failure the leak actually
+        // produced: a fresh entry in it inheriting a head into the free list.
+        let name = long_name(5);
+        unsafe {
+            let meta = get_or_create_meta(0, list, pool_ptr, &name, || false);
+            assert!(!meta.is_null());
+            assert_eq!(value_read(pool_ptr, list_meta_name_slot(meta)), name);
+            remove_meta(0, list, pool_ptr, &name);
+        }
+        assert_eq!(unsafe { pool_free_chunks(pool_ptr) }, full);
     }
 }

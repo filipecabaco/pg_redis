@@ -36,6 +36,8 @@ pub mod sql {
         })
     });
 
+    pub static REAP_EXPIRED: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| arr(reap_expired_keys));
+
     pub static MGET: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| {
             format!(
@@ -123,61 +125,34 @@ pub mod sql {
         })
     });
 
-    pub static INCR: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
-        arr(|db| {
-            format!(
-                "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, convert_to('1', 'UTF8')) \
+    /// The four counters differ in two places: what they store for a key that
+    /// is not there yet, and how they change one that is. Everything else is
+    /// the guard, and the guard is the part that must not drift — it is what
+    /// keeps a value that is not an integer, or an increment that would leave
+    /// the `bigint` range, from being written at all.
+    fn counter_like(db: usize, seed: &str, delta: &str) -> String {
+        format!(
+            "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, convert_to({seed}, 'UTF8')) \
          ON CONFLICT (key) DO UPDATE \
-         SET value = convert_to((CAST(encode(redis.kv_{db}.value, 'escape') AS bigint) + 1)::text, 'UTF8') \
+         SET value = convert_to((CAST(encode(redis.kv_{db}.value, 'escape') AS bigint) {delta})::text, 'UTF8') \
          WHERE encode(redis.kv_{db}.value, 'escape') ~ '^(0|-?[1-9][0-9]*)$' \
            AND encode(redis.kv_{db}.value, 'escape')::numeric \
                BETWEEN -9223372036854775808 AND 9223372036854775807 \
          RETURNING CAST(encode(value, 'escape') AS bigint)"
-            )
-        })
-    });
+        )
+    }
 
-    pub static DECR: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
-        arr(|db| {
-            format!(
-                "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, convert_to('-1', 'UTF8')) \
-         ON CONFLICT (key) DO UPDATE \
-         SET value = convert_to((CAST(encode(redis.kv_{db}.value, 'escape') AS bigint) - 1)::text, 'UTF8') \
-         WHERE encode(redis.kv_{db}.value, 'escape') ~ '^(0|-?[1-9][0-9]*)$' \
-           AND encode(redis.kv_{db}.value, 'escape')::numeric \
-               BETWEEN -9223372036854775808 AND 9223372036854775807 \
-         RETURNING CAST(encode(value, 'escape') AS bigint)"
-            )
-        })
-    });
+    pub static INCR: LazyLock<[String; NUM_DBS]> =
+        LazyLock::new(|| arr(|db| counter_like(db, "'1'", "+ 1")));
 
-    pub static INCRBY: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
-        arr(|db| {
-            format!(
-                "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, convert_to($2::text, 'UTF8')) \
-         ON CONFLICT (key) DO UPDATE \
-         SET value = convert_to((CAST(encode(redis.kv_{db}.value, 'escape') AS bigint) + $3)::text, 'UTF8') \
-         WHERE encode(redis.kv_{db}.value, 'escape') ~ '^(0|-?[1-9][0-9]*)$' \
-           AND encode(redis.kv_{db}.value, 'escape')::numeric \
-               BETWEEN -9223372036854775808 AND 9223372036854775807 \
-         RETURNING CAST(encode(value, 'escape') AS bigint)"
-            )
-        })
-    });
+    pub static DECR: LazyLock<[String; NUM_DBS]> =
+        LazyLock::new(|| arr(|db| counter_like(db, "'-1'", "- 1")));
 
-    pub static DECRBY: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
-        arr(|db| {
-            format!(
-                "INSERT INTO redis.kv_{db} (key, value) VALUES ($1, convert_to((-$2::bigint)::text, 'UTF8')) \
-         ON CONFLICT (key) DO UPDATE \
-         SET value = convert_to((CAST(encode(redis.kv_{db}.value, 'escape') AS bigint) - $3)::text, 'UTF8') \
-         WHERE encode(redis.kv_{db}.value, 'escape') ~ '^(0|-?[1-9][0-9]*)$' \
-           AND encode(redis.kv_{db}.value, 'escape')::numeric \
-               BETWEEN -9223372036854775808 AND 9223372036854775807 \
-         RETURNING CAST(encode(value, 'escape') AS bigint)"
-            )
-        })
-    });
+    pub static INCRBY: LazyLock<[String; NUM_DBS]> =
+        LazyLock::new(|| arr(|db| counter_like(db, "$2::text", "+ $3")));
+
+    pub static DECRBY: LazyLock<[String; NUM_DBS]> =
+        LazyLock::new(|| arr(|db| counter_like(db, "(-$2::bigint)::text", "- $3")));
 
     pub static INCRBYFLOAT: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| {
@@ -260,6 +235,39 @@ pub mod sql {
                   {drops}, \
                   s AS (DELETE FROM redis.kv_{db} \
                          WHERE expires_at IS NOT NULL AND expires_at <= now()) \
+             SELECT 1"
+        )
+    }
+
+    /// `sweep_expired` for a named set of keys: reap only these, and only if
+    /// their deadline has passed.
+    ///
+    /// This runs before a collection read, so it is on the hot path and is
+    /// shaped for the case where nothing has expired — which is almost always.
+    /// That case is one indexed lookup on `redis.expiry_N`, a table holding
+    /// only the keys that carry a TTL, and four deletes that match no rows.
+    ///
+    /// Deliberately *not* `sql_key_kinds`, which is the other thing that would
+    /// answer the question: that runs five `EXISTS` across five tables to work
+    /// out a kind this caller does not need, and using it here cost two thirds
+    /// of the throughput of every `HGET`, `SCARD`, `ZCARD` and `LLEN`.
+    pub fn reap_expired_keys(db: usize) -> String {
+        let drops = ["hash", "list", "set", "zset"]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                format!(
+                    "d{i} AS (DELETE FROM redis.{t}_{db} t \
+                              WHERE t.key IN (SELECT key FROM dead))"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "WITH dead AS (DELETE FROM redis.expiry_{db} \
+                            WHERE key = ANY($1::bytea[]) AND expires_at <= now() \
+                            RETURNING key), \
+                  {drops} \
              SELECT 1"
         )
     }
@@ -2271,10 +2279,22 @@ impl Command {
         // front. A read cannot damage anything, and a read of a key holding
         // another type finds nothing — so it runs first and only asks what the
         // key holds when it came back empty. That keeps the extra round trip
-        // off every successful `GET`, `HGET` and `LRANGE`.
+        // off every successful `GET` and `GETRANGE`.
+        //
+        // A read of a *collection* is the exception, and has to be. Its rows
+        // outlive the key's expiry until the sweep runs, so coming back with
+        // data is not evidence the key is live — which is how `LLEN` answered
+        // 3 for a key `TYPE` had already called gone. Asking first is what
+        // reaps it. Strings are excluded because they never had the problem:
+        // the expiry is a column of `kv_N` and every statement reading one
+        // tests it, which is why the ordering above could be an optimisation
+        // in the first place.
         let writes = !self.write_keys().is_empty();
         if writes && let Some(err) = self.sql_type_error(client, db) {
             return err;
+        }
+        if !writes && self.reads_a_collection() {
+            self.sql_reap_expired(client, db);
         }
         let response = self.execute_inner(client, db);
         if !writes
@@ -2296,7 +2316,7 @@ impl Command {
             true => unsafe { crate::mem::mem_key_kind(db as usize, key) }?,
             false => Self::sql_key_kinds(client, db, &[key])
                 .first()
-                .map(|(_, k)| *k)?,
+                .and_then(|(_, k)| *k)?,
         };
         let idx = db as usize;
         let dump = match (kind, mem) {
@@ -2509,11 +2529,19 @@ impl Command {
     /// independently, so this is the durable half's key directory: derived on
     /// demand rather than stored, which is a query per typed command and no
     /// second copy of the truth to keep in step.
+    /// What each key holds, with `None` for one whose expiry has passed.
+    ///
+    /// Absent keys are simply missing from the result; a key that is present
+    /// but past its deadline comes back as `None`, because the caller has to
+    /// tell the two apart. It is the same distinction `dir_lookup_raw` keeps on
+    /// the shared-memory half, and for the same reason: a collection's rows
+    /// outlive its expiry until the sweep runs, and every collection read goes
+    /// to the rows rather than to `redis.expiry_N`.
     fn sql_key_kinds(
         client: &mut SpiClient<'_>,
         db: u8,
         keys: &[&[u8]],
-    ) -> Vec<(Vec<u8>, crate::mem::KeyKind)> {
+    ) -> Vec<(Vec<u8>, Option<crate::mem::KeyKind>)> {
         use crate::mem::KeyKind;
         let sql = format!(
             "SELECT a.key, \
@@ -2521,7 +2549,7 @@ impl Command {
                       WHEN EXISTS (SELECT 1 FROM redis.kv_{db} t WHERE t.key = a.key \
                                      AND (t.expires_at IS NULL OR t.expires_at > now())) THEN 'string' \
                       WHEN EXISTS (SELECT 1 FROM redis.expiry_{db} e WHERE e.key = a.key \
-                                     AND e.expires_at <= now()) THEN NULL \
+                                     AND e.expires_at <= now()) THEN 'expired' \
                       WHEN EXISTS (SELECT 1 FROM redis.list_{db} t WHERE t.key = a.key) THEN 'list' \
                       WHEN EXISTS (SELECT 1 FROM redis.set_{db}  t WHERE t.key = a.key) THEN 'set' \
                       WHEN EXISTS (SELECT 1 FROM redis.hash_{db} t WHERE t.key = a.key) THEN 'hash' \
@@ -2540,11 +2568,12 @@ impl Command {
                 continue;
             };
             let kind = match kind.as_str() {
-                "string" => KeyKind::String,
-                "list" => KeyKind::List,
-                "set" => KeyKind::Set,
-                "hash" => KeyKind::Hash,
-                "zset" => KeyKind::Zset,
+                "string" => Some(KeyKind::String),
+                "list" => Some(KeyKind::List),
+                "set" => Some(KeyKind::Set),
+                "hash" => Some(KeyKind::Hash),
+                "zset" => Some(KeyKind::Zset),
+                "expired" => None,
                 _ => continue,
             };
             out.push((key, kind));
@@ -2586,11 +2615,24 @@ impl Command {
             .chain(overwrites.iter().map(|(k, _)| *k))
             .collect();
         let kinds = Self::sql_key_kinds(client, db, &lookup);
+
+        // Reap before deciding anything. A key past its expiry is one the
+        // sweep has not reached yet: `TYPE` and `EXISTS` already call it gone,
+        // and its rows are still in the four collection tables, which is where
+        // `LLEN`, `SMEMBERS`, `HGETALL` and the rest read from. Dropping it
+        // here is what stops the command being answered out of them.
+        for (key, kind) in &kinds {
+            if kind.is_none() {
+                Self::sql_drop_key(client, db, key);
+            }
+        }
+
+        // Reaped keys are gone now, so they read as absent from here on.
         let kind_of = |key: &[u8]| {
             kinds
                 .iter()
                 .find(|(k, _)| k.as_slice() == key)
-                .map(|(_, kind)| *kind)
+                .and_then(|(_, kind)| *kind)
         };
         for (key, accepted) in &typed {
             if let Some(kind) = kind_of(key)
@@ -2682,7 +2724,7 @@ impl Command {
                 let (nx, xx) = {
                     let held = (*nx || *xx)
                         .then(|| Self::sql_key_kinds(client, db, &[key.as_slice()]))
-                        .and_then(|k| k.first().map(|(_, kind)| *kind))
+                        .and_then(|k| k.first().and_then(|(_, kind)| *kind))
                         .filter(|k| *k != crate::mem::KeyKind::String);
                     match held {
                         Some(_) if *nx => return Response::Null,
@@ -3460,7 +3502,7 @@ impl Command {
                 // As the shared-memory arm: nil, not an error.
                 let Some(kind) = Self::sql_key_kinds(client, db, &[key.as_slice()])
                     .first()
-                    .map(|(_, k)| *k)
+                    .and_then(|(_, k)| *k)
                 else {
                     return Response::Null;
                 };
@@ -5912,6 +5954,34 @@ impl Command {
         }
     }
 
+    /// Drop this command's keys if their deadline has passed, before it reads
+    /// them. One statement, and in the ordinary case — nothing expired — one
+    /// indexed lookup on a table holding only the keys that carry a TTL.
+    fn sql_reap_expired(&self, client: &mut SpiClient<'_>, db: u8) {
+        let keys: Vec<Option<Vec<u8>>> = self
+            .typed_keys()
+            .iter()
+            .map(|(k, _)| Some(k.to_vec()))
+            .collect();
+        if keys.is_empty() {
+            return;
+        }
+        let _ = client.update(&sql::REAP_EXPIRED[db as usize], None, &[keys.into()]);
+    }
+
+    /// Whether this command reads a key that could hold a collection.
+    ///
+    /// The four collection tables carry no expiry of their own — a key's
+    /// deadline lives in `redis.expiry_N` — so a statement reading them cannot
+    /// tell a live key from one the sweep has not reached. There are sixty-odd
+    /// such statements and guarding each one is sixty-odd chances to miss one,
+    /// so the question is asked here instead, once.
+    fn reads_a_collection(&self) -> bool {
+        self.typed_keys()
+            .iter()
+            .any(|(_, kinds)| kinds.iter().any(|k| *k != crate::mem::KeyKind::String))
+    }
+
     /// The keys this command replaces outright, with the type each becomes.
     /// Redis lets `SET` land on a key that held a list; the list goes, rather
     /// than the write being refused or the two sitting side by side.
@@ -5951,7 +6021,12 @@ impl Command {
     /// only structure that knows what a key holds.
     fn mem_type_error(&self, db_idx: usize) -> Option<Response> {
         for (key, kinds) in self.typed_keys() {
-            if let Some(kind) = unsafe { crate::mem::mem_key_kind(db_idx, key) }
+            // Reaping, not looking up: a collection whose expiry has passed is
+            // reported gone by the directory while its rows are still in the
+            // type's tables, and a collection read goes to the rows. Every
+            // command that touches a typed key comes through here, so this is
+            // the one place that has to make the two agree.
+            if let Some(kind) = unsafe { crate::mem::mem_key_kind_reaping(db_idx, key) }
                 && !kinds.contains(&kind)
             {
                 return Some(wrong_type());

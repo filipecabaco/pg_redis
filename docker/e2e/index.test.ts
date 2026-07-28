@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { errorReply, integerReply, RawRedis } from "./resp";
 
 const REDIS_HOST = process.env.REDIS_HOST ?? "localhost";
 const REDIS_PORT = process.env.REDIS_PORT ?? "6379";
@@ -10,117 +11,6 @@ const DATABASE_URL =
 const redisUrl = `redis://:${REDIS_PASSWORD}@${REDIS_HOST}:${REDIS_PORT}`;
 const sql = new Bun.sql(DATABASE_URL);
 let client: Bun.RedisClient;
-
-/**
- * A minimal RESP client that speaks bytes.
- *
- * `Bun.RedisClient` takes command arguments as strings and encodes them as
- * UTF-8, so it cannot express a value like `0xff` — that arrives as the two
- * bytes of U+00FF. Anything asserting on exact byte counts or exact byte
- * content has to bypass it, or it ends up measuring the client's encoder.
- */
-class RawRedis {
-	private socket!: Awaited<ReturnType<typeof Bun.connect>>;
-	private buffer = Buffer.alloc(0);
-	private waiters: Array<(b: Buffer) => void> = [];
-
-	async connect() {
-		this.socket = await Bun.connect({
-			hostname: REDIS_HOST,
-			port: Number(REDIS_PORT),
-			socket: {
-				data: (_s, chunk) => {
-					this.buffer = Buffer.concat([this.buffer, Buffer.from(chunk)]);
-					this.drain();
-				},
-				error: () => {},
-				close: () => {},
-			},
-		});
-		await this.send("AUTH", REDIS_PASSWORD);
-		return this;
-	}
-
-	/** Resolve waiters as soon as one complete reply is buffered. */
-	private drain() {
-		while (this.waiters.length > 0) {
-			const end = replyEnd(this.buffer);
-			if (end < 0) return;
-			const reply = this.buffer.subarray(0, end);
-			this.buffer = this.buffer.subarray(end);
-			this.waiters.shift()?.(Buffer.from(reply));
-		}
-	}
-
-	send(...args: Array<string | Buffer>): Promise<Buffer> {
-		const parts: Buffer[] = [Buffer.from(`*${args.length}\r\n`)];
-		for (const a of args) {
-			const b = Buffer.isBuffer(a) ? a : Buffer.from(a, "utf8");
-			parts.push(Buffer.from(`$${b.length}\r\n`), b, Buffer.from("\r\n"));
-		}
-		const done = new Promise<Buffer>((resolve) => this.waiters.push(resolve));
-		this.socket.write(Buffer.concat(parts));
-		return done;
-	}
-
-	/** The elements of a multi-bulk reply, with nil elements as null. */
-	async array(...args: Array<string | Buffer>): Promise<Array<Buffer | null>> {
-		const reply = await this.send(...args);
-		if (reply[0] !== 0x2a) {
-			throw new Error(`expected an array reply, got ${reply.subarray(0, 64)}`);
-		}
-		const first = reply.indexOf("\r\n") + 2;
-		const count = Number(reply.subarray(1, first - 2).toString());
-		const out: Array<Buffer | null> = [];
-		let cur = first;
-		for (let i = 0; i < count; i++) {
-			const head = reply.indexOf("\r\n", cur);
-			const len = Number(reply.subarray(cur + 1, head).toString());
-			out.push(len < 0 ? null : reply.subarray(head + 2, head + 2 + len));
-			cur = replyEnd(reply, cur);
-		}
-		return out;
-	}
-
-	/** The payload of a bulk-string reply, or null for a nil reply. */
-	async bulk(...args: Array<string | Buffer>): Promise<Buffer | null> {
-		const reply = await this.send(...args);
-		if (reply[0] !== 0x24) return null; // not '$'
-		const head = reply.indexOf("\r\n");
-		const len = Number(reply.subarray(1, head).toString());
-		if (len < 0) return null;
-		return reply.subarray(head + 2, head + 2 + len);
-	}
-
-	close() {
-		this.socket.end();
-	}
-}
-
-/** Offset just past the complete RESP reply starting at `from` in `buf`, or -1. */
-function replyEnd(buf: Buffer, from = 0): number {
-	if (from >= buf.length) return -1;
-	const head = buf.indexOf("\r\n", from);
-	if (head < 0) return -1;
-	// An array is a header and then that many replies, each of which has to be
-	// walked: stopping at the header would leave the elements in the buffer and
-	// hand them to whatever command replies next.
-	if (buf[from] === 0x2a) {
-		const count = Number(buf.subarray(from + 1, head).toString());
-		let cur = head + 2;
-		for (let i = 0; i < count; i++) {
-			cur = replyEnd(buf, cur);
-			if (cur < 0) return -1;
-		}
-		return cur;
-	}
-	// Bulk strings carry a length; every other reply type ends at the newline.
-	if (buf[from] !== 0x24) return head + 2;
-	const len = Number(buf.subarray(from + 1, head).toString());
-	if (len < 0) return head + 2;
-	const end = head + 2 + len + 2;
-	return buf.length >= end ? end : -1;
-}
 
 let raw: RawRedis;
 /** True when databases 0-7 are served from shared memory rather than tables. */
@@ -239,6 +129,21 @@ describe("Key-Value", () => {
 		const pttl = await client.pttl("ttlkey");
 		expect(pttl).toBeGreaterThanOrEqual(99000);
 		expect(pttl).toBeLessThanOrEqual(100000);
+	});
+
+	// The durable half increments in SQL, where the raise this used to trigger
+	// ended the worker process. The PING matters more than the reply.
+	test("INCR past the integer ceiling errors and leaves the worker up", async () => {
+		const ceiling = "9223372036854775807";
+		await raw.send("DEL", "incr-ceiling");
+		await raw.send("SET", "incr-ceiling", ceiling);
+		expect((await raw.send("INCR", "incr-ceiling")).toString()).toMatch(
+			/^-ERR increment or decrement would overflow/,
+		);
+		// The refused increment must not have changed what is stored.
+		expect((await raw.bulk("GET", "incr-ceiling"))?.toString()).toBe(ceiling);
+		expect((await raw.send("PING")).toString()).toBe("+PONG\r\n");
+		await raw.send("DEL", "incr-ceiling");
 	});
 
 	test("SET overwrites", async () => {
@@ -784,16 +689,16 @@ describe("List", () => {
 		await raw.send("SELECT", "cache");
 		await raw.send("DEL", "inslist");
 		await raw.send("RPUSH", "inslist", "a", "c", "e");
-		expect((await raw.send("LINSERT", "inslist", "BEFORE", "c", "b")).toString()).toBe(
-			":4\r\n",
-		);
+		expect(
+			(await raw.send("LINSERT", "inslist", "BEFORE", "c", "b")).toString(),
+		).toBe(":4\r\n");
 		expect(await raw.bulk("LINDEX", "inslist", "1")).toEqual(Buffer.from("b"));
 	});
 
 	test("LINSERT AFTER pivot", async () => {
-		expect((await raw.send("LINSERT", "inslist", "AFTER", "c", "d")).toString()).toBe(
-			":5\r\n",
-		);
+		expect(
+			(await raw.send("LINSERT", "inslist", "AFTER", "c", "d")).toString(),
+		).toBe(":5\r\n");
 		// The whole list, in order: a rewrite that renumbers positions has to
 		// leave every element reachable, not just the ones before the splice.
 		for (const [i, want] of ["a", "b", "c", "d", "e"].entries()) {
@@ -804,14 +709,16 @@ describe("List", () => {
 	});
 
 	test("LINSERT missing pivot returns -1", async () => {
-		expect((await raw.send("LINSERT", "inslist", "BEFORE", "Z", "x")).toString()).toBe(
-			":-1\r\n",
-		);
+		expect(
+			(await raw.send("LINSERT", "inslist", "BEFORE", "Z", "x")).toString(),
+		).toBe(":-1\r\n");
 	});
 
 	test("LINSERT on missing key returns 0", async () => {
 		expect(
-			(await raw.send("LINSERT", "nokey-linsert", "BEFORE", "p", "v")).toString(),
+			(
+				await raw.send("LINSERT", "nokey-linsert", "BEFORE", "p", "v")
+			).toString(),
 		).toBe(":0\r\n");
 		await raw.send("SELECT", "durable");
 	});
@@ -823,8 +730,8 @@ describe("List", () => {
 		await raw.send("SELECT", "cache");
 		await raw.send("DEL", "remraw");
 		await raw.send("RPUSH", "remraw", "a", "x", "a", "x", "a");
-		expect((await raw.send("LREM", "remraw", "2", "a")).toString()).toBe(":2\r\n");
-		expect((await raw.send("LLEN", "remraw")).toString()).toBe(":3\r\n");
+		expect(integerReply(await raw.send("LREM", "remraw", "2", "a"))).toBe(2);
+		expect(integerReply(await raw.send("LLEN", "remraw"))).toBe(3);
 		for (const [i, want] of ["x", "x", "a"].entries()) {
 			expect(await raw.bulk("LINDEX", "remraw", String(i))).toEqual(
 				Buffer.from(want),
@@ -1850,12 +1757,192 @@ describe("Binary safety", () => {
 		// first entry the scan reaches, not a uniform draw.)
 		const random = await raw.bulk("RANDOMKEY");
 		expect(random).not.toBeNull();
-		expect((await raw.send("EXISTS", random as Buffer)).toString()).toBe(
-			":1\r\n",
-		);
+		expect(integerReply(await raw.send("EXISTS", random as Buffer))).toBe(1);
 
 		for (const k of keys) await raw.send("DEL", k);
 		expect(await raw.array("KEYS", pattern)).toEqual([]);
+	});
+
+	// Members were read back up to their first NUL, so two sharing a prefix
+	// stored as two entries and read back as one truncated string.
+	const NUL_A = Buffer.from("a\0one");
+	const NUL_B = Buffer.from("a\0two");
+
+	test("set members differing only after a NUL round-trip whole", async () => {
+		await raw.send("DEL", "bin:set");
+		expect(integerReply(await raw.send("SADD", "bin:set", NUL_A))).toBe(1);
+		expect(integerReply(await raw.send("SADD", "bin:set", NUL_B))).toBe(1);
+		expect(integerReply(await raw.send("SCARD", "bin:set"))).toBe(2);
+		expect(integerReply(await raw.send("SISMEMBER", "bin:set", NUL_A))).toBe(1);
+		// The prefix is not a member of the set, however it reads back.
+		expect(integerReply(await raw.send("SISMEMBER", "bin:set", "a"))).toBe(0);
+		expect(hexes(await raw.array("SMEMBERS", "bin:set"))).toEqual(
+			hexes([NUL_A, NUL_B]),
+		);
+
+		// SPOP has to name something SREM can then remove.
+		const popped = await raw.array("SPOP", "bin:set", "1");
+		expect(popped.length).toBe(1);
+		const one = popped[0] as Buffer;
+		expect(hexes([one])).not.toEqual(hexes([Buffer.from("a")]));
+		expect(integerReply(await raw.send("SISMEMBER", "bin:set", one))).toBe(0);
+		expect(integerReply(await raw.send("SCARD", "bin:set"))).toBe(1);
+
+		const rest = await raw.array("SMEMBERS", "bin:set");
+		expect(
+			(await raw.send("SREM", "bin:set", rest[0] as Buffer)).toString(),
+		).toBe(":1\r\n");
+		expect(integerReply(await raw.send("SCARD", "bin:set"))).toBe(0);
+		await raw.send("DEL", "bin:set");
+	});
+
+	test("hash fields differing only after a NUL round-trip whole", async () => {
+		await raw.send("DEL", "bin:hash");
+		await raw.send("HSET", "bin:hash", NUL_A, "first");
+		await raw.send("HSET", "bin:hash", NUL_B, "second");
+		expect(integerReply(await raw.send("HLEN", "bin:hash"))).toBe(2);
+		expect((await raw.bulk("HGET", "bin:hash", NUL_A))?.toString()).toBe(
+			"first",
+		);
+		expect((await raw.bulk("HGET", "bin:hash", NUL_B))?.toString()).toBe(
+			"second",
+		);
+		expect(await raw.bulk("HGET", "bin:hash", "a")).toBeNull();
+
+		// HGETALL reads the field out of the entry; the pairs must still pair up.
+		const flat = await raw.array("HGETALL", "bin:hash");
+		expect(hexes([flat[0] as Buffer, flat[2] as Buffer])).toEqual(
+			hexes([NUL_A, NUL_B]),
+		);
+		expect(hexes(await raw.array("HKEYS", "bin:hash"))).toEqual(
+			hexes([NUL_A, NUL_B]),
+		);
+		const pairs = new Map<string, string>();
+		for (let i = 0; i < flat.length; i += 2) {
+			pairs.set(
+				(flat[i] as Buffer).toString("hex"),
+				(flat[i + 1] as Buffer).toString(),
+			);
+		}
+		expect(pairs.get(NUL_A.toString("hex"))).toBe("first");
+		expect(pairs.get(NUL_B.toString("hex"))).toBe("second");
+
+		expect(integerReply(await raw.send("HDEL", "bin:hash", NUL_A))).toBe(1);
+		expect((await raw.bulk("HGET", "bin:hash", NUL_B))?.toString()).toBe(
+			"second",
+		);
+		await raw.send("DEL", "bin:hash");
+	});
+
+	test("sorted-set members differing only after a NUL round-trip whole", async () => {
+		await raw.send("DEL", "bin:zset");
+		await raw.send("ZADD", "bin:zset", "1", NUL_A);
+		await raw.send("ZADD", "bin:zset", "2", NUL_B);
+		expect(integerReply(await raw.send("ZCARD", "bin:zset"))).toBe(2);
+		expect((await raw.bulk("ZSCORE", "bin:zset", NUL_A))?.toString()).toBe("1");
+		expect(await raw.bulk("ZSCORE", "bin:zset", "a")).toBeNull();
+		expect(hexes(await raw.array("ZRANGE", "bin:zset", "0", "-1"))).toEqual(
+			hexes([NUL_A, NUL_B]),
+		);
+
+		// ZPOPMIN names its member out of the meta, which keeps a hash of it.
+		const popped = await raw.array("ZPOPMIN", "bin:zset");
+		expect((popped[0] as Buffer).toString("hex")).toBe(NUL_A.toString("hex"));
+		expect((popped[1] as Buffer).toString()).toBe("1");
+		expect(integerReply(await raw.send("ZCARD", "bin:zset"))).toBe(1);
+
+		const max = await raw.array("ZPOPMAX", "bin:zset");
+		expect((max[0] as Buffer).toString("hex")).toBe(NUL_B.toString("hex"));
+		expect(integerReply(await raw.send("ZCARD", "bin:zset"))).toBe(0);
+		await raw.send("DEL", "bin:zset");
+	});
+
+	// A member has the same two boundaries a value has. A NUL every 16 bytes
+	// keeps a truncating read from passing on any of them.
+	test("members of every length round-trip through every collection", async () => {
+		const lengths = [1, 47, 48, 49, 112, 113, 200, 511, 512];
+		const member = (n: number) => {
+			const m = payload(n);
+			for (let i = 15; i < n; i += 16) m[i] = 0;
+			m[n - 1] = n & 0xff;
+			return m;
+		};
+		const members = lengths.map(member);
+
+		await raw.send("DEL", "len:set", "len:hash", "len:zset");
+		for (const [i, m] of members.entries()) {
+			await raw.send("SADD", "len:set", m);
+			await raw.send("HSET", "len:hash", m, `v${lengths[i]}`);
+			await raw.send("ZADD", "len:zset", String(i), m);
+		}
+
+		expect(hexes(await raw.array("SMEMBERS", "len:set"))).toEqual(
+			hexes(members),
+		);
+		expect(hexes(await raw.array("HKEYS", "len:hash"))).toEqual(hexes(members));
+		expect(hexes(await raw.array("ZRANGE", "len:zset", "0", "-1"))).toEqual(
+			hexes(members),
+		);
+		for (const [i, m] of members.entries()) {
+			expect(integerReply(await raw.send("SISMEMBER", "len:set", m))).toBe(1);
+			expect((await raw.bulk("HGET", "len:hash", m))?.toString()).toBe(
+				`v${lengths[i]}`,
+			);
+			expect((await raw.bulk("ZSCORE", "len:zset", m))?.toString()).toBe(
+				String(i),
+			);
+		}
+
+		// Removing them returns every chunk their tails took.
+		for (const m of members) {
+			expect(integerReply(await raw.send("SREM", "len:set", m))).toBe(1);
+			expect(integerReply(await raw.send("HDEL", "len:hash", m))).toBe(1);
+			expect(integerReply(await raw.send("ZREM", "len:zset", m))).toBe(1);
+		}
+		await raw.send("DEL", "len:set", "len:hash", "len:zset");
+	});
+
+	// A member past the inline prefix owns a chain, and only a pool that runs
+	// dry reveals a removal path that fails to give it back.
+	test("churning long members does not exhaust the member pools", async () => {
+		if (!memoryMode) return; // db 0 is a table here; nothing is pooled
+
+		const long = (i: number) => {
+			const m = Buffer.alloc(MAX_MEMBER_LEN, 0x6d);
+			m.write(`churn:${i}:`, 0);
+			return m;
+		};
+		for (let i = 0; i < 3000; i++) {
+			const m = long(i);
+			await raw.send("SADD", "churn:set", m);
+			await raw.send("SREM", "churn:set", m);
+			await raw.send("ZADD", "churn:zset", "1", m);
+			await raw.send("ZREM", "churn:zset", m);
+			await raw.send("HSET", "churn:hash", m, "v");
+			await raw.send("HDEL", "churn:hash", m);
+		}
+		// SPOP, ZPOPMIN and the whole-key deletes free chains of their own.
+		for (let i = 0; i < 200; i++) {
+			await raw.send("SADD", "churn:set", long(i));
+			await raw.send("ZADD", "churn:zset", String(i), long(i));
+		}
+		for (let i = 0; i < 200; i++) {
+			await raw.send("SPOP", "churn:set");
+			await raw.send("ZPOPMIN", "churn:zset");
+		}
+		for (let round = 0; round < 8; round++) {
+			for (let i = 0; i < 200; i++) {
+				await raw.send("SADD", "churn:set", long(i));
+				await raw.send("ZADD", "churn:zset", String(i), long(i));
+			}
+			await raw.send("DEL", "churn:set", "churn:zset");
+		}
+
+		// If any of those leaked, the pool is dry by now and this is an OOM.
+		const m = long(9999);
+		expect(integerReply(await raw.send("SADD", "churn:set", m))).toBe(1);
+		expect(hexes(await raw.array("SMEMBERS", "churn:set"))).toEqual(hexes([m]));
+		await raw.send("DEL", "churn:set", "churn:zset", "churn:hash");
 	});
 });
 
@@ -1963,9 +2050,9 @@ const CHUNK_LEN = 64;
 // An eighth of a pool of `redis.mem_max_entries` chunks, capped at 64 KiB —
 // which is where the default 8192 lands. See docs/IMPLEMENTATION.md.
 const MAX_TOTAL_VAL_LEN = 64 * 1024;
-const MAX_MEMBER_LEN = 128;
-// Keys are length-prefixed in the shared-memory entry, so the whole 512 is
-// usable — none of it goes to a terminator. See docs/IMPLEMENTATION.md.
+// Members carry the same 512-byte bound as keys: a share of a chunk pool, not
+// the size of an array. See docs/IMPLEMENTATION.md.
+const MAX_MEMBER_LEN = 512;
 const MEM_MAX_KEY = 512;
 
 /** Distinct, position-dependent bytes, so a truncation cannot pass by luck. */
@@ -1989,6 +2076,816 @@ const VALUE_SIZES = [
 	MAX_TOTAL_VAL_LEN - 1, // 65535
 	MAX_TOTAL_VAL_LEN, // 65536 largest the memory backend accepts
 ];
+
+// Both storage backends, the same assertions. Every case here was found by the
+// parity harness, and all but the last two were an error reply — or, before
+// `in_subtransaction` learned to catch, a dead worker.
+for (const half of ["cache", "durable"]) {
+	describe(`Enumerating keys of every type (${half})`, () => {
+		beforeAll(async () => {
+			await raw.send("SELECT", half);
+			await raw.send("FLUSHDB");
+		});
+		afterAll(async () => {
+			await raw.send("FLUSHDB");
+			await raw.send("SELECT", "durable");
+		});
+
+		// The entry tables key on (key hash, member) and the directory on a
+		// hash, so a collection's name was written down nowhere: KEYS saw
+		// strings only, while DBSIZE counted everything.
+		test("KEYS lists every type, not only strings", async () => {
+			await raw.send("FLUSHDB");
+			await raw.send("SET", "kn:str", "v");
+			await raw.send("RPUSH", "kn:list", "a");
+			await raw.send("SADD", "kn:set", "m");
+			await raw.send("HSET", "kn:hash", "f", "v");
+			await raw.send("ZADD", "kn:zset", "1", "m");
+
+			const keys = async (pat: string) =>
+				(await raw.array("KEYS", pat)).map((k) => k?.toString()).sort();
+			expect(await keys("*")).toEqual([
+				"kn:hash",
+				"kn:list",
+				"kn:set",
+				"kn:str",
+				"kn:zset",
+			]);
+			// DBSIZE and KEYS have to agree about what exists.
+			expect(integerReply(await raw.send("DBSIZE"))).toBe(5);
+			// Globs apply to collections the same way.
+			expect(await keys("kn:s*")).toEqual(["kn:set", "kn:str"]);
+			expect(await keys("*hash")).toEqual(["kn:hash"]);
+			expect(await keys("nomatch*")).toEqual([]);
+			await raw.send("FLUSHDB");
+		});
+
+		test("a name goes when its key does, by DEL and by emptying", async () => {
+			await raw.send("FLUSHDB");
+			await raw.send("RPUSH", "kn:l", "a");
+			await raw.send("SADD", "kn:s", "m");
+			await raw.send("HSET", "kn:h", "f", "v");
+			await raw.send("ZADD", "kn:z", "1", "m");
+			const keys = async () =>
+				(await raw.array("KEYS", "kn:*")).map((k) => k?.toString()).sort();
+			expect(await keys()).toEqual(["kn:h", "kn:l", "kn:s", "kn:z"]);
+
+			// DEL takes the name with the data...
+			await raw.send("DEL", "kn:l");
+			expect(await keys()).toEqual(["kn:h", "kn:s", "kn:z"]);
+			// ...and so does removing the last member.
+			await raw.send("SREM", "kn:s", "m");
+			await raw.send("HDEL", "kn:h", "f");
+			await raw.send("ZREM", "kn:z", "m");
+			expect(await keys()).toEqual([]);
+			expect(integerReply(await raw.send("DBSIZE"))).toBe(0);
+		});
+
+		test("an expired collection stops being listed", async () => {
+			await raw.send("FLUSHDB");
+			await raw.send("RPUSH", "kn:exp", "a");
+			await raw.send("EXPIRE", "kn:exp", "1");
+			expect((await raw.array("KEYS", "kn:*")).length).toBe(1);
+			await Bun.sleep(1600);
+			expect((await raw.array("KEYS", "kn:*")).length).toBe(0);
+			expect(integerReply(await raw.send("DBSIZE"))).toBe(0);
+		});
+
+		// The name is an inline prefix with the tail chained into the pool, so
+		// a key past that prefix is the case that exercises the chain.
+		test("a long name round-trips whole through the pool", async () => {
+			await raw.send("FLUSHDB");
+			for (const len of [39, 40, 41, 104, MEM_MAX_KEY]) {
+				const name = `kn:${"n".repeat(len - 3)}`;
+				await raw.send("SADD", name, "m");
+				const listed = (await raw.array("KEYS", "kn:n*")).map((k) =>
+					k?.toString(),
+				);
+				expect(listed).toEqual([name]);
+				expect(listed[0]?.length).toBe(len);
+				await raw.send("DEL", name);
+			}
+		});
+
+		// A meta entry owns its name's chain. A removal that does not hand it
+		// back leaves the next occupant of that slot holding chunks already on
+		// the free list — which crashed the worker outright, not subtly.
+		test("churning long collection names does not exhaust the pool", async () => {
+			await raw.send("FLUSHDB");
+			const name = (i: number) =>
+				`kn:churn:${i}:${"x".repeat(MEM_MAX_KEY)}`.slice(0, MEM_MAX_KEY);
+			for (let i = 0; i < 400; i++) {
+				await raw.send("SADD", name(i), "m");
+				await raw.send("DEL", name(i));
+			}
+			// If the chain leaked, the pool is dry and this fails.
+			await raw.send("SADD", name(0), "m");
+			expect(
+				(await raw.array("KEYS", "kn:churn:0:*")).map((k) => k?.toString()),
+			).toEqual([name(0)]);
+			await raw.send("FLUSHDB");
+		});
+	});
+}
+
+for (const half of ["cache", "durable"]) {
+	describe(`Commands added in phase 5 (${half})`, () => {
+		beforeAll(async () => {
+			await raw.send("SELECT", half);
+		});
+		afterAll(async () => {
+			await raw.send("SELECT", "durable");
+		});
+
+		test("FLUSHDB empties this database and leaves the other alone", async () => {
+			await raw.send("SET", "p5:k", "v");
+			await raw.send("RPUSH", "p5:l", "a");
+			await raw.send("HSET", "p5:h", "f", "v");
+			await raw.send("SADD", "p5:s", "m");
+			await raw.send("ZADD", "p5:z", "1", "m");
+			// A marker on the half this test is not on.
+			const other = half === "cache" ? "durable" : "cache";
+			await raw.send("SELECT", other);
+			await raw.send("SET", "p5:other", "keep");
+			await raw.send("SELECT", half);
+
+			expect(integerReply(await raw.send("DBSIZE"))).toBeGreaterThanOrEqual(5);
+			expect((await raw.send("FLUSHDB")).toString()).toBe("+OK\r\n");
+			expect(integerReply(await raw.send("DBSIZE"))).toBe(0);
+			for (const k of ["p5:k", "p5:l", "p5:h", "p5:s", "p5:z"]) {
+				expect((await raw.send("TYPE", k)).toString()).toBe("+none\r\n");
+			}
+
+			await raw.send("SELECT", other);
+			expect((await raw.bulk("GET", "p5:other"))?.toString()).toBe("keep");
+			await raw.send("DEL", "p5:other");
+			await raw.send("SELECT", half);
+		});
+
+		test("DBSIZE counts every type, not only strings", async () => {
+			await raw.send("FLUSHDB");
+			await raw.send("SET", "p5:k", "v");
+			await raw.send("RPUSH", "p5:l", "a");
+			await raw.send("HSET", "p5:h", "f", "v");
+			await raw.send("SADD", "p5:s", "m");
+			await raw.send("ZADD", "p5:z", "1", "m");
+			expect(integerReply(await raw.send("DBSIZE"))).toBe(5);
+			await raw.send("FLUSHDB");
+		});
+
+		// Redis pads the gap with NUL bytes, which no UTF-8 client can express
+		// — so this goes through the raw socket and asserts on the bytes.
+		test("SETRANGE overwrites, extends and pads with NUL", async () => {
+			await raw.send("DEL", "p5:k");
+			await raw.send("SET", "p5:k", "Hello World");
+			expect(
+				integerReply(await raw.send("SETRANGE", "p5:k", "6", "Redis")),
+			).toBe(11);
+			expect((await raw.bulk("GET", "p5:k"))?.toString()).toBe("Hello Redis");
+
+			await raw.send("DEL", "p5:k");
+			expect(integerReply(await raw.send("SETRANGE", "p5:k", "5", "abc"))).toBe(
+				8,
+			);
+			const padded = await raw.bulk("GET", "p5:k");
+			expect(padded?.length).toBe(8);
+			expect([...(padded ?? [])]).toEqual([0, 0, 0, 0, 0, 97, 98, 99]);
+
+			// An empty value writes nothing and reports the length as it stands.
+			expect(integerReply(await raw.send("SETRANGE", "p5:k", "0", ""))).toBe(8);
+			expect(
+				integerReply(await raw.send("SETRANGE", "p5:absent", "0", "")),
+			).toBe(0);
+			expect(integerReply(await raw.send("EXISTS", "p5:absent"))).toBe(0);
+			await raw.send("DEL", "p5:k");
+		});
+
+		test("GETRANGE clamps rather than erroring", async () => {
+			await raw.send("DEL", "p5:k");
+			await raw.send("SET", "p5:k", "Hello");
+			const range = async (a: string, b: string) =>
+				(await raw.bulk("GETRANGE", "p5:k", a, b))?.toString();
+			expect(await range("0", "-1")).toBe("Hello");
+			expect(await range("0", "4")).toBe("Hello");
+			expect(await range("-3", "-1")).toBe("llo");
+			expect(await range("0", "100")).toBe("Hello");
+			expect(await range("10", "20")).toBe("");
+			expect(await range("3", "1")).toBe("");
+			expect(
+				(await raw.bulk("GETRANGE", "p5:absent", "0", "-1"))?.toString(),
+			).toBe("");
+			await raw.send("DEL", "p5:k");
+		});
+
+		test("HINCRBYFLOAT creates, increments and refuses a non-float", async () => {
+			await raw.send("DEL", "p5:h");
+			expect(
+				(await raw.bulk("HINCRBYFLOAT", "p5:h", "f", "10.5"))?.toString(),
+			).toBe("10.5");
+			expect(
+				(await raw.bulk("HINCRBYFLOAT", "p5:h", "f", "0.1"))?.toString(),
+			).toBe("10.6");
+			expect(
+				(await raw.bulk("HINCRBYFLOAT", "p5:h", "f", "-5"))?.toString(),
+			).toBe("5.6");
+			await raw.send("HSET", "p5:h", "word", "abc");
+			expect(
+				(await raw.send("HINCRBYFLOAT", "p5:h", "word", "1")).toString(),
+			).toMatch(/^-ERR/);
+			// The refused field keeps its value, and no empty field is left.
+			expect((await raw.bulk("HGET", "p5:h", "word"))?.toString()).toBe("abc");
+			expect(integerReply(await raw.send("HLEN", "p5:h"))).toBe(2);
+			await raw.send("DEL", "p5:h");
+		});
+
+		test("RENAMENX renames only onto a free name", async () => {
+			await raw.send("DEL", "p5:a", "p5:b", "p5:c");
+			await raw.send("SET", "p5:a", "1");
+			expect(integerReply(await raw.send("RENAMENX", "p5:a", "p5:b"))).toBe(1);
+			expect((await raw.bulk("GET", "p5:b"))?.toString()).toBe("1");
+			expect(integerReply(await raw.send("EXISTS", "p5:a"))).toBe(0);
+
+			await raw.send("SET", "p5:c", "3");
+			expect(integerReply(await raw.send("RENAMENX", "p5:c", "p5:b"))).toBe(0);
+			expect((await raw.bulk("GET", "p5:b"))?.toString()).toBe("1");
+			expect((await raw.bulk("GET", "p5:c"))?.toString()).toBe("3");
+
+			expect(errorReply(await raw.send("RENAMENX", "p5:missing", "p5:b"))).toBe(
+				"ERR no such key",
+			);
+			await raw.send("DEL", "p5:b", "p5:c");
+		});
+
+		test("GETEX reads the value and moves the expiry", async () => {
+			await raw.send("DEL", "p5:k");
+			await raw.send("SET", "p5:k", "v");
+			await raw.send("EXPIRE", "p5:k", "100");
+			// No option: the expiry is left exactly as it was.
+			expect((await raw.bulk("GETEX", "p5:k"))?.toString()).toBe("v");
+			expect(integerReply(await raw.send("TTL", "p5:k"))).toBeGreaterThan(0);
+
+			expect((await raw.bulk("GETEX", "p5:k", "PERSIST"))?.toString()).toBe(
+				"v",
+			);
+			expect(integerReply(await raw.send("TTL", "p5:k"))).toBe(-1);
+
+			expect((await raw.bulk("GETEX", "p5:k", "EX", "50"))?.toString()).toBe(
+				"v",
+			);
+			const ttl = integerReply(await raw.send("TTL", "p5:k"));
+			expect(ttl).toBeGreaterThan(0);
+			expect(ttl).toBeLessThanOrEqual(50);
+
+			expect(await raw.bulk("GETEX", "p5:absent")).toBeNull();
+			await raw.send("DEL", "p5:k");
+		});
+
+		test("RPOPLPUSH moves the tail onto the head", async () => {
+			await raw.send("DEL", "p5:src", "p5:dst");
+			await raw.send("RPUSH", "p5:src", "a", "b", "c");
+			expect(
+				(await raw.bulk("RPOPLPUSH", "p5:src", "p5:dst"))?.toString(),
+			).toBe("c");
+			expect(
+				(await raw.bulk("RPOPLPUSH", "p5:src", "p5:dst"))?.toString(),
+			).toBe("b");
+			expect(
+				(await raw.array("LRANGE", "p5:dst", "0", "-1")).map((b) =>
+					b?.toString(),
+				),
+			).toEqual(["b", "c"]);
+			expect(
+				(await raw.array("LRANGE", "p5:src", "0", "-1")).map((b) =>
+					b?.toString(),
+				),
+			).toEqual(["a"]);
+			// A missing source is nil, and creates nothing.
+			expect(await raw.bulk("RPOPLPUSH", "p5:missing", "p5:dst")).toBeNull();
+			await raw.send("DEL", "p5:src", "p5:dst");
+		});
+
+		test("SETBIT, GETBIT and BITCOUNT count from the most significant bit", async () => {
+			await raw.send("DEL", "p5:b");
+			// Bit 0 is 0x80 of byte 0, not 0x01 — the opposite of PostgreSQL.
+			expect(integerReply(await raw.send("SETBIT", "p5:b", "0", "1"))).toBe(0);
+			expect([...((await raw.bulk("GET", "p5:b")) ?? [])]).toEqual([0x80]);
+			expect(integerReply(await raw.send("GETBIT", "p5:b", "0"))).toBe(1);
+			expect(integerReply(await raw.send("GETBIT", "p5:b", "1"))).toBe(0);
+			// Setting it back reports the bit as it was.
+			expect(integerReply(await raw.send("SETBIT", "p5:b", "0", "0"))).toBe(1);
+			expect([...((await raw.bulk("GET", "p5:b")) ?? [])]).toEqual([0x00]);
+			// A far offset grows the value with NUL bytes.
+			await raw.send("DEL", "p5:b");
+			expect(integerReply(await raw.send("SETBIT", "p5:b", "15", "1"))).toBe(0);
+			expect([...((await raw.bulk("GET", "p5:b")) ?? [])]).toEqual([
+				0x00, 0x01,
+			]);
+			// Past the end reads zero rather than erroring.
+			expect(integerReply(await raw.send("GETBIT", "p5:b", "999"))).toBe(0);
+			expect(integerReply(await raw.send("GETBIT", "p5:absent", "0"))).toBe(0);
+
+			// Redis's own documented examples.
+			await raw.send("SET", "p5:fb", "foobar");
+			expect(integerReply(await raw.send("BITCOUNT", "p5:fb"))).toBe(26);
+			expect(integerReply(await raw.send("BITCOUNT", "p5:fb", "0", "0"))).toBe(
+				4,
+			);
+			expect(integerReply(await raw.send("BITCOUNT", "p5:fb", "1", "1"))).toBe(
+				6,
+			);
+			expect(
+				integerReply(await raw.send("BITCOUNT", "p5:fb", "5", "30", "BIT")),
+			).toBe(17);
+			expect(integerReply(await raw.send("BITCOUNT", "p5:absent"))).toBe(0);
+			await raw.send("DEL", "p5:b", "p5:fb");
+		});
+
+		test("OBJECT ENCODING reports Redis's representation", async () => {
+			await raw.send(
+				"DEL",
+				"p5:k",
+				"p5:n",
+				"p5:big",
+				"p5:h",
+				"p5:s",
+				"p5:i",
+				"p5:l",
+				"p5:z",
+			);
+			await raw.send("SET", "p5:k", "hello");
+			await raw.send("SET", "p5:n", "12345");
+			await raw.send("SET", "p5:big", "x".repeat(45));
+			await raw.send("HSET", "p5:h", "f", "v");
+			await raw.send("SADD", "p5:s", "a", "b");
+			await raw.send("SADD", "p5:i", "1", "2");
+			await raw.send("RPUSH", "p5:l", "a");
+			await raw.send("ZADD", "p5:z", "1", "m");
+			const enc = async (k: string) =>
+				(await raw.send("OBJECT", "ENCODING", k))
+					.toString()
+					.replace(/^\+|\r\n$/g, "");
+			expect(await enc("p5:k")).toBe("embstr");
+			expect(await enc("p5:n")).toBe("int");
+			expect(await enc("p5:big")).toBe("raw");
+			expect(await enc("p5:h")).toBe("listpack");
+			expect(await enc("p5:s")).toBe("listpack");
+			expect(await enc("p5:i")).toBe("intset");
+			expect(await enc("p5:l")).toBe("listpack");
+			expect(await enc("p5:z")).toBe("listpack");
+			// A missing key is nil here, not the error every other command gives.
+			expect(await raw.bulk("OBJECT", "ENCODING", "p5:absent")).toBeNull();
+			await raw.send(
+				"DEL",
+				"p5:k",
+				"p5:n",
+				"p5:big",
+				"p5:h",
+				"p5:s",
+				"p5:i",
+				"p5:l",
+				"p5:z",
+			);
+		});
+
+		test("HRANDFIELD takes distinct fields unless the count is negative", async () => {
+			await raw.send("DEL", "p5:h");
+			await raw.send("HSET", "p5:h", "a", "1", "b", "2");
+			expect((await raw.bulk("HRANDFIELD", "p5:h"))?.length).toBeGreaterThan(0);
+			expect((await raw.array("HRANDFIELD", "p5:h", "1")).length).toBe(1);
+			// Capped at what the hash holds...
+			expect((await raw.array("HRANDFIELD", "p5:h", "5")).length).toBe(2);
+			// ...unless the count is negative, which repeats.
+			expect((await raw.array("HRANDFIELD", "p5:h", "-5")).length).toBe(5);
+			expect(
+				(await raw.array("HRANDFIELD", "p5:h", "2", "WITHVALUES")).length,
+			).toBe(4);
+			expect(await raw.bulk("HRANDFIELD", "p5:absent")).toBeNull();
+			expect((await raw.array("HRANDFIELD", "p5:absent", "3")).length).toBe(0);
+			await raw.send("DEL", "p5:h");
+		});
+
+		test("SINTERCARD counts the intersection and honours LIMIT", async () => {
+			await raw.send("DEL", "p5:s1", "p5:s2");
+			await raw.send("SADD", "p5:s1", "a", "b", "c");
+			await raw.send("SADD", "p5:s2", "b", "c", "d");
+			expect(
+				integerReply(await raw.send("SINTERCARD", "2", "p5:s1", "p5:s2")),
+			).toBe(2);
+			expect(
+				integerReply(
+					await raw.send("SINTERCARD", "2", "p5:s1", "p5:s2", "LIMIT", "1"),
+				),
+			).toBe(1);
+			// LIMIT 0 means no limit, not an empty answer.
+			expect(
+				integerReply(
+					await raw.send("SINTERCARD", "2", "p5:s1", "p5:s2", "LIMIT", "0"),
+				),
+			).toBe(2);
+			expect(
+				integerReply(await raw.send("SINTERCARD", "2", "p5:s1", "p5:absent")),
+			).toBe(0);
+			await raw.send("DEL", "p5:s1", "p5:s2");
+		});
+
+		test("COPY duplicates a key of any type, and declines an occupied name", async () => {
+			await raw.send("DEL", "p5:src", "p5:dst");
+			await raw.send("SET", "p5:src", "v");
+			expect(integerReply(await raw.send("COPY", "p5:src", "p5:dst"))).toBe(1);
+			expect((await raw.bulk("GET", "p5:dst"))?.toString()).toBe("v");
+			// The destination is occupied now, so this declines...
+			await raw.send("SET", "p5:src", "w");
+			expect(integerReply(await raw.send("COPY", "p5:src", "p5:dst"))).toBe(0);
+			expect((await raw.bulk("GET", "p5:dst"))?.toString()).toBe("v");
+			// ...unless REPLACE says otherwise.
+			expect(
+				integerReply(await raw.send("COPY", "p5:src", "p5:dst", "REPLACE")),
+			).toBe(1);
+			expect((await raw.bulk("GET", "p5:dst"))?.toString()).toBe("w");
+			expect(integerReply(await raw.send("COPY", "p5:absent", "p5:dst2"))).toBe(
+				0,
+			);
+
+			// Every type, not just strings.
+			await raw.send("DEL", "p5:l", "p5:l2", "p5:h", "p5:h2", "p5:z", "p5:z2");
+			await raw.send("RPUSH", "p5:l", "a", "b", "c");
+			expect(integerReply(await raw.send("COPY", "p5:l", "p5:l2"))).toBe(1);
+			expect(
+				(await raw.array("LRANGE", "p5:l2", "0", "-1")).map((b) =>
+					b?.toString(),
+				),
+			).toEqual(["a", "b", "c"]);
+			await raw.send("HSET", "p5:h", "f", "v");
+			expect(integerReply(await raw.send("COPY", "p5:h", "p5:h2"))).toBe(1);
+			expect((await raw.bulk("HGET", "p5:h2", "f"))?.toString()).toBe("v");
+			await raw.send("ZADD", "p5:z", "1.5", "m");
+			expect(integerReply(await raw.send("COPY", "p5:z", "p5:z2"))).toBe(1);
+			expect((await raw.bulk("ZSCORE", "p5:z2", "m"))?.toString()).toBe("1.5");
+			await raw.send(
+				"DEL",
+				"p5:src",
+				"p5:dst",
+				"p5:l",
+				"p5:l2",
+				"p5:h",
+				"p5:h2",
+				"p5:z",
+				"p5:z2",
+			);
+		});
+
+		test("an unknown command names the arguments it was given", async () => {
+			expect(errorReply(await raw.send("NOSUCHCOMMAND"))).toBe(
+				"ERR unknown command 'NOSUCHCOMMAND', with args beginning with: ",
+			);
+			expect(errorReply(await raw.send("NOSUCHCOMMAND", "arg"))).toBe(
+				"ERR unknown command 'NOSUCHCOMMAND', with args beginning with: 'arg' ",
+			);
+		});
+	});
+}
+
+for (const half of ["cache", "durable"]) {
+	describe(`Key type discipline (${half})`, () => {
+		beforeAll(async () => {
+			await raw.send("SELECT", half);
+		});
+		afterAll(async () => {
+			await raw.send("SELECT", "durable");
+		});
+
+		// Each of the five tables was keyed independently and none asked the
+		// others, so one key could hold a string and a list and a set at once.
+		test("a key holds one type, and the others are refused", async () => {
+			await raw.send("DEL", "p4:k");
+			await raw.send("SET", "p4:k", "v");
+			for (const cmd of [
+				["LPUSH", "p4:k", "a"],
+				["RPUSH", "p4:k", "a"],
+				["SADD", "p4:k", "m"],
+				["HSET", "p4:k", "f", "v"],
+				["ZADD", "p4:k", "1", "m"],
+				["LLEN", "p4:k"],
+				["SMEMBERS", "p4:k"],
+				["HGETALL", "p4:k"],
+				["ZCARD", "p4:k"],
+			]) {
+				expect(errorReply(await raw.send(...cmd))).toBe(
+					"WRONGTYPE Operation against a key holding the wrong kind of value",
+				);
+			}
+			expect((await raw.send("TYPE", "p4:k")).toString()).toBe("+string\r\n");
+			expect((await raw.bulk("GET", "p4:k"))?.toString()).toBe("v");
+			await raw.send("DEL", "p4:k");
+		});
+
+		test("reading a collection as a string is refused too", async () => {
+			await raw.send("DEL", "p4:l");
+			await raw.send("RPUSH", "p4:l", "a");
+			for (const cmd of [
+				["GET", "p4:l"],
+				["INCR", "p4:l"],
+				["APPEND", "p4:l", "x"],
+				["STRLEN", "p4:l"],
+				["GETDEL", "p4:l"],
+			]) {
+				expect(errorReply(await raw.send(...cmd))).toBe(
+					"WRONGTYPE Operation against a key holding the wrong kind of value",
+				);
+			}
+			expect(integerReply(await raw.send("LLEN", "p4:l"))).toBe(1);
+			await raw.send("DEL", "p4:l");
+		});
+
+		// Redis replaces rather than refuses here, and the old value goes.
+		test("SET replaces a key of any type, and its old value is gone", async () => {
+			await raw.send("DEL", "p4:k");
+			await raw.send("RPUSH", "p4:k", "a", "b");
+			expect((await raw.send("SET", "p4:k", "v")).toString()).toBe("+OK\r\n");
+			expect((await raw.send("TYPE", "p4:k")).toString()).toBe("+string\r\n");
+			expect((await raw.bulk("GET", "p4:k"))?.toString()).toBe("v");
+			// The list must not still be sitting behind the string.
+			await raw.send("DEL", "p4:k");
+			expect(integerReply(await raw.send("LLEN", "p4:k"))).toBe(0);
+		});
+
+		// NX and XX decide on whether the key is there, so clearing it up front
+		// would answer their own question for them.
+		test("SET NX declines over a collection and leaves it whole", async () => {
+			await raw.send("DEL", "p4:k");
+			await raw.send("RPUSH", "p4:k", "a");
+			expect((await raw.send("SET", "p4:k", "v", "NX")).toString()).toBe(
+				"$-1\r\n",
+			);
+			expect((await raw.send("TYPE", "p4:k")).toString()).toBe("+list\r\n");
+			expect(integerReply(await raw.send("LLEN", "p4:k"))).toBe(1);
+			// XX takes the opposite branch: the key exists, so the write lands.
+			expect((await raw.send("SET", "p4:k", "v", "XX")).toString()).toBe(
+				"+OK\r\n",
+			);
+			expect((await raw.send("TYPE", "p4:k")).toString()).toBe("+string\r\n");
+			await raw.send("DEL", "p4:k");
+		});
+
+		// Only the KV row had a column for an expiry, so every cache-with-a-TTL
+		// pattern over a collection kept its data forever.
+		test("a collection carries an expiry, and PERSIST clears it", async () => {
+			for (const [make, len] of [
+				[
+					["RPUSH", "p4:e", "a"],
+					["LLEN", "p4:e"],
+				],
+				[
+					["SADD", "p4:e", "m"],
+					["SCARD", "p4:e"],
+				],
+				[
+					["HSET", "p4:e", "f", "v"],
+					["HLEN", "p4:e"],
+				],
+				[
+					["ZADD", "p4:e", "1", "m"],
+					["ZCARD", "p4:e"],
+				],
+			] as const) {
+				await raw.send("DEL", "p4:e");
+				await raw.send(...make);
+				expect(integerReply(await raw.send("EXPIRE", "p4:e", "100"))).toBe(1);
+				const ttl = integerReply(await raw.send("TTL", "p4:e"));
+				expect(ttl).toBeGreaterThan(0);
+				expect(ttl).toBeLessThanOrEqual(100);
+				expect(integerReply(await raw.send("PERSIST", "p4:e"))).toBe(1);
+				expect(integerReply(await raw.send("TTL", "p4:e"))).toBe(-1);
+				expect(integerReply(await raw.send(...len))).toBe(1);
+				await raw.send("DEL", "p4:e");
+			}
+		});
+
+		test("an expired collection is gone, not merely untyped", async () => {
+			await raw.send("DEL", "p4:e");
+			await raw.send("RPUSH", "p4:e", "a", "b");
+			expect(integerReply(await raw.send("EXPIRE", "p4:e", "1"))).toBe(1);
+			await Bun.sleep(1200);
+
+			// Key-level reads are exact the moment the deadline passes: they go
+			// through the directory, which treats a passed expiry as absent.
+			expect(integerReply(await raw.send("TTL", "p4:e"))).toBe(-2);
+			expect((await raw.send("TYPE", "p4:e")).toString()).toBe("+none\r\n");
+			expect(integerReply(await raw.send("EXISTS", "p4:e"))).toBe(0);
+
+			// `LLEN` reads the list's own meta and does not consult the
+			// directory, so the count survives until the sweep runs — up to a
+			// second later. Redis expires lazily on access and has no such
+			// window; see "An expired collection outlives its own expiry" in
+			// docs/IMPLEMENTATION.md §12. Polled rather than slept on, so this
+			// asserts the end state without pinning the sweep's phase.
+			for (
+				let i = 0;
+				i < 40 && integerReply(await raw.send("LLEN", "p4:e"));
+				i++
+			) {
+				await Bun.sleep(100);
+			}
+			expect(integerReply(await raw.send("LLEN", "p4:e"))).toBe(0);
+
+			// And the key is free for another type to take.
+			expect(integerReply(await raw.send("SADD", "p4:e", "m"))).toBe(1);
+			await raw.send("DEL", "p4:e");
+		});
+
+		test("replacing a collection discards the expiry with the value", async () => {
+			await raw.send("DEL", "p4:a", "p4:b", "p4:dst");
+			await raw.send("SADD", "p4:a", "x", "y");
+			await raw.send("SADD", "p4:b", "y", "z");
+			await raw.send("SINTERSTORE", "p4:dst", "p4:a", "p4:b");
+			expect(integerReply(await raw.send("EXPIRE", "p4:dst", "100"))).toBe(1);
+			expect(integerReply(await raw.send("TTL", "p4:dst"))).toBeGreaterThan(0);
+			await raw.send("SUNIONSTORE", "p4:dst", "p4:a", "p4:b");
+			expect(integerReply(await raw.send("SCARD", "p4:dst"))).toBe(3);
+			expect(integerReply(await raw.send("TTL", "p4:dst"))).toBe(-1);
+			await raw.send("DEL", "p4:a", "p4:b", "p4:dst");
+		});
+
+		// The hash table had no per-key count, so nothing knew its last field
+		// had gone; the key lingered and TYPE still called it a hash.
+		test("emptying a collection removes the key", async () => {
+			await raw.send("DEL", "p4:h", "p4:s", "p4:z", "p4:l");
+			await raw.send("HSET", "p4:h", "f", "v");
+			expect(integerReply(await raw.send("HDEL", "p4:h", "f"))).toBe(1);
+			expect((await raw.send("TYPE", "p4:h")).toString()).toBe("+none\r\n");
+			expect(integerReply(await raw.send("EXISTS", "p4:h"))).toBe(0);
+			// So the name is free for another type.
+			expect(integerReply(await raw.send("RPUSH", "p4:h", "a"))).toBe(1);
+
+			await raw.send("SADD", "p4:s", "m");
+			await raw.send("SREM", "p4:s", "m");
+			expect((await raw.send("TYPE", "p4:s")).toString()).toBe("+none\r\n");
+
+			await raw.send("ZADD", "p4:z", "1", "m");
+			await raw.send("ZREM", "p4:z", "m");
+			expect((await raw.send("TYPE", "p4:z")).toString()).toBe("+none\r\n");
+
+			await raw.send("RPUSH", "p4:l", "a");
+			await raw.send("LPOP", "p4:l");
+			expect((await raw.send("TYPE", "p4:l")).toString()).toBe("+none\r\n");
+			await raw.send("DEL", "p4:h", "p4:s", "p4:z", "p4:l");
+		});
+
+		test("HLEN counts the fields of its own key only", async () => {
+			await raw.send("DEL", "p4:h1", "p4:h2");
+			await raw.send("HSET", "p4:h1", "a", "1", "b", "2");
+			await raw.send("HSET", "p4:h2", "c", "3");
+			expect(integerReply(await raw.send("HLEN", "p4:h1"))).toBe(2);
+			expect(integerReply(await raw.send("HLEN", "p4:h2"))).toBe(1);
+			await raw.send("HDEL", "p4:h1", "a");
+			expect(integerReply(await raw.send("HLEN", "p4:h1"))).toBe(1);
+			expect(integerReply(await raw.send("HLEN", "p4:h2"))).toBe(1);
+			expect(integerReply(await raw.send("HLEN", "p4:absent"))).toBe(0);
+			await raw.send("DEL", "p4:h1", "p4:h2");
+		});
+	});
+}
+
+for (const half of ["cache", "durable"]) {
+	describe(`Multi-argument and overwrite semantics (${half})`, () => {
+		beforeAll(async () => {
+			await raw.send("SELECT", half);
+		});
+		afterAll(async () => {
+			await raw.send("SELECT", "durable");
+		});
+
+		test("HINCRBY creates, increments and refuses a non-integer", async () => {
+			await raw.send("DEL", "p0:h");
+			expect(integerReply(await raw.send("HINCRBY", "p0:h", "n", "5"))).toBe(5);
+			expect(integerReply(await raw.send("HINCRBY", "p0:h", "n", "-2"))).toBe(
+				3,
+			);
+			expect((await raw.bulk("HGET", "p0:h", "n"))?.toString()).toBe("3");
+			await raw.send("HSET", "p0:h", "word", "abc");
+			expect(
+				(await raw.send("HINCRBY", "p0:h", "word", "1")).toString(),
+			).toMatch(/^-ERR/);
+			expect((await raw.bulk("HGET", "p0:h", "word"))?.toString()).toBe("abc");
+			await raw.send("DEL", "p0:h");
+		});
+
+		test("HSET counts the fields it added, not the ones it wrote", async () => {
+			await raw.send("DEL", "p0:h");
+			expect(
+				(await raw.send("HSET", "p0:h", "a", "1", "b", "2")).toString(),
+			).toBe(":2\r\n");
+			expect(integerReply(await raw.send("HSET", "p0:h", "a", "9"))).toBe(0);
+			expect(
+				(await raw.send("HSET", "p0:h", "a", "8", "c", "3")).toString(),
+			).toBe(":1\r\n");
+			expect((await raw.bulk("HGET", "p0:h", "a"))?.toString()).toBe("8");
+			await raw.send("DEL", "p0:h");
+		});
+
+		// `ON CONFLICT DO UPDATE` cannot touch a row twice in one statement, so
+		// these raised. Redis takes the last of each.
+		test("an argument list may name the same key twice", async () => {
+			await raw.send("DEL", "p0:k", "p0:h", "p0:z");
+			expect(
+				(await raw.send("MSET", "p0:k", "v1", "p0:k", "v2")).toString(),
+			).toBe("+OK\r\n");
+			expect((await raw.bulk("GET", "p0:k"))?.toString()).toBe("v2");
+
+			expect(
+				(await raw.send("HSET", "p0:h", "f", "v1", "f", "v2")).toString(),
+			).toBe(":1\r\n");
+			expect((await raw.bulk("HGET", "p0:h", "f"))?.toString()).toBe("v2");
+
+			expect(
+				(await raw.send("ZADD", "p0:z", "1", "m", "2", "m")).toString(),
+			).toBe(":1\r\n");
+			expect((await raw.bulk("ZSCORE", "p0:z", "m"))?.toString()).toBe("2");
+			await raw.send("DEL", "p0:k", "p0:h", "p0:z");
+		});
+
+		test("EXISTS counts each argument", async () => {
+			await raw.send("DEL", "p0:k");
+			await raw.send("SET", "p0:k", "v");
+			expect(integerReply(await raw.send("EXISTS", "p0:k", "p0:k"))).toBe(2);
+			expect(integerReply(await raw.send("EXISTS", "p0:k", "p0:missing"))).toBe(
+				1,
+			);
+			await raw.send("DEL", "p0:k");
+		});
+
+		test("LINDEX past either end is nil, not an error", async () => {
+			await raw.send("DEL", "p0:l");
+			await raw.send("RPUSH", "p0:l", "a");
+			expect(await raw.bulk("LINDEX", "p0:l", "-100")).toBeNull();
+			expect(await raw.bulk("LINDEX", "p0:l", "100")).toBeNull();
+			expect((await raw.bulk("LINDEX", "p0:l", "-1"))?.toString()).toBe("a");
+			await raw.send("DEL", "p0:l");
+		});
+
+		test("RENAME replaces its destination and carries the expiry", async () => {
+			await raw.send("DEL", "p0:src", "p0:dst");
+			await raw.send("SET", "p0:src", "one", "EX", "100");
+			await raw.send("SET", "p0:dst", "two");
+			expect((await raw.send("RENAME", "p0:src", "p0:dst")).toString()).toBe(
+				"+OK\r\n",
+			);
+			expect((await raw.bulk("GET", "p0:dst"))?.toString()).toBe("one");
+			expect(integerReply(await raw.send("EXISTS", "p0:src"))).toBe(0);
+			// The expiry moves with the key rather than being dropped in transit.
+			const ttl = Number(
+				(await raw.send("TTL", "p0:dst")).toString().replace(/[^0-9-]/g, ""),
+			);
+			expect(ttl).toBeGreaterThan(0);
+
+			// A rename that finds no source must leave the destination alone.
+			expect(
+				(await raw.send("RENAME", "p0:missing", "p0:dst")).toString(),
+			).toMatch(/^-ERR no such key/);
+			expect((await raw.bulk("GET", "p0:dst"))?.toString()).toBe("one");
+
+			// ...and a key renamed to itself survives it.
+			expect((await raw.send("RENAME", "p0:dst", "p0:dst")).toString()).toBe(
+				"+OK\r\n",
+			);
+			expect((await raw.bulk("GET", "p0:dst"))?.toString()).toBe("one");
+			await raw.send("DEL", "p0:dst");
+		});
+
+		// The insert's uniqueness check still sees rows the same statement
+		// deleted, so a destination that overlapped the result lost the overlap.
+		test("a store command replaces a destination that overlaps its result", async () => {
+			await raw.send("DEL", "p0:s1", "p0:s2", "p0:dst");
+			await raw.send("SADD", "p0:s1", "a", "b", "c");
+			await raw.send("SADD", "p0:s2", "b", "c", "d");
+			expect(
+				(await raw.send("SINTERSTORE", "p0:dst", "p0:s1", "p0:s2")).toString(),
+			).toBe(":2\r\n");
+			expect(
+				(await raw.send("SUNIONSTORE", "p0:dst", "p0:s1", "p0:s2")).toString(),
+			).toBe(":4\r\n");
+			expect(integerReply(await raw.send("SCARD", "p0:dst"))).toBe(4);
+			const members = (await raw.array("SMEMBERS", "p0:dst"))
+				.map((m) => m?.toString())
+				.sort();
+			expect(members).toEqual(["a", "b", "c", "d"]);
+
+			expect(
+				(await raw.send("SDIFFSTORE", "p0:dst", "p0:s1", "p0:s2")).toString(),
+			).toBe(":1\r\n");
+			expect(integerReply(await raw.send("SCARD", "p0:dst"))).toBe(1);
+			await raw.send("DEL", "p0:s1", "p0:s2", "p0:dst");
+		});
+
+		test("GETSET discards the expiry with the value it replaces", async () => {
+			await raw.send("DEL", "p0:k");
+			await raw.send("SET", "p0:k", "v", "EX", "100");
+			expect((await raw.bulk("GETSET", "p0:k", "v2"))?.toString()).toBe("v");
+			expect(integerReply(await raw.send("TTL", "p0:k"))).toBe(-1);
+			await raw.send("DEL", "p0:k");
+		});
+	});
+}
 
 describe("Value size limits", () => {
 	// These limits belong to the ephemeral half. On db 8 every value is a
@@ -2138,6 +3035,39 @@ describe("Value size limits", () => {
 		for (const key of stored) await raw.send("DEL", key);
 	});
 
+	// Storing the first key of an MSET and then reporting OOM is what the
+	// pre-check exists to prevent. Filling the pool is the cheap way there.
+	test("an MSET that does not fit stores none of it", async () => {
+		if (!memoryMode) return; // db 0 is a table here; nothing is pooled
+
+		const big = payload(MAX_TOTAL_VAL_LEN);
+		const stored: string[] = [];
+		for (let i = 0; i < 64; i++) {
+			const key = `vs:atomic:${i}`;
+			if ((await raw.send("SET", key, big)).toString() !== "+OK\r\n") break;
+			stored.push(key);
+		}
+		expect(stored.length).toBeGreaterThan(1);
+
+		// One value's worth of room was just freed, so an MSET of two is short.
+		await raw.send("DEL", stored.pop() as string);
+		const reply = (
+			await raw.send("MSET", "vs:atomic:a", big, "vs:atomic:b", big)
+		).toString();
+		expect(reply).toMatch(/^-OOM /);
+		expect(await raw.bulk("GET", "vs:atomic:a")).toBeNull();
+		expect(await raw.bulk("GET", "vs:atomic:b")).toBeNull();
+
+		// ...and a full table still takes an MSET that only overwrites, because
+		// the check counts the keys that are actually absent.
+		expect(
+			(
+				await raw.send("MSET", stored[0], "small", stored[1], "small")
+			).toString(),
+		).toBe("+OK\r\n");
+		for (const key of stored) await raw.send("DEL", key);
+	});
+
 	// The pool is finite and shared by every value in its table, so a path that
 	// drops a value without returning its chunks is invisible until the pool
 	// runs dry. Each of these rewrites far more than a pool's worth of chunks
@@ -2193,6 +3123,7 @@ describe("Value size limits", () => {
 	// is dry, so the only way to see it is to churn enough keys to empty one —
 	// 512-byte keys are 6 chunks each, so 4,000 of them is three pools' worth.
 	test("churning long keys does not exhaust the chunk pool", async () => {
+		if (!memoryMode) return; // db 0 is a table here; nothing is pooled
 		const longKey = (i: number) => {
 			const k = Buffer.alloc(MEM_MAX_KEY, 0x6b);
 			k.write(`churnkey:${i}:`, 0);
@@ -2445,5 +3376,50 @@ describe("Pub/Sub multi-channel persistency", () => {
 		expect(ordersAfter).toBe(before.orders);
 		expect(alertsAfter).toBe(before.alerts);
 		expect(auditAfter).toBe(before.audit);
+	});
+});
+
+describe("COPY across the storage halves", () => {
+	beforeAll(async () => {
+		await raw.send("SELECT", "cache");
+		await raw.send("DEL", "p5:x", "p5:xl");
+		await raw.send("SELECT", "durable");
+		await raw.send("DEL", "p5:x", "p5:xl");
+	});
+
+	// The two halves are different storage engines; COPY is the only command
+	// that reads from one and writes to the other.
+	test("a cache key is promoted to the durable half and back", async () => {
+		await raw.send("SELECT", "cache");
+		await raw.send("SET", "p5:x", "cached");
+		await raw.send("RPUSH", "p5:xl", "a", "b");
+		expect(
+			integerReply(await raw.send("COPY", "p5:x", "p5:x", "DB", "8")),
+		).toBe(1);
+		expect(
+			integerReply(await raw.send("COPY", "p5:xl", "p5:xl", "DB", "8")),
+		).toBe(1);
+
+		await raw.send("SELECT", "durable");
+		expect((await raw.bulk("GET", "p5:x"))?.toString()).toBe("cached");
+		expect(
+			(await raw.array("LRANGE", "p5:xl", "0", "-1")).map((b) => b?.toString()),
+		).toEqual(["a", "b"]);
+
+		// And the other way: durable back into the cache.
+		await raw.send("SET", "p5:x", "durable-value");
+		expect(
+			integerReply(await raw.send("COPY", "p5:x", "p5:back", "DB", "0")),
+		).toBe(1);
+		await raw.send("SELECT", "cache");
+		expect((await raw.bulk("GET", "p5:back"))?.toString()).toBe(
+			"durable-value",
+		);
+		// The source is untouched by either direction.
+		expect((await raw.bulk("GET", "p5:x"))?.toString()).toBe("cached");
+
+		await raw.send("DEL", "p5:x", "p5:xl", "p5:back");
+		await raw.send("SELECT", "durable");
+		await raw.send("DEL", "p5:x", "p5:xl");
 	});
 });

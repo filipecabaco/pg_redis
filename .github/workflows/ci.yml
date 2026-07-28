@@ -341,6 +341,53 @@ jobs:
         if: failure()
         run: docker compose --profile e2e logs
 
+  # Every reply diffed against a real Redis, both halves, in one run. A gate on
+  # *new* differences only: the ones already known are recorded in
+  # docker/e2e/parity-baseline.json, so this fails when a change moves pg_redis
+  # further from Redis, not because the gap exists.
+  parity:
+    name: Redis parity
+    needs: [image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      PG_REDIS_STORAGE_MODE: memory
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+
+      - name: Restore Docker layers
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ hashFiles('Dockerfile', 'Cargo.toml', 'Cargo.lock', 'src/**', 'sql/**') }}
+          restore-keys: ${{ runner.os }}-buildx-
+
+      - name: Load postgres image from cache
+        uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1 # v6.16.0
+        with:
+          context: .
+          load: true
+          tags: pg_redis:latest
+          cache-from: type=local,src=/tmp/.buildx-cache
+
+      - name: Build parity image
+        run: docker compose --profile parity build parity
+
+      - name: Diff every reply against Redis
+        run: |
+          docker compose --profile parity up \
+            --no-build \
+            --exit-code-from parity \
+            --abort-on-container-exit
+
+      - name: Print logs on failure
+        if: failure()
+        run: docker compose --profile parity logs
+
   # Benchmarks, published on the pull request rather than buried in a log.
   #
   # Not a gate. GitHub-hosted runners are shared, so absolute numbers move

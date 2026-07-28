@@ -57,3 +57,4 @@ nav:
       - Commands: commands.md
       - Command coverage: command-coverage.md
   - Implementation: IMPLEMENTATION.md
+  - Parity roadmap: PARITY.md

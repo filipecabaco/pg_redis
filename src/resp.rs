@@ -128,14 +128,9 @@ pub fn write_simple_string(w: &mut impl Write, s: &str) -> io::Result<()> {
     write!(w, "+{}\r\n", s)
 }
 
-/// A RESP error, prefixed with `ERR` only when the message does not already
-/// carry a code of its own.
-///
-/// Redis errors begin with an uppercase code — `ERR`, `WRONGTYPE`, `NOAUTH`,
-/// `OOM` — and clients match on it. Prefixing unconditionally produced
-/// `-ERR ERR value is not an integer` for the messages that already had one,
-/// and turned an OOM reply into `-ERR OOM ...`, which no client's OOM handling
-/// recognises.
+/// A RESP error, prefixed with `ERR` only when the message carries no code of
+/// its own. Clients match on the code, so prefixing unconditionally turned an
+/// OOM reply into `-ERR OOM …`, which no OOM handling recognises.
 pub fn write_error(w: &mut impl Write, msg: &str) -> io::Result<()> {
     if has_error_code(msg) {
         write!(w, "-{}\r\n", msg)
@@ -144,11 +139,9 @@ pub fn write_error(w: &mut impl Write, msg: &str) -> io::Result<()> {
     }
 }
 
-/// The error codes Redis defines, so a message opening with one keeps it.
-///
-/// Matched against a list rather than "the first word is uppercase": plenty of
-/// messages open with a command name — `WATCH requires ...`, `EXEC without
-/// MULTI` — and those are prose that still needs the ERR prefix.
+/// The error codes Redis defines, so a message opening with one keeps it. A
+/// list rather than "first word is uppercase": plenty of messages open with a
+/// command name and still need the prefix.
 const ERROR_CODES: &[&str] = &[
     "ERR",
     "WRONGTYPE",

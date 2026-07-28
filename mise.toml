@@ -86,6 +86,20 @@ run = [
   "docker compose --profile e2e down -v",
 ]
 
+[tasks.parity]
+description = "Diff every reply against a real Redis (both halves)"
+run = [
+  "docker compose -f docker-compose.yml -f docker-compose.noports.yml --profile parity up --build --abort-on-container-exit --exit-code-from parity",
+  "docker compose --profile parity down -v",
+]
+
+[tasks.parity-update]
+description = "Re-record the parity baseline after a difference is fixed or accepted"
+run = [
+  "docker compose -f docker-compose.yml -f docker-compose.noports.yml --profile parity run --build --rm -v $PWD/docker/e2e:/app parity bun run parity.ts --update-baseline",
+  "docker compose --profile parity down -v",
+]
+
 [tasks.clients]
 description = "Run client-compatibility e2e tests in Docker (node-redis, ioredis)"
 run = [

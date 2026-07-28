@@ -1,16 +1,12 @@
 //! Write-version counters backing WATCH / EXEC.
 //!
-//! These live in shared memory rather than in each worker because the listener
-//! uses `SO_REUSEPORT`: a client's WATCH is served by whichever worker accepted
-//! its connection, while the conflicting write may be dispatched through any
-//! other worker. Per-process counters therefore reported "no conflict" for
-//! writes the process never saw, and EXEC committed when it should have aborted.
+//! In shared memory rather than per worker because the listener uses
+//! `SO_REUSEPORT`: a WATCH is served by whichever worker accepted the
+//! connection, while the conflicting write may go through any other.
 //!
-//! Keys are hashed into a fixed table of counters instead of being stored. That
-//! keeps the structure allocation-free, lock-free and fixed-size — no eviction
-//! policy, and no growth a client can drive by writing unique keys. The cost is
-//! that two keys can share a counter, which makes an EXEC abort when it strictly
-//! did not have to. That direction is safe; the reverse would not be.
+//! Keys are hashed into a fixed table rather than stored, which keeps it
+//! allocation-free, lock-free and unable to grow. Two keys sharing a counter
+//! aborts an EXEC that did not have to abort; the reverse would not be safe.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -55,6 +51,19 @@ pub unsafe fn version(ctl: *mut WatchCtl, db: u8, key: &[u8]) -> u64 {
 pub unsafe fn bump(ctl: *mut WatchCtl, db: u8, key: &[u8]) {
     unsafe {
         (*ctl).versions[slot_of(db, key)].fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Record a write to every key there could be. `FLUSHDB` and `FLUSHALL` touch
+/// keys they cannot name, and the table cannot be walked back to the keys that
+/// hashed into it — so every counter moves. It aborts watches on databases the
+/// flush did not touch, which is the direction this table is allowed to err in.
+///
+/// # Safety
+/// `ctl` must point at the initialised shared-memory block.
+pub unsafe fn bump_all(ctl: *mut WatchCtl) {
+    for slot in 0..WATCH_SLOTS {
+        unsafe { (*ctl).versions[slot].fetch_add(1, Ordering::AcqRel) };
     }
 }
 

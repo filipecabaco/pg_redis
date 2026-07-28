@@ -177,6 +177,44 @@ CREATE INDEX IF NOT EXISTS zset_13_key_score_member ON redis.zset_13 (key, score
 CREATE INDEX IF NOT EXISTS zset_14_key_score_member ON redis.zset_14 (key, score, member);
 CREATE INDEX IF NOT EXISTS zset_15_key_score_member ON redis.zset_15 (key, score, member);
 
+-- Where a collection's expiry lives. Only the KV table has a column for one,
+-- so without this a list, set, hash or sorted set could not carry a TTL at all
+-- and every cache-with-an-expiry pattern over a collection kept its data
+-- forever. A string keeps its own column: it is read on the GET path already.
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.expiry_0   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.expiry_1   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.expiry_2   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.expiry_3   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.expiry_4   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.expiry_5   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.expiry_6   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.expiry_7   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.expiry_8   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.expiry_9   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.expiry_10  (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.expiry_11  (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.expiry_12  (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.expiry_13  (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.expiry_14  (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.expiry_15  (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
+
+CREATE INDEX IF NOT EXISTS expiry_0_expires_idx   ON redis.expiry_0   (expires_at);
+CREATE INDEX IF NOT EXISTS expiry_1_expires_idx   ON redis.expiry_1   (expires_at);
+CREATE INDEX IF NOT EXISTS expiry_2_expires_idx   ON redis.expiry_2   (expires_at);
+CREATE INDEX IF NOT EXISTS expiry_3_expires_idx   ON redis.expiry_3   (expires_at);
+CREATE INDEX IF NOT EXISTS expiry_4_expires_idx   ON redis.expiry_4   (expires_at);
+CREATE INDEX IF NOT EXISTS expiry_5_expires_idx   ON redis.expiry_5   (expires_at);
+CREATE INDEX IF NOT EXISTS expiry_6_expires_idx   ON redis.expiry_6   (expires_at);
+CREATE INDEX IF NOT EXISTS expiry_7_expires_idx   ON redis.expiry_7   (expires_at);
+CREATE INDEX IF NOT EXISTS expiry_8_expires_idx   ON redis.expiry_8   (expires_at);
+CREATE INDEX IF NOT EXISTS expiry_9_expires_idx   ON redis.expiry_9   (expires_at);
+CREATE INDEX IF NOT EXISTS expiry_10_expires_idx  ON redis.expiry_10  (expires_at);
+CREATE INDEX IF NOT EXISTS expiry_11_expires_idx  ON redis.expiry_11  (expires_at);
+CREATE INDEX IF NOT EXISTS expiry_12_expires_idx  ON redis.expiry_12  (expires_at);
+CREATE INDEX IF NOT EXISTS expiry_13_expires_idx  ON redis.expiry_13  (expires_at);
+CREATE INDEX IF NOT EXISTS expiry_14_expires_idx  ON redis.expiry_14  (expires_at);
+CREATE INDEX IF NOT EXISTS expiry_15_expires_idx  ON redis.expiry_15  (expires_at);
+
 -- Pub/sub table routing: persists channel→table mappings across server restarts.
 -- Loaded into shared memory by the first BGW on startup via CAS flag.
 CREATE TABLE IF NOT EXISTS redis.pubsub_routes (

@@ -358,12 +358,18 @@ pub(crate) unsafe fn in_subtransaction<F: FnOnce() -> Response>(body: F) -> Resp
 fn run_dispatch_batch(cmds: &[(Command, u8)], mem_mode: bool) -> Vec<Response> {
     // `FLUSHALL` reaches both halves, `COPY` may, and the routed-table INSERT
     // reaches user tables — none can be served from shared memory alone.
+    // `DUMP` and `RESTORE` ride along: they share `COPY`'s whole-key
+    // machinery, which branches per backend inside the SQL path.
     let all_mem = mem_mode
         && cmds.iter().all(|(cmd, db)| {
             crate::commands::is_ephemeral(*db)
                 && !matches!(
                     cmd,
-                    Command::TablePublish { .. } | Command::FlushAll | Command::Copy { .. }
+                    Command::TablePublish { .. }
+                        | Command::FlushAll
+                        | Command::Copy { .. }
+                        | Command::Dump { .. }
+                        | Command::Restore { .. }
                 )
         });
     let responses: Vec<Response> = if all_mem {
@@ -845,7 +851,13 @@ fn conn_loop(
                 watched.clear();
                 reply(&mut writer, |w| write_simple_string(w, "OK"));
             }
-            Command::CmdCount => reply(&mut writer, |w| write_integer(w, 100)),
+            Command::Time => {
+                write_response(&mut writer, crate::commands::time_reply()).ok();
+                flush(&mut writer);
+            }
+            Command::CmdCount => reply(&mut writer, |w| {
+                write_integer(w, *crate::commands::COMMAND_COUNT)
+            }),
             Command::CmdInfo | Command::CmdDocs | Command::CmdList | Command::CmdOther => {
                 reply(&mut writer, |w| write_array_header(w, 0))
             }

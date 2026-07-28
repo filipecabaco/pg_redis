@@ -24,9 +24,10 @@ repeated per command.
 | `RESET` |  |
 | `QUIT` |  |
 | `CLIENT` | Accepted and answered, but connection state is not tracked |
-| `COMMAND` | Returns an empty array, enough for client handshakes |
+| `COMMAND` | Returns an empty array, enough for client handshakes; `COUNT` reports the number of rows on this page |
 | `CONFIG` | `GET` returns nothing; `SET` is accepted and ignored |
 | `INFO` |  |
+| `TIME` | Seconds and microseconds, from one clock reading |
 
 ## Strings
 
@@ -51,7 +52,8 @@ repeated per command.
 | `INCRBYFLOAT` |  |
 | `GETEX` | EX, PX, EXAT, PXAT and PERSIST |
 | `SETRANGE` | Pads the gap with NUL bytes, as in Redis |
-| `GETRANGE` | `SUBSTR` is accepted as its older name |
+| `GETRANGE` |  |
+| `SUBSTR` | Older name of `GETRANGE`; a separate command, as in Redis's own table |
 | `SETBIT` |  |
 | `GETBIT` |  |
 | `BITCOUNT` | BYTE and BIT ranges; bits are numbered from the most significant |
@@ -63,10 +65,13 @@ repeated per command.
 | `DEL` |  |
 | `UNLINK` |  |
 | `EXISTS` |  |
+| `TOUCH` | Counts as `EXISTS` does; there is no LRU clock to refresh |
 | `TYPE` |  |
 | `KEYS` | Full scan, as in Redis, over keys of every type. Glob matching is done in-process, not in SQL |
 | `SCAN` | Cursor is always 0 — one full pass, no incremental guarantee |
-| `RANDOMKEY` | Favours strings over collections; see IMPLEMENTATION.md |
+| `RANDOMKEY` | Uniform over every live key, whatever table holds it |
+| `DUMP` | Redis's serialisation format, version 10; restores into a real 7.0 |
+| `RESTORE` | REPLACE and ABSTTL honoured, IDLETIME and FREQ accepted; refuses payloads newer than version 10 and pre-7 compact encodings |
 | `RENAME` |  |
 | `RENAMENX` |  |
 | `COPY` | `DB` may name a database on the other storage half |
@@ -104,6 +109,7 @@ repeated per command.
 | `HVALS` |  |
 | `HLEN` |  |
 | `HEXISTS` |  |
+| `HSTRLEN` |  |
 | `HINCRBY` |  |
 | `HINCRBYFLOAT` |  |
 | `HRANDFIELD` | A negative count repeats; WITHVALUES interleaves |
@@ -178,6 +184,7 @@ repeated per command.
 | `ZREMRANGEBYLEX` |  |
 | `ZUNION` |  |
 | `ZINTER` |  |
+| `ZINTERCARD` | `LIMIT 0` means no limit, as `SINTERCARD` |
 | `ZDIFF` |  |
 | `ZUNIONSTORE` |  |
 | `ZINTERSTORE` |  |
@@ -207,10 +214,9 @@ repeated per command.
 ## Not implemented
 
 Notable absences, so you do not have to infer them from silence: `BITOP`,
-`BITPOS`, `BITFIELD`, `HSCAN`, `SSCAN`, `ZSCAN`, `SORT`, `DUMP`, `RESTORE`,
-`MIGRATE`, `BLPOP` and the other blocking list commands, `HEXPIRE` and the
-per-field TTLs, `EVAL` and scripting, streams (`XADD` and friends), and cluster
-commands.
+`BITPOS`, `BITFIELD`, `HSCAN`, `SSCAN`, `ZSCAN`, `SORT`, `MIGRATE`, `BLPOP`
+and the other blocking list commands, `HEXPIRE` and the per-field TTLs, `EVAL`
+and scripting, streams (`XADD` and friends), and cluster commands.
 
 A test asserts that every command named above is genuinely rejected, so this
 paragraph cannot quietly go stale — which it did once, naming as absent two

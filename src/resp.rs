@@ -152,6 +152,7 @@ const ERROR_CODES: &[&str] = &[
     "NOSCRIPT",
     "LOADING",
     "BUSY",
+    "BUSYKEY",
     "NOPERM",
     "READONLY",
     "NOPROTO",

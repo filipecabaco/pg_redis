@@ -6487,7 +6487,13 @@ pub unsafe fn mem_zset_collect_all(db_idx: usize, key: &[u8]) -> Vec<(Vec<u8>, f
 
 // ─────────────── Random key ─────────────────────────────────────────────────
 
-/// Returns a single arbitrary non-expired key, or None if the database is empty.
+/// Returns a uniformly drawn non-expired key, or None if the database is empty.
+///
+/// A reservoir of one over every live key the five tables hold: the k-th
+/// candidate replaces the pick with probability 1/k, which lands every key at
+/// 1/n without knowing n up front. This used to hand back the first live
+/// string the KV scan reached and consult the collections only when there was
+/// none, so a database of mostly collections saw strings almost every draw.
 ///
 /// # Safety
 /// Must be called from bgworker thread with mem_init_worker already called.
@@ -6497,11 +6503,19 @@ pub unsafe fn mem_random_key(db_idx: usize) -> Option<Vec<u8>> {
         if htab.is_null() {
             return None;
         }
+        let mut pick: Option<Vec<u8>> = None;
+        let mut seen: u64 = 0;
+        let mut consider = |key: Vec<u8>| {
+            seen += 1;
+            if fast_random().is_multiple_of(seen) {
+                pick = Some(key);
+            }
+        };
+
         let pool = kv_pool_for(db_idx);
         let lk = lwlock(db_idx);
         let guard = LockGuard::shared(lk);
         let now = now_micros();
-        let mut result: Option<Vec<u8>> = None;
         let mut status: pg_sys::HASH_SEQ_STATUS = std::mem::zeroed();
         pg_sys::hash_seq_init(&mut status, htab);
         loop {
@@ -6513,19 +6527,24 @@ pub unsafe fn mem_random_key(db_idx: usize) -> Option<Vec<u8>> {
             if exp != 0 && exp <= now {
                 continue;
             }
-            result = Some(with_kv_key(entry, pool, <[u8]>::to_vec));
-            pg_sys::hash_seq_term(&mut status);
-            break;
+            consider(with_kv_key(entry, pool, <[u8]>::to_vec));
         }
         // As `mem_scan`: the KV lock goes before the four `collection_names`
         // takes, so only one lock order is ever in play.
         drop(guard);
 
-        // A string if there is one, else whatever a collection is called. Redis
-        // draws from every key; this favours strings, which is a distribution
-        // difference rather than a wrong answer — `RANDOMKEY` is compared by
-        // reply shape.
-        result.or_else(|| collection_names(db_idx, |_| true).into_iter().next())
+        // Collected first and filtered after, rather than filtered inside the
+        // `keep` closure: the closure runs under a meta table's lock, and the
+        // directory lookup the filter needs takes a lock of its own.
+        for name in collection_names(db_idx, |_| true) {
+            match dir_lookup_raw(db_idx, &key_hash(&name)) {
+                Some((_, exp)) if exp == 0 || exp > now_micros() => consider(name),
+                // Expired but unswept, or missing from the directory
+                // altogether: not a key a client may be handed.
+                _ => {}
+            }
+        }
+        pick
     }
 }
 

@@ -28,6 +28,9 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock* ./
 COPY src/ src/
 COPY sql/ sql/
+# The crate embeds the coverage page: `COMMAND COUNT` answers with its row
+# count, so the build needs it alongside src/.
+COPY docs/command-coverage.md docs/command-coverage.md
 COPY pg_redis.control pg_redis.control
 
 # Install cargo-pgrx matching the project version

@@ -689,6 +689,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#an-entry-must-not-outlive-the-chunks-it-names" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        An entry must not outlive the chunks it names
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#the-key-directory" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1374,6 +1385,17 @@
     <span class="md-ellipsis">
       
         Tables and entry layouts
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#an-entry-must-not-outlive-the-chunks-it-names" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        An entry must not outlive the chunks it names
       
     </span>
   </a>
@@ -2249,7 +2271,44 @@ pool that is not already exhausted has the room.</p>
 <code>remove_meta</code>, <code>remove_zset_meta</code>, and <code>remove_meta_of</code> on the <code>DEL</code> and
 eviction paths — hands it back before the entry goes. Missing one is not a leak
 that shows up later: the next occupant of that slot inherits a head pointing
-into the free list, and the worker aborts. Which is what it did, once.</p>
+into the free list, and the worker aborts. Which is what it did, once.
+<code>removing_a_meta_entry_releases_its_name_chain</code> drives all four against real
+tables; it exists because that bug was found by a crash and fixed without one.</p>
+<h3 id="an-entry-must-not-outlive-the-chunks-it-names">An entry must not outlive the chunks it names</h3>
+<p>The rule above is not about meta entries. It is about <strong>dynahash</strong>, and it
+applies to every table here.</p>
+<p>A removed element goes on dynahash's own free list holding the bytes it had. The
+next key to land in that slot gets them, and <code>value_free</code> reads exactly one
+field before deciding to release: a <code>value_len</code> past the inline slot. So an
+entry removed without its chains being cleared arms the <em>next</em> write of an
+unrelated key to release chunks it does not own.</p>
+<p><code>FLUSHDB</code> broke this for every table at once, and the shape is worth keeping in
+mind because it looks correct. <code>flush_table</code> removes every entry and then calls
+<code>pool_init</code>, which reformats the whole pool — so not walking the chains
+individually is right, and freeing them one at a time would be wasted work. What
+it missed is that the <em>entries</em> still name chunks the reformat has just handed
+back. A later write into a recycled slot released one of those chains a second
+time, which splices the free list onto itself: a cycle, and a <code>free_count</code>
+inflated by however many nodes the walk crossed. <code>pool_alloc</code> trusts that count.</p>
+<p>The symptom is not a corrupt reply. It is a <strong>segfault in a different command,
+on a different connection, some time later</strong> — and because the crashing process
+is a background worker, PostgreSQL takes the whole instance down with it. Two
+things now stand between a mistake and that outcome:</p>
+<ul>
+<li><code>flush_table</code> <strong>zeroes each entry past its key</strong> before removing it. All-zero
+  is what <code>ShmemInitHash</code> hands out, so a recycled element is indistinguishable
+  from a fresh one — which is the state every entry path is already written
+  against. Clearing the length and head fields by name would work too, and was
+  the first fix; zeroing is shorter, needs no per-type function, and cannot be
+  out of date when a field is added.</li>
+<li><code>pool_alloc</code> bounds its walk by the pool's capacity, not only by <code>free_count</code>.
+  The count says <em>whether</em> to allocate; only the links say where to stop. A
+  short list against a count that disagrees is now a refused write with the free
+  list untouched, which a caller can survive.</li>
+</ul>
+<p><code>flushing_a_table_leaves_no_entry_naming_freed_chunks</code> reproduces the recycle
+deterministically — dynahash hands back the element just freed — and asserts the
+free list is walkable, acyclic and the length its count claims.</p>
 <h3 id="the-key-directory">The key directory</h3>
 <p>The five tables that hold data are keyed independently and none of them asks the
 others, which is how one key came to hold a string and a list and a set at once,
@@ -3056,14 +3115,42 @@ better than the absolute numbers. <code>mise run bench-report</code> runs it loc
 </tr>
 </tbody>
 </table>
-<p><strong>The gap in the middle is the important one.</strong> <code>cargo pgrx test</code> starts its own
-throwaway cluster <em>without</em> <code>shared_preload_libraries</code>, so memory mode — the
-default storage mode, and all of <code>mem.rs</code> — is invisible to it. Four bugs
-reached a branch that way. Run both storage modes for anything touching
-<code>mem.rs</code>; CI does:</p>
+<p><strong>The gap in the middle is the important one.</strong> <code>cargo pgrx test</code> never reaches
+the shared-memory tables. Its cluster <em>does</em> preload the library — <code>pg_test</code>'s
+<code>postgresql_conf_options</code> sets <code>shared_preload_libraries = 'pg_redis'</code>, which is
+what lets <code>watch_counters_are_visible_through_shared_memory</code> run — but it leaves
+<code>redis.storage_mode</code> at its <code>auto</code> default, and both the shmem request and
+<code>mem_init_tables</code> are gated on <code>memory</code>. So every HTAB in <code>mem.rs</code> is null
+there, and every <code>ctl_accessor!</code> returns a null pointer. Four bugs reached a
+branch that way. Run both storage modes for anything touching <code>mem.rs</code>; CI does:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>mise<span class="w"> </span>run<span class="w"> </span>e2e<span class="w">                              </span><span class="c1"># storage_mode=auto</span>
 <a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="nv">PG_REDIS_STORAGE_MODE</span><span class="o">=</span>memory<span class="w"> </span>mise<span class="w"> </span>run<span class="w"> </span>e2e<span class="w"> </span><span class="c1"># the shared-memory backend</span>
 </code></pre></div>
+<p><strong>A <code>#[pg_test]</code> can still reach the table code</strong>, without the storage mode and
+without the postmaster's startup hook, by building the table it needs locally:
+<code>hash_create</code> with the same <code>keysize</code>/<code>entrysize</code> gives a backend-local HTAB
+that <code>SharedTable</code> wraps unchanged, and the chunk pool runs on a <code>Vec&lt;u64&gt;</code>
+because it only ever touches the bytes it was handed. That is how the meta and
+flush tests drive the real removal paths. Two things it has to get right, both
+of which are differences from shared memory rather than from dynahash:</p>
+<ul>
+<li><strong>Ask for zeroed memory.</strong> <code>ShmemInitHash</code> hands out zeroed shared memory and
+  the entry code depends on it — <code>value_write</code> frees whatever chain the slot
+  names before writing, so an uninitialised <code>value_len</code> releases a garbage chunk
+  index. Pass <code>alloc: palloc0</code> with <code>HASH_ALLOC</code>.</li>
+<li><strong>Name the module <code>tests</code>.</strong> pgrx resolves every <code>#[pg_test]</code> to the <code>tests</code>
+  schema (<code>framework.rs</code>: <code>let schema = "tests"</code>), so a module called anything
+  else compiles and then fails at the call. <code>pg_tests</code> is worse than wrong:
+  <code>#[pg_schema]</code> turns it into a schema name, and PostgreSQL reserves the <code>pg_</code>
+  prefix, so <code>CREATE EXTENSION</code> fails and <em>every</em> test in the run reports
+  "Could not obtain test mutex" instead.</li>
+</ul>
+<p>One constraint on the plain <code>#[test]</code>s in <code>mem.rs</code>: they may not call anything
+that reaches PostgreSQL. <code>cargo test --lib</code> links a binary with no PostgreSQL
+symbols to resolve against, and it only gets away with that because everything
+FFI is dead code there — a <code>#[pg_test]</code> body is not linked into it. Calling
+<code>meta_name_write</code> from a unit test is enough to break the link, because it can
+<code>warning!</code>; call <code>value_write</code> and check the chunk accounting instead.</p>
 <h3 id="parity-against-a-real-redis">Parity against a real Redis</h3>
 <p>The three layers above assert against expectations written by hand, so they can
 only catch what someone already knew to expect. <code>docker/e2e/parity.ts</code> asks

@@ -632,6 +632,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Tier 1 — commands we have that behave differently">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#the-stale-collection-read-was-bigger-than-this-table-said" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The stale-collection read was bigger than this table said
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -793,6 +810,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Tier 1 — commands we have that behave differently">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#the-stale-collection-read-was-bigger-than-this-table-said" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The stale-collection read was bigger than this table said
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -924,6 +958,11 @@ recalled.</p>
 <p>Written against <code>claude/pg-redis-member-array-b41dkl</code> at the point it went in.
 Re-measure before trusting any table here; the recipe is below and takes two
 minutes.</p>
+<p><strong>Re-measured against Redis 7.0.15 on <code>claude/pg-redis-correctness</code>.</strong> Every
+table below still holds exactly: 240 top-level commands in the reference, 143
+accepted, 97 missing, and each tier-2 group the same size and the same members.
+The tier-3 rows reproduce unchanged, <code>COMMAND COUNT</code> included. Nothing in tiers
+1–3 has moved; what has changed is <a href="#tier-0--correctness-the-harness-never-looks-at">tier 0</a>.</p>
 <h2 id="how-to-pick-this-up">How to pick this up</h2>
 <p>Everything on this page came from probing a live pair of servers, not from
 reading the source. Redo it first — a merged PR or two will have moved it.</p>
@@ -984,8 +1023,8 @@ in one place.</p>
 </tr>
 <tr>
 <td>An expired collection outlives its expiry: <code>TYPE</code> answers <code>none</code> while <code>LLEN</code> still reports the old count, until the sweep runs</td>
-<td>memory</td>
-<td>Open, ~1s window. Fix is for <code>mem_type_error</code> to <em>reap</em> rather than ignore, which needs <code>dir_lookup</code> to tell "absent" from "expired"</td>
+<td>both</td>
+<td><strong>Fixed.</strong> It was never memory-only, and it was never one command — see <a href="#the-stale-collection-read-was-bigger-than-this-table-said">below</a></td>
 </tr>
 <tr>
 <td><code>SCAN</code>/<code>KEYS</code> return the whole keyspace in one reply, cursor always 0</td>
@@ -1001,6 +1040,46 @@ in one place.</p>
 </table>
 <p><code>ZPOPMIN</code> being O(entries in the database) is a performance defect rather than a
 parity one, so it stays in §12 and is not repeated here.</p>
+<h3 id="the-stale-collection-read-was-bigger-than-this-table-said">The stale-collection read was bigger than this table said</h3>
+<p>The row above used to read "memory", and to describe one command. Measured
+against a live pair before touching it, it was <strong>both halves and sixteen read
+commands</strong>: <code>LLEN</code> <code>LRANGE</code> <code>LINDEX</code>, <code>SCARD</code> <code>SMEMBERS</code> <code>SISMEMBER</code>
+<code>SRANDMEMBER</code>, <code>HLEN</code> <code>HGETALL</code> <code>HGET</code> <code>HKEYS</code>, and <code>ZCARD</code> <code>ZRANGE</code> <code>ZSCORE</code>
+<code>ZCOUNT</code>. Strings were correct on both halves throughout, which is not luck:
+<code>kv_N</code> carries its own <code>expires_at</code> and every statement reading one tests it.
+A collection's rows carry nothing — the deadline lives in the key directory or
+in <code>redis.expiry_N</code> — so a read of the rows cannot tell a live key from one the
+sweep has not reached.</p>
+<p>Both halves had the same shape of bug and needed different fixes, because they
+disagree about when the type of a key is checked.</p>
+<ul>
+<li><strong>Memory.</strong> <code>dir_lookup</code> folded "expiry has passed" onto "absent", so
+  <code>mem_type_error</code> let the command through and the read went to the tables.
+  <code>dir_lookup_raw</code> keeps the distinction and <code>mem_key_kind_reaping</code> acts on it,
+  in the one place every memory command already passes through. Same single
+  directory lookup as before, so it costs nothing.</li>
+<li><strong>Durable.</strong> Reads deliberately skip the type check: a read runs first and
+  only asks what the key holds if it came back empty, which keeps a round trip
+  off every successful <code>GET</code>. That optimisation is exactly what made the stale
+  read reachable — coming back with data is not evidence the key is live. A
+  collection read now reaps first, with a keyed form of the sweep statement.</li>
+</ul>
+<p><strong>That costs about 63% of durable-half collection-read throughput</strong>
+(<code>redis-benchmark -n 20000 -c 50</code>): <code>HGET</code> 35.2k → 12.1k, <code>LLEN</code> 33.2k → 12.2k,
+<code>ZCARD</code> 30.5k → 11.4k, <code>SCARD</code> 27.0k → 11.4k. <code>GET</code> is unchanged at ~32k.</p>
+<p>The price is the round trip and nothing else. The first attempt routed reads
+through <code>sql_type_error</code>, which runs five <code>EXISTS</code> across five tables; replacing
+it with one indexed lookup on <code>redis.expiry_N</code> that usually deletes nothing
+moved <code>HGET</code> from 11.3k to 12.1k. A second statement on the read path costs
+roughly two thirds of throughput whatever it does.</p>
+<p>The alternative is to put the guard in the read statements instead, which costs
+nothing at run time and is <strong>12 cached statements plus 56 inline ones</strong> — many
+of the 56 being <code>EXCEPT</code> chains and <code>unnest</code> joins where the predicate is not a
+one-line addition. It would want a source-scanning test asserting that no
+<code>SELECT</code> from a collection table lacks the guard, because one missed statement
+is a stale read that nothing else would catch. Guarding only the 12 cached ones
+covers every command in the table above for a twelfth of the work, at the cost
+of two mechanisms living side by side.</p>
 <h2 id="tier-2-commands-we-do-not-implement">Tier 2 — commands we do not implement</h2>
 <p><strong>143 of 240 accepted, 97 missing.</strong> Grouped by what a client loses, which is
 the same ordering <a href="../IMPLEMENTATION/#the-plan">§12's phase plan</a> used and for
@@ -1212,51 +1291,75 @@ memory half, and the difference documented — or cursor-0 on both until the
 sorted-index work that <code>ZPOPMIN</code> also wants gets done. That is a decision, not a
 detail.</p>
 <h2 id="decisions-needed-before-the-next-block">Decisions needed before the next block</h2>
-<p>Nothing below can be settled from the code.</p>
+<p>Nothing below can be settled from the code. Two of the four are now taken.</p>
 <ol>
-<li><strong>Are streams, scripting, ACL and cluster non-goals?</strong> 50 of the 97 missing
-   commands. They read as out of scope for a Postgres-backed Redis endpoint, but
-   that has never been said out loud, so they are still counted as parity debt
-   on this page. Saying so would move the honest denominator from 240 to ~190
-   and make the number mean something.</li>
-<li><strong>Is polled blocking acceptable, losing FIFO fairness?</strong> The alternative is
-   cross-process wake infrastructure, which is a much larger piece of work and
-   has to be built twice, once per storage half.</li>
+<li><strong>Are streams, scripting, ACL and cluster non-goals?</strong> <em>Open.</em> 50 of the 97
+   missing commands. They read as out of scope for a Postgres-backed Redis
+   endpoint, but that has never been said out loud, so they are still counted as
+   parity debt on this page. Saying so would move the honest denominator from
+   240 to ~190 and make the number mean something.</li>
+<li><strong>Is polled blocking acceptable, losing FIFO fairness?</strong> <strong>Taken: neither —
+   blocking is deferred.</strong> Not polling, and not the cross-process wake
+   infrastructure either. The eight blocking commands stay missing for now, on
+   the same principle that orders this page: an absent command errors, and an
+   error is honest, where a <code>BLPOP</code> that quietly serves the wrong waiter is a
+   difference no test here would catch. Revisit once the correctness work is
+   done, and take the decision then rather than inheriting it.</li>
 <li><strong>Real <code>SCAN</code> cursors, or the cursor-0 convention extended to the
-   collections?</strong> See above. Cheap and consistent, or correct and structural.</li>
-<li><strong>Does <code>CLIENT</code> get real connection state?</strong> It is a prerequisite for five
-   commands and is otherwise a family of plausible lies.</li>
+   collections?</strong> <strong>Taken: real, on both halves, via a sorted index.</strong> Not the
+   cheap split. The durable half gets <code>ORDER BY</code> plus a cursor predicate; the
+   memory half gets the sorted index it needs to answer honestly — which is the
+   same structure <code>ZPOPMIN</code>'s O(entries in the database) wants, so the two
+   should be planned as one piece of work rather than two. It changes the
+   shared-memory layout, so it wants sizing against
+   <a href="../IMPLEMENTATION/#3-the-shared-memory-backend">§3</a> before any code, and it
+   is the largest item on this page that is not blocking.</li>
+<li><strong>Does <code>CLIENT</code> get real connection state?</strong> <em>Open.</em> It is a prerequisite for
+   five commands and is otherwise a family of plausible lies. Needed before the
+   <code>CLIENT</code> half of tier 3; <code>COMMAND COUNT</code> does not wait on it.</li>
 </ol>
 <h2 id="tier-0-correctness-the-harness-never-looks-at">Tier 0 — correctness the harness never looks at</h2>
 <p>Everything above this line is about <em>what</em> we answer. This tier is about whether
 the answer is right at all, and none of it is parity debt in the sense the other
 tiers are — the differential harness cannot see any of it, because it runs one
 client, in sequence, against a freshly flushed database.</p>
-<p>Three gaps, found by reading rather than by any test failing:</p>
+<p>Three gaps, found by reading rather than by any test failing. <strong>All three now
+have tests, and the third had a crash behind it.</strong></p>
 <ul>
-<li><strong>The meta name chains have no leak test, and they are the one chain that has
-  actually corrupted the pool.</strong> <code>mem.rs</code>'s test module checks that every
-  allocated chunk comes back for KV entries
-  (<code>freeing_a_kv_entry_releases_both_its_chains</code>) and for collection entries
-  (<code>freeing_a_collection_entry_releases_every_chain</code>). The four meta tables'
-  name chains — added when <code>KEYS</code>/<code>SCAN</code> learned to see collections — appear in
-  that module only in the size-budget assertion. That is precisely the chain
-  <code>remove_meta_of</code> failed to free: the next occupant of the slot inherited a
-  head pointing into the free list and the worker aborted. The bug was found by
-  a crash, fixed, and never given a regression test. <code>pool_free_chunks</code> already
-  gives the invariant; the test is a few lines and should exist before anything
-  else is built on top.</li>
-<li><strong>Nothing tests concurrent clients for correctness.</strong> <code>redis.workers</code> defaults
-  to 4 <em>processes</em> sharing one set of HTABs and pools. The only concurrent code
-  in the tree is <code>bench_pubsub.ts</code>, which measures throughput and asserts
-  nothing about the data. Two clients incrementing the same counter, pushing to
-  the same list, or racing an eviction against a read have never been checked to
-  produce a defensible result.</li>
-<li><strong>Eviction under pressure is unproven end to end.</strong> <code>key_evictor!</code> drops keys
-  when a table fills. Its <em>sampling</em> is unit-tested
-  (<code>the_eviction_sample_keeps_the_lowest_ranked_candidates</code>); what a client sees
-  when its key is evicted mid-sequence is not.</li>
+<li><strong>The meta name chains had no leak test, and they are the one chain that has
+  actually corrupted the pool.</strong> <em>Closed.</em>
+  <code>removing_a_meta_entry_releases_its_name_chain</code> drives all four meta tables
+  through both removal paths — the per-type <code>remove_meta</code>/<code>remove_zset_meta</code>/
+  <code>remove_count_meta</code> and the generic <code>remove_meta_of</code> that <code>DEL</code> and eviction
+  use — against real dynahash tables, and asserts every chunk comes back.
+  Deleting the <code>value_free</code> from any one of the four fails it, each with its own
+  label. <code>a_meta_name_round_trips_through_the_pool_and_comes_back</code> covers the
+  three slot accessors underneath.</li>
+<li><strong>Nothing tested concurrent clients for correctness.</strong> <em>Closed.</em> The
+  <code>Concurrent clients</code> describe runs eight connections on both halves against
+  one counter, one list, one set, one hash and one sorted set, plus a reader
+  racing a writer that keeps changing a value's size across the inline and chunk
+  boundaries. It asserts totals, that a collection's meta count matches the
+  members actually stored, and that no read is ever a splice of two writes.
+  Giving <code>mem_incr</code> a read-modify-write window loses 11 of 200 increments and
+  fails it.</li>
+<li><strong>Eviction under pressure was unproven end to end.</strong> <em>Closed, and it was not
+  eviction that was broken.</em> Writing past the chunk pool with the default
+  <code>noeviction</code> policy <strong>segfaulted the worker</strong>, which takes the whole
+  PostgreSQL instance down with it. The cause was <code>FLUSHDB</code>: <code>flush_table</code>
+  removed entries without clearing the chains they named, so a later write into
+  a recycled dynahash slot released those chunks a second time, spliced the free
+  list into a cycle, and left <code>free_count</code> claiming nodes that were not there.
+  <code>pool_alloc</code> trusted the count and walked off the list. Written up in
+  <a href="../IMPLEMENTATION/#an-entry-must-not-outlive-the-chunks-it-names">§3</a>; the
+  <code>Pressure and FLUSHDB</code> describe and
+  <code>flushing_a_table_leaves_no_entry_naming_freed_chunks</code> are the regression.</li>
 </ul>
+<p>What that third one says about the tier is worth keeping. It was the last item
+on the list, reached by writing the test the doc asked for, and the defect it
+found was not the one the entry predicted — it was a whole-instance crash
+reachable from <code>FLUSHDB</code> and ordinary traffic, with no eviction involved. The
+entry was right that the area was untested and wrong about what was in it.</p>
 <p>The stale-collection read in <a href="#tier-1--commands-we-have-that-behave-differently">tier 1</a>
 belongs to this tier as much as to that one: <code>TYPE</code> answering <code>none</code> while
 <code>LLEN</code> reports the old count is a client being served data that no longer
@@ -1268,13 +1371,13 @@ it is worth saying why: a missing command errors, and an error is honest. A
 wrong answer is not. That puts all of tier 0 and tier 3 ahead of the 97 absences
 in tier 2, even though tier 2 is where the visible feature gap is.</p>
 <ol>
-<li><strong>Tier 0.</strong> The meta-name leak test first, since it is a few lines and guards
-   a failure mode that has already happened once. Then a concurrent-client
-   correctness test on both halves, then eviction under pressure. No decisions
-   needed for any of it.</li>
-<li><strong>The stale-collection read.</strong> Make <code>dir_lookup</code> distinguish absent from
-   expired and have <code>mem_type_error</code> reap rather than ignore. This is the only
-   case where we knowingly serve data for a key we also report as gone.</li>
+<li>~~<strong>Tier 0.</strong>~~ <strong>Done.</strong> All three items have tests on both halves, and the
+   third turned up a worker segfault reachable from <code>FLUSHDB</code> plus ordinary
+   traffic. See <a href="#tier-0--correctness-the-harness-never-looks-at">tier 0</a>.</li>
+<li>~~<strong>The stale-collection read.</strong>~~ <strong>Done</strong>, on both halves rather than the
+   one this page predicted. See
+   <a href="#the-stale-collection-read-was-bigger-than-this-table-said">above</a>; the
+   durable half's fix costs throughput and the alternative is priced there.</li>
 <li><strong>Tier 3 introspection.</strong> <code>COMMAND COUNT</code> is wrong by inspection and is one
    line. The <code>CLIENT</code> family needs question 4 answered first, because giving a
    connection an identity is the actual work.</li>
@@ -1282,11 +1385,15 @@ in tier 2, even though tier 2 is where the visible feature gap is.</p>
    parity hat.</li>
 <li><strong>The free wins in tier 2.</strong> <code>TIME</code>, <code>HSTRLEN</code>, <code>TOUCH</code>, <code>ZINTERCARD</code>, and
    <code>DUMP</code>/<code>RESTORE</code> on top of the existing <code>dump_key</code>. Mechanical, no decisions.</li>
-<li><strong><code>HSCAN</code>/<code>SSCAN</code>/<code>ZSCAN</code></strong>, under whatever comes out of question 3. Note
-   that the unbounded cursor-0 reply is itself a correctness concern on a large
+<li><strong>The sorted index, then <code>HSCAN</code>/<code>SSCAN</code>/<code>ZSCAN</code> and <code>SCAN</code> on top of it.</strong>
+   Question 3 is taken: real cursors on both halves. That makes this structural
+   rather than mechanical, and it absorbs <code>ZPOPMIN</code>'s O(entries in the database)
+   at the same time, so plan the index once and spend it twice. The unbounded
+   cursor-0 reply it replaces is itself a correctness concern on a large
    keyspace, not only a parity one.</li>
-<li><strong>Blocking</strong>, under whatever comes out of question 2. Largest and most
-   valuable; it changes how a connection is serviced, so it wants its own PR.</li>
+<li>~~<strong>Blocking.</strong>~~ Deferred by question 2 — the eight commands stay absent
+   until the correctness work above is done. When it is taken up it changes how
+   a connection is serviced, so it wants its own PR.</li>
 <li><strong>Finish the bitmap family</strong>, then HyperLogLog, then GEO — bitmaps reuse code
    that exists, HyperLogLog is self-contained, GEO is the largest.</li>
 </ol>

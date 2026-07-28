@@ -40,7 +40,9 @@ const UNORDERED = new Set([
 	"SPOP",
 ]);
 
-/** Draws, clocks and builds: only the reply shape is comparable. */
+/** Draws, clocks and builds: only the reply shape is comparable. `TIME` is
+ * two clocks, and `DUMP` two valid spellings of one value — a hashtable's
+ * iteration order alone makes byte identity impossible. */
 const SHAPE_ONLY = new Set([
 	"RANDOMKEY",
 	"INFO",
@@ -54,6 +56,8 @@ const SHAPE_ONLY = new Set([
 	"ZSCAN",
 	"DEBUG",
 	"MEMORY",
+	"TIME",
+	"DUMP",
 ]);
 
 /** RESP type name for a reply, used when only the shape is comparable. */
@@ -1042,6 +1046,59 @@ c(
 	["SETBIT", "b", "0", "1"],
 	["BITCOUNT", "b"],
 	["FLUSHDB"],
+);
+c(
+	"TOUCH counts like EXISTS",
+	["SET", "k", "v"],
+	["RPUSH", "l", "a"],
+	["TOUCH", "k", "l"],
+	["TOUCH", "k", "k"],
+	["TOUCH", "missing"],
+	["TOUCH"],
+);
+c(
+	"HSTRLEN",
+	["HSET", "h", "f", "hello"],
+	["HSTRLEN", "h", "f"],
+	["HSTRLEN", "h", "nope"],
+	["HSTRLEN", "missing", "f"],
+	["SET", "k", "v"],
+	["HSTRLEN", "k", "f"],
+);
+c(
+	"ZINTERCARD",
+	["ZADD", "za", "1", "m1", "2", "m2", "3", "m3"],
+	["ZADD", "zb", "1", "m2", "2", "m3", "3", "m4"],
+	["ZINTERCARD", "2", "za", "zb"],
+	["ZINTERCARD", "2", "za", "zb", "LIMIT", "1"],
+	["ZINTERCARD", "2", "za", "zb", "LIMIT", "0"],
+	["ZINTERCARD", "2", "za", "missing"],
+	["ZINTERCARD", "0"],
+	["ZINTERCARD", "0", "za"],
+	["ZINTERCARD", "-1", "za"],
+	["ZINTERCARD", "x", "za"],
+	["SINTERCARD", "0"],
+	["SINTERCARD", "0", "za"],
+	["SINTERCARD", "x", "za"],
+	["ZINTERCARD", "1", "za", "LIMIT", "-1"],
+	["SET", "s", "v"],
+	["ZINTERCARD", "1", "s"],
+);
+c(
+	"TIME is two parts, and takes no arguments",
+	["TIME"],
+	["TIME", "x"],
+);
+c(
+	"DUMP and RESTORE refusals",
+	["SET", "k", "v"],
+	["DUMP", "k"],
+	["DUMP", "missing"],
+	["RESTORE", "fresh", "0", "garbage"],
+	["RESTORE", "k", "0", "garbage"],
+	["RESTORE", "fresh", "-1", "garbage"],
+	["RESTORE", "fresh", "notanumber", "garbage"],
+	["EXISTS", "fresh"],
 );
 
 // ────────────────────────────────── Runner ──────────────────────────────────

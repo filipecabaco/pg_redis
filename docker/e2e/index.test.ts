@@ -472,6 +472,13 @@ describe("Server", () => {
 	test("COMMAND returns empty array", async () => {
 		expect(await client.send("COMMAND", [])).toEqual([]);
 	});
+
+	// The number of rows in docs/command-coverage.md, which a unit test pins
+	// to the parser in both directions. A change here means a command was
+	// added or removed: update the page and this number together.
+	test("COMMAND COUNT reports the number of accepted commands", async () => {
+		expect(await client.send("COMMAND", ["COUNT"])).toBe(149);
+	});
 });
 
 describe("SET flags", () => {
@@ -2534,6 +2541,25 @@ for (const half of ["cache", "durable"]) {
 			);
 		});
 
+		test("COPY lands on a key past its expiry, and does not merge", async () => {
+			// The destination is expired but likely unswept: its rows are
+			// still in the tables. It must not count as occupied, and the
+			// copy must not merge with what the sweep has not reached.
+			await raw.send("DEL", "p5:cs", "p5:cd");
+			await raw.send("RPUSH", "p5:cd", "old1", "old2", "old3");
+			await raw.send("PEXPIRE", "p5:cd", "30");
+			await raw.send("RPUSH", "p5:cs", "new");
+			await Bun.sleep(60);
+			expect(integerReply(await raw.send("COPY", "p5:cs", "p5:cd"))).toBe(1);
+			expect(integerReply(await raw.send("LLEN", "p5:cd"))).toBe(1);
+			expect(
+				(await raw.array("LRANGE", "p5:cd", "0", "-1")).map((b) =>
+					b?.toString(),
+				),
+			).toEqual(["new"]);
+			await raw.send("DEL", "p5:cs", "p5:cd");
+		});
+
 		test("an unknown command names the arguments it was given", async () => {
 			expect(errorReply(await raw.send("NOSUCHCOMMAND"))).toBe(
 				"ERR unknown command 'NOSUCHCOMMAND', with args beginning with: ",
@@ -3774,7 +3800,10 @@ describe("Expiry and collections", () => {
 			["HLEN", ["HLEN", "x:h"]],
 			["HGETALL", ["HGETALL", "x:h"]],
 			["HGET", ["HGET", "x:h", "f"]],
-			["HKEYS", ["HKEYS", "x:h"]]]],
+			["HKEYS", ["HKEYS", "x:h"]],
+			["HVALS", ["HVALS", "x:h"]],
+			["HEXISTS", ["HEXISTS", "x:h", "f"]],
+			["HSTRLEN", ["HSTRLEN", "x:h", "f"]]]],
 		["a sorted set", "x:z", ["ZADD", "x:z", "1", "m"], [
 			["ZCARD", ["ZCARD", "x:z"]],
 			["ZRANGE", ["ZRANGE", "x:z", "0", "-1"]],
@@ -3787,11 +3816,15 @@ describe("Expiry and collections", () => {
 			test(`${half}: ${label} past its expiry reads empty, not stale`, async () => {
 				await raw.send("SELECT", half);
 				await pastItsExpiry(key, build);
-
-				// TYPE has just said `none`. Every read of the same key has to
-				// agree, before the sweep has run and without waiting for it.
 				expect(integerReply(await raw.send("EXISTS", key))).toBe(0);
+
+				// TYPE says `none`, and every read of the same key has to
+				// agree, before the sweep has run and without waiting for it.
+				// The key is re-built and re-expired for every read: a read
+				// that answers honestly may also reap, and stale rows one
+				// command cleaned up must not vouch for the next.
 				for (const [name, cmd] of reads) {
+					await pastItsExpiry(key, build);
 					const rep = (await raw.send(...cmd)).toString();
 					const isEmpty =
 						rep === ":0\r\n" || rep === "$-1\r\n" || rep === "*0\r\n" || rep === "*-1\r\n";
@@ -3826,4 +3859,392 @@ describe("Expiry and collections", () => {
 			await raw.send("DEL", "x:re");
 		});
 	}
+});
+
+// ─────────────────── RANDOMKEY ──────────────────────────────────────────────
+//
+// The harness compares RANDOMKEY by shape, because any live key is a valid
+// answer — which is exactly why the two defects here needed their own tests.
+// The durable half read kv_N alone, so a database holding only collections
+// answered nil while DBSIZE counted them. The memory half handed back the
+// first live string and consulted the collections only when there was none,
+// so a database of mostly collections saw strings almost every draw.
+
+for (const half of HALVES) {
+	describe(`RANDOMKEY (${half})`, () => {
+		beforeAll(async () => {
+			await raw.send("SELECT", half);
+			await raw.send("FLUSHDB");
+		});
+		afterAll(async () => {
+			await raw.send("FLUSHDB");
+			await raw.send("SELECT", "durable");
+		});
+
+		test("a database holding only a collection is not empty to it", async () => {
+			await raw.send("FLUSHDB");
+			await raw.send("RPUSH", "rk:only", "a");
+			expect((await raw.bulk("RANDOMKEY"))?.toString()).toBe("rk:only");
+		});
+
+		test("every type is reachable, not only strings", async () => {
+			await raw.send("FLUSHDB");
+			await raw.send("SET", "rk:str", "v");
+			await raw.send("RPUSH", "rk:list", "a");
+			await raw.send("SADD", "rk:set", "m");
+			await raw.send("HSET", "rk:hash", "f", "v");
+			await raw.send("ZADD", "rk:zset", "1", "m");
+
+			// 250 uniform draws miss one of five keys with probability
+			// 5·(4/5)^250 ≈ 10⁻²⁴ — a miss here is a skew, not bad luck.
+			const seen = new Set<string>();
+			for (let i = 0; i < 250; i++) {
+				const k = await raw.bulk("RANDOMKEY");
+				if (k) seen.add(k.toString());
+			}
+			expect([...seen].sort()).toEqual([
+				"rk:hash",
+				"rk:list",
+				"rk:set",
+				"rk:str",
+				"rk:zset",
+			]);
+		});
+
+		test("an expired collection is not a valid draw", async () => {
+			await raw.send("FLUSHDB");
+			await raw.send("RPUSH", "rk:dead", "a");
+			await raw.send("PEXPIRE", "rk:dead", "30");
+			// Past the deadline but likely ahead of the sweep: the rows may
+			// still be in the tables, and the draw must not see them.
+			await Bun.sleep(80);
+			expect(await raw.bulk("RANDOMKEY")).toBeNull();
+		});
+	});
+}
+
+// ─────────────────── TIME, TOUCH, HSTRLEN, ZINTERCARD ───────────────────────
+
+describe("TIME", () => {
+	test("answers one clock reading as two strings", async () => {
+		const before = Math.floor(Date.now() / 1000);
+		const parts = (await raw.array("TIME")).map((b) => Number(b?.toString()));
+		const after = Math.ceil(Date.now() / 1000);
+		expect(parts.length).toBe(2);
+		expect(parts[0]).toBeGreaterThanOrEqual(before);
+		expect(parts[0]).toBeLessThanOrEqual(after);
+		expect(parts[1]).toBeGreaterThanOrEqual(0);
+		expect(parts[1]).toBeLessThan(1_000_000);
+	});
+
+	test("inside MULTI it executes at EXEC time", async () => {
+		await raw.send("MULTI");
+		await raw.send("TIME");
+		// One queued reply, itself the two-part array.
+		expect((await raw.send("EXEC")).toString().startsWith("*1\r\n*2\r\n")).toBe(
+			true,
+		);
+	});
+
+	test("rejects arguments", async () => {
+		expect((await raw.send("TIME", "x")).toString()).toContain(
+			"wrong number of arguments",
+		);
+	});
+});
+
+for (const half of HALVES) {
+	describe(`TOUCH (${half})`, () => {
+		beforeAll(async () => {
+			await raw.send("SELECT", half);
+		});
+		afterAll(async () => {
+			await raw.send("SELECT", "durable");
+		});
+
+		test("counts the keys that exist, duplicates included", async () => {
+			await raw.send("SET", "to:a", "1");
+			await raw.send("RPUSH", "to:l", "x");
+			expect(integerReply(await raw.send("TOUCH", "to:a", "to:l"))).toBe(2);
+			expect(integerReply(await raw.send("TOUCH", "to:a", "to:a"))).toBe(2);
+			expect(
+				integerReply(await raw.send("TOUCH", "to:a", "to:missing")),
+			).toBe(1);
+			expect(integerReply(await raw.send("TOUCH", "to:missing"))).toBe(0);
+			await raw.send("DEL", "to:a", "to:l");
+		});
+
+		test("an expired key does not count", async () => {
+			await raw.send("SET", "to:exp", "v", "PX", "30");
+			await Bun.sleep(60);
+			expect(integerReply(await raw.send("TOUCH", "to:exp"))).toBe(0);
+		});
+	});
+
+	describe(`HSTRLEN (${half})`, () => {
+		beforeAll(async () => {
+			await raw.send("SELECT", half);
+		});
+		afterAll(async () => {
+			await raw.send("SELECT", "durable");
+		});
+
+		test("byte length of one field, 0 when either is missing", async () => {
+			await raw.send("DEL", "hsl:h");
+			await raw.send("HSET", "hsl:h", "f", "hello");
+			expect(integerReply(await raw.send("HSTRLEN", "hsl:h", "f"))).toBe(5);
+			expect(integerReply(await raw.send("HSTRLEN", "hsl:h", "nope"))).toBe(0);
+			expect(integerReply(await raw.send("HSTRLEN", "hsl:none", "f"))).toBe(0);
+			await raw.send("DEL", "hsl:h");
+		});
+
+		test("a key of another type is refused", async () => {
+			await raw.send("SET", "hsl:str", "v");
+			expect((await raw.send("HSTRLEN", "hsl:str", "f")).toString()).toContain(
+				"WRONGTYPE",
+			);
+			await raw.send("DEL", "hsl:str");
+		});
+	});
+
+	describe(`ZINTERCARD (${half})`, () => {
+		beforeAll(async () => {
+			await raw.send("SELECT", half);
+			await raw.send("DEL", "zic:a", "zic:b", "zic:c");
+			await raw.send("ZADD", "zic:a", "1", "m1", "2", "m2", "3", "m3");
+			await raw.send("ZADD", "zic:b", "1", "m2", "2", "m3", "3", "m4");
+		});
+		afterAll(async () => {
+			await raw.send("DEL", "zic:a", "zic:b", "zic:c");
+			await raw.send("SELECT", "durable");
+		});
+
+		test("the intersection's size, without building it", async () => {
+			expect(
+				integerReply(await raw.send("ZINTERCARD", "2", "zic:a", "zic:b")),
+			).toBe(2);
+			expect(integerReply(await raw.send("ZINTERCARD", "1", "zic:a"))).toBe(3);
+			expect(
+				integerReply(await raw.send("ZINTERCARD", "2", "zic:a", "zic:none")),
+			).toBe(0);
+		});
+
+		test("LIMIT caps the count and 0 lifts the cap", async () => {
+			expect(
+				integerReply(
+					await raw.send("ZINTERCARD", "2", "zic:a", "zic:b", "LIMIT", "1"),
+				),
+			).toBe(1);
+			expect(
+				integerReply(
+					await raw.send("ZINTERCARD", "2", "zic:a", "zic:b", "LIMIT", "0"),
+				),
+			).toBe(2);
+		});
+
+		test("refuses bad arguments the way 7.0.15 spells it", async () => {
+			// Arity is -3, so a bare numkeys is an arity error. Past that,
+			// ZINTERCARD's refusals differ from SINTERCARD's, measured: the
+			// integer error for a non-number, the ZUNION family's message for
+			// a non-positive count.
+			expect((await raw.send("ZINTERCARD", "0")).toString()).toContain(
+				"wrong number of arguments",
+			);
+			expect((await raw.send("ZINTERCARD", "0", "zic:a")).toString()).toContain(
+				"at least 1 input key is needed",
+			);
+			expect((await raw.send("ZINTERCARD", "x", "zic:a")).toString()).toContain(
+				"not an integer",
+			);
+			expect(
+				(
+					await raw.send("ZINTERCARD", "1", "zic:a", "LIMIT", "-1")
+				).toString(),
+			).toContain("LIMIT can't be negative");
+		});
+	});
+}
+
+// ─────────────────── DUMP and RESTORE ───────────────────────────────────────
+
+for (const half of HALVES) {
+	describe(`DUMP and RESTORE (${half})`, () => {
+		beforeAll(async () => {
+			await raw.send("SELECT", half);
+		});
+		afterAll(async () => {
+			await raw.send("SELECT", "durable");
+		});
+
+		test("every type round-trips through its payload", async () => {
+			await raw.send("DEL", "dr:s", "dr:l", "dr:se", "dr:h", "dr:z");
+			await raw.send("SET", "dr:s", "hello");
+			await raw.send("RPUSH", "dr:l", "a", "b", "c");
+			await raw.send("SADD", "dr:se", "m1", "m2");
+			await raw.send("HSET", "dr:h", "f1", "v1", "f2", "v2");
+			await raw.send("ZADD", "dr:z", "1.5", "m1", "-2", "m2");
+
+			for (const key of ["dr:s", "dr:l", "dr:se", "dr:h", "dr:z"]) {
+				const payload = await raw.bulk("DUMP", key);
+				expect(payload).not.toBeNull();
+				await raw.send("DEL", key);
+				expect(
+					(await raw.send("RESTORE", key, "0", payload as Buffer)).toString(),
+				).toBe("+OK\r\n");
+			}
+
+			expect(await raw.bulk("GET", "dr:s")).toEqual(Buffer.from("hello"));
+			expect(
+				(await raw.array("LRANGE", "dr:l", "0", "-1")).map((b) =>
+					b?.toString(),
+				),
+			).toEqual(["a", "b", "c"]);
+			expect(
+				(await raw.array("SMEMBERS", "dr:se")).map((b) => b?.toString()).sort(),
+			).toEqual(["m1", "m2"]);
+			expect(
+				(await raw.array("HGETALL", "dr:h")).map((b) => b?.toString()),
+			).toEqual(["f1", "v1", "f2", "v2"]);
+			expect(
+				(await raw.array("ZRANGE", "dr:z", "0", "-1", "WITHSCORES")).map((b) =>
+					b?.toString(),
+				),
+			).toEqual(["m2", "-2", "m1", "1.5"]);
+			await raw.send("DEL", "dr:s", "dr:l", "dr:se", "dr:h", "dr:z");
+		});
+
+		test("a missing key dumps as nil, and so does an expired one", async () => {
+			await raw.send("DEL", "dr:none");
+			expect(await raw.bulk("DUMP", "dr:none")).toBeNull();
+			await raw.send("RPUSH", "dr:gone", "a");
+			await raw.send("PEXPIRE", "dr:gone", "30");
+			await Bun.sleep(60);
+			expect(await raw.bulk("DUMP", "dr:gone")).toBeNull();
+		});
+
+		test("the TTL argument is milliseconds, 0 meaning none", async () => {
+			await raw.send("DEL", "dr:t");
+			await raw.send("SET", "dr:t", "v");
+			const payload = (await raw.bulk("DUMP", "dr:t")) as Buffer;
+			await raw.send("DEL", "dr:t");
+
+			await raw.send("RESTORE", "dr:t", "0", payload);
+			expect(integerReply(await raw.send("TTL", "dr:t"))).toBe(-1);
+			await raw.send("DEL", "dr:t");
+
+			await raw.send("RESTORE", "dr:t", "60000", payload);
+			const ttl = integerReply(await raw.send("TTL", "dr:t"));
+			expect(ttl).toBeGreaterThan(55);
+			expect(ttl).toBeLessThanOrEqual(60);
+			await raw.send("DEL", "dr:t");
+
+			// ABSTTL: the value is a deadline, not a duration.
+			const deadline = Date.now() + 90_000;
+			await raw.send(
+				"RESTORE", "dr:t", String(deadline), payload, "ABSTTL",
+			);
+			const absttl = integerReply(await raw.send("TTL", "dr:t"));
+			expect(absttl).toBeGreaterThan(85);
+			expect(absttl).toBeLessThanOrEqual(90);
+			await raw.send("DEL", "dr:t");
+		});
+
+		test("an occupied key is BUSYKEY unless REPLACE", async () => {
+			await raw.send("DEL", "dr:busy");
+			await raw.send("SET", "dr:busy", "old");
+			const payload = (await raw.bulk("DUMP", "dr:busy")) as Buffer;
+			await raw.send("SET", "dr:busy", "other");
+			expect(
+				(await raw.send("RESTORE", "dr:busy", "0", payload)).toString(),
+			).toContain("BUSYKEY");
+			expect(
+				(
+					await raw.send("RESTORE", "dr:busy", "0", payload, "REPLACE")
+				).toString(),
+			).toBe("+OK\r\n");
+			expect(await raw.bulk("GET", "dr:busy")).toEqual(Buffer.from("old"));
+			await raw.send("DEL", "dr:busy");
+		});
+
+		test("REPLACE swaps the whole key, its old type included", async () => {
+			await raw.send("DEL", "dr:sw");
+			await raw.send("SET", "dr:sw", "str");
+			const strPayload = (await raw.bulk("DUMP", "dr:sw")) as Buffer;
+			await raw.send("DEL", "dr:sw");
+			await raw.send("RPUSH", "dr:sw", "a", "b");
+			await raw.send(
+				"RESTORE", "dr:sw", "0", strPayload, "REPLACE",
+			);
+			expect((await raw.send("TYPE", "dr:sw")).toString()).toContain("string");
+			expect(await raw.bulk("GET", "dr:sw")).toEqual(Buffer.from("str"));
+			await raw.send("DEL", "dr:sw");
+		});
+
+		test("a key past its expiry is not BUSYKEY, and does not merge", async () => {
+			await raw.send("DEL", "dr:tmp", "dr:exp");
+			await raw.send("RPUSH", "dr:tmp", "new");
+			const payload = (await raw.bulk("DUMP", "dr:tmp")) as Buffer;
+			await raw.send("DEL", "dr:tmp");
+
+			// Expired but likely unswept: rows still in the tables. Without
+			// REPLACE this must restore, and onto a clean slate.
+			await raw.send("RPUSH", "dr:exp", "old1", "old2", "old3");
+			await raw.send("PEXPIRE", "dr:exp", "30");
+			await Bun.sleep(60);
+			expect(
+				(await raw.send("RESTORE", "dr:exp", "0", payload)).toString(),
+			).toBe("+OK\r\n");
+			expect(integerReply(await raw.send("LLEN", "dr:exp"))).toBe(1);
+			expect(
+				(await raw.array("LRANGE", "dr:exp", "0", "-1")).map((b) =>
+					b?.toString(),
+				),
+			).toEqual(["new"]);
+			await raw.send("DEL", "dr:exp");
+		});
+
+		test("a corrupt payload is refused loudly", async () => {
+			await raw.send("DEL", "dr:bad");
+			expect(
+				(await raw.send("RESTORE", "dr:bad", "0", "garbage")).toString(),
+			).toContain("DUMP payload version or checksum are wrong");
+
+			// Flip one bit in a valid payload: the checksum must catch it.
+			await raw.send("SET", "dr:bad", "v");
+			const payload = (await raw.bulk("DUMP", "dr:bad")) as Buffer;
+			await raw.send("DEL", "dr:bad");
+			payload[0] ^= 0x01;
+			expect(
+				(await raw.send("RESTORE", "dr:bad", "0", payload)).toString(),
+			).toContain("DUMP payload version or checksum are wrong");
+			expect(integerReply(await raw.send("EXISTS", "dr:bad"))).toBe(0);
+		});
+	});
+}
+
+// The payload names no database and no storage engine, so it also moves keys
+// between the halves — the same trip COPY makes, through a client instead.
+describe("DUMP and RESTORE across the halves", () => {
+	afterAll(async () => {
+		await raw.send("SELECT", "durable");
+	});
+
+	test("a cache key restores into the durable half intact", async () => {
+		await raw.send("SELECT", "cache");
+		await raw.send("DEL", "dr:x");
+		await raw.send("ZADD", "dr:x", "1", "a", "2", "b");
+		const payload = (await raw.bulk("DUMP", "dr:x")) as Buffer;
+		await raw.send("DEL", "dr:x");
+		await raw.send("SELECT", "durable");
+		await raw.send("DEL", "dr:x");
+		expect((await raw.send("RESTORE", "dr:x", "0", payload)).toString()).toBe(
+			"+OK\r\n",
+		);
+		expect(
+			(await raw.array("ZRANGE", "dr:x", "0", "-1", "WITHSCORES")).map((b) =>
+				b?.toString(),
+			),
+		).toEqual(["a", "1", "b", "2"]);
+		await raw.send("DEL", "dr:x");
+	});
 });

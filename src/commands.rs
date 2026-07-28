@@ -301,54 +301,174 @@ pub mod sql {
         })
     });
 
+    /// Refuses a key whose deadline has passed. A collection's rows carry no
+    /// expiry of their own — the deadline is a row in `redis.expiry_N` — so a
+    /// statement reading them has to ask that table or it serves a key the
+    /// sweep has not reached. Mentions `$1` and nothing from the outer query,
+    /// so the planner runs it once per statement as an InitPlan rather than
+    /// once per row: the liveness question rides inside the round trip the
+    /// read was already making, which a separate reap statement was measured
+    /// to cost two thirds of collection-read throughput.
+    pub fn live(db: usize) -> String {
+        format!(
+            "NOT EXISTS (SELECT 1 FROM redis.expiry_{db} \
+                          WHERE key = $1 AND expires_at <= now())"
+        )
+    }
+
+    // The thirteen statements below are the cached collection reads, and
+    // each carries `live` in its own predicate. That is what lets
+    // `Command::collection_read_guarded` route their commands past the
+    // up-front reap — the two lists name the same thirteen commands and must
+    // move together. A statement that lost its guard is a stale read nothing
+    // in-process would notice; the expired-key e2e tests cover every one of
+    // the thirteen on both halves, and
+    // `every_cached_collection_read_carries_the_liveness_guard` pins the
+    // guard's presence here.
+
     pub static HGET: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
-        arr(|db| format!("SELECT value FROM redis.hash_{db} WHERE key=$1 AND field=$2"))
+        arr(|db| {
+            format!(
+                "SELECT value FROM redis.hash_{db} WHERE key=$1 AND field=$2 AND {}",
+                live(db)
+            )
+        })
     });
 
     pub static HGETALL: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
-        arr(|db| format!("SELECT field, value FROM redis.hash_{db} WHERE key=$1 ORDER BY field"))
+        arr(|db| {
+            format!(
+                "SELECT field, value FROM redis.hash_{db} WHERE key=$1 AND {} ORDER BY field",
+                live(db)
+            )
+        })
     });
 
     pub static HKEYS: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
-        arr(|db| format!("SELECT field FROM redis.hash_{db} WHERE key=$1 ORDER BY field"))
+        arr(|db| {
+            format!(
+                "SELECT field FROM redis.hash_{db} WHERE key=$1 AND {} ORDER BY field",
+                live(db)
+            )
+        })
     });
 
     pub static HVALS: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
-        arr(|db| format!("SELECT value FROM redis.hash_{db} WHERE key=$1 ORDER BY field"))
+        arr(|db| {
+            format!(
+                "SELECT value FROM redis.hash_{db} WHERE key=$1 AND {} ORDER BY field",
+                live(db)
+            )
+        })
     });
 
     pub static HLEN: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
-        arr(|db| format!("SELECT count(*)::bigint FROM redis.hash_{db} WHERE key=$1"))
+        arr(|db| {
+            format!(
+                "SELECT count(*)::bigint FROM redis.hash_{db} WHERE key=$1 AND {}",
+                live(db)
+            )
+        })
     });
 
     pub static HEXISTS: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
-        arr(|db| format!("SELECT 1 FROM redis.hash_{db} WHERE key=$1 AND field=$2"))
+        arr(|db| {
+            format!(
+                "SELECT 1 FROM redis.hash_{db} WHERE key=$1 AND field=$2 AND {}",
+                live(db)
+            )
+        })
+    });
+
+    pub static HSTRLEN: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
+        arr(|db| {
+            format!(
+                "SELECT length(value)::bigint FROM redis.hash_{db} \
+                 WHERE key=$1 AND field=$2 AND {}",
+                live(db)
+            )
+        })
     });
 
     pub static SCARD: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
-        arr(|db| format!("SELECT count(*)::bigint FROM redis.set_{db} WHERE key=$1"))
+        arr(|db| {
+            format!(
+                "SELECT count(*)::bigint FROM redis.set_{db} WHERE key=$1 AND {}",
+                live(db)
+            )
+        })
     });
 
     pub static SMEMBERS: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
-        arr(|db| format!("SELECT member FROM redis.set_{db} WHERE key=$1 ORDER BY member"))
+        arr(|db| {
+            format!(
+                "SELECT member FROM redis.set_{db} WHERE key=$1 AND {} ORDER BY member",
+                live(db)
+            )
+        })
     });
 
     pub static SISMEMBER: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
-        arr(|db| format!("SELECT 1 FROM redis.set_{db} WHERE key=$1 AND member=$2"))
+        arr(|db| {
+            format!(
+                "SELECT 1 FROM redis.set_{db} WHERE key=$1 AND member=$2 AND {}",
+                live(db)
+            )
+        })
     });
 
     pub static ZCARD: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
-        arr(|db| format!("SELECT count(*)::bigint FROM redis.zset_{db} WHERE key=$1"))
+        arr(|db| {
+            format!(
+                "SELECT count(*)::bigint FROM redis.zset_{db} WHERE key=$1 AND {}",
+                live(db)
+            )
+        })
     });
 
     pub static ZSCORE: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
-        arr(|db| format!("SELECT score FROM redis.zset_{db} WHERE key=$1 AND member=$2"))
+        arr(|db| {
+            format!(
+                "SELECT score FROM redis.zset_{db} WHERE key=$1 AND member=$2 AND {}",
+                live(db)
+            )
+        })
     });
 
     pub static LLEN: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
-        arr(|db| format!("SELECT count(*)::bigint FROM redis.list_{db} WHERE key=$1"))
+        arr(|db| {
+            format!(
+                "SELECT count(*)::bigint FROM redis.list_{db} WHERE key=$1 AND {}",
+                live(db)
+            )
+        })
     });
 }
+
+/// Every command named by a row of the coverage page.
+///
+/// The page is data, not prose: `the_coverage_doc_lists_exactly_what_parses`
+/// asserts it against the parser in both directions, and `COMMAND COUNT`
+/// answers with the length of this list. Chained that way, the reply, the
+/// page and the parser cannot drift apart in pairs — a command added without
+/// a row fails the test, and a row added without a command does too.
+pub fn documented_commands() -> impl Iterator<Item = &'static str> {
+    include_str!("../docs/command-coverage.md")
+        .lines()
+        .filter_map(|l| l.strip_prefix("| `"))
+        .filter_map(|l| l.split('`').next())
+        .filter(|c| {
+            !c.is_empty()
+                && c.chars()
+                    .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
+        })
+}
+
+/// What `COMMAND COUNT` reports, counted the way Redis counts its own
+/// table: every accepted name is a command, aliases included — `SUBSTR` has
+/// its own entry even though it parses to the same variant as `GETRANGE`.
+pub static COMMAND_COUNT: std::sync::LazyLock<i64> =
+    std::sync::LazyLock::new(|| documented_commands().count() as i64);
 
 /// Score bound for ZRANGEBYSCORE / ZCOUNT. `exclusive` encodes the Redis
 /// `(` prefix; `value` may be +/- infinity.
@@ -397,6 +517,7 @@ pub enum Command {
         password: String,
     },
     Info,
+    Time,
     Hello {
         proto: Option<u8>,
         auth: Option<String>,
@@ -461,6 +582,9 @@ pub enum Command {
         keys: Vec<Vec<u8>>,
     },
     Exists {
+        keys: Vec<Vec<u8>>,
+    },
+    Touch {
         keys: Vec<Vec<u8>>,
     },
     Expire {
@@ -579,12 +703,27 @@ pub enum Command {
         db: Option<u8>,
         replace: bool,
     },
+    Dump {
+        key: Vec<u8>,
+    },
+    Restore {
+        key: Vec<u8>,
+        /// Milliseconds, relative unless `absttl`; 0 means no expiry.
+        ttl_ms: i64,
+        absttl: bool,
+        replace: bool,
+        payload: Vec<u8>,
+    },
     HRandField {
         key: Vec<u8>,
         count: Option<i64>,
         withvalues: bool,
     },
     SInterCard {
+        keys: Vec<Vec<u8>>,
+        limit: Option<i64>,
+    },
+    ZInterCard {
         keys: Vec<Vec<u8>>,
         limit: Option<i64>,
     },
@@ -650,6 +789,10 @@ pub enum Command {
         key: Vec<u8>,
     },
     HExists {
+        key: Vec<u8>,
+        field: Vec<u8>,
+    },
+    HStrLen {
         key: Vec<u8>,
         field: Vec<u8>,
     },
@@ -986,7 +1129,7 @@ pub enum Response {
 type DumpRow = (Vec<u8>, Option<f64>, Option<Vec<u8>>);
 
 /// Everything one key holds, in a form neither backend stores — see `dump_key`.
-enum KeyDump {
+pub(crate) enum KeyDump {
     String(Vec<u8>),
     List(Vec<Vec<u8>>),
     Set(Vec<Vec<u8>>),
@@ -1292,6 +1435,20 @@ impl Command {
                     keys: args.iter().map(|a| a.to_vec()).collect(),
                 })
             }
+            "TIME" => {
+                if !args.is_empty() {
+                    return Err(wrong_arity("TIME"));
+                }
+                Ok(Command::Time)
+            }
+            "TOUCH" => {
+                if args.is_empty() {
+                    return Err(wrong_arity("TOUCH"));
+                }
+                Ok(Command::Touch {
+                    keys: args.iter().map(|a| a.to_vec()).collect(),
+                })
+            }
             "EXPIRE" => Ok(Command::Expire {
                 key: bytes_arg(args, 0, "EXPIRE")?,
                 secs: {
@@ -1548,6 +1705,57 @@ impl Command {
                     replace,
                 })
             }
+            "DUMP" => {
+                if args.len() != 1 {
+                    return Err(wrong_arity("DUMP"));
+                }
+                Ok(Command::Dump {
+                    key: bytes_arg(args, 0, "DUMP")?,
+                })
+            }
+            "RESTORE" => {
+                let key = bytes_arg(args, 0, "RESTORE")?;
+                let ttl_ms: i64 = str_arg(args, 1, "RESTORE")?
+                    .parse()
+                    .map_err(|_| NOT_AN_INTEGER.to_string())?;
+                if ttl_ms < 0 {
+                    return Err("ERR Invalid TTL value, must be >= 0".to_string());
+                }
+                let payload = bytes_arg(args, 2, "RESTORE")?;
+                let (mut replace, mut absttl) = (false, false);
+                let mut i = 3;
+                while i < args.len() {
+                    match String::from_utf8_lossy(&args[i]).to_uppercase().as_str() {
+                        "REPLACE" => {
+                            replace = true;
+                            i += 1;
+                        }
+                        "ABSTTL" => {
+                            absttl = true;
+                            i += 1;
+                        }
+                        // Accepted and unused, as Redis accepts them without
+                        // LRU or LFU tracking to hand them to.
+                        "IDLETIME" | "FREQ" => {
+                            let n: i64 = str_arg(args, i + 1, "RESTORE")?
+                                .parse()
+                                .map_err(|_| NOT_AN_INTEGER.to_string())?;
+                            if n < 0 {
+                                return Err("ERR Invalid IDLETIME value, must be >= 0".to_string());
+                            }
+                            i += 2;
+                        }
+                        _ => return Err("ERR syntax error".to_string()),
+                    }
+                }
+                Ok(Command::Restore {
+                    key,
+                    ttl_ms,
+                    absttl,
+                    replace,
+                    payload,
+                })
+            }
             "HRANDFIELD" => {
                 let key = bytes_arg(args, 0, "HRANDFIELD")?;
                 let count = match args.get(1) {
@@ -1573,34 +1781,12 @@ impl Command {
                 })
             }
             "SINTERCARD" => {
-                let numkeys: i64 = str_arg(args, 0, "SINTERCARD")?
-                    .parse()
-                    .map_err(|_| "ERR numkeys should be greater than 0".to_string())?;
-                if numkeys <= 0 {
-                    return Err("ERR numkeys should be greater than 0".to_string());
-                }
-                let numkeys = numkeys as usize;
-                if args.len() < 1 + numkeys {
-                    return Err(
-                        "ERR Number of keys can't be greater than number of args".to_string()
-                    );
-                }
-                let keys: Vec<Vec<u8>> = args[1..1 + numkeys].to_vec();
-                let limit = match args.get(1 + numkeys) {
-                    None => None,
-                    Some(a) if a.eq_ignore_ascii_case(b"LIMIT") => {
-                        let n: i64 = str_arg(args, 2 + numkeys, "SINTERCARD")?
-                            .parse()
-                            .map_err(|_| "ERR LIMIT can't be negative".to_string())?;
-                        if n < 0 {
-                            return Err("ERR LIMIT can't be negative".to_string());
-                        }
-                        // Redis reads 0 as "no limit".
-                        (n > 0).then_some(n)
-                    }
-                    Some(_) => return Err("ERR syntax error".to_string()),
-                };
+                let (keys, limit) = intercard_args(args, "SINTERCARD")?;
                 Ok(Command::SInterCard { keys, limit })
+            }
+            "ZINTERCARD" => {
+                let (keys, limit) = intercard_args(args, "ZINTERCARD")?;
+                Ok(Command::ZInterCard { keys, limit })
             }
             "OBJECT" => match str_arg(args, 0, "OBJECT")?.to_uppercase().as_str() {
                 "ENCODING" => Ok(Command::ObjectEncoding {
@@ -1738,6 +1924,10 @@ impl Command {
             }),
             "HLEN" => Ok(Command::HLen {
                 key: bytes_arg(args, 0, "HLEN")?,
+            }),
+            "HSTRLEN" => Ok(Command::HStrLen {
+                key: bytes_arg(args, 0, "HSTRLEN")?,
+                field: bytes_arg(args, 1, "HSTRLEN")?,
             }),
             "HINCRBY" => Ok(Command::HIncrBy {
                 key: bytes_arg(args, 0, "HINCRBY")?,
@@ -2284,24 +2474,38 @@ impl Command {
         // A read of a *collection* is the exception, and has to be. Its rows
         // outlive the key's expiry until the sweep runs, so coming back with
         // data is not evidence the key is live — which is how `LLEN` answered
-        // 3 for a key `TYPE` had already called gone. Asking first is what
-        // reaps it. Strings are excluded because they never had the problem:
-        // the expiry is a column of `kv_N` and every statement reading one
-        // tests it, which is why the ordering above could be an optimisation
-        // in the first place.
+        // 3 for a key `TYPE` had already called gone. Strings are excluded
+        // because they never had the problem: the expiry is a column of
+        // `kv_N` and every statement reading one tests it, which is why the
+        // ordering above could be an optimisation in the first place.
+        //
+        // Two mechanisms make a collection read honest, and which applies is
+        // decided here and nowhere else. The cached single-key reads carry
+        // the liveness test inside their own statement and pay nothing;
+        // everything else reaps its keys first, one extra statement that
+        // cannot be missed by a statement that forgot the predicate.
         let writes = !self.write_keys().is_empty();
         if writes && let Some(err) = self.sql_type_error(client, db) {
             return err;
         }
-        if !writes && self.reads_a_collection() {
+        let guarded = self.collection_read_guarded();
+        if !writes && !guarded && self.reads_a_collection() {
             self.sql_reap_expired(client, db);
         }
         let response = self.execute_inner(client, db);
-        if !writes
-            && response.found_nothing()
-            && let Some(err) = self.sql_type_error(client, db)
-        {
-            return err;
+        if !writes && response.found_nothing() {
+            // A guarded read that found nothing may have refused an expired
+            // key whose rows are still in the tables. They have to go before
+            // the type check looks, or `LLEN` on an expired hash would answer
+            // WRONGTYPE where Redis answers 0 — and going now spares the
+            // sweep the work. This is the miss path, so the statement costs
+            // nothing where it matters.
+            if guarded {
+                self.sql_reap_expired(client, db);
+            }
+            if let Some(err) = self.sql_type_error(client, db) {
+                return err;
+            }
         }
         response
     }
@@ -2670,6 +2874,7 @@ impl Command {
                 )
                 .into_bytes(),
             ),
+            Command::Time => time_reply(),
             Command::Hello { .. } => Response::Ok,
             Command::Reset => Response::Ok,
             Command::Quit => Response::Ok,
@@ -2690,7 +2895,7 @@ impl Command {
             Command::ClientOther => Response::Ok,
 
             // COMMAND commands
-            Command::CmdCount => Response::Integer(100),
+            Command::CmdCount => Response::Integer(*COMMAND_COUNT),
             Command::CmdInfo => Response::Array(vec![]),
             Command::CmdDocs => Response::Array(vec![]),
             Command::CmdList => Response::Array(vec![]),
@@ -2949,7 +3154,9 @@ impl Command {
                 integer_query(client, Spi::Writes, "DEL", &sql, &[keys_vec.into()], 0)
             }
 
-            Command::Exists { keys } => {
+            // TOUCH answers exactly as EXISTS does; the access-time refresh it
+            // performs in Redis feeds an LRU clock these tables do not keep.
+            Command::Exists { keys } | Command::Touch { keys } => {
                 // Once per argument, duplicates included: `EXISTS k k` is 2 in
                 // Redis when k is there.
                 let sql = format!(
@@ -3382,9 +3589,15 @@ impl Command {
                         "ERR source and destination objects are the same".to_string(),
                     );
                 }
+                // Liveness, not row-presence: `sql_key_kinds` reports a key
+                // past its expiry as a row with no kind, and a dead key must
+                // not refuse the copy.
                 let exists = match uses_shared_memory(dst_db) {
                     true => unsafe { crate::mem::mem_key_kind(dst_db as usize, dst) }.is_some(),
-                    false => !Self::sql_key_kinds(client, dst_db, &[dst.as_slice()]).is_empty(),
+                    false => Self::sql_key_kinds(client, dst_db, &[dst.as_slice()])
+                        .first()
+                        .and_then(|(_, k)| *k)
+                        .is_some(),
                 };
                 if exists && !*replace {
                     return Response::Integer(0);
@@ -3392,21 +3605,97 @@ impl Command {
                 let Some((dump, expires_at)) = Self::dump_key(client, db, src) else {
                     return Response::Integer(0);
                 };
-                if exists {
-                    match uses_shared_memory(dst_db) {
-                        true => unsafe {
-                            if let Some(kind) = crate::mem::mem_key_kind(dst_db as usize, dst) {
-                                crate::mem::mem_drop_key_of(dst_db as usize, kind, dst);
-                            }
-                        },
-                        false => Self::sql_drop_key(client, dst_db, dst),
-                    }
+                // Cleared whether or not the destination read as live: a key
+                // past its expiry that the sweep has not reached still has
+                // rows, and the write below must not merge with them.
+                match uses_shared_memory(dst_db) {
+                    true => unsafe {
+                        crate::mem::mem_del(dst_db as usize, &[dst.as_slice()]);
+                        crate::mem::mem_del_all_types(dst_db as usize, dst);
+                    },
+                    false => Self::sql_drop_key(client, dst_db, dst),
                 }
                 Self::restore_key(client, dst_db, dst, &dump);
                 if expires_at != 0 && uses_shared_memory(dst_db) {
                     unsafe { crate::mem::mem_set_expiry(dst_db as usize, dst, expires_at) };
                 }
                 Response::Integer(1)
+            }
+
+            Command::Dump { key } => match Self::dump_key(client, db, key) {
+                Some((dump, _)) => Response::BulkString(crate::rdb::serialize(&dump)),
+                None => Response::Null,
+            },
+
+            Command::Restore {
+                key,
+                ttl_ms,
+                absttl,
+                replace,
+                payload,
+            } => {
+                let mem = uses_shared_memory(db);
+                let idx = db as usize;
+                let exists = match mem {
+                    true => unsafe { crate::mem::mem_key_kind(idx, key) }.is_some(),
+                    false => Self::sql_key_kinds(client, db, &[key.as_slice()])
+                        .first()
+                        .and_then(|(_, k)| *k)
+                        .is_some(),
+                };
+                // The checks in Redis's order: the busy key wins over a
+                // payload that would also have been refused.
+                if exists && !*replace {
+                    return Response::Error("BUSYKEY Target key name already exists.".to_string());
+                }
+                let dump = match crate::rdb::deserialize(payload) {
+                    Ok(d) => d,
+                    Err(crate::rdb::RestoreError::Envelope) => {
+                        return Response::Error(
+                            "ERR DUMP payload version or checksum are wrong".to_string(),
+                        );
+                    }
+                    Err(crate::rdb::RestoreError::Format) => {
+                        return Response::Error("ERR Bad data format".to_string());
+                    }
+                };
+                // Cleared whether or not the key read as live: a key past its
+                // expiry that the sweep has not reached still has rows, and
+                // the write below must not merge with them.
+                match mem {
+                    true => unsafe {
+                        crate::mem::mem_del(idx, &[key.as_slice()]);
+                        crate::mem::mem_del_all_types(idx, key);
+                    },
+                    false => Self::sql_drop_key(client, db, key),
+                }
+                Self::restore_key(client, db, key, &dump);
+                if *ttl_ms > 0 {
+                    match (mem, absttl) {
+                        (true, true) => unsafe {
+                            crate::mem::mem_set_expiry(idx, key, ttl_ms * 1000);
+                        },
+                        (true, false) => unsafe {
+                            crate::mem::mem_set_expiry(idx, key, now_micros() + ttl_ms * 1000);
+                        },
+                        (false, true) => {
+                            let sql =
+                                sql::set_expiry(idx, "to_timestamp($2::float8 / 1000.0)");
+                            let ms_f = *ttl_ms as f64;
+                            let _ =
+                                client.update(&sql, None, &[key.as_slice().into(), ms_f.into()]);
+                        }
+                        (false, false) => {
+                            let sql = sql::set_expiry(
+                                idx,
+                                "now() + ($2::bigint * interval '1 millisecond')",
+                            );
+                            let _ = client
+                                .update(&sql, None, &[key.as_slice().into(), (*ttl_ms).into()]);
+                        }
+                    }
+                }
+                Response::Ok
             }
 
             Command::GetBit { key, offset } => {
@@ -3495,6 +3784,26 @@ impl Command {
                 match client.select(&sql, None, args) {
                     Ok(tbl) => Response::Integer(tbl.first().get(1).ok().flatten().unwrap_or(0)),
                     Err(e) => spi_failed("SINTERCARD", e),
+                }
+            }
+
+            Command::ZInterCard { keys, limit } => {
+                let body = zagg_body(AggOp::Inter, "SUM(w_score)", db);
+                let sql = format!(
+                    "SELECT count(*)::bigint FROM ( \
+                         SELECT 1 FROM ({body}) agg LIMIT $3::bigint \
+                     ) c"
+                );
+                let keys_vec = key_array(keys);
+                let weights: Vec<Option<f64>> = vec![Some(1.0); keys.len()];
+                let cap = limit.unwrap_or(i64::MAX);
+                match client.select(
+                    &sql,
+                    None,
+                    &[keys_vec.into(), weights.into(), cap.into()],
+                ) {
+                    Ok(tbl) => Response::Integer(tbl.first().get(1).ok().flatten().unwrap_or(0)),
+                    Err(e) => spi_failed("ZINTERCARD", e),
                 }
             }
 
@@ -3596,9 +3905,23 @@ impl Command {
             Command::Rename { key, newkey } => Self::rename_to(client, db, key, newkey),
 
             Command::RandomKey => {
+                // Every live key, whatever table holds it. This read kv_N
+                // alone once, which was not a skew but a wrong answer: a
+                // database holding only collections replied nil while DBSIZE
+                // counted them. `UNION` rather than `UNION ALL` because a
+                // list stores one row per element and each key must weigh
+                // the same once the draw is made.
                 let sql = format!(
-                    "SELECT key FROM redis.kv_{db} \
-                     WHERE (expires_at IS NULL OR expires_at > now()) \
+                    "SELECT key FROM ( \
+                         SELECT key FROM redis.kv_{db} \
+                          WHERE (expires_at IS NULL OR expires_at > now()) \
+                         UNION SELECT key FROM redis.list_{db} \
+                         UNION SELECT key FROM redis.set_{db} \
+                         UNION SELECT key FROM redis.hash_{db} \
+                         UNION SELECT key FROM redis.zset_{db} \
+                     ) u \
+                     WHERE NOT EXISTS (SELECT 1 FROM redis.expiry_{db} e \
+                                        WHERE e.key = u.key AND e.expires_at <= now()) \
                      ORDER BY random() LIMIT 1"
                 );
                 bulk_query(client, Spi::Reads, "RANDOMKEY", &sql, &[])
@@ -3736,6 +4059,10 @@ impl Command {
 
             Command::HLen { key } => {
                 integer_query(client, Spi::Reads, "HLEN", &sql::HLEN[db as usize], &[key.as_slice().into()], 0)
+            }
+
+            Command::HStrLen { key, field } => {
+                integer_query(client, Spi::Reads, "HSTRLEN", &sql::HSTRLEN[db as usize], &[key.as_slice().into(), field.as_slice().into()], 0)
             }
 
             Command::HIncrBy { key, field, delta } => {
@@ -4787,9 +5114,13 @@ impl Command {
                 Response::Integer(count)
             }
 
-            Command::Exists { keys } => {
+            // As the SQL arm: the reply is EXISTS's, and the access-time
+            // refresh feeds an LRU clock this backend does not keep.
+            Command::Exists { keys } | Command::Touch { keys } => {
                 Response::Integer(unsafe { mem::mem_exists(db_idx, &strs(keys)) })
             }
+
+            Command::Time => time_reply(),
 
             Command::Incr { key } => match unsafe { mem::mem_incr(db_idx, key, 1) } {
                 Ok(n) => Response::Integer(n),
@@ -4995,6 +5326,16 @@ impl Command {
                 Response::Integer(limit.map_or(n, |l| n.min(l)))
             }
 
+            // As the ZINTER arm: intersect into a scratch key, then throw the
+            // result away — only its size is the answer.
+            Command::ZInterCard { keys, limit } => {
+                let tmp: &[u8] = b"__mem_zintercard_tmp__";
+                let n =
+                    unsafe { mem::mem_zinterstore(db_idx, tmp, &strs(keys), &[], Aggregate::Sum) };
+                unsafe { mem::mem_del_zset_key(db_idx, tmp) };
+                Response::Integer(limit.map_or(n, |l| n.min(l)))
+            }
+
             Command::ObjectEncoding { key } => {
                 // Redis answers nil rather than erroring here, unlike every
                 // other command that names a key it cannot find.
@@ -5091,6 +5432,9 @@ impl Command {
                 Response::Array(vals.into_iter().map(Some).collect())
             }
             Command::HLen { key } => Response::Integer(unsafe { mem::mem_hlen(db_idx, key) }),
+            Command::HStrLen { key, field } => Response::Integer(
+                unsafe { mem::mem_hget(db_idx, key, field) }.map_or(0, |v| v.len() as i64),
+            ),
             Command::HMGet { key, fields } => {
                 let results = unsafe { mem::mem_hmget(db_idx, key, &strs(fields)) };
                 Response::Array(results.into_iter().collect())
@@ -5887,6 +6231,7 @@ impl Command {
             | Command::HVals { key }
             | Command::HExists { key, .. }
             | Command::HLen { key }
+            | Command::HStrLen { key, .. }
             | Command::HIncrBy { key, .. }
             | Command::HIncrByFloat { key, .. }
             | Command::HRandField { key, .. }
@@ -5948,7 +6293,8 @@ impl Command {
             | Command::ZDiff { keys, .. }
             | Command::ZUnionStore { keys, .. }
             | Command::ZInterStore { keys, .. }
-            | Command::ZDiffStore { keys, .. } => many(keys, ZSET_OR_SET),
+            | Command::ZDiffStore { keys, .. }
+            | Command::ZInterCard { keys, .. } => many(keys, ZSET_OR_SET),
 
             _ => vec![],
         }
@@ -5980,6 +6326,41 @@ impl Command {
         self.typed_keys()
             .iter()
             .any(|(_, kinds)| kinds.iter().any(|k| *k != crate::mem::KeyKind::String))
+    }
+
+    /// The single-key collection reads whose cached statement carries
+    /// `sql::live` in its own predicate, listed next to the statements it
+    /// names. They skip the up-front reap: the liveness question rides inside
+    /// the round trip the read was already making, where a separate reap
+    /// statement was measured to cost two thirds of their throughput.
+    ///
+    /// Misclassifying in either direction is survivable, which is the point
+    /// of the design. A command missing from this list pays the reap it does
+    /// not need. A command on it whose statement lost the guard is caught
+    /// twice over: per statement by
+    /// `every_cached_collection_read_carries_the_liveness_guard`, and end to
+    /// end by the expired-key e2e tests, which rebuild and re-expire the key
+    /// before every read — one honest command's miss-path reap must not
+    /// clean the rows and vouch for the next. That masking was observed, not
+    /// theorised: an unguarded `HGET` passed the suite until the tests
+    /// stopped sharing one expired key.
+    fn collection_read_guarded(&self) -> bool {
+        matches!(
+            self,
+            Command::HGet { .. }
+                | Command::HGetAll { .. }
+                | Command::HKeys { .. }
+                | Command::HVals { .. }
+                | Command::HLen { .. }
+                | Command::HExists { .. }
+                | Command::HStrLen { .. }
+                | Command::SMembers { .. }
+                | Command::SIsMember { .. }
+                | Command::SCard { .. }
+                | Command::ZCard { .. }
+                | Command::ZScore { .. }
+                | Command::LLen { .. }
+        )
     }
 
     /// The keys this command replaces outright, with the type each becomes.
@@ -6098,6 +6479,7 @@ impl Command {
                 vec![key.as_slice(), newkey.as_slice()]
             }
             Command::Copy { dst, .. } => vec![dst.as_slice()],
+            Command::Restore { key, .. } => vec![key.as_slice()],
             Command::LMove { src, dst, .. } => vec![src.as_slice(), dst.as_slice()],
             Command::SMove { src, dst, .. } => vec![src.as_slice(), dst.as_slice()],
             Command::SUnionStore { dst, .. }
@@ -6247,6 +6629,16 @@ fn parse_lex_bound_infallible(s: &[u8]) -> LexBound {
         [b'(', rest @ ..] => LexBound::Exclusive(rest.to_vec()),
         _ => LexBound::Inclusive(s.to_vec()),
     }
+}
+
+/// `TIME`: seconds and leftover microseconds, both spelled as strings. One
+/// clock reading, so the two parts cannot straddle a second.
+pub(crate) fn time_reply() -> Response {
+    let us = now_micros();
+    Response::Array(vec![
+        Some((us / 1_000_000).to_string().into_bytes()),
+        Some((us % 1_000_000).to_string().into_bytes()),
+    ])
 }
 
 fn now_micros() -> i64 {
@@ -6880,6 +7272,56 @@ const NOT_A_FLOAT: &str = "value is not a valid float";
 /// Adding infinities of opposite sign. Redis refuses rather than storing NaN,
 /// which would order unpredictably against every other score.
 const NAN_SCORE: &str = "ERR resulting score is not a number (NaN)";
+
+/// `numkeys key [key ...] [LIMIT n]`, as `SINTERCARD` and `ZINTERCARD` both
+/// spell their arguments. The LIMIT handling is shared, 0 as "no limit"
+/// included; the numkeys refusals are not, because Redis's are not — measured
+/// against 7.0.15, `SINTERCARD` answers "numkeys should be greater than 0" to
+/// both a non-integer and a non-positive value, where `ZINTERCARD` gives the
+/// integer error and the `ZUNION` family's "at least 1 input key" in turn.
+fn intercard_args(args: &[Vec<u8>], cmd: &str) -> Result<(Vec<Vec<u8>>, Option<i64>), String> {
+    // Arity is -3: numkeys with no key after it is an arity error, and the
+    // numkeys messages only come once at least one key is on the line.
+    if args.len() < 2 {
+        return Err(wrong_arity(cmd));
+    }
+    let (parse_err, range_err) = match cmd {
+        "ZINTERCARD" => (
+            NOT_AN_INTEGER,
+            "ERR at least 1 input key is needed for 'zintercard' command",
+        ),
+        _ => (
+            "ERR numkeys should be greater than 0",
+            "ERR numkeys should be greater than 0",
+        ),
+    };
+    let numkeys: i64 = str_arg(args, 0, cmd)?
+        .parse()
+        .map_err(|_| parse_err.to_string())?;
+    if numkeys <= 0 {
+        return Err(range_err.to_string());
+    }
+    let numkeys = numkeys as usize;
+    if args.len() < 1 + numkeys {
+        return Err("ERR Number of keys can't be greater than number of args".to_string());
+    }
+    let keys: Vec<Vec<u8>> = args[1..1 + numkeys].to_vec();
+    let limit = match args.get(1 + numkeys) {
+        None => None,
+        Some(a) if a.eq_ignore_ascii_case(b"LIMIT") => {
+            let n: i64 = str_arg(args, 2 + numkeys, cmd)?
+                .parse()
+                .map_err(|_| "ERR LIMIT can't be negative".to_string())?;
+            if n < 0 {
+                return Err("ERR LIMIT can't be negative".to_string());
+            }
+            // Redis reads 0 as "no limit".
+            (n > 0).then_some(n)
+        }
+        Some(_) => return Err("ERR syntax error".to_string()),
+    };
+    Ok((keys, limit))
+}
 
 /// A `SETBIT`/`GETBIT` offset. Redis caps it at 4 GiB of bits and gives that
 /// ceiling its own message, distinct from a value that is not a number at all.
@@ -8086,6 +8528,40 @@ struct ZAggregateOptions<'a> {
     store_into: Option<&'a [u8]>,
 }
 
+/// The member/score core the sorted-set arithmetic commands share. `$1` is
+/// the key array and `$2` a weight per key; `ZINTERCARD` binds every weight
+/// to 1 and counts the rows instead of reading them.
+fn zagg_body(op: AggOp, agg_fn: &str, db: u8) -> String {
+    match op {
+        AggOp::Union => format!(
+            "SELECT member, {agg_fn} AS score FROM ( \
+                 SELECT z.member, z.score * kw.w AS w_score \
+                 FROM unnest($1::bytea[], $2::float8[]) WITH ORDINALITY AS kw(k, w, ord) \
+                 JOIN redis.zset_{db} z ON z.key = kw.k \
+             ) t \
+             GROUP BY member"
+        ),
+        AggOp::Inter => format!(
+            "SELECT member, {agg_fn} AS score FROM ( \
+                 SELECT z.member, z.score * kw.w AS w_score \
+                 FROM unnest($1::bytea[], $2::float8[]) WITH ORDINALITY AS kw(k, w, ord) \
+                 JOIN redis.zset_{db} z ON z.key = kw.k \
+             ) t \
+             GROUP BY member \
+             HAVING count(*) = array_length($1::bytea[], 1)"
+        ),
+        AggOp::Diff => format!(
+            "SELECT z.member, z.score FROM redis.zset_{db} z \
+             WHERE z.key = ($1::bytea[])[1] \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM redis.zset_{db} z2 \
+                   WHERE z2.member = z.member \
+                     AND z2.key = ANY(($1::bytea[])[2:array_length($1::bytea[], 1)]) \
+               )"
+        ),
+    }
+}
+
 fn zaggregate_execute(
     client: &mut SpiClient<'_>,
     db: u8,
@@ -8116,34 +8592,7 @@ fn zaggregate_execute(
         Aggregate::Min => "MIN(w_score)",
         Aggregate::Max => "MAX(w_score)",
     };
-    let body = match op {
-        AggOp::Union => format!(
-            "SELECT member, {agg_fn} AS score FROM ( \
-                 SELECT z.member, z.score * kw.w AS w_score \
-                 FROM unnest($1::bytea[], $2::float8[]) WITH ORDINALITY AS kw(k, w, ord) \
-                 JOIN redis.zset_{db} z ON z.key = kw.k \
-             ) t \
-             GROUP BY member"
-        ),
-        AggOp::Inter => format!(
-            "SELECT member, {agg_fn} AS score FROM ( \
-                 SELECT z.member, z.score * kw.w AS w_score \
-                 FROM unnest($1::bytea[], $2::float8[]) WITH ORDINALITY AS kw(k, w, ord) \
-                 JOIN redis.zset_{db} z ON z.key = kw.k \
-             ) t \
-             GROUP BY member \
-             HAVING count(*) = array_length($1::bytea[], 1)"
-        ),
-        AggOp::Diff => format!(
-            "SELECT z.member, z.score FROM redis.zset_{db} z \
-             WHERE z.key = ($1::bytea[])[1] \
-               AND NOT EXISTS ( \
-                   SELECT 1 FROM redis.zset_{db} z2 \
-                   WHERE z2.member = z.member \
-                     AND z2.key = ANY(($1::bytea[])[2:array_length($1::bytea[], 1)]) \
-               )"
-        ),
-    };
+    let body = zagg_body(op, agg_fn, db);
 
     let keys_vec = key_array(keys);
     let weights_opt: Vec<Option<f64>> = weights_vec.iter().map(|w| Some(*w)).collect();
@@ -8220,6 +8669,89 @@ mod tests {
                 );
             )*
         };
+    }
+
+    /// A cached collection read that lost `sql::live` is a stale read that
+    /// no in-process check would notice, because the reply is well-formed
+    /// either way. The expired-key e2e tests catch it end to end; this pins
+    /// it at the source, one statement at a time, so the failure names the
+    /// statement rather than a command three layers up.
+    #[test]
+    fn every_cached_collection_read_carries_the_liveness_guard() {
+        for db in 0..NUM_DBS {
+            let guard = sql::live(db);
+            for (name, stmt) in [
+                ("HGET", &sql::HGET[db]),
+                ("HGETALL", &sql::HGETALL[db]),
+                ("HKEYS", &sql::HKEYS[db]),
+                ("HVALS", &sql::HVALS[db]),
+                ("HLEN", &sql::HLEN[db]),
+                ("HEXISTS", &sql::HEXISTS[db]),
+                ("HSTRLEN", &sql::HSTRLEN[db]),
+                ("SCARD", &sql::SCARD[db]),
+                ("SMEMBERS", &sql::SMEMBERS[db]),
+                ("SISMEMBER", &sql::SISMEMBER[db]),
+                ("ZCARD", &sql::ZCARD[db]),
+                ("ZSCORE", &sql::ZSCORE[db]),
+                ("LLEN", &sql::LLEN[db]),
+            ] {
+                assert!(
+                    stmt.contains(&guard),
+                    "{name} statement for db {db} lost its liveness guard: {stmt}"
+                );
+            }
+        }
+    }
+
+    /// The other direction: `collection_read_guarded` must name exactly the
+    /// commands whose statements the test above covers. A command wrongly on
+    /// the list skips the reap its unguarded statement needed; one wrongly
+    /// off it merely pays a reap, so only the first direction can lie.
+    #[test]
+    fn the_guarded_list_names_the_thirteen_cached_reads_and_no_others() {
+        let guarded = [
+            vec!["HGET", "k", "f"],
+            vec!["HGETALL", "k"],
+            vec!["HKEYS", "k"],
+            vec!["HVALS", "k"],
+            vec!["HLEN", "k"],
+            vec!["HEXISTS", "k", "f"],
+            vec!["HSTRLEN", "k", "f"],
+            vec!["SMEMBERS", "k"],
+            vec!["SISMEMBER", "k", "m"],
+            vec!["SCARD", "k"],
+            vec!["ZCARD", "k"],
+            vec!["ZSCORE", "k", "m"],
+            vec!["LLEN", "k"],
+        ];
+        for args in &guarded {
+            let cmd = is_ok(Command::parse(parts(args)));
+            assert!(
+                cmd.collection_read_guarded(),
+                "{} should skip the up-front reap",
+                args[0]
+            );
+        }
+        // Collection reads that run inline SQL without the guard, and must
+        // therefore keep reaping first.
+        let unguarded = [
+            vec!["LRANGE", "k", "0", "-1"],
+            vec!["LINDEX", "k", "0"],
+            vec!["SRANDMEMBER", "k"],
+            vec!["ZRANGE", "k", "0", "-1"],
+            vec!["ZCOUNT", "k", "-inf", "+inf"],
+            vec!["SINTERCARD", "1", "k"],
+            vec!["LPOS", "k", "m"],
+            vec!["ZRANDMEMBER", "k"],
+        ];
+        for args in &unguarded {
+            let cmd = is_ok(Command::parse(parts(args)));
+            assert!(
+                !cmd.collection_read_guarded(),
+                "{} reads through inline SQL and must reap first",
+                args[0]
+            );
+        }
     }
 
     /// Redis numbers bits from the most significant of byte 0, which is the
@@ -8695,6 +9227,16 @@ mod tests {
         &["HVALS", "h"] => Command::HVals { key } if key == b"h",
         &["HEXISTS", "h", "field"] => Command::HExists { key, field } if key == b"h" && field == b"field",
         &["HLEN", "h"] => Command::HLen { key } if key == b"h",
+        &["HSTRLEN", "h", "f"] => Command::HStrLen { key, field } if key == b"h" && field == b"f",
+        // Server and keyspace commands added with tier 2
+        &["TIME"] => Command::Time,
+        &["TOUCH", "k1", "k2"] => Command::Touch { keys } if keys.len() == 2,
+        &["ZINTERCARD", "2", "a", "b"] => Command::ZInterCard { keys, limit: None } if keys.len() == 2,
+        &["ZINTERCARD", "1", "a", "LIMIT", "5"] => Command::ZInterCard { limit: Some(5), .. },
+        &["DUMP", "k"] => Command::Dump { key } if key == b"k",
+        &["RESTORE", "k", "0", "payload"] => Command::Restore { ttl_ms: 0, replace: false, absttl: false, .. },
+        &["RESTORE", "k", "100", "p", "REPLACE", "ABSTTL"] => Command::Restore { ttl_ms: 100, replace: true, absttl: true, .. },
+        &["RESTORE", "k", "0", "p", "IDLETIME", "3", "FREQ", "9"] => Command::Restore { .. },
         // Command names are matched case-insensitively.
         &["get", "k"] => Command::Get { .. },
         &["Get", "k"] => Command::Get { .. },
@@ -8743,20 +9285,15 @@ mod tests {
     fn the_coverage_doc_lists_exactly_what_parses() {
         const DOC: &str = include_str!("../docs/command-coverage.md");
 
-        let listed: Vec<&str> = DOC
-            .lines()
-            .filter_map(|l| l.strip_prefix("| `"))
-            .filter_map(|l| l.split('`').next())
-            .filter(|c| {
-                c.chars()
-                    .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
-            })
-            .collect();
+        // The same extraction `COMMAND COUNT` answers from, so this test
+        // vouches for the reply as well as the page.
+        let listed: Vec<&str> = documented_commands().collect();
         assert!(
             listed.len() > 100,
             "only {} commands parsed out of the doc",
             listed.len()
         );
+        assert_eq!(*COMMAND_COUNT, listed.len() as i64);
 
         for cmd in &listed {
             let parsed = Command::parse(vec![cmd.as_bytes().to_vec()]);

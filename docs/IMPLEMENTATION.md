@@ -1313,21 +1313,26 @@ set's, `LRANGE` the entries — none consults the directory — so for up to a
 second, until the sweep runs, `TYPE` answers `none` while `LLEN` still reports
 the old count. Redis expires lazily on every access and has no such window.
 
-The fix is not a lookup on each of those paths, which would put a directory
-probe on the hot read path for a case that almost never happens. It is for the
-type gate to *reap* rather than merely ignore: `mem_type_error` already looks
-the key up before every typed command, so an expired one could be dropped there
-and the command would then find nothing, which is what Redis does. That needs
-`dir_lookup` to distinguish "absent" from "expired", which it currently does
-not.
+**Fixed, on both halves.** The memory half went the way this entry suggested:
+`dir_lookup_raw` distinguishes "absent" from "expired", and
+`mem_key_kind_reaping` drops an expired key at the type gate every command
+already passes through — the same single directory lookup as before. The
+durable half took two mechanisms, decided in `Command::execute` and nowhere
+else: the cached single-key collection reads carry `sql::live` in their own
+predicate, an InitPlan that rides inside the round trip they were already
+making, and every other collection read reaps its keys first with
+`sql::reap_expired_keys`. What each choice costs, measured, is in
+[PARITY.md](PARITY.md#the-stale-collection-read-was-bigger-than-this-table-said).
 
 ### `RANDOMKEY` favours strings
 
-It returns the first live key the KV table's scan reaches, and only looks at the
-collection metas when there is none. Redis draws from the whole keyspace. The
-reply is a valid key either way, which is why the parity harness compares
-`RANDOMKEY` by shape and not by value — but a caller sampling a database of
-mostly collections will see the strings far more often than it should.
+**Fixed, on both halves** — and the durable half turned out worse than this
+entry said: it read `kv_N` alone, so a database holding only collections
+answered *nil* while `DBSIZE` counted them. Both halves now draw uniformly
+over every live key — the durable half with a five-table `UNION` under
+`ORDER BY random()`, the memory half with a single-pass reservoir over the KV
+scan and the collection names, expired-but-unswept keys excluded on both. The
+write-up is in [PARITY.md](PARITY.md#tier-1--commands-we-have-that-behave-differently).
 
 ### `ZPOPMIN` is O(entries in the database)
 

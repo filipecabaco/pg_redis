@@ -9,8 +9,9 @@
 | `SELECT db` | 0–15, or the names `cache` (0) and `durable` (8). Databases 0–7 are ephemeral, 8–15 WAL-logged — see [Storage modes](IMPLEMENTATION.md) |
 | `AUTH [password]` | Validates against `redis.password` GUC; no-op when unset |
 | `INFO` | Returns server info string |
-| `COMMAND` | Returns empty array (client compatibility) |
+| `COMMAND` | Returns empty array (client compatibility); `COMMAND COUNT` reports the number of accepted commands |
 | `CLIENT ...` | No-op, returns OK |
+| `TIME` | Unix seconds and leftover microseconds, from one clock reading |
 
 ## Key–value
 
@@ -24,6 +25,7 @@
 | `MSET key value [key value ...]` | Bulk upsert |
 | `DEL key [key ...]` | Delete keys, returns count deleted |
 | `EXISTS key [key ...]` | Returns count of existing keys |
+| `TOUCH key [key ...]` | Counts as `EXISTS` does; there is no LRU clock to refresh |
 | `SETRANGE key offset value` | Overwrite from `offset`, padding the gap with NUL bytes; returns the new length |
 | `GETRANGE key start end` | Substring; negative indices count from the end, and both clamp |
 | `SETBIT key offset 0\|1` | Set a bit, growing the value to reach it; returns the bit as it was |
@@ -32,6 +34,7 @@
 | `RENAME key newkey` | Rename, replacing `newkey`; errors if `key` is missing |
 | `RENAMENX key newkey` | The same, but `0` rather than replacing an occupied `newkey` |
 | `COPY src dst [DB n] [REPLACE]` | Duplicate a key of any type — see below |
+| `DUMP key` / `RESTORE key ttl payload [REPLACE\|ABSTTL]` | Redis's serialisation format, interchangeable with a real 7.0 — see below |
 | `OBJECT ENCODING key` | Redis's name for the representation — see below |
 | `FLUSHDB [ASYNC\|SYNC]` | Empty the current database |
 | `FLUSHALL [ASYNC\|SYNC]` | Empty **all sixteen**, the durable half included — see below |
@@ -63,6 +66,19 @@ one place `COPY` does more here than there. The read and the write land in one
 transaction, but they are two different storage engines: a crash between them
 cannot leave the destination half-written, though the value must also pass every
 limit of the half it is going to.
+
+### `DUMP` and `RESTORE`
+
+`DUMP` emits Redis's own payload format — an RDB-serialised value, a two-byte
+version stamped 10, and a CRC-64 — so what it produces restores into a real
+Redis 7.0 and vice versa. The bytes are not identical to what Redis itself
+would emit for the same value, because valid encodings are not unique;
+`RESTORE` accepts everything a 7.0 produces, listpacks and compressed strings
+included. Two deliberate refusals, both loud: payloads stamped newer than
+version 10 (what a 7.2 would hand you — Redis 7.0 refuses them too), and the
+compact encodings no server since 6.x has written (ziplists, zipmaps).
+`REPLACE` and `ABSTTL` behave as in Redis; `IDLETIME` and `FREQ` are accepted
+and unused, there being no LRU or LFU clock to hand them to.
 
 ### `OBJECT ENCODING`
 
@@ -101,6 +117,7 @@ its TTL, as in Redis — `SET` over a string, and `SUNIONSTORE` over a set alike
 | `HSET key field value [field value ...]` | Upsert one or more fields, returns new field count |
 | `HDEL key field [field ...]` | Delete fields, returns count deleted |
 | `HGETALL key` | Returns interleaved field/value pairs, sorted by field |
+| `HSTRLEN key field` | Byte length of one field's value, `0` when either is absent |
 | `HINCRBYFLOAT key field increment` | Increment a field as a float; returns the new value |
 | `HRANDFIELD key [count [WITHVALUES]]` | One field, `count` distinct ones, or `-count` with repeats |
 

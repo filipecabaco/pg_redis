@@ -2,6 +2,7 @@ mod commands;
 pub(crate) mod htab;
 pub(crate) mod mem;
 pub(crate) mod pubsub;
+pub(crate) mod rdb;
 mod resp;
 pub(crate) mod watch;
 pub(crate) mod worker;

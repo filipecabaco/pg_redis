@@ -17,13 +17,13 @@ pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
 pg_test = []
 
 [dependencies]
-pgrx = "=0.18.0"
+pgrx = "=0.19.2"
 socket2 = { version = "0.5", features = ["all"] }
 libc = "0.2"
 subtle = "2"
 
 [dev-dependencies]
-pgrx-tests = "=0.18.0"
+pgrx-tests = "=0.19.2"
 
 [profile.dev]
 panic = "unwind"

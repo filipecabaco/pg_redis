@@ -131,9 +131,11 @@ const SUBSCRIBE_POLL: Duration = Duration::from_millis(5);
 /// wakes the sleeper — only how long a command from a quiet subscriber waits.
 const SUBSCRIBE_WAIT_MIN: Duration = Duration::from_millis(5);
 const SUBSCRIBE_WAIT_MAX: Duration = Duration::from_millis(250);
-/// How long a write to a subscriber may wait for it to read before the
-/// connection is closed: the 60 seconds of Redis's pub/sub output limit.
-const WRITE_STALL: Duration = Duration::from_secs(60);
+/// How long a write to a subscriber waits for it to read before looking
+/// again at whether the connection is to close: its queue past
+/// `client-output-buffer-limit pubsub`, or a CLIENT KILL. Redis closes such a
+/// client at once, not when the socket next drains.
+const WRITE_SLICE: Duration = Duration::from_millis(100);
 
 pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
@@ -2473,7 +2475,7 @@ fn deliver_messages(writer: &mut ConnWriter, idx: usize, proto: u8) {
     let Some(slots) = crate::pubsub_state() else {
         return;
     };
-    writer.limit_stalls();
+    writer.limit_stalls(idx);
     let muted = std::mem::replace(&mut writer.muted, false);
     let mut any = false;
     while let Some((channel, pattern, payload)) = crate::pubsub::poll_message(slots, idx) {
@@ -2633,7 +2635,7 @@ fn subscribe_loop(
     let mut keep_conn = true;
     let mut slot_freed = false;
     let mut idle_wait = SUBSCRIBE_WAIT_MIN;
-    writer.limit_stalls();
+    writer.limit_stalls(slot_idx);
 
     'outer: loop {
         // Snapshot before draining, so a publish that lands between the drain
@@ -3110,8 +3112,10 @@ struct ConnWriter {
     /// QUIT was asked for: its OK goes out after the connection is torn
     /// down.
     quit_reply: bool,
-    /// Writes time out after `WRITE_STALL`; set once the client subscribes.
+    /// The client's pub/sub slot once it subscribes: its writes then wait
+    /// in `WRITE_SLICE`s, and stop when the slot overflows.
     stall_limited: bool,
+    subscriber: Option<usize>,
     /// Replies not yet sent, while a normal-class output limit is set: Redis
     /// keeps a client's replies until the event they answer is done, and a
     /// client whose replies pass the limit gets none of them and is closed.
@@ -3138,19 +3142,55 @@ impl ConnWriter {
             pending_read: None,
             quit_reply: false,
             stall_limited: false,
+            subscriber: None,
             held: Vec::new(),
             more_input: false,
         }
     }
 
-    /// From a client's first subscription, a write it does not read for
-    /// `WRITE_STALL` closes the connection, as Redis's pub/sub output limit
-    /// does. A normal client gets no such limit, in Redis or here.
-    fn limit_stalls(&mut self) {
+    /// From a client's first subscription, its writes wait for it in
+    /// slices, so a client that stops reading is closed as soon as its queue
+    /// passes the pubsub output limit, as Redis closes it.
+    fn limit_stalls(&mut self, idx: usize) {
+        self.subscriber = Some(idx);
         if !self.stall_limited {
             self.stall_limited = true;
-            if let Err(e) = self.inner.get_ref().set_write_timeout(Some(WRITE_STALL)) {
+            if let Err(e) = self.inner.get_ref().set_write_timeout(Some(WRITE_SLICE)) {
                 eprintln!("pg_redis: set_write_timeout failed: {e}");
+            }
+        }
+    }
+
+    /// A subscriber's write that waited a slice: whether to give up on the
+    /// connection rather than wait another.
+    fn must_close(&self) -> bool {
+        let overflowed = match (self.subscriber, crate::pubsub_state()) {
+            (Some(idx), Some(slots)) => crate::pubsub::overflowed(slots, idx),
+            _ => false,
+        };
+        let id = CONN_CLIENT.with(|c| c.get());
+        overflowed
+            || crate::server::slot_of(id)
+                .is_some_and(|s| s.kill.load(std::sync::atomic::Ordering::Relaxed) != 0)
+    }
+
+    /// Run a write, waiting out the slices a subscriber's write times out in.
+    /// What the socket took stays taken: a timed-out write is tried again
+    /// with the rest.
+    fn patiently<T>(
+        &mut self,
+        mut op: impl FnMut(&mut BufWriter<TcpStream>) -> io::Result<T>,
+    ) -> io::Result<T> {
+        loop {
+            match op(&mut self.inner) {
+                Err(e)
+                    if self.stall_limited
+                        && matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        )
+                        && !self.must_close() => {}
+                r => return r,
             }
         }
     }
@@ -3184,7 +3224,9 @@ impl Write for ConnWriter {
             }
             return Ok(buf.len());
         }
-        let r = self.send_held().and_then(|()| self.inner.write(buf));
+        let r = self
+            .send_held()
+            .and_then(|()| self.patiently(|w| w.write(buf)));
         self.broken |= r.is_err();
         r
     }
@@ -3197,7 +3239,9 @@ impl Write for ConnWriter {
         if self.more_input && !self.held.is_empty() {
             return Ok(());
         }
-        let r = self.send_held().and_then(|()| self.inner.flush());
+        let r = self
+            .send_held()
+            .and_then(|()| self.patiently(|w| w.flush()));
         self.broken |= r.is_err();
         r
     }
@@ -3217,6 +3261,7 @@ impl ConnWriter {
             return Ok(());
         }
         let held = std::mem::take(&mut self.held);
+        // Held only for a normal client, whose writes never time out.
         self.inner.write_all(&held)
     }
 }

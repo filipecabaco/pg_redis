@@ -1253,34 +1253,43 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<DispatchMsg>, default_d
                     let mut exec_db = db;
                     let mut lines: Vec<(Vec<Vec<u8>>, u8)> = Vec::new();
                     let mut refused: Vec<Option<String>> = Vec::new();
-                    let cmds: Vec<(Command, u8)> = queue
-                        .drain(..)
-                        .filter_map(|r| r.ok())
-                        .filter_map(|(cmd, line)| {
-                            let at = exec_db;
-                            let no = match crate::acl::evaluate(session.serial, &line) {
-                                crate::acl::Verdict::Denied(d) => {
-                                    crate::acl::record_denial(
-                                        &d,
-                                        crate::acl::Context::Multi,
-                                        client.id,
-                                    );
-                                    Some(d.exec_message())
-                                }
-                                _ => crate::acl::sort_denied(session.serial, &line)
-                                    .map(str::to_string),
-                            };
-                            if no.is_none()
-                                && let Command::Select { db: selected } = &cmd
-                            {
-                                exec_db = *selected;
+                    let mut cmds: Vec<(Command, u8)> = Vec::new();
+                    for (cmd, line) in queue.drain(..).filter_map(|r| r.ok()) {
+                        let at = exec_db;
+                        let no = match crate::acl::evaluate(session.serial, &line) {
+                            crate::acl::Verdict::Denied(d) => {
+                                crate::acl::record_denial(
+                                    &d,
+                                    crate::acl::Context::Multi,
+                                    client.id,
+                                );
+                                Some(d.exec_message())
                             }
-                            lines.push((line, at));
-                            let keep = no.is_none();
-                            refused.push(no);
-                            keep.then_some((cmd, at))
-                        })
-                        .collect();
+                            _ => crate::acl::sort_denied(session.serial, &line).map(str::to_string),
+                        };
+                        // A queued AUTH runs in its turn, as Redis runs it:
+                        // the commands after it are checked as its user.
+                        let no = match (&no, &cmd) {
+                            (None, Command::Auth { user, password }) => exec_auth(
+                                &mut session,
+                                &client,
+                                user.as_deref(),
+                                password,
+                                &line[0],
+                            ),
+                            _ => no,
+                        };
+                        if no.is_none()
+                            && let Command::Select { db: selected } = &cmd
+                        {
+                            exec_db = *selected;
+                        }
+                        lines.push((line, at));
+                        if no.is_none() {
+                            cmds.push((cmd, at));
+                        }
+                        refused.push(no);
+                    }
                     if !watch_dirty {
                         for ((line, at), no) in lines.iter().zip(&refused) {
                             if no.is_none() {
@@ -2179,6 +2188,39 @@ fn acl_refusal(
             crate::acl::record_denial(&d, crate::acl::Context::Toplevel, client.id);
             Some(format!("NOPERM {}", d.message(false)))
         }
+    }
+}
+
+/// A queued `AUTH`, run as `EXEC` reaches it: the session becomes the user's,
+/// or the error its reply is.
+fn exec_auth(
+    session: &mut crate::acl::Session,
+    client: &crate::server::ClientHandle,
+    user: Option<&[u8]>,
+    password: &[u8],
+    name: &[u8],
+) -> Option<String> {
+    let user = match user {
+        Some(u) => u.to_vec(),
+        None if crate::acl::current().default_user().nopass() => {
+            return Some(
+                "ERR AUTH <password> called without any password configured for the default \
+                 user. Are you sure your configuration is correct?"
+                    .to_string(),
+            );
+        }
+        None => b"default".to_vec(),
+    };
+    match crate::acl::authenticate(&user, password, name, true, client.id) {
+        Some(serial) => {
+            *session = crate::acl::Session {
+                serial,
+                authenticated: true,
+            };
+            client.set_user(serial);
+            None
+        }
+        None => Some(crate::acl::WRONGPASS.to_string()),
     }
 }
 

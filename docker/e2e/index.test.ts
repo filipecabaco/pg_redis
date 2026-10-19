@@ -5905,7 +5905,27 @@ describe("ACL", () => {
 		await admin.send("DEL", "acl:ctr");
 	});
 
+	test("a queued AUTH switches the user in its turn at EXEC", async () => {
+		await cmd(admin, "ACL", "SETUSER", "acl-later", "on", ">pw2", "~*", "+@all", "-set");
+		await cmd(admin, "ACL", "SETUSER", "acl-multi", "+acl|whoami", "+auth");
+		const c = await as("acl-multi", "pw");
+		expect(await cmd(c, "MULTI")).toBe("OK");
+		expect(await cmd(c, "ACL", "WHOAMI")).toBe("QUEUED");
+		expect(await cmd(c, "AUTH", "acl-later", "wrong")).toBe("QUEUED");
+		expect(await cmd(c, "AUTH", "acl-later", "pw2")).toBe("QUEUED");
+		expect(await cmd(c, "ACL", "WHOAMI")).toBe("QUEUED");
+		const r = (await cmd(c, "EXEC")) as Resp[];
+		expect(r[0]).toBe("acl-multi");
+		expect((r[1] as { error: string }).error).toStartWith("WRONGPASS");
+		expect(r[2]).toBe("OK");
+		expect(r[3]).toBe("acl-later");
+		expect(await cmd(c, "ACL", "WHOAMI")).toBe("acl-later");
+		c.close();
+		await cmd(admin, "ACL", "DELUSER", "acl-later");
+	});
+
 	test("redis.call checks the script caller's permissions", async () => {
+
 		await cmd(admin, "ACL", "SETUSER", "acl-multi", "+eval", "resetkeys", "~ok:*");
 		const c = await as("acl-multi", "pw");
 		expect(await cmd(c, "EVAL", "return redis.call('get', KEYS[1])", "1", "ok:1")).toBeNull();

@@ -718,8 +718,7 @@ client get `BUSY`, on every worker, until it ends or `SCRIPT KILL` /
   `acl.c`; see [Users and permissions](#users-and-permissions). Where Redis
   reads and writes an ACL file, `ACL LOAD` and `ACL SAVE` read and write
   `redis.acl_users`, so they work on every server, and the acceptance test
-  that expects them to fail without an ACL file does not pass. A queued
-  `AUTH` inside `MULTI` answers `OK` at `EXEC` without changing the user. A
+  that expects them to fail without an ACL file does not pass. A
   blocked command is checked again each time it is retried (every 50 ms, and
   on each write to its keys), where Redis checks it again only when a write
   serves it.

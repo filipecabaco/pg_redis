@@ -156,8 +156,11 @@ async function runUnit(half: Half, unit: string): Promise<UnitResult> {
 		"--ignore-encoding",
 		"--ignore-digest",
 		"--no-latency",
+		// Seconds per test. The durable half's write-heavy tests (thousands of
+		// PFADDs, each committed to the WAL) ran past 120 on CI's shared disks
+		// while still passing; the limit catches a hang, not slowness.
 		"--timeout",
-		"120",
+		"300",
 		"--skipfile",
 		SKIPFILE,
 		"--tags",

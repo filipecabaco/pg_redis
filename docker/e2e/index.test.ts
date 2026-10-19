@@ -4232,6 +4232,21 @@ for (const half of HALVES) {
 			);
 		});
 
+		// A client that lost a reply sends the same cursor again. Redis gives
+		// it the same page; so does pg_redis for the latest two cursors.
+		test("resending the previous cursor gives the same page again", async () => {
+			await thousandKeys();
+			const names = (p: { items: Buffer[] }) => p.items.map((b) => b.toString()).sort();
+			const first = scanReply(await raw.send("SCAN", "0", "COUNT", "10"));
+			const second = scanReply(await raw.send("SCAN", first.cursor, "COUNT", "10"));
+			expect(second.cursor).not.toBe("0");
+			const latest = scanReply(await raw.send("SCAN", first.cursor, "COUNT", "10"));
+			expect(names(latest)).toEqual(names(second));
+			// And the iteration carries on from the newer cursor.
+			const third = scanReply(await raw.send("SCAN", second.cursor, "COUNT", "10"));
+			expect(third.items.length).toBeGreaterThan(0);
+		});
+
 		test("a cursor the server never issued restarts or resumes, and ends", async () => {
 			await thousandKeys();
 			for (const made_up of ["12345", "9223372036854775807", "18446744073709551615"]) {

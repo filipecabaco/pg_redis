@@ -23,7 +23,9 @@
 
 - PostgreSQL 15, 16, 17 or 18.
 - `pg_redis` in `shared_preload_libraries`, followed by a server restart. The background
-  workers and the shared memory they use are set up when the server starts.
+  workers and the shared memory they use are set up when the server starts. On a server
+  that has not preloaded it, `CREATE EXTENSION` and restoring a dump that contains the
+  extension still work, with a warning that the Redis listener is not running.
 - A superuser to run `CREATE EXTENSION pg_redis`. The extension is not marked trusted.
 - Run `CREATE EXTENSION` in the database named by `redis.database` (`postgres` by default).
   The workers connect to that database, and the `redis.*` tables live in it.

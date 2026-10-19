@@ -322,3 +322,15 @@ BEGIN
     END LOOP;
 END
 $$;
+
+-- Without preloading there is no Redis listener; say so to whoever creates
+-- the extension instead of leaving them to find a closed port. A warning:
+-- PostgreSQL hides notices while it runs an extension script.
+DO $$
+BEGIN
+    IF NOT ('pg_redis' = ANY (string_to_array(
+            replace(current_setting('shared_preload_libraries'), ' ', ''), ','))) THEN
+        RAISE WARNING 'pg_redis is not in shared_preload_libraries, so the Redis listener is not running. Add it there and restart PostgreSQL.';
+    END IF;
+END
+$$;

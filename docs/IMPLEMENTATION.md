@@ -475,10 +475,11 @@ client get `BUSY`, on every worker, until it ends or `SCRIPT KILL` /
   ([Storage policies](STORAGE.md#snapshots-phase-4)).
 - **`SCAN` cursors on a table are kept by the server.** On the durable half
   a cursor names an entry in a shared-memory table of 4,096 iterations in
-  progress ([SCAN cursors](#scan-cursors)). A cursor sent a second time, or
-  one pushed out by newer iterations, starts the iteration over, so elements
-  come back again; none is skipped. A Redis cursor carries its whole state and
-  can be sent again.
+  progress ([SCAN cursors](#scan-cursors)). The cursor from the latest call,
+  or from the one before it, resumes where it left off, which covers a client
+  retrying a lost reply. An older cursor, or one pushed out by newer
+  iterations, starts the iteration over, so elements come back again; none is
+  skipped. A Redis cursor carries its whole state, so any of them resumes.
 - **Small hashes and sets keep insertion order only until a removal.** Redis
   returns a listpack-encoded hash's fields, and a small set's members, in
   the order they were added, and keeps that order across deletions. The

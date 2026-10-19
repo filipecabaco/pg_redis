@@ -14,13 +14,16 @@ survive all three events below.
 | Policy | Clean restart | Crash | Failover to a physical standby |
 |--------|---------------|-------|--------------------------------|
 | `memory` | Lost | Lost | Lost |
-| `memory+snapshot` | Reloaded from the last snapshot | Reloaded from the last snapshot | Reloaded from the last snapshot the standby had replayed |
+| `memory+snapshot` | Kept: snapshotted at shutdown, reloaded at start | Reloaded from the last snapshot | Planned switchover: kept. Unplanned: reloaded from the last snapshot the standby had replayed |
 | `logged` | Kept | Kept, by WAL replay | Kept, up to what the standby had replayed |
 
 A `memory+snapshot` database is copied to `redis.snapshot` every `redis.snapshot_interval`
 seconds (60 by default), and on demand with `SAVE` or `BGSAVE`. `redis.snapshot` is a logged
-table, so it is replicated like any other. Writes since the last snapshot are lost, on a clean
-shutdown as well as a crash. The reload happens when the workers start.
+table, so it is replicated like any other. On a clean shutdown the last worker to stop takes
+one more snapshot, after every worker has stopped writing, and PostgreSQL waits for it before
+its shutdown checkpoint and streams it to standbys before it stops. A restart or a planned
+switchover therefore keeps every write. A crash, or the unplanned loss of the primary, loses
+the writes since the last snapshot. The reload happens when the workers start.
 
 The workers are registered to start once recovery has finished, so they do not run on a
 standby while it is in recovery. They start when it is promoted.

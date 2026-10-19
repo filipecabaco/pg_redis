@@ -94,6 +94,8 @@ pub struct PolicyTable {
     /// 2 done. No snapshot is taken before 2, or it would save the empty slot
     /// over the one it is about to be filled from.
     restored: [AtomicU8; NUM_DBS],
+    /// Workers between start and a clean exit. The last one out snapshots.
+    workers_alive: AtomicU32,
 }
 
 fn table() -> Option<&'static PolicyTable> {
@@ -775,6 +777,40 @@ pub fn snapshots_round() {
         BackgroundWorker::transaction(|| Spi::connect_mut(|c| take_snapshot(c, db, s)));
         saved(db);
         t.snapshot_busy[db as usize].store(0, Ordering::Release);
+    }
+}
+
+/// A worker is about to serve.
+pub fn worker_started() {
+    if let Some(t) = table() {
+        t.workers_alive.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// A worker leaving cleanly: shutdown, or `redis.remove_workers`. The last
+/// one out saves every snapshot database, after every worker has stopped
+/// writing to it. On a shutdown PostgreSQL waits for this before its
+/// checkpoint and streams the WAL to standbys before it stops, so a planned
+/// switchover loses nothing from a `memory+snapshot` database. A crash takes
+/// no snapshot; the database reloads the last one taken.
+pub fn worker_exiting() {
+    let Some(t) = table() else { return };
+    if t.workers_alive.fetch_sub(1, Ordering::AcqRel) != 1 {
+        return;
+    }
+    for db in 0..NUM_DBS as u8 {
+        let Some(s) = snapshot_slot(db) else { continue };
+        let taken = crate::pg::transaction_or_abort(|| {
+            Spi::connect_mut(|c| take_snapshot(c, db, s));
+            Some(())
+        });
+        match taken {
+            Some(()) => {
+                saved(db);
+                pgrx::log!("pg_redis: database {db} snapshotted at shutdown");
+            }
+            None => pgrx::warning!("pg_redis: database {db} could not be snapshotted at shutdown"),
+        }
     }
 }
 

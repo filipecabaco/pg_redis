@@ -4,6 +4,10 @@ use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 const MAX_PUBSUB_SLOTS: usize = 256;
 const PUBSUB_RING_CAP: usize = 256;
 pub const MAX_SUBS_PER_SLOT: usize = 16;
+/// The channel list has one entry more than a client may fill: the
+/// connection's own client-tracking channel (`tracking::channel`) lives there,
+/// so a client gets all `MAX_SUBS_PER_SLOT` of its own.
+const CHANNEL_ENTRIES: usize = MAX_SUBS_PER_SLOT + 1;
 /// Maximum PUBLISH payload: the size of one slot in the shared message ring.
 pub const PUBSUB_MSG_LEN: usize = 512;
 /// Maximum channel or pattern name. One byte is reserved for the NUL
@@ -152,7 +156,7 @@ pub struct PubsubMsg {
 /// What a slot is subscribed to. Under `PubsubCtl::lock` (rule 1).
 #[repr(C)]
 pub struct Subs {
-    pub channels: [[u8; CHAN_LEN]; MAX_SUBS_PER_SLOT],
+    pub channels: [[u8; CHAN_LEN]; CHANNEL_ENTRIES],
     pub patterns: [[u8; CHAN_LEN]; MAX_SUBS_PER_SLOT],
     pub channel_count: u32,
     pub pattern_count: u32,
@@ -173,6 +177,11 @@ pub struct PubsubSlot {
     subs: UnsafeCell<Subs>,
     head: AtomicU32,
     tail: AtomicU32,
+    /// Set when a publish found the ring full. Redis disconnects a subscriber
+    /// that falls this far behind (`client-output-buffer-limit pubsub`); its
+    /// connection sees this and closes, so the client learns it lost messages
+    /// instead of carrying on with a gap it cannot see.
+    overflowed: AtomicU8,
     ring: [UnsafeCell<PubsubMsg>; PUBSUB_RING_CAP],
 }
 
@@ -291,6 +300,7 @@ fn slot_reset(slots: &Slots, subs: &mut Subs, idx: usize) {
     subs.reset();
     slots[idx].head.store(0, Ordering::Relaxed);
     slots[idx].tail.store(0, Ordering::Relaxed);
+    slots[idx].overflowed.store(0, Ordering::Relaxed);
 }
 
 /// Length of a NUL-terminated fixed-size slot entry.
@@ -305,12 +315,17 @@ fn entry_eq(entry: &[u8; CHAN_LEN], value: &[u8]) -> bool {
     value.len() < CHAN_LEN && entry[..value.len()] == *value && entry[value.len()] == 0
 }
 
-fn slot_add(arr: &mut [[u8; CHAN_LEN]; MAX_SUBS_PER_SLOT], count: &mut u32, value: &[u8]) -> bool {
+fn slot_add(arr: &mut [[u8; CHAN_LEN]], count: &mut u32, value: &[u8]) -> bool {
     let n = *count as usize;
     if arr[..n].iter().any(|entry| entry_eq(entry, value)) {
         return false;
     }
-    if n >= MAX_SUBS_PER_SLOT {
+    let tracking = |name: &[u8]| name.starts_with(crate::tracking::TRACK_PREFIX);
+    let clients = arr[..n]
+        .iter()
+        .filter(|entry| !tracking(&entry[..entry_len(entry)]))
+        .count();
+    if n >= arr.len() || (!tracking(value) && clients >= MAX_SUBS_PER_SLOT) {
         return false;
     }
     let copy_len = value.len().min(CHAN_LEN - 1);
@@ -320,7 +335,7 @@ fn slot_add(arr: &mut [[u8; CHAN_LEN]; MAX_SUBS_PER_SLOT], count: &mut u32, valu
     true
 }
 
-fn slot_remove(arr: &mut [[u8; CHAN_LEN]; MAX_SUBS_PER_SLOT], count: &mut u32, value: &[u8]) {
+fn slot_remove(arr: &mut [[u8; CHAN_LEN]], count: &mut u32, value: &[u8]) {
     let n = *count as usize;
     if let Some(i) = arr[..n].iter().position(|entry| entry_eq(entry, value)) {
         arr[i] = arr[n - 1];
@@ -328,7 +343,7 @@ fn slot_remove(arr: &mut [[u8; CHAN_LEN]; MAX_SUBS_PER_SLOT], count: &mut u32, v
     }
 }
 
-fn slot_names(arr: &[[u8; CHAN_LEN]; MAX_SUBS_PER_SLOT], count: u32) -> Vec<Vec<u8>> {
+fn slot_names(arr: &[[u8; CHAN_LEN]], count: u32) -> Vec<Vec<u8>> {
     arr[..count as usize]
         .iter()
         .map(|entry| entry[..entry_len(entry)].to_vec())
@@ -342,7 +357,7 @@ enum List {
     Patterns,
 }
 
-fn list(subs: &mut Subs, which: List) -> (&mut [[u8; CHAN_LEN]; MAX_SUBS_PER_SLOT], &mut u32) {
+fn list(subs: &mut Subs, which: List) -> (&mut [[u8; CHAN_LEN]], &mut u32) {
     match which {
         List::Channels => (&mut subs.channels, &mut subs.channel_count),
         List::Patterns => (&mut subs.patterns, &mut subs.pattern_count),
@@ -505,6 +520,7 @@ fn write_to_ring(slot: &PubsubSlot, channel: &[u8], pattern: &[u8], payload: &[u
     let head = slot.head.load(Ordering::Acquire);
     let tail = slot.tail.load(Ordering::Relaxed);
     if tail.wrapping_sub(head) >= PUBSUB_RING_CAP as u32 {
+        slot.overflowed.store(1, Ordering::Release);
         return false;
     }
     // SAFETY: rule 2 — the message at `tail` is outside what the consumer may
@@ -553,6 +569,11 @@ fn wait_on(slot: &PubsubSlot, seen_tail: u32, timeout: std::time::Duration) {
 
 /// Take the oldest message from slot `idx`'s ring. Only the connection that
 /// owns the slot calls this: it is the ring's one consumer (rule 2).
+/// Whether a message for slot `idx` was dropped because its ring was full.
+pub fn overflowed(slots: &Slots, idx: usize) -> bool {
+    slots[idx].overflowed.load(Ordering::Acquire) != 0
+}
+
 pub fn poll_message(slots: &Slots, idx: usize) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     poll_slot(&slots[idx])
 }
@@ -821,6 +842,43 @@ mod tests {
         assert_eq!(PUBSUB_MSG_LEN, 512);
         // One byte of every channel slot is reserved for the terminator.
         assert_eq!(MAX_CHANNEL_LEN, CHAN_LEN - 1);
+    }
+
+    #[test]
+    fn a_full_ring_marks_its_slot_overflowed() {
+        let slot = slot();
+        assert_eq!(slot.overflowed.load(Ordering::Acquire), 0);
+        for _ in 0..PUBSUB_RING_CAP {
+            assert!(write_to_ring(&slot, b"ch", b"", b"m"));
+        }
+        assert_eq!(slot.overflowed.load(Ordering::Acquire), 0);
+        // One more than the ring holds is dropped, and the slot says so.
+        assert!(!write_to_ring(&slot, b"ch", b"", b"m"));
+        assert_eq!(slot.overflowed.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn a_client_gets_every_channel_beside_its_tracking_channel() {
+        let mut arr = [[0u8; CHAN_LEN]; CHANNEL_ENTRIES];
+        let mut count = 0u32;
+        let own = crate::tracking::channel(7);
+        assert!(slot_add(&mut arr, &mut count, &own));
+        for i in 0..MAX_SUBS_PER_SLOT {
+            assert!(
+                slot_add(&mut arr, &mut count, format!("c{i}").as_bytes()),
+                "channel {i}"
+            );
+        }
+        assert!(!slot_add(&mut arr, &mut count, b"one-too-many"));
+        assert_eq!(count as usize, MAX_SUBS_PER_SLOT + 1);
+
+        // The tracking channel fits after the client's own, too.
+        let mut arr = [[0u8; CHAN_LEN]; CHANNEL_ENTRIES];
+        let mut count = 0u32;
+        for i in 0..MAX_SUBS_PER_SLOT {
+            assert!(slot_add(&mut arr, &mut count, format!("c{i}").as_bytes()));
+        }
+        assert!(slot_add(&mut arr, &mut count, &own));
     }
 
     #[test]

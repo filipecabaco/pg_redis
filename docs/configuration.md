@@ -4,8 +4,8 @@
 
 | GUC | Default | PostgreSQL context | Description |
 |-----|---------|--------------------|-------------|
-| `redis.port` | `6379` | superuser | TCP port the Redis listener binds to (1024–65535) |
-| `redis.listen_address` | `127.0.0.1` | superuser | IP address to bind on. See [Exposing the listener](#exposing-the-listener) before widening this. |
+| `redis.port` | `6379` | postmaster | TCP port the Redis listener binds to (1024–65535) |
+| `redis.listen_address` | `127.0.0.1` | postmaster | IP address to bind on. See [Exposing the listener](#exposing-the-listener) before widening this. |
 | `redis.password` | _(none)_ | superuser | When set, clients must `AUTH <password>` before any command. Only superusers (and members of `pg_read_all_settings`) can read it, and `SHOW ALL` leaves it out. |
 | `redis.database` | `postgres` | postmaster | The database the workers connect to. Run `CREATE EXTENSION pg_redis` in this database. |
 | `redis.default_db` | `0` | superuser | Database new connections start on (0–15). `0` uses the `memory` policy by default, matching Redis's own default database; `8` uses `logged` by default. |
@@ -18,20 +18,33 @@
 
 ## When a change takes effect
 
-Each worker reads every `redis.*` setting once, when it starts, and does not re-read the
-configuration on `pg_reload_conf()`. A change takes effect when the workers next start, which
-for the workers started with the server means a server restart.
+`postmaster` settings change only at server start: `redis.port`, `redis.listen_address`,
+`redis.database`, `redis.workers` and `redis.maxmemory`. The listener is bound once, and the
+shared memory and the worker pool are sized when the server starts.
 
-The context column is what PostgreSQL itself allows. `postmaster` settings can only change
-at server start. `superuser` and `sighup` settings are accepted on a reload, and `SHOW` reports
-the new value, but the running workers keep the one they started with.
+Every other setting takes effect on a reload. Each worker reads the configuration again on
+`pg_reload_conf()` (or `SIGHUP`), as a backend does. A new `redis.password` applies to the
+next `AUTH` and to new connections; connections that already authenticated stay
+authenticated, as in Redis. A new `redis.default_db` and `redis.max_connections` apply to new
+connections. A new `redis.batch_size`, `redis.snapshot_interval` or `redis.maxmemory_policy`
+applies from the worker's next round. A value set with `CONFIG SET maxmemory-policy` keeps
+precedence over the setting until the server restarts.
 
-Change settings with `ALTER SYSTEM`, then restart:
+A setting given on the `postgres` command line (`-c redis.password=…`) outranks
+`postgresql.auto.conf`, so `ALTER SYSTEM` cannot change it; that is PostgreSQL's order of
+precedence for every setting.
+
+```sql
+ALTER SYSTEM SET redis.password = 'new-secret';
+ALTER SYSTEM SET redis.snapshot_interval = 30;
+SELECT pg_reload_conf();
+```
+
+The `postmaster` settings need a restart:
 
 ```sql
 ALTER SYSTEM SET redis.workers = 8;
 ALTER SYSTEM SET redis.maxmemory = '1GB';
-ALTER SYSTEM SET redis.snapshot_interval = 30;
 ```
 
 ```bash
@@ -108,10 +121,12 @@ SELECT redis.remove_workers(2); -- remove 2 (newest first)
 | `redis.add_workers(n)` | `integer` | Start n additional workers (no restart needed). Run it in the extension's database: the new workers connect to the database it is called from. |
 | `redis.remove_workers(n)` | `integer` | Terminate n workers (newest first) |
 
-No pg_redis worker is restarted by PostgreSQL once it exits, whether it was started with the
-server or added with `redis.add_workers`. A worker removed with `redis.remove_workers` stays
-gone until the next server restart or `redis.add_workers` call. To permanently change the pool
-size, update `redis.workers` and restart the server.
+A worker that fails is restarted after 5 seconds, and after a crash anywhere in the cluster
+the postmaster starts every worker again once it has reset shared memory. A worker removed
+with `redis.remove_workers` exits cleanly and is not restarted; the next server restart brings
+the pool back to `redis.workers`. Workers added with `redis.add_workers` restart the same way
+but are not re-created by a server restart. To change the pool size for good, set
+`redis.workers` and restart.
 
 `redis.add_workers`, `redis.remove_workers` and `redis.set_policy` raise
 `permission denied: superuser required` for any other role.

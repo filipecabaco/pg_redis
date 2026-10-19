@@ -64,6 +64,9 @@ const SUBSCRIBE_POLL: Duration = Duration::from_millis(5);
 /// wakes the sleeper — only how long a command from a quiet subscriber waits.
 const SUBSCRIBE_WAIT_MIN: Duration = Duration::from_millis(5);
 const SUBSCRIBE_WAIT_MAX: Duration = Duration::from_millis(250);
+/// How long a write may wait for a client to read before the connection is
+/// closed. Redis's pub/sub output limit gives a slow subscriber 60 seconds.
+const WRITE_STALL: Duration = Duration::from_secs(60);
 
 pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
@@ -151,29 +154,35 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
     // Connection threads report these through CONFIG GET and INFO, and may
     // not read a GUC themselves.
     crate::config::snapshot_gucs();
+    // The port and address are bound once; both need a restart to change.
+    // Everything else a connection uses is read from the snapshot as it is
+    // needed, so a reload reaches new connections and the next AUTH.
     let port = crate::PORT.get() as u16;
-    let default_db: u8 = crate::DEFAULT_DB.get().clamp(0, 15) as u8;
     let listen_addr = crate::LISTEN_ADDRESS
         .get()
         .as_deref()
         .and_then(|s| s.to_str().ok())
         .unwrap_or("0.0.0.0")
         .to_string();
-    let max_conn = crate::MAX_CONNECTIONS.get().max(1) as usize;
-    let password = configured_password();
-    let batch_size = crate::BATCH_SIZE.get().max(1) as usize;
+    let mut batch_size = crate::BATCH_SIZE.get().max(1) as usize;
 
     let (cmd_tx, cmd_rx) = mpsc::sync_channel::<DispatchMsg>(256);
 
-    std::thread::spawn(move || {
-        accept_loop(port, cmd_tx, default_db, listen_addr, max_conn, password)
-    });
+    std::thread::spawn(move || accept_loop(port, cmd_tx, listen_addr));
 
     let mut last_expiry_scan = Instant::now();
 
     loop {
         if BackgroundWorker::sigterm_received() {
             break;
+        }
+        // `pg_reload_conf()` or SIGHUP: read the configuration file again, as
+        // a backend does between queries, and hand the result to the
+        // connection threads.
+        if BackgroundWorker::sighup_received() {
+            crate::pg::reload_config();
+            crate::config::snapshot_gucs();
+            batch_size = crate::BATCH_SIZE.get().max(1) as usize;
         }
         match cmd_rx.recv_timeout(Duration::from_millis(250)) {
             Ok(first) => match first {
@@ -695,14 +704,7 @@ pub(crate) fn watch_targets(cmd: &Command, db: u8) -> Option<Vec<(u8, Vec<u8>)>>
     }
 }
 
-fn accept_loop(
-    port: u16,
-    cmd_tx: mpsc::SyncSender<DispatchMsg>,
-    default_db: u8,
-    listen_addr: String,
-    max_conn: usize,
-    password: Option<Vec<u8>>,
-) {
+fn accept_loop(port: u16, cmd_tx: mpsc::SyncSender<DispatchMsg>, listen_addr: String) {
     let addr: SocketAddr = match format!("{}:{}", listen_addr, port).parse() {
         Ok(a) => a,
         Err(e) => {
@@ -716,7 +718,7 @@ fn accept_loop(
     // The Redis port bypasses PostgreSQL authentication entirely: whoever reaches
     // it gets read/write access to every redis.* table through the worker's own
     // privileges. Binding it off-host without a password is almost never intended.
-    if password.is_none() && !addr.ip().is_loopback() {
+    if crate::config::live_gucs().password().is_none() && !addr.ip().is_loopback() {
         eprintln!(
             "pg_redis: WARNING listening on {} with no redis.password set — \
              any host that can reach this port has full access to redis.* data",
@@ -750,7 +752,8 @@ fn accept_loop(
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
-                if conn_count.load(Ordering::Relaxed) >= max_conn {
+                let settings = crate::config::live_gucs();
+                if conn_count.load(Ordering::Relaxed) >= settings.maxclients.max(1) as usize {
                     if let Ok(mut w) = s.try_clone() {
                         write_error(&mut w, "max clients reached").ok();
                     }
@@ -759,15 +762,23 @@ fn accept_loop(
                 if let Err(e) = s.set_read_timeout(Some(Duration::from_secs(30))) {
                     eprintln!("pg_redis: set_read_timeout failed: {}", e);
                 }
+                // A client that takes no bytes at all for this long is closed,
+                // where Redis would close it at its output buffer limit. Without
+                // it a client that stops reading parks its connection thread in
+                // a write for good, and a subscriber that fell behind is never
+                // told.
+                if let Err(e) = s.set_write_timeout(Some(WRITE_STALL)) {
+                    eprintln!("pg_redis: set_write_timeout failed: {}", e);
+                }
                 if let Err(e) = s.set_nodelay(true) {
                     eprintln!("pg_redis: set_nodelay failed: {}", e);
                 }
                 let tx = cmd_tx.clone();
                 let counter = Arc::clone(&conn_count);
-                let pw = password.clone();
+                let default_db = settings.default_db;
                 counter.fetch_add(1, Ordering::Relaxed);
                 std::thread::spawn(move || {
-                    conn_loop(s, tx, default_db, pw);
+                    conn_loop(s, tx, default_db, Password::Live);
                     counter.fetch_sub(1, Ordering::Relaxed);
                 });
             }
@@ -793,18 +804,30 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     bool::from(equal)
 }
 
-fn configured_password() -> Option<Vec<u8>> {
-    crate::PASSWORD.get().as_deref().and_then(|s| {
-        let b = s.to_bytes();
-        if b.is_empty() { None } else { Some(b.to_vec()) }
-    })
+/// Where a connection reads the password it checks `AUTH` against.
+enum Password {
+    /// `redis.password` as of the last reload, read at each check.
+    Live,
+    /// Fixed, for tests that drive a connection without a worker.
+    #[cfg(test)]
+    Fixed(Option<Vec<u8>>),
+}
+
+impl Password {
+    fn current(&self) -> Option<Vec<u8>> {
+        match self {
+            Password::Live => crate::config::live_gucs().password(),
+            #[cfg(test)]
+            Password::Fixed(p) => p.clone(),
+        }
+    }
 }
 
 fn conn_loop(
     stream: TcpStream,
     cmd_tx: mpsc::SyncSender<DispatchMsg>,
     default_db: u8,
-    required_password: Option<Vec<u8>>,
+    required_password: Password,
 ) {
     let write_stream = match stream.try_clone() {
         Ok(s) => s,
@@ -832,7 +855,7 @@ fn conn_loop(
     let mut in_flight: Option<InFlight> = None;
     let mut db = default_db;
     let mut proto: u8 = 2;
-    let mut authenticated = required_password.is_none();
+    let mut authenticated = required_password.current().is_none();
     let mut multi = false;
     // Queued commands with the lines they came from, which MONITOR shows
     // when EXEC runs them.
@@ -1276,9 +1299,9 @@ fn conn_loop(
                 ..
             } => {
                 if let Some(password) = inline_auth {
-                    let ok = match &required_password {
+                    let ok = match required_password.current() {
                         None => true,
-                        Some(expected) => constant_time_eq(password.as_bytes(), expected),
+                        Some(expected) => constant_time_eq(password.as_bytes(), &expected),
                     };
                     if ok {
                         authenticated = true;
@@ -1347,7 +1370,7 @@ fn conn_loop(
                 crate::tracking::disable(&client);
                 proto = 2;
                 client.set_proto(2);
-                authenticated = required_password.is_none();
+                authenticated = required_password.current().is_none();
                 db = default_db;
                 multi = false;
                 queue.clear();
@@ -1368,10 +1391,10 @@ fn conn_loop(
                 continue;
             }
             Command::Auth { password } => {
-                match &required_password {
+                match required_password.current() {
                     None => reply(&mut writer, |w| write_simple_string(w, "OK")),
                     Some(expected) => {
-                        if constant_time_eq(password.as_bytes(), expected) {
+                        if constant_time_eq(password.as_bytes(), &expected) {
                             authenticated = true;
                             reply(&mut writer, |w| write_simple_string(w, "OK"));
                         } else {
@@ -2114,6 +2137,12 @@ fn deliver_messages(writer: &mut ConnWriter, idx: usize, proto: u8) {
         writer.flush().ok();
     }
     writer.muted = muted;
+    // Messages were dropped: close the connection, as Redis does at its
+    // pub/sub output buffer limit. The connection loop leaves on `broken`.
+    if crate::pubsub::overflowed(slots, idx) {
+        eprintln!("pg_redis: closing a subscriber that fell behind its message queue");
+        writer.broken = true;
+    }
 }
 
 /// One published message, as the subscriber receives it.
@@ -2278,6 +2307,13 @@ fn subscribe_loop(
                     writer.flush().ok();
                 }
             }
+        }
+        // Messages were dropped: close the connection, as Redis does at its
+        // pub/sub output buffer limit.
+        if crate::pubsub::overflowed(slots, slot_idx) {
+            eprintln!("pg_redis: closing a subscriber that fell behind its message queue");
+            keep_conn = false;
+            break 'outer;
         }
 
         let parts = match parser.read_command() {
@@ -3288,7 +3324,7 @@ mod tests {
             let dispatched = fake_dispatcher(cmd_rx);
             std::thread::spawn(move || {
                 let (stream, _) = listener.accept().unwrap();
-                conn_loop(stream, cmd_tx, default_db, None);
+                conn_loop(stream, cmd_tx, default_db, Password::Fixed(None));
             });
             let client = TcpStream::connect(addr).unwrap();
             client

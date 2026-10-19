@@ -33,30 +33,27 @@ it terminates every other server process, reinitialises shared memory and runs c
 That empties every `memory` database and the in-memory copy of every `memory+snapshot` one. A
 crash of any other backend does the same.
 
-PostgreSQL does not restart the pg_redis workers after this. They are registered never to
-restart, so after a crash-and-restart cycle the Redis port stays closed and
-`redis.worker_count()` returns 0. To bring the listener back, either restart the server or, in
-the extension's database, start new workers:
-
-```sql
-SELECT redis.add_workers(4);
-```
-
-The new workers reload `memory+snapshot` databases from their snapshots before serving. The
-same applies to a single worker that exits for any reason, including `redis.remove_workers`
-and `pg_terminate_backend`: it is not restarted.
+The workers come back on their own. Each is registered with a five-second restart time, so
+once the postmaster has reset shared memory it starts them again; they reload
+`memory+snapshot` databases from their snapshots before serving. A worker that exits with an
+error is restarted the same way, after five seconds. A worker stopped with
+`redis.remove_workers` or `pg_terminate_backend` exits cleanly and is not restarted.
 
 ## Backups
 
-The `redis.*` tables belong to the extension, and the extension's SQL never marks them with
-`pg_extension_config_dump`. **`pg_dump` and `pg_dumpall` do not include pg_redis data.** A dump
-contains `CREATE EXTENSION pg_redis` and nothing from the `redis.*` tables, so restoring it
-gives you empty databases.
+`pg_dump` and `pg_dumpall` include pg_redis data. The extension marks every logged table in
+the `redis` schema with `pg_extension_config_dump`, so a dump carries the `logged` databases,
+the snapshots of `memory+snapshot` databases, the policy table, `FUNCTION` libraries and
+pub/sub routes. Restoring it runs `CREATE EXTENSION pg_redis` and then loads those rows. The
+script cache (`redis.scripts`) is left out: it is an unlogged cache, which Redis does not
+persist either.
 
-Physical backups do include it, because the tables are ordinary relations in the data
-directory: `pg_basebackup`, file-system level backups, point-in-time recovery and physical
-replicas all carry the `logged` databases, the snapshots of `memory+snapshot` databases and
-the policy table. `memory` databases are not in any backup.
+Physical backups include the same data, because the tables are ordinary relations in the
+data directory: `pg_basebackup`, file-system level backups, point-in-time recovery and
+physical replicas.
+
+`memory` databases are in no backup of either kind. A `memory+snapshot` database is backed up
+as of its last snapshot; run `SAVE` first to take one.
 
 ## Memory
 

@@ -302,3 +302,23 @@ BEGIN
     );
 END;
 $$;
+
+-- pg_dump skips the tables an extension creates unless its script marks them
+-- as holding user data, so without this a logical backup held none of the
+-- data in `logged` databases, snapshots, policies or functions. Every logged
+-- table in the schema is marked; `redis.scripts` is an unlogged cache that
+-- Redis does not persist either.
+DO $$
+DECLARE
+    t regclass;
+BEGIN
+    FOR t IN
+        SELECT c.oid::regclass
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'redis' AND c.relkind = 'r' AND c.relpersistence = 'p'
+    LOOP
+        PERFORM pg_catalog.pg_extension_config_dump(t, '');
+    END LOOP;
+END
+$$;

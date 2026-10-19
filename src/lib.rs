@@ -133,7 +133,8 @@ pub extern "C-unwind" fn _PG_init() {
         &PORT,
         1024,
         65535,
-        GucContext::Suset,
+        // Bound once at worker start; a reload cannot move the listener.
+        GucContext::Postmaster,
         GucFlags::default(),
     );
 
@@ -181,7 +182,7 @@ pub extern "C-unwind" fn _PG_init() {
           go through PostgreSQL authentication, so widening this exposes every redis.* \
           table to anything that can reach the port. Set redis.password as well.",
         &LISTEN_ADDRESS,
-        GucContext::Suset,
+        GucContext::Postmaster,
         GucFlags::default(),
     );
 
@@ -266,9 +267,19 @@ pub extern "C-unwind" fn _PG_init() {
             .set_argument(Some(db_oid_datum))
             .enable_spi_access()
             .set_start_time(BgWorkerStartTime::RecoveryFinished)
+            .set_restart_time(Some(WORKER_RESTART))
             .load();
     }
 }
+
+/// How long the postmaster waits before starting a worker again. A worker
+/// that exits with an uncaught ERROR (status 1) is restarted after this; after
+/// a crash anywhere in the cluster, the postmaster restarts every worker that
+/// has a restart time as soon as it has reset shared memory. Without one,
+/// either event left the Redis port closed until someone ran
+/// `redis.add_workers` or restarted PostgreSQL. A worker that exits cleanly
+/// (status 0: shutdown, or `redis.remove_workers`) is not restarted.
+const WORKER_RESTART: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[pg_guard]
 #[unsafe(no_mangle)]
@@ -277,7 +288,8 @@ pub extern "C-unwind" fn pg_redis_worker_main(arg: pg_sys::Datum) {
 }
 
 /// Add n additional pg_redis workers dynamically (no server restart required).
-/// Dynamic workers will not restart after being terminated.
+/// They restart like the startup workers (`WORKER_RESTART`); `remove_workers`
+/// stops them for good. They are not re-created by a server restart.
 #[pg_extern(schema = "redis")]
 fn add_workers(n: i32) -> i32 {
     if !pg::is_superuser() {
@@ -301,7 +313,7 @@ fn add_workers(n: i32) -> i32 {
             .set_argument(Some(db_oid_datum))
             .enable_spi_access()
             .set_start_time(BgWorkerStartTime::RecoveryFinished)
-            .set_restart_time(None)
+            .set_restart_time(Some(WORKER_RESTART))
             .load_dynamic()
         {
             Ok(_) => added += 1,
@@ -311,9 +323,9 @@ fn add_workers(n: i32) -> i32 {
     added
 }
 
-/// Terminate n pg_redis workers (newest first). Dynamic workers will not restart;
-/// startup workers will restart after ~5 seconds. To permanently reduce the startup
-/// pool, lower redis.workers and restart the server.
+/// Terminate n pg_redis workers (newest first). A terminated worker exits
+/// cleanly and is not restarted, startup or dynamic; a server restart brings
+/// the startup pool back to `redis.workers`.
 #[pg_extern(schema = "redis")]
 fn remove_workers(n: i32) -> i32 {
     if !pg::is_superuser() {

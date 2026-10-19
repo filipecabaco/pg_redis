@@ -19,9 +19,12 @@ pub fn spec(name: &str) -> Option<&'static ConfigSpec> {
         .find(|c| c.name == n || (!c.alias.is_empty() && c.alias == n))
 }
 
-/// The GUC values `CONFIG GET` reports in place of Redis's defaults. Read once
-/// on the worker's main thread by [`snapshot_gucs`]: pgrx refuses a GUC read
-/// from any other thread, and these are answered on connection threads.
+/// The GUC values connection threads need: what `CONFIG GET` reports in place
+/// of Redis's defaults, and the password, connection limit and default
+/// database the listener applies. Taken on the worker's main thread by
+/// [`snapshot_gucs`], at start and again after every reload: pgrx refuses a
+/// GUC read from any other thread, and these are answered on connection
+/// threads.
 #[derive(Default, Clone)]
 pub struct LiveGucs {
     pub port: i32,
@@ -29,26 +32,46 @@ pub struct LiveGucs {
     pub requirepass: Option<String>,
     pub maxclients: i32,
     pub maxmemory_policy: Option<String>,
+    pub default_db: u8,
 }
 
-static LIVE: std::sync::OnceLock<LiveGucs> = std::sync::OnceLock::new();
+impl LiveGucs {
+    /// `redis.password` as the bytes a client must send, or `None` when no
+    /// password is set.
+    pub fn password(&self) -> Option<Vec<u8>> {
+        self.requirepass
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .map(|p| p.as_bytes().to_vec())
+    }
+}
 
-/// Take the snapshot. Call on the background worker's main thread.
+static LIVE: std::sync::RwLock<Option<LiveGucs>> = std::sync::RwLock::new(None);
+
+/// Take the snapshot, replacing the last one. Call on the background
+/// worker's main thread.
 pub fn snapshot_gucs() {
     let s = |g: &pgrx::guc::GucSetting<Option<std::ffi::CString>>| {
         g.get().and_then(|c| c.to_str().ok().map(str::to_string))
     };
-    let _ = LIVE.set(LiveGucs {
+    let next = LiveGucs {
         port: crate::PORT.get(),
         bind: s(&crate::LISTEN_ADDRESS),
         requirepass: s(&crate::PASSWORD),
         maxclients: crate::MAX_CONNECTIONS.get(),
         maxmemory_policy: s(&crate::MAXMEMORY_POLICY),
-    });
+        default_db: crate::DEFAULT_DB.get().clamp(0, 15) as u8,
+    };
+    // A poisoned lock only means a reader panicked holding it; the value is
+    // a plain copy and still whole.
+    *LIVE.write().unwrap_or_else(|e| e.into_inner()) = Some(next);
 }
 
 pub fn live_gucs() -> LiveGucs {
-    LIVE.get().cloned().unwrap_or_default()
+    LIVE.read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default()
 }
 
 /// What pg_redis itself fixes for a parameter, where Redis's default would

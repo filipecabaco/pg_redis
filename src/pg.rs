@@ -27,6 +27,16 @@ pub fn is_superuser() -> bool {
     unsafe { pg_sys::superuser() }
 }
 
+/// Read the configuration files again after a SIGHUP, as a backend does
+/// between queries, so `SHOW` and every GUC read see the new values.
+pub fn reload_config() {
+    assert!(!in_transaction(), "a reload is taken between transactions");
+    // SAFETY: called on the main thread (the FFI guard enforces it) and
+    // outside a transaction (asserted), where PostgreSQL's own backends call
+    // it. An invalid setting in the file is logged and skipped, not raised.
+    unsafe { pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP) }
+}
+
 /// The database this backend is connected to.
 pub fn database_oid() -> pg_sys::Oid {
     // SAFETY: a plain read of a backend-local global, set once at connection

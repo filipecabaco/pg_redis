@@ -263,8 +263,8 @@ Everything runs through fixed-size slots, so these are hard caps:
 | Channel / pattern name | 255 bytes | `SUBSCRIBE`, `PSUBSCRIBE`, `PUBLISH` error |
 | Message payload | 512 bytes | `PUBLISH` errors |
 | Concurrent subscriber connections | 256 | `SUBSCRIBE` returns "max pub/sub subscribers reached" |
-| Channels + patterns per connection | 15 channels, 16 patterns | A name past the limit gets an error; the rest of the command still applies. The 16th channel slot holds the connection's own client-tracking channel |
-| Queued undelivered messages per subscriber | 256 | Further messages dropped for that subscriber |
+| Channels + patterns per connection | 16 each | A name past the limit gets an error; the rest of the command still applies. The connection's own client-tracking channel has a slot of its own and does not count |
+| Queued undelivered messages per subscriber | 256 | The subscriber is disconnected, as Redis does past its pub/sub output limit |
 | Active routes | 64 | — |
 
 Names and payloads over the limit are **rejected**. They are not truncated,
@@ -407,6 +407,10 @@ client get `BUSY`, on every worker, until it ends or `SCRIPT KILL` /
   A RESP3 client that invalidations are redirected to receives them as push
   messages with no subscription of its own; the connection that sets up the
   redirect hands it a pub/sub slot to receive them on.
+- **A client that stops reading is disconnected after 60 seconds.** A reply
+  or pub/sub message that cannot be written for that long closes the
+  connection. Redis instead buffers replies for a normal client without limit
+  and applies its output limits only to subscribers and replicas.
 - **Eviction is silent.** A key evicted under `redis.maxmemory_policy` sends
   no `evicted` notification and no client-tracking invalidation. Keyspace
   notifications otherwise follow `notify-keyspace-events` event for

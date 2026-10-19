@@ -2118,6 +2118,23 @@ describe("Pub/Sub size limits", () => {
 		}
 	});
 
+	// Every subscribed connection also holds its own client-tracking channel.
+	// It used to take one of the sixteen places, so the sixteenth SUBSCRIBE was
+	// refused by an error that said sixteen were allowed.
+	test("a connection holds sixteen channels, and the seventeenth is refused", async () => {
+		const sub = await new RawRedis().connect();
+		try {
+			for (let i = 1; i <= 16; i++) {
+				const reply = (await sub.send("SUBSCRIBE", `cap-${i}`)).toString();
+				expect(reply.startsWith("-")).toBe(false);
+			}
+			const refused = (await sub.send("SUBSCRIBE", "cap-17")).toString();
+			expect(refused).toContain("at most 16 channels");
+		} finally {
+			sub.close();
+		}
+	});
+
 	test("an over-long payload is rejected, not truncated", async () => {
 		await expect(
 			client.send("PUBLISH", ["limit-chan", "p".repeat(MAX_PAYLOAD + 1)]),

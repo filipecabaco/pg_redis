@@ -38,6 +38,8 @@ unsafe impl Shareable for crate::server::ServerCtl {}
 // SAFETY: atomics only, read and written under its spinlock; zeroed, every
 // slot is free and the lock open.
 unsafe impl Shareable for crate::cursor::CursorTable {}
+// SAFETY: atomics only; zeroed, every slot is free.
+unsafe impl Shareable for crate::access::AccessTable {}
 
 impl<T> Block<T> {
     pub const fn new() -> Self {

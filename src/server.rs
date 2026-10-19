@@ -223,6 +223,16 @@ pub struct ServerCtl {
     pub keyspace_hits: AtomicU64,
     pub keyspace_misses: AtomicU64,
     pub expired_keys: AtomicU64,
+    /// INFO's `evicted_keys`.
+    pub evicted_keys: AtomicU64,
+    /// When the arena went over the limit and stayed there (unix ms, 0 when
+    /// under), and the milliseconds spent over it before: Redis's
+    /// `current_eviction_exceeded_time` and `total_eviction_exceeded_time`.
+    pub eviction_exceeded_since: AtomicI64,
+    pub eviction_exceeded_total: AtomicU64,
+    /// Clients in `CLIENT NO-TOUCH` mode: while 0, no command looks its
+    /// client up to ask.
+    pub no_touch_clients: AtomicU32,
     pub net_input: AtomicU64,
     pub net_output: AtomicU64,
     pub cmdstats: [CmdStat; CMD_SLOTS],
@@ -443,10 +453,20 @@ impl ClientHandle {
 
     pub fn set_flag(&self, f: u32, on: bool) {
         if let Some(s) = self.slot {
-            if on {
-                s.flags.fetch_or(f, Ordering::Relaxed);
+            let was = if on {
+                s.flags.fetch_or(f, Ordering::Relaxed)
             } else {
-                s.flags.fetch_and(!f, Ordering::Relaxed);
+                s.flags.fetch_and(!f, Ordering::Relaxed)
+            };
+            if f & flag::NO_TOUCH != 0
+                && (was & flag::NO_TOUCH != 0) != on
+                && let Some(ctl) = ctl()
+            {
+                if on {
+                    ctl.no_touch_clients.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    ctl.no_touch_clients.fetch_sub(1, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -486,6 +506,7 @@ impl ClientHandle {
 impl Drop for ClientHandle {
     fn drop(&mut self) {
         if let Some(s) = self.slot {
+            self.set_flag(flag::NO_TOUCH, false);
             s.id.store(0, Ordering::Relaxed);
             s.state.store(0, Ordering::Release);
         }
@@ -709,6 +730,8 @@ pub fn reset_stats() {
         &ctl.keyspace_hits,
         &ctl.keyspace_misses,
         &ctl.expired_keys,
+        &ctl.evicted_keys,
+        &ctl.eviction_exceeded_total,
         &ctl.net_input,
         &ctl.net_output,
     ] {
@@ -739,6 +762,11 @@ pub fn config_get(name: &str) -> Option<String> {
             .find(|c| c.used.load(Ordering::Relaxed) == 1 && c.name.load() == name.as_bytes())
             .map(|c| String::from_utf8_lossy(&c.value.load()).into_owned())
     })
+}
+
+/// Changes with every `CONFIG SET`; odd while one is being written.
+pub fn config_generation() -> u32 {
+    ctl().map_or(0, |c| c.config_seq.load(Ordering::Acquire))
 }
 
 /// Store several values at once, all visible together.
@@ -1268,6 +1296,54 @@ pub fn count_expired(n: u64) {
     {
         ctl.expired_keys.fetch_add(n, Ordering::Relaxed);
     }
+}
+
+/// Keys evicted under `maxmemory-policy`, for INFO's `evicted_keys`.
+pub fn count_evicted(n: u64) {
+    if let Some(ctl) = ctl() {
+        ctl.evicted_keys.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// After an eviction round: whether the arena is still over the limit.
+pub fn eviction_exceeded(over: bool) {
+    let Some(ctl) = ctl() else { return };
+    let since = ctl.eviction_exceeded_since.load(Ordering::Relaxed);
+    if over {
+        if since == 0 {
+            ctl.eviction_exceeded_since
+                .store(now_ms(), Ordering::Relaxed);
+        }
+    } else if since != 0
+        && ctl
+            .eviction_exceeded_since
+            .compare_exchange(since, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        ctl.eviction_exceeded_total
+            .fetch_add((now_ms() - since).max(0) as u64, Ordering::Relaxed);
+    }
+}
+
+/// INFO's `total_eviction_exceeded_time` and `current_eviction_exceeded_time`,
+/// in milliseconds.
+pub fn eviction_exceeded_times() -> (u64, u64) {
+    let Some(ctl) = ctl() else { return (0, 0) };
+    let since = ctl.eviction_exceeded_since.load(Ordering::Relaxed);
+    let current = if since == 0 {
+        0
+    } else {
+        (now_ms() - since).max(0) as u64
+    };
+    (
+        ctl.eviction_exceeded_total.load(Ordering::Relaxed) + current,
+        current,
+    )
+}
+
+/// Whether any client is in `CLIENT NO-TOUCH` mode.
+pub fn any_no_touch() -> bool {
+    ctl().is_some_and(|c| c.no_touch_clients.load(Ordering::Relaxed) > 0)
 }
 
 /// Whether a `CLIENT PAUSE` is in force.

@@ -31,10 +31,11 @@ const SKIPFILE = `${HERE}skip.txt`;
  * Every unit a server with Redis's full command set should pass when driven
  * from outside. Left out: the units Redis itself tags external:skip at the
  * top — they reconfigure, restart or replicate the server under test (acl,
- * aofrw, auth, client-eviction, limits, maxmemory, obuf-limits, pubsubshard,
- * shutdown, wait) — and the ones that measure Redis's own allocator or
- * internals rather than behaviour (memefficiency, oom-score-adj, querybuf,
- * replybufsize, violations, tls).
+ * aofrw, auth, client-eviction, limits, obuf-limits, pubsubshard, shutdown,
+ * wait) — and the ones that measure Redis's own allocator or internals
+ * rather than behaviour (memefficiency, oom-score-adj, querybuf,
+ * replybufsize, violations, tls). maxmemory is the exception: it runs, in
+ * part, through `REWRITTEN` below.
  */
 const UNITS = [
 	"unit/type/string",
@@ -74,20 +75,63 @@ const UNITS = [
 	"unit/other",
 	"unit/auth",
 	"unit/quit",
+	"unit/maxmemory",
 ];
+
+/**
+ * Units Redis tags `external:skip` throughout that pg_redis can still run
+ * most of. Each is copied with the tag removed and with the top-level blocks
+ * that cannot run against an external server left out: the ones that start
+ * a replica, read the replication stream, or measure client output buffers.
+ * A block left in that fails is a failure in the report like any other.
+ * Only on the halves listed: maxmemory applies to memory databases alone.
+ */
+const REWRITTEN: Record<string, { halves: Half[]; drop: RegExp[] }> = {
+	"unit/maxmemory": {
+		halves: ["memory"],
+		drop: [/test_slave_buffers/, /attach_to_replication_stream/, /proc init_test/],
+	},
+};
 
 /**
  * Tags whose tests cannot pass against any external server that is not Redis:
  * they need DEBUG, replication, or SAVE/BGSAVE to set up the case at all.
  * Denying them keeps the report about the command under test.
  */
-const DENY_TAGS = [
-	"needs:debug",
-	"needs:repl",
-	"needs:save",
-	"needs:reset",
-	"needs:config-maxmemory",
-];
+const DENY_TAGS = ["needs:debug", "needs:repl", "needs:save", "needs:reset"];
+
+/**
+ * `needs:config-maxmemory` tests set a memory limit and expect eviction or
+ * OOM from it, which only the memory half has: a logged database is bounded
+ * by disk. Denied there, run on the memory half.
+ */
+const denyTags = (half: Half) =>
+	half === "durable" ? [...DENY_TAGS, "needs:config-maxmemory"] : DENY_TAGS;
+
+/**
+ * The unit as the suite is to run it: the file itself, or the rewritten copy
+ * `REWRITTEN` describes, written under tests/unit/pg_redis/.
+ */
+async function unitPath(unit: string): Promise<string> {
+	const rw = REWRITTEN[unit];
+	if (!rw) return unit;
+	const source = await Bun.file(`tests/${unit}.tcl`).text();
+	const chunks: string[][] = [];
+	for (const line of source.split("\n")) {
+		// A top-level block starts at the left margin; its closing brace and
+		// the lines inside it do not.
+		if (chunks.length === 0 || (/^\S/.test(line) && !/^}/.test(line))) chunks.push([]);
+		chunks[chunks.length - 1].push(line);
+	}
+	const kept = chunks
+		.map((c) => c.join("\n"))
+		.filter((c) => !rw.drop.some((re) => re.test(c)))
+		.join("\n")
+		.replaceAll(/\s*"?external:skip"?/g, "");
+	const name = `unit/pg_redis/${unit.replace(/^unit\//, "")}`;
+	await Bun.write(`tests/${name}.tcl`, kept);
+	return name;
+}
 
 const HALVES = {
 	durable: [] as string[],
@@ -149,7 +193,7 @@ async function runUnit(half: Half, unit: string): Promise<UnitResult> {
 		"--port",
 		PORT,
 		"--single",
-		unit,
+		await unitPath(unit),
 		"--clients",
 		"1",
 		"--durable",
@@ -161,7 +205,9 @@ async function runUnit(half: Half, unit: string): Promise<UnitResult> {
 		"--skipfile",
 		SKIPFILE,
 		"--tags",
-		DENY_TAGS.map((t) => `-${t}`).join(" "),
+		denyTags(half)
+			.map((t) => `-${t}`)
+			.join(" "),
 		...HALVES[half],
 	];
 	const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
@@ -219,6 +265,7 @@ const summary: string[] = [];
 for (const half of Object.keys(HALVES) as Half[]) {
 	console.log(`\n══ ${half} half ══════════════════════════════════════`);
 	for (const unit of units) {
+		if (REWRITTEN[unit] && !REWRITTEN[unit].halves.includes(half)) continue;
 		const r = await runUnit(half, unit);
 		results.set(`${half} | ${unit}`, r);
 		const counts = { ok: 0, err: 0, skip: 0 };
@@ -256,7 +303,10 @@ if (updating) {
 	if (onlyUnits.length > 0) {
 		const previous: Baseline = await Bun.file(BASELINE).json();
 		for (const half of Object.keys(HALVES) as Half[]) {
-			for (const unit of units) previous[half][unit] = baseline[half][unit] ?? [];
+			for (const unit of units) {
+				if (REWRITTEN[unit] && !REWRITTEN[unit].halves.includes(half)) continue;
+				previous[half][unit] = baseline[half][unit] ?? [];
+			}
 		}
 		Object.assign(baseline, previous);
 	}

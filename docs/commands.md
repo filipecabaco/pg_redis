@@ -81,8 +81,9 @@ listpacks and compressed strings included. It deliberately refuses two kinds of
 payload, with an error: payloads stamped newer than version 11, which is what a
 7.4 produces and Redis 7.2 also refuses, and the compact encodings (ziplists,
 zipmaps) that no server since 6.x has written.
-`REPLACE` and `ABSTTL` behave as in Redis. `IDLETIME` and `FREQ` are accepted
-and unused, because there is no LRU or LFU clock to apply them to.
+`REPLACE`, `ABSTTL`, `IDLETIME` and `FREQ` behave as in Redis: `IDLETIME`
+sets the key's access clock under an LRU-kept policy, `FREQ` its counter under
+an LFU one, and the two exclude each other.
 
 ### `OBJECT ENCODING`
 
@@ -94,9 +95,12 @@ The name is there for clients that branch on it, and says nothing about how
 this server stores the value. A missing key answers nil. That is Redis's own
 reply for this command, though most commands give an error instead.
 
-`OBJECT IDLETIME`, `OBJECT FREQ` and `OBJECT REFCOUNT` answer nil for every
-key, present or not. There is no LRU or LFU clock for the first two to read.
-Every other `OBJECT` subcommand answers nil too.
+`OBJECT IDLETIME` and `OBJECT FREQ` read the key's access field, kept as
+Redis 7.2 keeps it ([The access clock](IMPLEMENTATION.md#the-access-clock)),
+and give Redis's errors under the policy that does not keep what they ask
+for. `OBJECT REFCOUNT` answers `2147483647` for a string holding an integer
+from 0 to 9999, which Redis shares, unless an LRU or LFU policy is set with a
+limit, and 1 for anything else. A missing key answers nil.
 
 ## Expiry
 

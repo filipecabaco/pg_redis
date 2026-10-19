@@ -93,6 +93,15 @@ pub trait Store {
     /// `None` when the key is not there; then its deadline in microseconds
     /// since the epoch, or `None` for no expiry.
     fn deadline(&mut self, key: &[u8]) -> Out<Option<Option<i64>>>;
+    /// `TOUCH`: how many of `keys` exist, looked up as a read that updates
+    /// each one's access field.
+    fn touch(&mut self, keys: &[Vec<u8>]) -> Out<i64> {
+        self.exists(keys)
+    }
+    /// What `OBJECT` reads of a live key, without touching it: its access
+    /// field (`memdb::lru`), and the integer it holds when it is a string
+    /// that reads as one.
+    fn access(&mut self, key: &[u8]) -> Out<Option<(u32, Option<i64>)>>;
     /// Give a live key the deadline when `cond` allows; whether it did.
     fn expire(&mut self, key: &[u8], deadline_us: i64, cond: ExpireCond) -> Out<bool>;
     fn persist(&mut self, key: &[u8]) -> Out<bool>;
@@ -277,11 +286,9 @@ pub trait Store {
 pub fn run(cmd: &Command, store: &mut dyn Store) -> Option<Response> {
     let reply = match cmd {
         Command::Del { keys } | Command::Unlink { keys } => store.del(keys).map(Response::Integer),
-        // TOUCH answers as EXISTS does; the access time it refreshes in Redis
-        // feeds an LRU clock this server does not keep.
-        Command::Exists { keys } | Command::Touch { keys } => {
-            store.exists(keys).map(Response::Integer)
-        }
+        Command::Exists { keys } => store.exists(keys).map(Response::Integer),
+        // TOUCH counts as EXISTS does, and updates each key's access field.
+        Command::Touch { keys } => store.touch(keys).map(Response::Integer),
         Command::Type { key } => store
             .kind(key)
             .map(|k| Response::SimpleString(k.map_or("none", |k| k.name()).to_string())),
@@ -323,6 +330,7 @@ pub fn run(cmd: &Command, store: &mut dyn Store) -> Option<Response> {
         Command::RandomKey => store.random_key().map(bulk_or_nil),
         Command::FlushDb => store.flushdb().map(|()| Response::Ok),
         Command::ObjectEncoding { key } => object_encoding(store, key),
+        Command::ObjectAccess { key, field } => object_access(store, key, *field),
         Command::ObjectOther => Ok(Response::Null),
 
         Command::Get { key } => store.get(key).map(bulk_or_nil),
@@ -1007,6 +1015,49 @@ fn object_encoding(store: &mut dyn Store, key: &[u8]) -> Out<Response> {
     Ok(Response::BulkString(name.as_bytes().to_vec()))
 }
 
+/// `OBJECT REFCOUNT | IDLETIME | FREQ`, with Redis's replies and errors.
+fn object_access(
+    store: &mut dyn Store,
+    key: &[u8],
+    field: crate::commands::ObjectField,
+) -> Out<Response> {
+    use crate::commands::ObjectField;
+    use crate::memdb::lru;
+    const SWITCHING: &str = "Please note that when switching between policies at runtime \
+                             LRU and LFU data will take some time to adjust.";
+    let Some((lru_field, int)) = store.access(key)? else {
+        return Ok(Response::Null);
+    };
+    let s = crate::access::settings();
+    let now = crate::server::now_ms();
+    Ok(match field {
+        // Redis shares one object for each of 0..9999 unless the policy
+        // needs every key to have its own access field.
+        ObjectField::Refcount => Response::Integer(
+            if int.is_some_and(|n| (0..10_000).contains(&n)) && s.shares_integers() {
+                i64::from(i32::MAX)
+            } else {
+                1
+            },
+        ),
+        ObjectField::Idletime if s.policy.lfu() => Response::Error(format!(
+            "ERR An LFU maxmemory policy is selected, idle time not tracked. {SWITCHING}"
+        )),
+        ObjectField::Idletime => {
+            Response::Integer((lru::idle_ms(lru_field, lru::lru_clock(now)) / 1000) as i64)
+        }
+        ObjectField::Freq if !s.policy.lfu() => Response::Error(format!(
+            "ERR An LFU maxmemory policy is not selected, access frequency not tracked. \
+             {SWITCHING}"
+        )),
+        ObjectField::Freq => Response::Integer(i64::from(lru::lfu_decr_and_return(
+            lru_field,
+            s.decay_time,
+            lru::lfu_minutes(now),
+        ))),
+    })
+}
+
 fn integer_reply(n: Num<i64>) -> Response {
     match n {
         Num::Value(v) => Response::Integer(v),
@@ -1138,6 +1189,21 @@ impl Store for SqlStore<'_, '_> {
         Ok(Command::sql_key_kinds(self.client, self.db, &[key])
             .first()
             .and_then(|(_, k)| *k))
+    }
+
+    /// A logged key's access field lives in shared memory, not in its rows
+    /// (`crate::access`), so reading it costs no write.
+    fn access(&mut self, key: &[u8]) -> Out<Option<(u32, Option<i64>)>> {
+        let Some(kind) = self.kind(key)? else {
+            return Ok(None);
+        };
+        let int = match kind {
+            KeyKind::String => self
+                .get(key)?
+                .and_then(|v| crate::memdb::parse_stored_int(&v)),
+            _ => None,
+        };
+        Ok(Some((crate::access::logged_field(self.db, key), int)))
     }
 
     fn kinds(&mut self, keys: &[Vec<u8>]) -> Out<Vec<Option<KeyKind>>> {

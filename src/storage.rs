@@ -127,6 +127,16 @@ pub fn slot(db: u8) -> Option<usize> {
     }
 }
 
+/// The database a memory slot serves, or is moving out of: what an eviction
+/// from it is reported against.
+pub fn db_of_slot(s: usize) -> Option<u8> {
+    let dbs = 0..crate::commands::NUM_DBS as u8;
+    dbs.clone().find(|&db| slot(db) == Some(s)).or_else(|| {
+        dbs.into_iter()
+            .find(|&db| source(db) == Some(At::Memory(s)))
+    })
+}
+
 // ───────────────────────────── where a key lives ────────────────────────────
 
 /// One backend of one database.

@@ -56,11 +56,29 @@ impl<V, A: Allocator + Clone> Dict<V, A> {
         self.slots.len()
     }
 
+    /// Before adding an entry: when the entries are at capacity and doubling
+    /// them would take more than `room` bytes, grow by what fits in the room
+    /// instead, at least 16 entries and at most an eighth. Redis likewise
+    /// declines to grow a dictionary past `maxmemory` (`dictExpandAllowed`):
+    /// a doubling that eviction cannot take back would leave the arena over
+    /// the limit with nothing left to evict.
+    pub fn grow_within(&mut self, room: Option<usize>) {
+        let cap = self.slots.capacity();
+        if self.slots.len() < cap || cap == 0 {
+            return;
+        }
+        let per = std::mem::size_of::<Slot<V, A>>() + std::mem::size_of::<u32>();
+        if let Some(room) = room.filter(|&r| cap * per > r) {
+            self.slots
+                .reserve_exact((room / per).clamp(16, (cap / 8).max(16)));
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }
 
-    fn position(&self, key: &[u8]) -> Option<usize> {
+    pub fn position(&self, key: &[u8]) -> Option<usize> {
         let hash = self.seed.hash(key);
         let slots = &self.slots;
         self.index
@@ -141,6 +159,10 @@ impl<V, A: Allocator + Clone> Dict<V, A> {
         self.slots.get(i).map(|s| (s.key.as_slice(), &s.value))
     }
 
+    pub fn value_at_mut(&mut self, i: usize) -> Option<&mut V> {
+        self.slots.get_mut(i).map(|s| &mut s.value)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&[u8], &V)> {
         self.slots.iter().map(|s| (s.key.as_slice(), &s.value))
     }
@@ -187,6 +209,7 @@ impl<V, A: Allocator + Clone> Dict<V, A> {
     }
 
     /// Keep only the entries `keep` accepts.
+    #[cfg(test)]
     pub fn retain(&mut self, mut keep: impl FnMut(&[u8], &mut V) -> bool) {
         let mut i = 0;
         while i < self.slots.len() {
@@ -230,6 +253,29 @@ mod tests {
             assert_eq!(d.get(format!("k{i}").as_bytes()).copied(), want, "k{i}");
         }
         assert_eq!(d.len(), 1000 - 334);
+    }
+
+    #[test]
+    fn growth_near_the_limit_is_an_eighth_not_a_doubling() {
+        let mut d = dict();
+        for i in 0..64u32 {
+            d.insert(&i.to_be_bytes(), i);
+        }
+        while d.slots.len() < d.slots.capacity() {
+            let n = d.len() as u32;
+            d.insert(&n.to_be_bytes(), n);
+        }
+        let cap = d.slots.capacity();
+        d.grow_within(Some(1));
+        assert_eq!(d.slots.capacity(), cap + 16, "no room: the least step");
+        // With room to spare, the Vec doubles as usual on the next push.
+        let mut e = dict();
+        for i in 0..64u32 {
+            e.insert(&i.to_be_bytes(), i);
+        }
+        let cap = e.slots.capacity();
+        e.grow_within(None);
+        assert_eq!(e.slots.capacity(), cap);
     }
 
     #[test]

@@ -13,7 +13,7 @@
 | `redis.max_connections` | `128` | superuser | Max simultaneous Redis clients per worker, so the server accepts up to `redis.workers` times this many |
 | `redis.batch_size` | `64` | superuser | Max commands coalesced into one transaction (1–256); `1` disables batching |
 | `redis.maxmemory` | `256MB` | postmaster | The memory engine's equivalent of Redis's `maxmemory`. Past it, a write that could grow memory is refused with `OOM` unless `redis.maxmemory_policy` evicts enough first. Reserved at startup (plus a quarter, at least 32 MB, of headroom) but backed by RAM only as data fills it. `CONFIG SET maxmemory` changes the limit at runtime, never past this. |
-| `redis.maxmemory_policy` | `noeviction` | superuser | What memory mode does past `redis.maxmemory`: `noeviction` (refuse the write, as in Redis), `allkeys-random`, or `volatile-ttl`. `CONFIG SET maxmemory-policy` changes it at runtime. See [Storage policies](./STORAGE.md). |
+| `redis.maxmemory_policy` | `noeviction` | superuser | What memory mode does past `redis.maxmemory`, with Redis's eight values: `noeviction` (refuse the write, as in Redis), `allkeys-lru`, `allkeys-lfu`, `allkeys-random`, `volatile-lru`, `volatile-lfu`, `volatile-random` or `volatile-ttl`. Any other value is refused. `CONFIG SET maxmemory-policy` changes it at runtime, and `CONFIG SET maxmemory-samples`, `lfu-log-factor`, `lfu-decay-time` and `maxmemory-eviction-tenacity` tune it as in Redis. See [the limit and eviction](./IMPLEMENTATION.md#the-limit-and-eviction). |
 | `redis.snapshot_interval` | `60` | sighup | Seconds between snapshots of a `memory+snapshot` database (1–86400). See [Storage policies](./STORAGE.md). |
 
 ## When a change takes effect

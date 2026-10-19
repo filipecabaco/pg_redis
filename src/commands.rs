@@ -542,6 +542,14 @@ pub enum Aggregate {
     Max,
 }
 
+/// What `OBJECT` reports of a key's object beyond its encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectField {
+    Refcount,
+    Idletime,
+    Freq,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RangeBy {
     Index,
@@ -775,6 +783,10 @@ pub enum Command {
         absttl: bool,
         replace: bool,
         payload: Vec<u8>,
+        /// `IDLETIME seconds`, applied under an LRU-kept policy.
+        idletime: Option<i64>,
+        /// `FREQ frequency`, applied under an LFU policy.
+        freq: Option<u8>,
     },
     HRandField {
         key: Vec<u8>,
@@ -787,6 +799,11 @@ pub enum Command {
     },
     ObjectEncoding {
         key: Vec<u8>,
+    },
+    /// `OBJECT REFCOUNT | IDLETIME | FREQ`.
+    ObjectAccess {
+        key: Vec<u8>,
+        field: ObjectField,
     },
     /// Any other `OBJECT` subcommand, which is answered rather than refused.
     ObjectOther,
@@ -1881,6 +1898,43 @@ impl Command {
             }
             "RESTORE" => {
                 let key = bytes_arg(args, 0, "RESTORE")?;
+                // Options first, as `restoreCommand` reads them: IDLETIME and
+                // FREQ exclude each other, and each needs its value.
+                let (mut replace, mut absttl) = (false, false);
+                let (mut idletime, mut freq): (Option<i64>, Option<u8>) = (None, None);
+                let mut i = 3;
+                while i < args.len() {
+                    let more = i + 1 < args.len();
+                    let int = |j: usize| -> Result<i64, String> {
+                        String::from_utf8_lossy(&args[j])
+                            .parse()
+                            .map_err(|_| NOT_AN_INTEGER.to_string())
+                    };
+                    match String::from_utf8_lossy(&args[i]).to_uppercase().as_str() {
+                        "REPLACE" => replace = true,
+                        "ABSTTL" => absttl = true,
+                        "IDLETIME" if more && freq.is_none() => {
+                            let n = int(i + 1)?;
+                            if n < 0 {
+                                return Err("ERR Invalid IDLETIME value, must be >= 0".to_string());
+                            }
+                            idletime = Some(n);
+                            i += 1;
+                        }
+                        "FREQ" if more && idletime.is_none() => {
+                            let n = int(i + 1)?;
+                            if !(0..=255).contains(&n) {
+                                return Err(
+                                    "ERR Invalid FREQ value, must be >= 0 and <= 255".to_string()
+                                );
+                            }
+                            freq = Some(n as u8);
+                            i += 1;
+                        }
+                        _ => return Err("ERR syntax error".to_string()),
+                    }
+                    i += 1;
+                }
                 let ttl_ms: i64 = str_arg(args, 1, "RESTORE")?
                     .parse()
                     .map_err(|_| NOT_AN_INTEGER.to_string())?;
@@ -1888,38 +1942,14 @@ impl Command {
                     return Err("ERR Invalid TTL value, must be >= 0".to_string());
                 }
                 let payload = bytes_arg(args, 2, "RESTORE")?;
-                let (mut replace, mut absttl) = (false, false);
-                let mut i = 3;
-                while i < args.len() {
-                    match String::from_utf8_lossy(&args[i]).to_uppercase().as_str() {
-                        "REPLACE" => {
-                            replace = true;
-                            i += 1;
-                        }
-                        "ABSTTL" => {
-                            absttl = true;
-                            i += 1;
-                        }
-                        // Accepted and unused, as Redis accepts them without
-                        // LRU or LFU tracking to hand them to.
-                        "IDLETIME" | "FREQ" => {
-                            let n: i64 = str_arg(args, i + 1, "RESTORE")?
-                                .parse()
-                                .map_err(|_| NOT_AN_INTEGER.to_string())?;
-                            if n < 0 {
-                                return Err("ERR Invalid IDLETIME value, must be >= 0".to_string());
-                            }
-                            i += 2;
-                        }
-                        _ => return Err("ERR syntax error".to_string()),
-                    }
-                }
                 Ok(Command::Restore {
                     key,
                     ttl_ms,
                     absttl,
                     replace,
                     payload,
+                    idletime,
+                    freq,
                 })
             }
             "HRANDFIELD" => {
@@ -1949,6 +1979,14 @@ impl Command {
             "OBJECT" => match str_arg(args, 0, "OBJECT")?.to_uppercase().as_str() {
                 "ENCODING" => Ok(Command::ObjectEncoding {
                     key: bytes_arg(args, 1, "OBJECT")?,
+                }),
+                sub @ ("REFCOUNT" | "IDLETIME" | "FREQ") => Ok(Command::ObjectAccess {
+                    key: bytes_arg(args, 1, "OBJECT")?,
+                    field: match sub {
+                        "REFCOUNT" => ObjectField::Refcount,
+                        "IDLETIME" => ObjectField::Idletime,
+                        _ => ObjectField::Freq,
+                    },
                 }),
                 _ => Ok(Command::ObjectOther),
             },
@@ -2704,7 +2742,14 @@ impl Command {
         }
     }
 
+    /// Run on the SQL path. What it reaches of the memory engine — `COPY`,
+    /// `DUMP`, `RESTORE` — looks keys up as the command would.
     pub fn execute(&self, client: &mut SpiClient<'_>, db: u8) -> Response {
+        let access = crate::access::mode(self, crate::tracking::origin());
+        crate::access::with_mode(access, || self.execute_scoped(client, db))
+    }
+
+    fn execute_scoped(&self, client: &mut SpiClient<'_>, db: u8) -> Response {
         // A write has to be refused before it lands, so its keys are checked up
         // front. A read cannot damage anything, and a read of a key holding
         // another type finds nothing — so it runs first and only asks what the
@@ -3460,6 +3505,7 @@ impl Command {
             | Command::RandomKey
             | Command::FlushDb
             | Command::ObjectEncoding { .. }
+            | Command::ObjectAccess { .. }
             | Command::ObjectOther => {
                 Response::Error("ERR internal error: command not routed to store".to_string())
             }
@@ -3557,6 +3603,9 @@ impl Command {
                         "ERR source and destination objects are the same".to_string(),
                     );
                 }
+                if crate::storage::slot(dst_db).is_some() && !crate::evict::make_room() {
+                    return mem_out_of_memory();
+                }
                 // Liveness, not row-presence: `sql_key_kinds` reports a key
                 // past its expiry as a row with no kind, and a dead key must
                 // not refuse the copy.
@@ -3571,6 +3620,8 @@ impl Command {
                 // rows, and the write below must not merge with them.
                 crate::storage::clear(client, dst_db, dst);
                 crate::storage::restore(client, dst_db, dst, &dump, deadline_us);
+                // A copy is a new object: a fresh access field.
+                crate::access::restored(dst_db, dst, None, None);
                 Response::Integer(1)
             }
 
@@ -3597,11 +3648,17 @@ impl Command {
                 absttl,
                 replace,
                 payload,
+                idletime,
+                freq,
             } => {
                 // The checks in Redis's order: the busy key wins over a
                 // payload that would also have been refused.
                 if crate::storage::kind(client, db, key).is_some() && !*replace {
                     return Response::Error("BUSYKEY Target key name already exists.".to_string());
+                }
+                // `denyoom`, for a key bound for the memory engine.
+                if crate::storage::slot(db).is_some() && !crate::evict::make_room() {
+                    return mem_out_of_memory();
                 }
                 let dump = match crate::rdb::deserialize(payload) {
                     Ok(d) => d,
@@ -3624,6 +3681,7 @@ impl Command {
                     (true, false) => deadline_us(now_micros(), *ttl_ms, 1000),
                 };
                 crate::storage::restore(client, db, key, &dump, deadline_us);
+                crate::access::restored(db, key, *idletime, *freq);
                 Response::Ok
             }
 
@@ -3695,22 +3753,26 @@ impl Command {
                 "ERR internal error: database {db} is not in memory"
             ));
         };
-        // Redis's `denyoom`: past `redis.maxmemory`, a write that could grow
-        // memory is refused unless the policy can evict enough first.
-        if self.may_grow() && !crate::shm::make_room() {
+        // Redis's `performEvictions`, before every command: past
+        // `redis.maxmemory`, evict what the policy allows. A write that could
+        // grow memory (`denyoom`) is refused if that was not enough.
+        if !crate::evict::make_room() && self.may_grow() {
             return mem_out_of_memory();
         }
+        let access = crate::access::mode(self, crate::tracking::origin());
         // The type check and the command under one lock, so no other worker
         // can change the key between them. What `store::run` does not know,
         // streams aside, runs after the lock is released: the SQL fallback
         // comes back here for each sub-command of a composite.
         // Whatever an earlier caller left unreported is not this command's.
         crate::memdb::take_reaped();
-        let ran = crate::shm::with_db(slot, |m| {
-            self.run_on_db(m).or_else(|| match self {
-                Command::Stream(c) => Some(c.run(m)),
-                Command::StreamRead { cmd, resolved } => Some(stream_read(cmd, resolved, m)),
-                _ => None,
+        let ran = crate::access::with_mode(access, || {
+            crate::shm::with_db(slot, |m| {
+                self.run_on_db(m).or_else(|| match self {
+                    Command::Stream(c) => Some(c.run(m)),
+                    Command::StreamRead { cmd, resolved } => Some(stream_read(cmd, resolved, m)),
+                    _ => None,
+                })
             })
         });
         // `expireIfNeeded`'s report, as the durable half's `reap_keys` makes it.
@@ -4097,7 +4159,7 @@ impl Command {
 
     /// Whether the command can need more memory: Redis's `denyoom`, a write
     /// that is not purely a removal. Refused past `redis.maxmemory`.
-    fn may_grow(&self) -> bool {
+    pub(crate) fn may_grow(&self) -> bool {
         !self.write_keys().is_empty()
             && !matches!(
                 self,
@@ -4207,7 +4269,7 @@ pub(crate) fn wrong_type() -> Response {
 
 /// Redis's own wording for a write refused because memory is full, so a
 /// client's existing OOM handling recognises it.
-fn mem_out_of_memory() -> Response {
+pub(crate) fn mem_out_of_memory() -> Response {
     Response::Error(
         "OOM command not allowed when used memory > 'maxmemory'. Raise \
          redis.maxmemory, set redis.maxmemory_policy, or use SELECT durable."
@@ -6100,7 +6162,8 @@ mod tests {
         &["DUMP", "k"] => Command::Dump { key } if key == b"k",
         &["RESTORE", "k", "0", "payload"] => Command::Restore { ttl_ms: 0, replace: false, absttl: false, .. },
         &["RESTORE", "k", "100", "p", "REPLACE", "ABSTTL"] => Command::Restore { ttl_ms: 100, replace: true, absttl: true, .. },
-        &["RESTORE", "k", "0", "p", "IDLETIME", "3", "FREQ", "9"] => Command::Restore { .. },
+        &["RESTORE", "k", "0", "p", "IDLETIME", "3"] => Command::Restore { idletime: Some(3), freq: None, .. },
+        &["RESTORE", "k", "0", "p", "FREQ", "9"] => Command::Restore { idletime: None, freq: Some(9), .. },
         // Command names are matched case-insensitively.
         &["get", "k"] => Command::Get { .. },
         &["Get", "k"] => Command::Get { .. },

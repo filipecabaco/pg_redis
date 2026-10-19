@@ -269,16 +269,17 @@ Measured side by side against the reference:
 
 | | pg_redis | Redis |
 |---|---|---|
-| `OBJECT REFCOUNT k` | *(nil)* | `1` |
-| `OBJECT IDLETIME k` | *(nil)* | `0` |
-| `OBJECT FREQ k` | *(nil)* | error unless LFU is on |
+| `OBJECT REFCOUNT k` | ~~*(nil)*~~ `1`, or `2147483647` for a shared small integer. **Closed.** | `1` |
+| `OBJECT IDLETIME k` | ~~*(nil)*~~ `0`. **Closed.** | `0` |
+| `OBJECT FREQ k` | ~~*(nil)*~~ error unless LFU is on. **Closed.** | error unless LFU is on |
 | `CONFIG GET maxmemory` | ~~*(empty)*~~ the memory limit in bytes. **Closed.** | `maxmemory 0` |
 | `COMMAND COUNT` | ~~`100`~~ ~~**150**~~ **235**, the rows of the coverage page. **Closed.** | `240` (7.0), `242` (7.2) |
 | `COMMAND DOCS` / `INFO` / `LIST` | ~~*(empty)*~~ populated from Redis 7.2's command table. **Closed.** | populated |
 | `CLIENT ID` | ~~`0`, always~~ unique per connection. **Closed.** | unique per connection |
 
-The three `OBJECT` rows are still current: every `OBJECT` subcommand other
-than `ENCODING` answers nil.
+The three `OBJECT` rows are closed: each key carries Redis's 24-bit access
+field, and the parity case "OBJECT IDLETIME, FREQ and REFCOUNT" compares them
+under noeviction, allkeys-lfu and allkeys-lru.
 
 `COMMAND COUNT` was a hardcoded `Response::Integer(100)`. It now answers with
 the number of rows in [docs/command-coverage.md](command-coverage.md), counted

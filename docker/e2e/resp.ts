@@ -57,6 +57,13 @@ export class RawRedis {
 		}
 	}
 
+	/** The next reply the server sends unasked: a pub/sub message. */
+	next(): Promise<Buffer> {
+		const done = new Promise<Buffer>((resolve) => this.waiters.push(resolve));
+		this.drain();
+		return done;
+	}
+
 	send(...args: Array<string | Buffer>): Promise<Buffer> {
 		const parts: Buffer[] = [Buffer.from(`*${args.length}\r\n`)];
 		for (const a of args) {

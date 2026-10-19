@@ -96,17 +96,17 @@ The limits that apply only to databases in memory are described once, in
 | `DEL` |  |
 | `UNLINK` |  |
 | `EXISTS` |  |
-| `TOUCH` | Counts as `EXISTS` does; there is no LRU clock to refresh |
+| `TOUCH` | Counts as `EXISTS` does and updates each key's access field, also for a client in `CLIENT NO-TOUCH` mode |
 | `TYPE` |  |
 | `KEYS` | Full scan, as in Redis, over keys of every type. Glob matching is done in-process, outside SQL |
 | `SCAN` | Incremental, with Redis's guarantee: a full iteration returns every key present from its start to its end at least once. `COUNT` (default 10) is the work per call; `MATCH` and `TYPE` filter each page afterwards, so a page can be empty before the end. Cursor values differ from Redis's. See [Cursors](IMPLEMENTATION.md#scan-cursors) |
 | `RANDOMKEY` | Uniform over every live key, whatever table holds it |
 | `DUMP` | Redis's serialisation format, version 11, streams included; restores into a real 7.2 |
-| `RESTORE` | REPLACE and ABSTTL honoured, IDLETIME and FREQ accepted; Redis stream payloads of every format since 5.0; refuses payloads newer than version 11 and pre-7 compact encodings |
+| `RESTORE` | REPLACE, ABSTTL, IDLETIME and FREQ honoured; Redis stream payloads of every format since 5.0; refuses payloads newer than version 11 and pre-7 compact encodings |
 | `RENAME` |  |
 | `RENAMENX` |  |
 | `COPY` | `DB` may name a database on the other storage half |
-| `OBJECT` | `ENCODING` reports the encoding Redis would use. `IDLETIME`, `FREQ`, `REFCOUNT` and every other subcommand answer nil |
+| `OBJECT` | `ENCODING` reports the encoding Redis would use. `IDLETIME` and `FREQ` read Redis's 24-bit access field, with its errors under the wrong policy; on a `logged` database from a lossy table in shared memory. `REFCOUNT` is 2147483647 for a shared small integer, else 1 |
 | `MEMORY` | `USAGE` only, an estimate from the key's serialised size; `SAMPLES` accepted and ignored |
 | `DBSIZE` | Counts keys of every type |
 | `FLUSHDB` | ASYNC and SYNC accepted and ignored |

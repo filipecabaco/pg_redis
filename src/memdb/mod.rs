@@ -15,9 +15,11 @@
 mod db;
 pub mod deque;
 pub mod dict;
+pub mod keyspace;
+pub mod lru;
 pub mod zset;
 
-pub use db::{Db, take_reaped};
+pub use db::{Db, Score, take_reaped};
 
 use allocator_api2::alloc::Allocator;
 use allocator_api2::vec::Vec;

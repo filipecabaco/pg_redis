@@ -192,6 +192,14 @@ fn normalise(spec: &ConfigSpec, arg: &str, v: &str) -> Result<String, String> {
                 if n < 0 {
                     return Err(failed(arg, "argument must be a memory or percent value"));
                 }
+                // Redis keeps a percentage as its negative, bounded below by
+                // the config's lower bound.
+                if -n < *min {
+                    return Err(failed(
+                        arg,
+                        &format!("percentage argument must be less or equal to {}", -*min),
+                    ));
+                }
                 return Ok(format!("{n}%"));
             }
             let n = if *mem {
@@ -421,6 +429,17 @@ pub fn set(args: &[Vec<u8>]) -> Result<(), String> {
         // Redis takes any hz and clamps it when applying it.
         if spec.name == "hz" {
             value = value.parse::<i64>().unwrap_or(10).clamp(1, 500).to_string();
+        }
+        // Applied by moving the listener, which Redis tries as it sets it:
+        // a port nothing can listen on fails the whole CONFIG SET.
+        if spec.name == "port"
+            && let Ok(port) = value.parse::<u16>()
+            && port != 0
+            && i64::from(port) != get_i64("port")
+        {
+            let at = live_gucs().bind.unwrap_or_else(|| "0.0.0.0".into());
+            crate::worker::bind_listener(&at, port)
+                .map_err(|e| failed(&arg, &format!("Unable to listen on this port: {e}")))?;
         }
         staged.push((spec.name, value));
     }

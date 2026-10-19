@@ -237,7 +237,8 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
     // Connection threads report these through CONFIG GET and INFO, and may
     // not read a GUC themselves.
     crate::config::snapshot_gucs();
-    // The port and address are bound once; both need a restart to change.
+    // The address is bound once and needs a restart to change; the port
+    // follows CONFIG SET port.
     // Everything else a connection uses is read from the snapshot as it is
     // needed, so a reload reaches new connections and the next AUTH.
     let port = crate::PORT.get() as u16;
@@ -861,54 +862,66 @@ pub(crate) fn watch_targets(cmd: &Command, db: u8) -> Option<Vec<(u8, Vec<u8>)>>
     }
 }
 
-fn accept_loop(port: u16, cmd_tx: mpsc::SyncSender<DispatchMsg>, listen_addr: String) {
-    let addr: SocketAddr = match format!("{}:{}", listen_addr, port).parse() {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!(
-                "pg_redis: invalid listen address '{}:{}': {}",
-                listen_addr, port, e
-            );
-            return;
-        }
-    };
-    // The Redis port bypasses PostgreSQL authentication entirely: whoever reaches
-    // it gets read/write access to every redis.* table through the worker's own
-    // privileges. Binding it off-host without a password is almost never intended.
-    if crate::acl::current().default_open() && !addr.ip().is_loopback() {
-        eprintln!(
-            "pg_redis: WARNING listening on {} with no redis.password set — \
-             any host that can reach this port has full access to redis.* data",
-            addr
-        );
-    }
-    let socket = match Socket::new(Domain::IPV4, Type::STREAM, None) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("pg_redis: failed to create socket: {}", e);
-            return;
-        }
-    };
+/// A listener on `addr:port`, shared with the other workers' through
+/// `SO_REUSEPORT`, which the kernel spreads connections across.
+pub(crate) fn bind_listener(listen_addr: &str, port: u16) -> std::io::Result<TcpListener> {
+    let addr: SocketAddr = format!("{listen_addr}:{port}")
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, None)?;
     if let Err(e) = socket.set_reuse_address(true) {
         eprintln!("pg_redis: SO_REUSEADDR failed: {}", e);
     }
-    if let Err(e) = socket.set_reuse_port(true) {
-        eprintln!("pg_redis: SO_REUSEPORT failed: {}", e);
-    }
-    if let Err(e) = socket.bind(&addr.into()) {
-        eprintln!("pg_redis: failed to bind port {}: {}", port, e);
-        return;
-    }
-    if let Err(e) = socket.listen(128) {
-        eprintln!("pg_redis: listen failed: {}", e);
-        return;
-    }
-    let listener: TcpListener = socket.into();
-    let conn_count = Arc::new(AtomicUsize::new(0));
+    socket.set_reuse_port(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(128)?;
+    Ok(socket.into())
+}
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(s) => {
+/// Accept connections on the port `CONFIG GET port` names: bound at start,
+/// moved when `CONFIG SET port` changes it, closed at 0, as Redis does.
+fn accept_loop(port: u16, cmd_tx: mpsc::SyncSender<DispatchMsg>, listen_addr: String) {
+    let conn_count = Arc::new(AtomicUsize::new(0));
+    let mut bound: Option<(u16, TcpListener)> = None;
+    loop {
+        let want = u16::try_from(crate::config::get_i64("port")).unwrap_or(port);
+        if bound.as_ref().map(|(p, _)| *p) != Some(want) {
+            bound = None;
+            if want != 0 {
+                match bind_listener(&listen_addr, want) {
+                    Ok(l) => {
+                        // The Redis port bypasses PostgreSQL authentication
+                        // entirely: whoever reaches it gets read/write access
+                        // to every redis.* table through the worker's own
+                        // privileges. Binding it off-host without a password
+                        // is almost never intended.
+                        let loopback = l.local_addr().is_ok_and(|a| a.ip().is_loopback());
+                        if crate::acl::current().default_open() && !loopback {
+                            eprintln!(
+                                "pg_redis: WARNING listening on {listen_addr}:{want} with no redis.password set — \
+                                 any host that can reach this port has full access to redis.* data"
+                            );
+                        }
+                        bound = Some((want, l));
+                    }
+                    Err(e) => {
+                        eprintln!("pg_redis: failed to listen on {listen_addr}:{want}: {e}");
+                        std::thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
+                }
+            }
+        }
+        let Some((_, listener)) = &bound else {
+            std::thread::sleep(Duration::from_millis(250));
+            continue;
+        };
+        // In slices, so a changed port is noticed between connections.
+        if !crate::sys::wait_readable(listener, Duration::from_millis(250)) {
+            continue;
+        }
+        match listener.accept() {
+            Ok((s, _)) => {
                 let settings = crate::config::live_gucs();
                 if conn_count.load(Ordering::Relaxed) >= settings.maxclients.max(1) as usize {
                     if let Ok(mut w) = s.try_clone() {

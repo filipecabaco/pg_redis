@@ -27,7 +27,7 @@ pub fn peer_closed(stream: &TcpStream) -> bool {
 /// Wait up to `timeout` for `stream` to become readable. True once it is, or
 /// has hung up or failed (the next read reports which); false when the time
 /// ran out.
-pub fn wait_readable(stream: &TcpStream, timeout: Duration) -> bool {
+pub fn wait_readable(stream: &impl std::os::fd::AsFd, timeout: Duration) -> bool {
     let mut fds = [rustix::event::PollFd::new(
         stream,
         rustix::event::PollFlags::IN,

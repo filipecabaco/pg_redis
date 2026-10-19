@@ -1806,8 +1806,10 @@ fn corrupt(_: crate::hll::Corrupt) -> Response {
     Response::Error(crate::hll::INVALID.to_string())
 }
 
+/// `hll-sparse-max-bytes`: past it a sparse HyperLogLog turns dense.
 fn sparse_max() -> usize {
-    crate::hll::DEFAULT_SPARSE_MAX_BYTES
+    usize::try_from(crate::config::get_i64("hll-sparse-max-bytes"))
+        .unwrap_or(crate::hll::DEFAULT_SPARSE_MAX_BYTES)
 }
 
 fn run_pfadd(

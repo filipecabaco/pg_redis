@@ -3631,7 +3631,24 @@ impl Command {
             Command::Ping { msg } => Response::Pong(msg.clone()),
             Command::Echo { msg } => Response::BulkString(msg.clone()),
             Command::Select { .. } => Response::Ok,
-            Command::Auth { .. } => Response::Ok,
+            // A queued AUTH the connection checked when EXEC reached it: the
+            // user changes here, in its turn, so a command queued before it
+            // still ran as the old one.
+            Command::Auth { user, password } => {
+                let name = user.as_deref().unwrap_or(b"default");
+                match (
+                    crate::acl::user_serial(name, password),
+                    crate::server::slot_of(crate::tracking::origin()),
+                ) {
+                    (Some(serial), Some(slot)) => {
+                        slot.user_serial
+                            .store(serial, std::sync::atomic::Ordering::Relaxed);
+                        Response::Ok
+                    }
+                    (Some(_), None) => Response::Ok,
+                    (None, _) => Response::Error(crate::acl::WRONGPASS.into()),
+                }
+            }
             Command::Stream(c) => c.run(&mut SqlStreams { client, db }),
             Command::StreamRead { cmd, resolved } => {
                 stream_read(cmd, resolved, &mut SqlStreams { client, db })

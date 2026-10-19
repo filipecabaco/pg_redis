@@ -2191,8 +2191,9 @@ fn acl_refusal(
     }
 }
 
-/// A queued `AUTH`, run as `EXEC` reaches it: the session becomes the user's,
-/// or the error its reply is.
+/// A queued `AUTH`, checked as `EXEC` reaches it: the session the rest of the
+/// queue is checked as becomes the user's, or the error is its reply. The
+/// client's user changes when the dispatcher runs it, in its turn.
 fn exec_auth(
     session: &mut crate::acl::Session,
     client: &crate::server::ClientHandle,
@@ -2217,7 +2218,6 @@ fn exec_auth(
                 serial,
                 authenticated: true,
             };
-            client.set_user(serial);
             None
         }
         None => Some(crate::acl::WRONGPASS.to_string()),

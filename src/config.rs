@@ -266,22 +266,45 @@ fn special(name: &str, arg: &str, v: &str) -> Result<String, String> {
             }
             Ok(keyspace_events_canonical(v))
         }
+        // Only the classes named change; all three are reported, in bytes,
+        // in Redis's order.
         "client-output-buffer-limit" => {
             let parts: Vec<&str> = v.split_whitespace().collect();
-            if !parts.len().is_multiple_of(4)
-                || parts.chunks(4).any(|c| {
-                    !matches!(c[0], "normal" | "replica" | "slave" | "pubsub")
-                        || memory(c[1]).is_none()
-                        || memory(c[2]).is_none()
-                        || c[3].parse::<u64>().is_err()
-                })
-            {
+            if !parts.len().is_multiple_of(4) {
                 return Err(failed(
                     arg,
                     "Wrong number of arguments in buffer limit configuration.",
                 ));
             }
-            Ok(v.to_string())
+            let mut classes = output_limit_classes(&get_str("client-output-buffer-limit"));
+            for c in parts.chunks(4) {
+                let class = match c[0].to_ascii_lowercase().as_str() {
+                    "normal" => 0,
+                    "replica" | "slave" => 1,
+                    "pubsub" => 2,
+                    _ => {
+                        return Err(failed(
+                            arg,
+                            "Invalid client class specified in buffer limit configuration.",
+                        ));
+                    }
+                };
+                match (bytes(c[1]), bytes(c[2]), c[3].parse::<u64>()) {
+                    (Some(hard), Some(soft), Ok(secs)) => classes[class] = [hard, soft, secs],
+                    _ => {
+                        return Err(failed(
+                            arg,
+                            "Error in hard, soft or soft_seconds setting in buffer limit configuration.",
+                        ));
+                    }
+                }
+            }
+            Ok(["normal", "slave", "pubsub"]
+                .iter()
+                .zip(classes)
+                .map(|(name, [h, s, t])| format!("{name} {h} {s} {t}"))
+                .collect::<Vec<_>>()
+                .join(" "))
         }
         "oom-score-adj-values" => {
             let parts: Vec<&str> = v.split_whitespace().collect();
@@ -296,6 +319,35 @@ fn special(name: &str, arg: &str, v: &str) -> Result<String, String> {
         }
         _ => Ok(v.to_string()),
     }
+}
+
+/// A size as Redis writes one, in bytes, for the buffer limits.
+fn bytes(v: &str) -> Option<u64> {
+    memory(v).and_then(|n| u64::try_from(n).ok())
+}
+
+/// The three classes of a `client-output-buffer-limit` value, normal, replica
+/// and pubsub, each hard, soft and soft seconds; Redis's defaults for any it
+/// does not name.
+fn output_limit_classes(value: &str) -> [[u64; 3]; 3] {
+    let mut classes = [
+        [0, 0, 0],
+        [256 << 20, 64 << 20, 60],
+        [32 << 20, 8 << 20, 60],
+    ];
+    let words: Vec<&str> = value.split_whitespace().collect();
+    for c in words.chunks(4).filter(|c| c.len() == 4) {
+        let i = match c[0] {
+            "normal" => 0,
+            "replica" | "slave" => 1,
+            "pubsub" => 2,
+            _ => continue,
+        };
+        if let (Some(h), Some(s), Ok(t)) = (bytes(c[1]), bytes(c[2]), c[3].parse()) {
+            classes[i] = [h, s, t];
+        }
+    }
+    classes
 }
 
 /// Redis normalises the flags it was given: `A` expands to its classes and
@@ -384,7 +436,39 @@ mod tests {
                 .unwrap_err()
                 .contains("memory value")
         );
+        let o = spec("client-output-buffer-limit").unwrap();
+        let set = |v: &str| normalise(o, "client-output-buffer-limit", v);
+        assert_eq!(
+            set("normal 1mb 2mb 60 replica 3mb 4mb 70 pubsub 5mb 6mb 80").unwrap(),
+            "normal 1048576 2097152 60 slave 3145728 4194304 70 pubsub 5242880 6291456 80"
+        );
+        // A class not named keeps its value.
+        assert_eq!(
+            set("normal 100000 0 0").unwrap(),
+            "normal 100000 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60"
+        );
+        assert!(
+            set("wrong number")
+                .unwrap_err()
+                .contains("Wrong number of arguments")
+        );
+        assert!(
+            set("master 10mb 10mb 60")
+                .unwrap_err()
+                .contains("Invalid client class")
+        );
+        assert!(
+            set("normal 10mbs 10mb 60")
+                .unwrap_err()
+                .contains("Error in hard")
+        );
+        assert!(
+            set("pubsub 10mb 10mb 60s")
+                .unwrap_err()
+                .contains("soft_seconds")
+        );
         let b = spec("appendonly").unwrap();
+
         assert_eq!(normalise(b, "appendonly", "YES").unwrap(), "yes");
         assert!(
             normalise(b, "appendonly", "maybe")

@@ -1643,6 +1643,15 @@ pub fn authenticate(
     None
 }
 
+/// The user `name` and `password` authenticate as, logging nothing: for a
+/// queued `AUTH` the connection has already checked.
+pub fn user_serial(name: &[u8], password: &[u8]) -> Option<u64> {
+    current()
+        .get(name)
+        .filter(|u| u.accepts(password))
+        .map(|u| u.serial)
+}
+
 pub const WRONGPASS: &str = "WRONGPASS invalid username-password pair or user is disabled.";
 
 // ──────────────────────────────── checks ────────────────────────────────────

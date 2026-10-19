@@ -2207,8 +2207,11 @@ describe("Pub/Sub and client tracking without fixed limits", () => {
 	// count stops part way instead of building the whole reply.
 	test("a normal client past its output limit is closed with no reply", async () => {
 		const name = `obuf-${Date.now()}`;
-		await client.send("DEL", ["obuf:list"]);
-		for (let i = 0; i < 150; i++) await client.send("LPUSH", ["obuf:list", "x".repeat(1000)]);
+		// Filled on a fresh connection, on the default database the test's
+		// own socket reads; the shared client may have selected another.
+		const filler = await new RawRedis().connect();
+		await filler.send("DEL", "obuf:list");
+		for (let i = 0; i < 150; i++) await filler.send("LPUSH", "obuf:list", "x".repeat(1000));
 		await client.send("CONFIG", ["SET", "client-output-buffer-limit", "normal 100000 0 0"]);
 		try {
 			let got = 0;
@@ -2255,7 +2258,8 @@ describe("Pub/Sub and client tracking without fixed limits", () => {
 			expect(performance.now() - started).toBeLessThan(5000);
 		} finally {
 			await client.send("CONFIG", ["SET", "client-output-buffer-limit", "normal 0 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60"]);
-			await client.send("DEL", ["obuf:list", "obuf:h"]);
+			await filler.send("DEL", "obuf:list", "obuf:h");
+			filler.close();
 		}
 	});
 

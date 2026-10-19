@@ -500,7 +500,7 @@ fn offer_listener(target: u64) {
         return;
     };
     let channel = [channel(target)];
-    let Some((idx, _)) = crate::pubsub::slot_alloc_and_subscribe(slots, &channel) else {
+    let Some((idx, _)) = crate::pubsub::slot_alloc_and_subscribe(slots, target, &channel) else {
         return;
     };
     let handed = t

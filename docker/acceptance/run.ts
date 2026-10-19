@@ -31,10 +31,11 @@ const SKIPFILE = `${HERE}skip.txt`;
  * Every unit a server with Redis's full command set should pass when driven
  * from outside. Left out: the units Redis itself tags external:skip at the
  * top — they reconfigure, restart or replicate the server under test (aofrw,
- * client-eviction, limits, obuf-limits, pubsubshard, shutdown, wait) — and
+ * client-eviction, limits, shutdown, wait) — and
  * the ones that measure Redis's own allocator or internals rather than
  * behaviour (memefficiency, oom-score-adj, querybuf, replybufsize,
- * violations, tls). maxmemory runs, in part, through `REWRITTEN` below. acl,
+ * violations, tls). maxmemory, obuf-limits and pubsubshard run, in part,
+ * through `REWRITTEN` below. acl,
  * acl-v2 and auth are in, with the tag lifted from their first server block
  * (`UNTAG`): those blocks only change users and the password, which pg_redis
  * can undo between units (`resetConfig`).
@@ -80,6 +81,8 @@ const UNITS = [
 	"unit/acl-v2",
 	"unit/quit",
 	"unit/maxmemory",
+	"unit/pubsubshard",
+	"unit/obuf-limits",
 ];
 
 /**
@@ -94,6 +97,16 @@ const REWRITTEN: Record<string, { halves: Half[]; drop: RegExp[] }> = {
 	"unit/maxmemory": {
 		halves: ["memory"],
 		drop: [/test_slave_buffers/, /attach_to_replication_stream/, /proc init_test/],
+	},
+	// Every block runs: the tag is the file's, not its tests'.
+	"unit/obuf-limits": {
+		halves: ["memory", "durable"],
+		drop: [],
+	},
+	// Its second block publishes on a master and reads on a replica.
+	"unit/pubsubshard": {
+		halves: ["memory", "durable"],
+		drop: [/setup replication/],
 	},
 };
 

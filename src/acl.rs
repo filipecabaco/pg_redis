@@ -1869,7 +1869,7 @@ pub fn subscriptions_allowed(serial: u64, channels: &[Vec<u8>], patterns: &[Vec<
 
 /// The command line of a connected client, for the log.
 fn client_info(id: u64) -> String {
-    crate::server::clients()
+    crate::server::clients_with_output()
         .into_iter()
         .find(|c| c.id == id)
         .map(|c| c.line())

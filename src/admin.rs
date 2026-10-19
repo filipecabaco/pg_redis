@@ -260,7 +260,7 @@ fn client(a: &Admin, conn: &mut Conn) -> Response {
             Response::Ok
         }
         "INFO" => {
-            let me = server::clients()
+            let me = server::clients_with_output()
                 .into_iter()
                 .find(|c| c.id == conn.client.id);
             bulk(me.map(|c| format!("{}\n", c.line())).unwrap_or_default())
@@ -376,7 +376,7 @@ fn client(a: &Admin, conn: &mut Conn) -> Response {
 }
 
 fn client_list(opts: &[Vec<u8>]) -> Response {
-    let mut all = server::clients();
+    let mut all = server::clients_with_output();
     match opts {
         [] => {}
         [t, kind] if t.eq_ignore_ascii_case(b"TYPE") => {

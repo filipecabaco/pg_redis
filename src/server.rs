@@ -582,6 +582,8 @@ pub struct ClientInfo {
     pub lib_name: String,
     pub lib_ver: String,
     pub qbuf: u32,
+    /// Undelivered pub/sub bytes, filled by [`clients_with_output`].
+    pub omem: usize,
     pub user_serial: u64,
     pub user: String,
     slot: &'static ClientSlot,
@@ -651,7 +653,7 @@ impl ClientInfo {
             f.push('N');
         }
         format!(
-            "id={} addr={} laddr={} fd={} name={} age={} idle={} flags={} db={} sub={} psub={} ssub=0 multi={} qbuf={} qbuf-free=0 argv-mem=0 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd={} user={} redir=-1 resp={} lib-name={} lib-ver={}",
+            "id={} addr={} laddr={} fd={} name={} age={} idle={} flags={} db={} sub={} psub={} ssub=0 multi={} qbuf={} qbuf-free=0 argv-mem=0 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} tot-mem={} events=r cmd={} user={} redir=-1 resp={} lib-name={} lib-ver={}",
             self.id,
             self.addr,
             self.laddr,
@@ -665,6 +667,8 @@ impl ClientInfo {
             self.psub,
             self.multi,
             self.qbuf,
+            self.omem,
+            self.omem,
             self.cmd,
             self.user,
             self.resp,
@@ -672,6 +676,19 @@ impl ClientInfo {
             self.lib_ver,
         )
     }
+}
+
+/// [`clients`], each with its output memory, for `CLIENT LIST` and `CLIENT
+/// INFO`: what waits in its pub/sub queue.
+pub fn clients_with_output() -> Vec<ClientInfo> {
+    let mut all = clients();
+    if let Some(slots) = crate::pubsub_state() {
+        let out = crate::pubsub::output_bytes(slots);
+        for c in &mut all {
+            c.omem = out.get(&c.id).copied().unwrap_or(0);
+        }
+    }
+    all
 }
 
 /// Every registered client, ordered by id as Redis lists them.
@@ -712,6 +729,7 @@ pub fn clients() -> Vec<ClientInfo> {
                 lib_name: text(lib_name),
                 lib_ver: text(lib_ver),
                 qbuf: s.qbuf.load(Ordering::Relaxed),
+                omem: 0,
                 user_serial: s.user_serial.load(Ordering::Relaxed),
                 user: crate::acl::name_of(s.user_serial.load(Ordering::Relaxed)),
                 slot: s,

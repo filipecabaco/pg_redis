@@ -181,6 +181,8 @@ struct Sub {
     overflowed: bool,
     /// Moved on every message queued; the owner sleeps on it.
     seq: AtomicU32,
+    /// The client the slot is for, for `CLIENT LIST`'s `omem`.
+    owner: u64,
 }
 
 impl Sub {
@@ -194,6 +196,7 @@ impl Sub {
             soft_since_ms: 0,
             overflowed: false,
             seq: AtomicU32::new(0),
+            owner: 0,
         }
     }
 
@@ -229,19 +232,26 @@ impl Sub {
             return self.overflow();
         }
         self.queued += bytes;
-        if limits.hard > 0 && self.queued > limits.hard {
+        if self.over_limit(limits, now_ms) {
             return self.overflow();
         }
-        if limits.soft > 0 && self.queued > limits.soft {
-            if self.soft_since_ms == 0 {
-                self.soft_since_ms = now_ms;
-            } else if now_ms - self.soft_since_ms >= limits.soft_secs * 1000 {
-                return self.overflow();
-            }
-        } else {
-            self.soft_since_ms = 0;
-        }
         self.wake();
+    }
+
+    /// `checkClientOutputBufferLimits`: at or past the hard limit, or at or
+    /// past the soft one for more than its seconds, counted from the first
+    /// check that found it there.
+    fn over_limit(&mut self, limits: &Limits, now_ms: i64) -> bool {
+        let hard = limits.hard > 0 && self.queued >= limits.hard;
+        let soft = limits.soft > 0 && self.queued >= limits.soft;
+        if !soft {
+            self.soft_since_ms = 0;
+        } else if self.soft_since_ms == 0 {
+            self.soft_since_ms = now_ms;
+        } else if (now_ms - self.soft_since_ms) / 1000 > limits.soft_secs {
+            return true;
+        }
+        hard
     }
 
     fn overflow(&mut self) {
@@ -471,9 +481,12 @@ impl Inner {
 }
 
 /// Take a new slot and subscribe it. `None` when the heap is full.
-fn alloc_and(slots: &Slots, items: &[Vec<u8>], which: List) -> Option<(usize, u32)> {
+fn alloc_and(slots: &Slots, owner: u64, items: &[Vec<u8>], which: List) -> Option<(usize, u32)> {
     let l = lock(slots);
     let idx = catching(|| l.inner.new_slot())?;
+    if let Some(sub) = l.inner.sub(idx) {
+        sub.owner = owner;
+    }
     for item in items {
         l.inner.add(idx, item, which);
     }
@@ -485,12 +498,50 @@ fn alloc_and(slots: &Slots, items: &[Vec<u8>], which: List) -> Option<(usize, u3
     Some((idx, if which == List::Channels { c } else { p }))
 }
 
-pub fn slot_alloc_and_subscribe(slots: &Slots, channels: &[Vec<u8>]) -> Option<(usize, u32)> {
-    alloc_and(slots, channels, List::Channels)
+/// A slot for client `owner`, subscribed to `channels`: its number and how
+/// many it holds.
+pub fn slot_alloc_and_subscribe(
+    slots: &Slots,
+    owner: u64,
+    channels: &[Vec<u8>],
+) -> Option<(usize, u32)> {
+    alloc_and(slots, owner, channels, List::Channels)
 }
 
-pub fn slot_alloc_and_psubscribe(slots: &Slots, patterns: &[Vec<u8>]) -> Option<(usize, u32)> {
-    alloc_and(slots, patterns, List::Patterns)
+pub fn slot_alloc_and_psubscribe(
+    slots: &Slots,
+    owner: u64,
+    patterns: &[Vec<u8>],
+) -> Option<(usize, u32)> {
+    alloc_and(slots, owner, patterns, List::Patterns)
+}
+
+/// Each client's undelivered pub/sub bytes, for `CLIENT LIST`'s `omem`.
+pub fn output_bytes(slots: &Slots) -> std::collections::HashMap<u64, usize> {
+    let l = lock(slots);
+    let mut out = std::collections::HashMap::new();
+    for sub in l.inner.subs.iter().flatten() {
+        if sub.owner != 0 {
+            *out.entry(sub.owner).or_insert(0) += sub.queued;
+        }
+    }
+    out
+}
+
+/// `clientsCron`'s output limit check, for subscribers no message has
+/// reached lately: one held past the soft limit for its time is closed.
+pub fn enforce_limits(slots: &Slots) {
+    let limits = Limits::current();
+    if limits.soft == 0 {
+        return;
+    }
+    let now = crate::server::now_ms();
+    let l = lock(slots);
+    for sub in l.inner.subs.iter_mut().flatten() {
+        if !sub.overflowed && sub.queued > 0 && sub.over_limit(&limits, now) {
+            sub.overflow();
+        }
+    }
 }
 
 pub fn slot_free(slots: &Slots, idx: usize) {
@@ -972,7 +1023,7 @@ mod tests {
     #[test]
     fn a_message_reaches_its_channels_subscribers_in_order() {
         let r = reg();
-        let (idx, n) = slot_alloc_and_subscribe(r, &[v("t1:a"), v("t1:b")]).unwrap();
+        let (idx, n) = slot_alloc_and_subscribe(r, 1, &[v("t1:a"), v("t1:b")]).unwrap();
         assert_eq!(n, 2);
         assert_eq!(publish(r, b"t1:a", b"one"), 1);
         assert_eq!(publish(r, b"t1:b", b"two"), 1);
@@ -987,11 +1038,12 @@ mod tests {
     #[test]
     fn a_pattern_gets_a_pmessage_and_never_an_internal_channel() {
         let r = reg();
-        let (idx, _) = slot_alloc_and_psubscribe(r, &[v("t2:*")]).unwrap();
+        let (idx, _) = slot_alloc_and_psubscribe(r, 1, &[v("t2:*")]).unwrap();
         assert_eq!(publish(r, b"t2:x", b"m"), 1);
         assert_eq!(poll_message(r, idx), Some((v("t2:x"), v("t2:*"), v("m"))));
-        // A pattern that matches everything still skips internal channels.
-        psubscribe(r, idx, &[v("*")]);
+        // A pattern that matches the internal mark still skips internal
+        // channels. (`*` would also catch the other tests' channels.)
+        psubscribe(r, idx, &[v("\x01*")]);
         publish(r, b"\x01shard:t2", b"internal");
         assert_eq!(poll_message(r, idx), None);
         slot_free(r, idx);
@@ -1003,7 +1055,7 @@ mod tests {
     fn subscriptions_names_and_payloads_are_unbounded() {
         let r = reg();
         let channels: Vec<Vec<u8>> = (0..200).map(|i| v(&format!("t3:{i}"))).collect();
-        let (idx, n) = slot_alloc_and_subscribe(r, &channels).unwrap();
+        let (idx, n) = slot_alloc_and_subscribe(r, 1, &channels).unwrap();
         assert_eq!(n, 200);
         let long = vec![b'c'; 4000];
         subscribe(r, idx, std::slice::from_ref(&long));
@@ -1021,7 +1073,7 @@ mod tests {
     #[test]
     fn a_subscriber_past_the_hard_limit_is_disconnected() {
         let r = reg();
-        let (idx, _) = slot_alloc_and_subscribe(r, &[v("t4")]).unwrap();
+        let (idx, _) = slot_alloc_and_subscribe(r, 1, &[v("t4")]).unwrap();
         let limits = Limits {
             hard: 1 << 20,
             soft: 0,
@@ -1044,7 +1096,7 @@ mod tests {
     #[test]
     fn the_soft_limit_disconnects_only_once_held_for_its_time() {
         let r = reg();
-        let (idx, _) = slot_alloc_and_subscribe(r, &[v("t5")]).unwrap();
+        let (idx, _) = slot_alloc_and_subscribe(r, 1, &[v("t5")]).unwrap();
         let limits = Limits {
             hard: 0,
             soft: 100,
@@ -1056,16 +1108,34 @@ mod tests {
         assert!(!sub.overflowed);
         sub.push(b"t5", b"", &[0u8; 10], &limits, 30_000);
         assert!(!sub.overflowed);
+        // Held 60 seconds is not more than 60.
         sub.push(b"t5", b"", &[0u8; 10], &limits, 61_000);
+        assert!(!sub.overflowed);
+        sub.push(b"t5", b"", &[0u8; 10], &limits, 62_000);
         assert!(sub.overflowed);
         drop(l);
         slot_free(r, idx);
     }
 
     #[test]
+    fn output_bytes_are_counted_per_owner() {
+        let r = reg();
+        let (idx, _) = slot_alloc_and_subscribe(r, 4242, &[v("t9")]).unwrap();
+        publish(r, b"t9", b"hi");
+        assert_eq!(
+            output_bytes(r).get(&4242),
+            Some(&frame_bytes(b"t9", b"", b"hi"))
+        );
+        poll_message(r, idx);
+        assert_eq!(output_bytes(r).get(&4242), Some(&0));
+        slot_free(r, idx);
+        assert_eq!(output_bytes(r).get(&4242), None);
+    }
+
+    #[test]
     fn a_publish_wakes_a_waiting_subscriber() {
         let r = reg();
-        let (idx, _) = slot_alloc_and_subscribe(r, &[v("t6")]).unwrap();
+        let (idx, _) = slot_alloc_and_subscribe(r, 1, &[v("t6")]).unwrap();
         let seen = current_tail(r, idx);
         let waiter = std::thread::spawn(move || {
             let started = std::time::Instant::now();
@@ -1083,7 +1153,7 @@ mod tests {
     #[test]
     fn unsubscribing_from_everything_frees_the_slot() {
         let r = reg();
-        let (idx, _) = slot_alloc_and_subscribe(r, &[v("t7:a"), v("t7:b")]).unwrap();
+        let (idx, _) = slot_alloc_and_subscribe(r, 1, &[v("t7:a"), v("t7:b")]).unwrap();
         assert_eq!(unsubscribe(r, idx, &[v("t7:a")]), (1, 0));
         assert_eq!(unsubscribe(r, idx, &[v("t7:b")]), (0, 0));
         assert_eq!(publish(r, b"t7:b", b"x"), 0);
@@ -1093,9 +1163,9 @@ mod tests {
     #[test]
     fn channels_and_patterns_are_listed_and_counted_as_redis_does() {
         let r = reg();
-        let (a, _) = slot_alloc_and_subscribe(r, &[v("t8:x"), v("t8:y")]).unwrap();
-        let (b, _) = slot_alloc_and_psubscribe(r, &[v("t8:*")]).unwrap();
-        let (c, _) = slot_alloc_and_psubscribe(r, &[v("t8:*")]).unwrap();
+        let (a, _) = slot_alloc_and_subscribe(r, 1, &[v("t8:x"), v("t8:y")]).unwrap();
+        let (b, _) = slot_alloc_and_psubscribe(r, 1, &[v("t8:*")]).unwrap();
+        let (c, _) = slot_alloc_and_psubscribe(r, 1, &[v("t8:*")]).unwrap();
         subscribe(r, b, &[shard_name(b"t8:s")]);
         assert_eq!(
             pubsub_channels(r, Some(b"t8:*"), false),

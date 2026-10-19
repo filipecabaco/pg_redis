@@ -344,6 +344,12 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
         // random to get back under it.
         crate::tracking::limit_used_slots();
 
+        // And closes a subscriber held past its soft output limit for its
+        // time, though no message has reached it since.
+        if let Some(slots) = crate::pubsub_state() {
+            crate::pubsub::enforce_limits(slots);
+        }
+
         // Redis's `evictionTimeProc`: past the limit — a `CONFIG SET
         // maxmemory` below what is held, or a round that ran out of time —
         // eviction carries on with no command to start it.
@@ -2314,7 +2320,7 @@ fn listen_for_invalidations(
             crate::pubsub::subscribe(slots, idx, &channel);
             true
         }
-        None => match crate::pubsub::slot_alloc_and_subscribe(slots, &channel) {
+        None => match crate::pubsub::slot_alloc_and_subscribe(slots, client.id, &channel) {
             Some((idx, _)) => {
                 *sub_slot = Some(idx);
                 true
@@ -2493,9 +2499,9 @@ fn subscribe_in_place(
         Some(idx) => confirm_subscriptions(writer, slots, idx, proto, items, kind),
         None => {
             let alloc = if kind == SubKind::Pattern {
-                crate::pubsub::slot_alloc_and_psubscribe(slots, &items[..1])
+                crate::pubsub::slot_alloc_and_psubscribe(slots, client.id, &items[..1])
             } else {
-                crate::pubsub::slot_alloc_and_subscribe(slots, &items[..1])
+                crate::pubsub::slot_alloc_and_subscribe(slots, client.id, &items[..1])
             };
             match alloc {
                 None => reply(writer, |w| write_error(w, PUBSUB_FULL)),
@@ -2524,7 +2530,7 @@ fn enter_subscribe_mode(
     proto: u8,
     items: &[Vec<u8>],
     kind: SubKind,
-    alloc_fn: impl Fn(&'static crate::pubsub::Slots, &[Vec<u8>]) -> Option<(usize, u32)>,
+    alloc_fn: impl Fn(&'static crate::pubsub::Slots, u64, &[Vec<u8>]) -> Option<(usize, u32)>,
 ) -> bool {
     let Some(slots) = crate::pubsub_state() else {
         reply(writer, |w| write_error(w, PUBSUB_NOT_LOADED));
@@ -2534,9 +2540,9 @@ fn enter_subscribe_mode(
     writer.muted = false;
     let own_channel = vec![crate::tracking::channel(CONN_CLIENT.with(|c| c.get()))];
     // The slot is taken with the first name; the rest go through the same
-    // path as a SUBSCRIBE already in subscribe mode, so duplicates and names
-    // past the per-connection limit are answered the way Redis would.
-    match alloc_fn(slots, &items[..1]) {
+    // path as a SUBSCRIBE already in subscribe mode, so duplicates are
+    // answered the way Redis would.
+    match alloc_fn(slots, who.0.id, &items[..1]) {
         None => {
             reply(writer, |w| write_error(w, PUBSUB_FULL));
             true
@@ -3362,7 +3368,7 @@ fn monitor_loop(
         return true;
     };
     let Some((idx, _)) =
-        crate::pubsub::slot_alloc_and_subscribe(pslots, &[MONITOR_CHANNEL.to_vec()])
+        crate::pubsub::slot_alloc_and_subscribe(pslots, client.id, &[MONITOR_CHANNEL.to_vec()])
     else {
         reply(writer, |w| write_error(w, PUBSUB_FULL));
         return true;

@@ -3,6 +3,7 @@
 // pubsub, pg, scripting's Lua bridge, and the worker entry point here.
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+pub(crate) mod access;
 pub(crate) mod admin;
 pub(crate) mod blocking;
 mod commands;
@@ -10,6 +11,7 @@ pub(crate) mod composite;
 pub(crate) mod config;
 pub(crate) mod cursor;
 pub(crate) mod dblock;
+pub(crate) mod evict;
 #[cfg(test)]
 mod fuzz;
 pub(crate) mod geo;
@@ -66,10 +68,10 @@ pub(crate) static SNAPSHOT_INTERVAL: GucSetting<i32> = GucSetting::<i32>::new(60
 pub(crate) static DATABASE: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(Some(c"postgres"));
 
-/// What memory mode does when a shared-memory table fills. Defaults to
-/// `noeviction`, as Redis's own `maxmemory-policy` does.
-pub(crate) static MAXMEMORY_POLICY: GucSetting<Option<std::ffi::CString>> =
-    GucSetting::<Option<std::ffi::CString>>::new(Some(c"noeviction"));
+/// What memory mode does past `redis.maxmemory`: Redis's `maxmemory-policy`,
+/// all eight of its values, `noeviction` by default as in Redis.
+pub(crate) static MAXMEMORY_POLICY: GucSetting<shm::Policy> =
+    GucSetting::<shm::Policy>::new(shm::Policy::NoEviction);
 
 /// Megabytes the memory engine may hold — Redis's `maxmemory`. The arena is
 /// reserved at this size (plus headroom) but backed only as it fills.
@@ -82,6 +84,7 @@ static WATCH_CTL: shared::Block<watch::WatchCtl> = shared::Block::new();
 static SERVER_CTL: shared::Block<server::ServerCtl> = shared::Block::new();
 static CURSOR_TABLE: shared::Block<cursor::CursorTable> = shared::Block::new();
 static DB_LOCKS: shared::Block<dblock::DbLocks> = shared::Block::new();
+static ACCESS_TABLE: shared::Block<access::AccessTable> = shared::Block::new();
 
 /// Everything this extension keeps in shared memory, reserved in the
 /// postmaster's request hook.
@@ -94,6 +97,8 @@ fn request_shmem() {
     // The SCAN cursors of databases kept in tables.
     shared::request(cursor::cursor_table_size());
     shared::request(dblock::db_locks_size());
+    // The access fields of logged databases' keys (`access.rs`).
+    shared::request(access::access_table_size());
     // The memory engine's arena: reserved at redis.maxmemory, backed by RAM
     // only as it fills.
     shm::request();
@@ -111,6 +116,7 @@ fn attach_shmem() {
         server::init(ctl);
     }
     CURSOR_TABLE.attach(c"pg_redis_cursor_table", cursor::cursor_table_size());
+    ACCESS_TABLE.attach(c"pg_redis_access_table", access::access_table_size());
     shm::startup();
 }
 
@@ -136,6 +142,11 @@ pub(crate) fn cursor_state() -> Option<&'static cursor::CursorTable> {
 /// The per-database reader/writer locks, once they exist (`dblock.rs`).
 pub(crate) fn db_locks() -> Option<&'static dblock::DbLocks> {
     DB_LOCKS.get()
+}
+
+/// The logged databases' access fields, once they exist (`access.rs`).
+pub(crate) fn access_state() -> Option<&'static access::AccessTable> {
+    ACCESS_TABLE.get()
 }
 
 /// The WATCH counters, once they exist.
@@ -262,12 +273,14 @@ pub extern "C-unwind" fn _PG_init() {
         GucFlags::default(),
     );
 
-    GucRegistry::define_string_guc(
+    GucRegistry::define_enum_guc(
         c"redis.maxmemory_policy",
         c"What memory mode does past redis.maxmemory",
-        c"'noeviction' (default, as in Redis): refuse the write with an OOM error. \
-          'allkeys-random': evict random keys, collections whole, to make room. \
-          'volatile-ttl': evict only keys that carry an expiry, soonest first.",
+        c"Redis's maxmemory-policy. 'noeviction' (default, as in Redis): refuse the \
+          write with an OOM error. 'allkeys-lru', 'allkeys-lfu', 'allkeys-random': \
+          evict any key, least recently used, least frequently used or at random. \
+          'volatile-lru', 'volatile-lfu', 'volatile-random', 'volatile-ttl': evict \
+          only keys that carry an expiry, the last by soonest expiry.",
         &MAXMEMORY_POLICY,
         GucContext::Suset,
         GucFlags::default(),

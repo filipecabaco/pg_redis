@@ -5408,3 +5408,294 @@ describe("Atomicity across workers", () => {
 		}
 	}, 120_000);
 });
+
+// Redis 7.2's eviction policies and access clock (src/evict.rs, src/access.rs,
+// src/memdb/lru.rs). Memory database 0 for eviction; logged database 8 for
+// OBJECT, which must answer there too. Every test puts the limit and the
+// policy back, and the memory databases are emptied first, since an allkeys
+// policy may take a key from any of them.
+describe("Eviction and access tracking", () => {
+	const usedMemory = async (): Promise<number> => {
+		const info = (await raw.bulk("INFO", "memory"))?.toString() ?? "";
+		return Number(info.match(/used_memory:(\d+)/)?.[1] ?? 0);
+	};
+	const stat = async (name: string): Promise<number> => {
+		const info = (await raw.bulk("INFO", "stats"))?.toString() ?? "";
+		return Number(info.match(new RegExp(`${name}:(\\d+)`))?.[1] ?? -1);
+	};
+	const reset = async () => {
+		await raw.send("CONFIG", "SET", "maxmemory", "0", "maxmemory-policy", "noeviction");
+		await raw.send("CONFIG", "SET", "notify-keyspace-events", "");
+	};
+	const within = <T>(p: Promise<T>, ms: number) =>
+		Promise.race([p, Bun.sleep(ms).then(() => null)]);
+	const exists = async (key: string) => integerReply(await raw.send("EXISTS", key)) === 1;
+	const value = "x".repeat(200);
+
+	beforeAll(async () => {
+		for (let db = 0; db < 8; db++) {
+			await raw.send("SELECT", String(db));
+			await raw.send("FLUSHDB");
+		}
+		await raw.send("SELECT", "0");
+	});
+
+	afterAll(async () => {
+		await reset();
+		await raw.send("SELECT", "0");
+		await raw.send("FLUSHDB");
+		await raw.send("SELECT", "durable");
+	});
+
+	test("every policy is accepted, reported, and refused when misspelt", async () => {
+		try {
+			for (const p of [
+				"noeviction",
+				"allkeys-lru",
+				"allkeys-lfu",
+				"allkeys-random",
+				"volatile-lru",
+				"volatile-lfu",
+				"volatile-random",
+				"volatile-ttl",
+			]) {
+				expect((await raw.send("CONFIG", "SET", "maxmemory-policy", p)).toString()).toBe("+OK\r\n");
+				expect((await raw.array("CONFIG", "GET", "maxmemory-policy"))[1]?.toString()).toBe(p);
+				expect((await raw.bulk("INFO", "memory"))?.toString()).toContain(`maxmemory_policy:${p}`);
+			}
+			expect(errorReply(await raw.send("CONFIG", "SET", "maxmemory-policy", "lru"))).toStartWith(
+				"ERR CONFIG SET failed (possibly related to argument 'maxmemory-policy') - argument(s) must be one of the following: volatile-lru,",
+			);
+			expect(errorReply(await raw.send("CONFIG", "SET", "maxmemory-samples", "0"))).toContain(
+				"argument must be between 1 and 2147483647 inclusive",
+			);
+		} finally {
+			await reset();
+		}
+	});
+
+	for (const policy of ["volatile-lru", "volatile-lfu", "volatile-random", "volatile-ttl"]) {
+		test(`${policy} evicts only keys with an expiry, then refuses writes`, async () => {
+			await raw.send("FLUSHDB");
+			try {
+				for (let i = 0; i < 200; i++) {
+					await raw.send("SET", `p:${i}`, value);
+					await raw.send("SET", `v:${i}`, value, "EX", String(1000 + i));
+				}
+				const before = await stat("evicted_keys");
+				const used = await usedMemory();
+				await raw.send("CONFIG", "SET", "maxmemory-policy", policy);
+				await raw.send("CONFIG", "SET", "maxmemory", String(used - 20_000));
+				expect((await raw.send("SET", "trigger", "1")).toString()).toBe("+OK\r\n");
+				const evicted = (await stat("evicted_keys")) - before;
+				expect(evicted).toBeGreaterThan(10);
+				for (let i = 0; i < 200; i++) expect(await exists(`p:${i}`)).toBe(true);
+				const gone: number[] = [];
+				for (let i = 0; i < 200; i++) if (!(await exists(`v:${i}`))) gone.push(i);
+				expect(gone.length).toBe(evicted);
+				if (policy === "volatile-ttl") {
+					// The soonest deadlines go first: what went is from the low end.
+					const mean = gone.reduce((a, b) => a + b, 0) / gone.length;
+					expect(mean).toBeLessThan(60);
+				}
+				// With every volatile key gone, nothing may be evicted: OOM.
+				await raw.send("CONFIG", "SET", "maxmemory", "1");
+				expect(errorReply(await raw.send("SET", "more", value))).toStartWith("OOM ");
+				expect(await exists("p:0")).toBe(true);
+				for (let i = 0; i < 200; i++) expect(await exists(`v:${i}`)).toBe(false);
+			} finally {
+				await reset();
+				await raw.send("FLUSHDB");
+			}
+		});
+	}
+
+	// Redis's own LRU test, in outline: keys touched after a pause outlive
+	// keys left alone, because an idle key scores higher in the pool.
+	test("allkeys-lru keeps the keys used recently", async () => {
+		await raw.send("FLUSHDB");
+		try {
+			await raw.send("CONFIG", "SET", "maxmemory-policy", "allkeys-lru");
+			const empty = await usedMemory();
+			for (let i = 0; i < 1000; i++) await raw.send("SET", `k:${i}`, value);
+			const full = await usedMemory();
+			await Bun.sleep(2100);
+			for (let i = 0; i < 500; i++) await raw.send("GET", `k:${i}`);
+			await raw.send("CONFIG", "SET", "maxmemory", String(full - Math.floor((full - empty) * 0.25)));
+			await raw.send("PING");
+			let touched = 0;
+			let idle = 0;
+			for (let i = 0; i < 1000; i++) {
+				const here = await exists(`k:${i}`);
+				if (here && i < 500) touched++;
+				if (here && i >= 500) idle++;
+			}
+			expect(idle).toBeLessThan(450);
+			expect(touched).toBeGreaterThan(475);
+		} finally {
+			await reset();
+			await raw.send("FLUSHDB");
+		}
+	});
+
+	test("allkeys-lfu keeps the keys used often", async () => {
+		await raw.send("FLUSHDB");
+		try {
+			await raw.send("CONFIG", "SET", "maxmemory-policy", "allkeys-lfu");
+			const empty = await usedMemory();
+			for (let i = 0; i < 1000; i++) await raw.send("SET", `k:${i}`, value);
+			const full = await usedMemory();
+			for (let round = 0; round < 20; round++) {
+				await Promise.all(Array.from({ length: 200 }, (_, i) => raw.send("GET", `k:${i}`)));
+			}
+			expect(integerReply(await raw.send("OBJECT", "FREQ", "k:0"))).toBeGreaterThan(6);
+			expect(integerReply(await raw.send("OBJECT", "FREQ", "k:999"))).toBe(5);
+			await raw.send("CONFIG", "SET", "maxmemory", String(full - Math.floor((full - empty) * 0.25)));
+			await raw.send("PING");
+			let hot = 0;
+			for (let i = 0; i < 200; i++) if (await exists(`k:${i}`)) hot++;
+			expect(hot).toBeGreaterThan(190);
+			expect(integerReply(await raw.send("DBSIZE"))).toBeLessThan(950);
+		} finally {
+			await reset();
+			await raw.send("FLUSHDB");
+		}
+	});
+
+	test("an evicted key raises `evicted` and invalidates a tracking client", async () => {
+		await raw.send("FLUSHDB");
+		const sub = await new RawRedis().connect();
+		const inval = await new RawRedis().connect();
+		const tracker = await new RawRedis().connect();
+		try {
+			await raw.send("CONFIG", "SET", "notify-keyspace-events", "Ee");
+			await sub.send("PSUBSCRIBE", "__keyevent@0__:evicted");
+			const invalId = integerReply(await inval.send("CLIENT", "ID"));
+			await inval.send("SUBSCRIBE", "__redis__:invalidate");
+			await tracker.send("SELECT", "0");
+			await tracker.send("CLIENT", "TRACKING", "on", "REDIRECT", String(invalId));
+			await raw.send("SET", "ev:k", value, "EX", "1000");
+			await tracker.send("GET", "ev:k");
+			const before = await stat("evicted_keys");
+			const event = sub.next();
+			const invalidation = inval.next();
+			// The only key with an expiry: volatile-ttl takes it and nothing
+			// else, and with no command to start it, the worker's next round.
+			await raw.send("CONFIG", "SET", "maxmemory-policy", "volatile-ttl");
+			await raw.send("CONFIG", "SET", "maxmemory", String((await usedMemory()) - 1));
+			const got = (await within(event, 3000))?.toString() ?? "";
+			expect(got).toContain("__keyevent@0__:evicted");
+			expect(got).toContain("ev:k");
+			const inv = (await within(invalidation, 3000))?.toString() ?? "";
+			expect(inv).toContain("__redis__:invalidate");
+			expect(inv).toContain("ev:k");
+			expect(await stat("evicted_keys")).toBe(before + 1);
+			expect(await stat("evicted_clients")).toBe(0);
+		} finally {
+			await reset();
+			sub.close();
+			inval.close();
+			tracker.close();
+		}
+	});
+
+	for (const half of ["0", "8"]) {
+		test(`OBJECT IDLETIME grows and resets on access (db ${half})`, async () => {
+			await raw.send("SELECT", half);
+			try {
+				await raw.send("DEL", "at:k");
+				await raw.send("SET", "at:k", "v");
+				expect(integerReply(await raw.send("OBJECT", "IDLETIME", "at:k"))).toBeLessThanOrEqual(1);
+				await Bun.sleep(2100);
+				// TTL, TYPE and EXISTS look without touching.
+				await raw.send("TTL", "at:k");
+				await raw.send("TYPE", "at:k");
+				await raw.send("EXISTS", "at:k");
+				expect(integerReply(await raw.send("OBJECT", "IDLETIME", "at:k"))).toBeGreaterThanOrEqual(2);
+				await raw.send("GET", "at:k");
+				expect(integerReply(await raw.send("OBJECT", "IDLETIME", "at:k"))).toBeLessThanOrEqual(1);
+				expect(await raw.bulk("OBJECT", "IDLETIME", "at:absent")).toBeNull();
+				expect(errorReply(await raw.send("OBJECT", "FREQ", "at:k"))).toBe(
+					"ERR An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.",
+				);
+			} finally {
+				await raw.send("DEL", "at:k");
+				await raw.send("SELECT", "0");
+			}
+		});
+
+		test(`OBJECT FREQ counts under LFU (db ${half})`, async () => {
+			await raw.send("SELECT", half);
+			try {
+				await raw.send("CONFIG", "SET", "maxmemory-policy", "allkeys-lfu");
+				await raw.send("DEL", "af:k");
+				await raw.send("SET", "af:k", "v");
+				expect(integerReply(await raw.send("OBJECT", "FREQ", "af:k"))).toBe(5);
+				for (let i = 0; i < 30; i++) await raw.send("GET", "af:k");
+				expect(integerReply(await raw.send("OBJECT", "FREQ", "af:k"))).toBeGreaterThan(5);
+				expect(errorReply(await raw.send("OBJECT", "IDLETIME", "af:k"))).toBe(
+					"ERR An LFU maxmemory policy is selected, idle time not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.",
+				);
+				expect(await raw.bulk("OBJECT", "FREQ", "af:absent")).toBeNull();
+			} finally {
+				await reset();
+				await raw.send("DEL", "af:k");
+				await raw.send("SELECT", "0");
+			}
+		});
+
+		test(`CLIENT NO-TOUCH leaves the clock alone but TOUCH still touches (db ${half})`, async () => {
+			await raw.send("SELECT", half);
+			try {
+				await raw.send("SET", "nt:k", "v");
+				await Bun.sleep(2100);
+				await raw.send("CLIENT", "NO-TOUCH", "ON");
+				await raw.send("GET", "nt:k");
+				expect(integerReply(await raw.send("OBJECT", "IDLETIME", "nt:k"))).toBeGreaterThanOrEqual(2);
+				await raw.send("TOUCH", "nt:k");
+				expect(integerReply(await raw.send("OBJECT", "IDLETIME", "nt:k"))).toBeLessThanOrEqual(1);
+			} finally {
+				await raw.send("CLIENT", "NO-TOUCH", "OFF");
+				await raw.send("DEL", "nt:k");
+				await raw.send("SELECT", "0");
+			}
+		});
+
+		test(`RESTORE sets IDLETIME and FREQ, and REFCOUNT follows sharing (db ${half})`, async () => {
+			await raw.send("SELECT", half);
+			try {
+				await raw.send("SET", "rs:k", "bar");
+				const dump = (await raw.bulk("DUMP", "rs:k")) as Buffer;
+				await raw.send("DEL", "rs:k");
+				await raw.send("CONFIG", "SET", "maxmemory-policy", "allkeys-lru");
+				expect((await raw.send("RESTORE", "rs:k", "0", dump, "IDLETIME", "1000")).toString()).toBe("+OK\r\n");
+				const idle = integerReply(await raw.send("OBJECT", "IDLETIME", "rs:k"));
+				expect(idle).toBeGreaterThanOrEqual(1000);
+				expect(idle).toBeLessThanOrEqual(1010);
+				await raw.send("DEL", "rs:k");
+				await raw.send("CONFIG", "SET", "maxmemory-policy", "allkeys-lfu");
+				await raw.send("RESTORE", "rs:k", "0", dump, "FREQ", "100");
+				expect(integerReply(await raw.send("OBJECT", "FREQ", "rs:k"))).toBe(100);
+				expect(errorReply(await raw.send("RESTORE", "rs:k", "0", dump, "REPLACE", "FREQ", "256"))).toBe(
+					"ERR Invalid FREQ value, must be >= 0 and <= 255",
+				);
+				expect(errorReply(await raw.send("RESTORE", "rs:k", "0", dump, "REPLACE", "IDLETIME", "1", "FREQ", "1"))).toBe(
+					"ERR syntax error",
+				);
+				// Small integers are shared objects unless an LRU or LFU policy
+				// has a limit to keep per key.
+				await raw.send("CONFIG", "SET", "maxmemory", "1gb");
+				await raw.send("SET", "rs:n", "100");
+				expect(integerReply(await raw.send("OBJECT", "REFCOUNT", "rs:n"))).toBe(1);
+				await raw.send("CONFIG", "SET", "maxmemory-policy", "noeviction");
+				expect(integerReply(await raw.send("OBJECT", "REFCOUNT", "rs:n"))).toBe(2147483647);
+				expect(integerReply(await raw.send("OBJECT", "REFCOUNT", "rs:k"))).toBe(1);
+				expect(await raw.bulk("OBJECT", "REFCOUNT", "rs:absent")).toBeNull();
+			} finally {
+				await reset();
+				await raw.send("DEL", "rs:k", "rs:n");
+				await raw.send("SELECT", "0");
+			}
+		});
+	}
+});

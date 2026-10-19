@@ -38,6 +38,8 @@ unsafe impl Shareable for crate::server::ServerCtl {}
 // SAFETY: atomics only, read and written under its spinlock; zeroed, every
 // slot is free and the lock open.
 unsafe impl Shareable for crate::cursor::CursorTable {}
+// SAFETY: atomics only; zeroed, every slot is free.
+unsafe impl Shareable for crate::access::AccessTable {}
 
 // SAFETY: two atomic words per database, zero when nobody holds the lock.
 unsafe impl Shareable for crate::dblock::DbLocks {}

@@ -715,6 +715,8 @@ fn info_section(section: &str, conn: &Conn, data: &mut Data) -> String {
                     crate::config::get_str("maxmemory-policy")
                 ),
                 "mem_fragmentation_ratio:1.00".into(),
+                // No replication or AOF buffers are counted in the arena.
+                "mem_not_counted_for_evict:0".into(),
                 "mem_allocator:postgresql".into(),
                 "lazyfree_pending_objects:0".into(),
                 "lazyfreed_objects:0".into(),
@@ -751,8 +753,16 @@ fn info_section(section: &str, conn: &Conn, data: &mut Data) -> String {
                 format!("total_net_output_bytes:{}", stat(|c| &c.net_output)),
                 format!("rejected_connections:{}", stat(|c| &c.rejected_connections)),
                 format!("expired_keys:{}", stat(|c| &c.expired_keys)),
-                "evicted_keys:0".into(),
+                format!("evicted_keys:{}", stat(|c| &c.evicted_keys)),
                 "evicted_clients:0".into(),
+                format!(
+                    "total_eviction_exceeded_time:{}",
+                    server::eviction_exceeded_times().0
+                ),
+                format!(
+                    "current_eviction_exceeded_time:{}",
+                    server::eviction_exceeded_times().1
+                ),
                 format!("keyspace_hits:{}", stat(|c| &c.keyspace_hits)),
                 format!("keyspace_misses:{}", stat(|c| &c.keyspace_misses)),
                 "pubsub_channels:0".into(),
@@ -895,9 +905,15 @@ fn implemented() -> impl Iterator<Item = &'static CommandSpec> {
     })
 }
 
+/// `implemented` by name, built once: `get_keys` runs after every command on
+/// a logged database (`access::after_command`), and the filter above walks
+/// the coverage page for each entry of the command table.
+static BY_NAME: std::sync::LazyLock<std::collections::HashMap<&'static str, &'static CommandSpec>> =
+    std::sync::LazyLock::new(|| implemented().map(|c| (c.name, c)).collect());
+
 fn find_spec(name: &[u8]) -> Option<&'static CommandSpec> {
     let lower = String::from_utf8_lossy(name).to_ascii_lowercase();
-    implemented().find(|c| c.name == lower)
+    BY_NAME.get(lower.as_str()).copied()
 }
 
 /// Redis's `populateCommandLegacyRangeSpec`: the single first/last/step
@@ -1378,7 +1394,7 @@ pub(crate) fn get_keys(argv: &[Vec<u8>]) -> Result<KeysWithFlags, String> {
             spec.name,
             String::from_utf8_lossy(&argv[1]).to_ascii_lowercase()
         );
-        if let Some(s) = implemented().find(|c| c.name == full) {
+        if let Some(s) = BY_NAME.get(full.as_str()) {
             spec = s;
         }
     }

@@ -15,7 +15,7 @@ it was slower than memory and not durable, so it was never the best choice.
 
 | Workload | Policy | Why |
 |---|---|---|
-| Cache, memoised query results | `memory` | Losing it on a restart costs only recomputation. Set `redis.maxmemory_policy` to `allkeys-random` or `volatile-ttl` so a full cache evicts keys; the default, `noeviction`, refuses writes past `redis.maxmemory` with `OOM`. |
+| Cache, memoised query results | `memory` | Losing it on a restart costs only recomputation. Set `redis.maxmemory_policy` to `allkeys-lru` (or another evicting policy) so a full cache evicts keys; the default, `noeviction`, refuses writes past `redis.maxmemory` with `OOM`. |
 | Rate limits | `memory` | Short-lived counters with a TTL. Losing them on a restart only resets the limits. |
 | Sessions | `memory+snapshot`, or `logged` if losing any is unacceptable | Served from memory and copied to a logged table every `redis.snapshot_interval` seconds (60 by default), so a crash loses at most that interval of changes. `logged` loses none. |
 | Job queues, anything you cannot lose | `logged` | Survives a crash, is replicated and can be queried in SQL. Every write commits to the WAL, so writes are much slower than in memory; see [Performance](IMPLEMENTATION.md#8-performance). |
@@ -210,13 +210,17 @@ allocated from one arena in PostgreSQL's main shared segment.
   a page only once it is written, so a nearly empty server uses next to
   nothing. There is no per-type entry limit, no 64 KiB value cap and no
   key-length limit: a key or value can be as long as Redis allows (512 MB).
-- **The limit, as in Redis.** Before a write that could grow memory (Redis's
-  `denyoom` commands), use is checked against the limit. Past it the write is
-  refused with `OOM`, unless `redis.maxmemory_policy` can evict enough first:
-  `allkeys-random` drops random keys, `volatile-ttl` the soonest to expire
-  among a sample of keys with a deadline. As in Redis, the limit is checked
-  before the command, so one large write can overshoot it; the headroom (a
-  quarter of the limit, at least 32 MB) is what it overshoots into.
+- **The limit, as in Redis.** Before every command, use is checked against
+  the limit, and past it `redis.maxmemory_policy` evicts keys until use is
+  back under: any of Redis's eight policies, with its sampled LRU and LFU
+  ([The limit and eviction](IMPLEMENTATION.md#the-limit-and-eviction)). A
+  write that could grow memory (Redis's `denyoom` commands) is refused with
+  `OOM` when the policy can evict nothing more. Each evicted key raises the
+  `evicted` keyspace event and a `CLIENT TRACKING` invalidation and counts
+  in INFO's `evicted_keys`. As in Redis, the limit is checked before the
+  command, so one large write can overshoot it; the headroom (a quarter of
+  the limit, at least 32 MB) is what it overshoots into. A `logged`
+  database is never evicted: it is bounded by disk.
   `CONFIG SET maxmemory` lowers the limit at runtime, `CONFIG GET maxmemory`
   and `INFO memory` report it, and `used_memory` is the arena's real use.
 - **One lock per command.** A memory command takes its database's lock once

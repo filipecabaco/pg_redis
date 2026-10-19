@@ -59,12 +59,21 @@ pub fn snapshot_gucs() {
         bind: s(&crate::LISTEN_ADDRESS),
         requirepass: s(&crate::PASSWORD),
         maxclients: crate::MAX_CONNECTIONS.get(),
-        maxmemory_policy: s(&crate::MAXMEMORY_POLICY),
+        maxmemory_policy: Some(crate::MAXMEMORY_POLICY.get().name().to_string()),
         default_db: crate::DEFAULT_DB.get().clamp(0, 15) as u8,
     };
     // A poisoned lock only means a reader panicked holding it; the value is
     // a plain copy and still whole.
     *LIVE.write().unwrap_or_else(|e| e.into_inner()) = Some(next);
+    GUC_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// Bumped by every snapshot, so a cache of settings read through it knows
+/// to read them again (`access::settings`).
+static GUC_GENERATION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn guc_generation() -> u32 {
+    GUC_GENERATION.load(std::sync::atomic::Ordering::Acquire)
 }
 
 pub fn live_gucs() -> LiveGucs {

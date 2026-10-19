@@ -1556,6 +1556,11 @@ fn run_from_script(argv: &[Vec<u8>], ctx: &mut CallCtx<'_>) -> Result<Response, 
                 .as_ref()
                 .and_then(|c| crate::notify::before(c, db, &mut exists));
             let r = host.exec(db, cmd);
+            crate::access::after_command(
+                db,
+                argv,
+                crate::access::client_no_touch(crate::tracking::origin()),
+            );
             if let Some(c) = &notified {
                 let mut exists = |d: u8, k: &[u8]| {
                     matches!(

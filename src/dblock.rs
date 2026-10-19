@@ -342,6 +342,43 @@ pub fn release_held() {
     release(crate::db_locks());
 }
 
+/// Run `f`, a change to database `db` made on the side of whatever this
+/// thread runs, as eviction is: at once if the run holds `db`, otherwise
+/// holding it shared for just `f` if that needs no wait. `None`, without
+/// running `f`, when another client holds it exclusive or waits to: a
+/// transaction or script on it sees nothing change under it, as in Redis,
+/// where eviction happens only between commands.
+pub fn beside<R>(db: u8, f: impl FnOnce() -> R) -> Option<R> {
+    beside_on(crate::db_locks(), db, f)
+}
+
+pub fn beside_on<R>(locks: Option<&'static DbLocks>, db: u8, f: impl FnOnce() -> R) -> Option<R> {
+    let held = HELD.get();
+    let Some(locks) = locks else {
+        return Some(f());
+    };
+    if held.is_some_and(|h| (h.shared | h.exclusive) & bit(db) != 0) {
+        return Some(f());
+    }
+    if !locks.lock(db).try_shared() {
+        return None;
+    }
+    // Recorded with the run's, so an exit that never unwinds releases it.
+    HELD.set(Some(
+        held.unwrap_or(Plan::NONE).union(Plan::shared(bit(db))),
+    ));
+    /// Gives the side hold back, on unwinding too.
+    struct Side(&'static RwLock, Option<Plan>);
+    impl Drop for Side {
+        fn drop(&mut self) {
+            HELD.set(self.1);
+            self.0.unlock_shared();
+        }
+    }
+    let _side = Side(locks.lock(db), held);
+    Some(f())
+}
+
 /// Extend the run in progress to `dbs`, each exclusive, without waiting: for
 /// a script that reaches a database it was not started with (a command name
 /// built at run time). `Err` names the first one another client holds. A

@@ -444,19 +444,94 @@ keyspace notifications or tracking want them.
 
 ### The limit and eviction
 
-Before a write that could grow memory (every write but the removals, Redis's
-`denyoom`), `shm::make_room` compares the arena's use with the limit. If use
-is under the limit, the command runs and may overshoot into the headroom. If
-it is over:
+Before every command on a memory database, as Redis's `performEvictions`
+runs before every command, `evict::perform` compares the arena's use with
+the limit. If use is under the limit, the command runs and may overshoot
+into the headroom. If it is over, keys are evicted under
+`redis.maxmemory_policy` (or `CONFIG SET maxmemory-policy`) until use is
+under the limit again. A write that could grow memory (Redis's `denyoom`) is
+refused with `OOM command not allowed when used memory > 'maxmemory'` when
+the policy finds nothing more it may evict; reads and removals still run.
 
-| `redis.maxmemory_policy` | What happens |
+| `redis.maxmemory_policy` | Evicts |
 |---|---|
-| `noeviction` (default, as in Redis) | The write is refused with `OOM command not allowed when used memory > 'maxmemory'`. Reads and removals still run. |
-| `allkeys-random` | Random keys are evicted, collections whole, across the memory databases until use is under the limit. |
-| `volatile-ttl` | Of a sample of keys, the one with a deadline that comes soonest is evicted, until use is under the limit or no key has a deadline. |
+| `noeviction` (default, as in Redis) | Nothing. |
+| `allkeys-lru` | The least recently used key, by Redis's approximation. |
+| `allkeys-lfu` | The least frequently used key. |
+| `allkeys-random` | A random key. |
+| `volatile-lru`, `volatile-lfu`, `volatile-random` | As the `allkeys-*` policy, among keys with a deadline only. |
+| `volatile-ttl` | The key with a deadline that comes soonest, among those sampled. |
+
+The algorithm is Redis 7.2's (`evict.c`):
+
+- **Sampling and the pool.** For the LRU, LFU and TTL policies each round
+  draws `maxmemory-samples` keys (5 by default) at random from every memory
+  database, scores them (idle time, `255 - frequency`, or nearness of the
+  deadline), and keeps the best 16 across rounds in an eviction pool. The
+  best candidate still present is evicted. The random policies take a random
+  key from each database in turn. A collection is evicted whole.
+- **Keys with a deadline have their own index.** Each database keeps a list
+  of the positions of its keys with a deadline, as Redis keeps its `expires`
+  dictionary, so the `volatile-*` policies sample only those keys and the
+  expiry sweep walks only those keys (`memdb::keyspace`).
+- **Time limit.** A round stops after `maxmemory-eviction-tenacity`'s limit
+  (500 µs at the default 10), checked every 16 keys. The command then runs,
+  and the worker's next round, every 250 ms, carries on, as Redis's
+  `evictionTimeProc` does. The same round evicts after `CONFIG SET
+  maxmemory` lowers the limit below what is held, with no command needed.
+- **What an eviction reports.** Each evicted key increments INFO's
+  `evicted_keys`, raises the `evicted` keyspace event (class `e`), sends a
+  `CLIENT TRACKING` invalidation and breaks a `WATCH` on it, as Redis's
+  `signalModifiedKey` does. INFO's `total_eviction_exceeded_time` and
+  `current_eviction_exceeded_time` count the milliseconds spent over the
+  limit; `evicted_clients` stays 0, since clients are never evicted.
 
 `CONFIG SET maxmemory` changes the limit for every worker, never past what
-the arena was sized for; `CONFIG SET maxmemory-policy` changes the policy.
+the arena was sized for; `CONFIG SET maxmemory-policy`, `maxmemory-samples`,
+`lfu-log-factor`, `lfu-decay-time` and `maxmemory-eviction-tenacity` take
+effect from the next command.
+
+### The access clock
+
+Every key carries Redis's 24-bit access field (`memdb::lru`). Under an LRU or
+random policy it is an LRU clock: seconds since the epoch, in 24 bits, so it
+wraps every 194 days and an idle time is measured across one wrap. Under an
+LFU policy it is a 16-bit minute of the last decrement and an 8-bit
+logarithmic counter: a new key starts at 5, each access first takes one off
+per `lfu-decay-time` minutes since the last decrement, then adds one with
+probability `1 / ((counter - 5) * lfu-log-factor + 1)`. Switching between
+LRU and LFU policies reinterprets the same bits, as in Redis.
+
+A command's lookups update the field as Redis's `lookupKey` does. `EXISTS`,
+`TYPE`, `TTL`, `PTTL`, `EXPIRETIME`, `PEXPIRETIME`, `OBJECT`, `SCAN`, `KEYS`,
+`RANDOMKEY` and `DBSIZE` look without touching (`LOOKUP_NOTOUCH`), and so does
+every command from a client in `CLIENT NO-TOUCH` mode except `TOUCH`. An
+overwrite keeps the field its lookup just updated, as `dbSetValue` keeps the
+old object's; a new key, a `COPY` destination and a `RESTORE` start fresh,
+and `RESTORE ... IDLETIME | FREQ` sets it.
+
+`OBJECT IDLETIME` answers the idle seconds, or under an LFU policy `ERR An
+LFU maxmemory policy is selected, idle time not tracked. ...`. `OBJECT FREQ`
+answers the decayed counter, or without an LFU policy `ERR An LFU maxmemory
+policy is not selected, access frequency not tracked. ...`. `OBJECT REFCOUNT`
+answers `2147483647` for a string holding an integer from 0 to 9999, which
+Redis keeps as a shared object, unless an LRU or LFU policy is set with a
+nonzero `maxmemory` (Redis's `MAXMEMORY_FLAG_NO_SHARED_INTEGERS`), and 1
+otherwise. All three answer nil for a missing key.
+
+A `logged` database keeps no field in its rows: writing one on every read
+would turn each `GET` into a table write. Its fields live in a table in
+shared memory of 65,536 slots of 8 bytes, keyed by a hash of the database,
+its flush count and the key (`access.rs`). The connection that ran a
+command updates the fields of the keys its arguments name, by the same key
+specifications `COMMAND GETKEYS` reads; the commands a script runs do the
+same, and `DEL`, `UNLINK` and `GETDEL` clear the slot, `RENAME` moves it.
+The table is lossy: two keys that hash to one slot share it, the later
+winning, and it starts empty after a restart, so a key with no slot gets a
+fresh field the first time `OBJECT` asks. A key that leaves the database
+another way (a collection emptied by a pop, an expiry) keeps its slot, so a
+key written again under the same name continues its old field. Eviction never
+applies to a logged database, which is bounded by disk.
 
 ---
 
@@ -634,13 +709,16 @@ client get `BUSY`, on every worker, until it ends or `SCRIPT KILL` /
   not wait.
 - **No ACL users, replicas or cluster mode.** `ACL`, `WAIT`, `REPLICAOF` and
   `CLUSTER` answer as a single-user, stand-alone server would.
-- **Eviction is silent.** A key evicted under `redis.maxmemory_policy` sends
-  no `evicted` notification and no client-tracking invalidation. Keyspace
-  notifications otherwise follow `notify-keyspace-events` event for
-  event, `expired` included for both lazy and background expiry.
-- **No access clock and no dirty counter.** `OBJECT IDLETIME` and `OBJECT
-  FREQ` answer nil, because keeping a last-access time would turn every read
-  on the durable half into a write; `rdb_changes_since_last_save` stays 0.
+- **Logged keys' access fields are approximate.** `OBJECT IDLETIME` and
+  `OBJECT FREQ` on a `logged` database read a lossy table in shared memory
+  ([The access clock](#the-access-clock)): two keys can share a slot, and the
+  table starts empty after a restart. On memory databases they are Redis's.
+- **Small-integer sharing follows the current policy.** Redis decides when a
+  value is written whether it is a shared object; pg_redis answers `OBJECT
+  REFCOUNT` from the policy and `maxmemory` in force when asked, so the two
+  differ for a key written before the policy changed. With no `CONFIG SET
+  maxmemory`, `maxmemory` reports the arena's limit, never Redis's default 0.
+- **No dirty counter.** `rdb_changes_since_last_save` stays 0.
   `SAVE`, `BGSAVE` and `LASTSAVE` act on `memory+snapshot` databases' snapshots
   ([Storage policies](STORAGE.md#snapshots-phase-4)).
 - **`SCAN` cursors on a table are kept by the server.** On the durable half
@@ -892,13 +970,17 @@ in its own process, so a unit that aborts takes only itself down.
   that pass today, per half and unit. The gate fails when one of them stops
   passing; the run lists the ones that started passing so the baseline moves
   forward. Most of the suite fails for a missing command (`BLPOP`, `BITOP`,
-  `SSCAN`, `OBJECT FREQ`, ...), and gating on those would mean gating on
+  `SSCAN`, ...), and gating on those would mean gating on
   commands not yet built.
 - **What is left out, on purpose.** Whole units for command families that do
   not exist here (streams, geo, HyperLogLog, scripting, ...), and the units
   that reconfigure or restart the server under test, which Redis itself tags
-  `external:skip`. Tests needing `DEBUG`, replication, `SAVE` or a real
-  `maxmemory` are denied by tag. `--ignore-encoding` and `--ignore-digest`
+  `external:skip`. Tests needing `DEBUG`, replication or `SAVE` are denied by
+  tag; tests needing a real `maxmemory` run on the memory half only. The
+  `maxmemory` unit, `external:skip` throughout, runs on the memory half from
+  a copy without the tag and without the blocks that start a replica, read
+  the replication stream or measure client output buffers (`REWRITTEN` in
+  `run.ts`). `--ignore-encoding` and `--ignore-digest`
   turn off the assertions about Redis's internal encodings.
 - **`skip.txt` is for hangs only.** A failing test belongs in the baseline,
   where it stays visible. Two groups hang instead of failing, and each entry

@@ -16,6 +16,8 @@ use allocator_api2::alloc::Allocator;
 use super::deque::Deque;
 use super::dict::{Dict, Seed};
 use super::encoding::{self, Enc, Limits, SetBuilder, SetView};
+use super::keyspace::{Entry, Keyspace};
+use super::lru::{self, Tracking};
 use super::zset::ZSet;
 use super::{Bytes, KeyKind, bytes_in, fast_random, parse_stored_int, random_picks, range_bounds};
 use crate::commands::{ExpireCond, GetExExpiry, KeyDump, LexBound, Response, ScoreBound};
@@ -61,24 +63,32 @@ impl<A: Allocator + Clone> Value<A> {
     }
 }
 
-pub struct Entry<A: Allocator + Clone> {
-    pub value: Value<A>,
-    /// Microseconds since the Unix epoch; 0 for none.
-    pub deadline: i64,
-}
-
-impl<A: Allocator + Clone> Entry<A> {
-    fn expired(&self, now: i64) -> bool {
-        self.deadline != 0 && self.deadline <= now
-    }
-
-    fn deadline(&self) -> Option<i64> {
-        (self.deadline != 0).then_some(self.deadline)
-    }
+fn held_deadline<A: Allocator + Clone>(e: &Entry<A>) -> Option<i64> {
+    (e.deadline() != 0).then_some(e.deadline())
 }
 
 fn now() -> i64 {
     crate::server::now_ms().saturating_mul(1000)
+}
+
+/// The access field a new key starts with under the policy in force.
+fn fresh() -> u32 {
+    lru::access().tracking.fresh(crate::server::now_ms())
+}
+
+/// A key the eviction sampler drew, with its score: higher goes first.
+pub struct Sample {
+    pub score: u64,
+    pub key: Vec<u8>,
+}
+
+/// What the eviction sampler scores a key by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Score {
+    /// Idle time or inverse frequency, from the access field.
+    Access(Tracking),
+    /// `volatile-ttl`: the sooner the deadline, the higher.
+    Deadline,
 }
 
 thread_local! {
@@ -103,7 +113,7 @@ fn vecs<'a>(items: impl Iterator<Item = &'a [u8]>) -> Vec<Vec<u8>> {
 }
 
 pub struct Db<A: Allocator + Clone> {
-    keys: Dict<Entry<A>, A>,
+    keys: Keyspace<A>,
     seed: Seed,
 }
 
@@ -122,9 +132,8 @@ macro_rules! typed {
         fn $make(&mut self, key: &[u8]) -> Out<&mut $ty> {
             let (seed, alloc) = (self.seed, self.keys.alloc());
             self.entry(key);
-            let (e, _) = self.keys.get_or_insert_with(key, || Entry {
-                value: Value::$variant(($new)(seed, alloc)),
-                deadline: 0,
+            let (e, _) = self.keys.get_or_insert_with(key, || {
+                Entry::new(Value::$variant(($new)(seed, alloc)), 0, fresh())
             });
             match &mut e.value {
                 Value::$variant(v) => Ok(v),
@@ -157,9 +166,8 @@ macro_rules! typed_enc {
         ) -> Out<(&mut $ty, &mut Enc, bool)> {
             let (seed, alloc) = (self.seed, self.keys.alloc());
             self.entry(key);
-            let (e, created) = self.keys.get_or_insert_with(key, || Entry {
-                value: Value::$variant(($new)(seed, alloc), enc()),
-                deadline: 0,
+            let (e, created) = self.keys.get_or_insert_with(key, || {
+                Entry::new(Value::$variant(($new)(seed, alloc), enc()), 0, fresh())
             });
             match &mut e.value {
                 Value::$variant(v, e) => Ok((v, e, created)),
@@ -230,7 +238,7 @@ fn set_insert<A: Allocator + Clone>(s: &mut Dict<(), A>, enc: &mut Enc, m: &[u8]
 impl<A: Allocator + Clone> Db<A> {
     pub fn new_in(seed: Seed, alloc: A) -> Self {
         Db {
-            keys: Dict::new_in(seed, alloc),
+            keys: Keyspace::new_in(seed, alloc),
             seed,
         }
     }
@@ -239,8 +247,20 @@ impl<A: Allocator + Clone> Db<A> {
         bytes_in(s, self.keys.alloc())
     }
 
-    /// The live entry at `key`. One past its deadline is removed on the way.
+    /// The live entry at `key`, as Redis's `lookupKey` finds it: one past its
+    /// deadline is removed on the way, and a live one has its access field
+    /// updated unless the command runs without touching (`lru::Access`).
     pub fn entry(&mut self, key: &[u8]) -> Option<&mut Entry<A>> {
+        let access = lru::access();
+        let e = self.lookup(key)?;
+        if access.touch {
+            e.lru = access.tracking.touched(e.lru, crate::server::now_ms());
+        }
+        Some(e)
+    }
+
+    /// `entry` with `LOOKUP_NOTOUCH`: expires, never touches.
+    fn lookup(&mut self, key: &[u8]) -> Option<&mut Entry<A>> {
         if self.keys.get(key)?.expired(now()) {
             self.keys.remove(key);
             REAPED.with_borrow_mut(|r| r.push(key.to_vec()));
@@ -249,12 +269,42 @@ impl<A: Allocator + Clone> Db<A> {
         self.keys.get_mut(key)
     }
 
+    /// Look the keys up as a command reading them does, for the commands
+    /// that then read them without `entry`.
+    fn touch_all(&mut self, keys: &[Vec<u8>]) {
+        for k in keys {
+            self.entry(k);
+        }
+    }
+
     pub fn key_kind(&mut self, key: &[u8]) -> Option<KeyKind> {
         self.entry(key).map(|e| e.value.kind())
     }
 
+    /// The access field of a live key without touching it, and the integer
+    /// a string key holds: what `OBJECT` reads.
+    pub fn access_of(&mut self, key: &[u8]) -> Option<(u32, Option<i64>)> {
+        let e = self.lookup(key)?;
+        let int = match &e.value {
+            Value::Str(v) => parse_stored_int(v),
+            _ => None,
+        };
+        Some((e.lru, int))
+    }
+
+    /// Set a live key's access field: `RESTORE ... IDLETIME | FREQ`.
+    pub fn set_access(&mut self, key: &[u8], field: u32) {
+        if let Some(e) = self.lookup(key) {
+            e.lru = field;
+        }
+    }
+
+    /// Write `value` at `key`. A key that was there keeps its access field,
+    /// as Redis's `dbSetValue` keeps the old object's: the lookup before the
+    /// write has already updated it. A new key starts fresh.
     fn put(&mut self, key: &[u8], value: Value<A>, deadline: i64) {
-        self.keys.insert(key, Entry { value, deadline });
+        let lru = self.keys.get(key).map_or_else(fresh, |e| e.lru);
+        self.keys.insert(key, Entry::new(value, deadline, lru));
     }
 
     fn put_str(&mut self, key: &[u8], value: &[u8], deadline: i64) {
@@ -325,8 +375,8 @@ impl<A: Allocator + Clone> Db<A> {
     }
 
     pub fn set_deadline(&mut self, key: &[u8], deadline_us: i64) {
-        if let Some(e) = self.entry(key) {
-            e.deadline = deadline_us;
+        if self.lookup(key).is_some() {
+            self.keys.set_deadline(key, deadline_us);
         }
     }
 
@@ -347,7 +397,7 @@ impl<A: Allocator + Clone> Db<A> {
                 KeyDump::Zset(z.iter().map(|(m, s)| (m.to_vec(), s)).collect(), *enc)
             }
         };
-        Some((dump, e.deadline))
+        Some((dump, e.deadline()))
     }
 
     /// Write `dump` as `key` with a deadline (0 for none), replacing whatever
@@ -384,66 +434,100 @@ impl<A: Allocator + Clone> Db<A> {
                 Value::Zset(z, *enc)
             }
         };
+        // A new object, as `rdbLoadObject` makes one: a fresh access field.
         if value.is_empty_collection() {
             self.keys.remove(key);
         } else {
-            self.put(key, value, deadline_us);
+            self.keys
+                .insert(key, Entry::new(value, deadline_us, fresh()));
         }
     }
 
     /// Remove every key past its deadline: how many, and — when `names` —
-    /// which, for keyspace notifications and tracking.
+    /// which, for keyspace notifications and tracking. Only the keys with a
+    /// deadline are looked at.
     pub fn sweep_expired(&mut self, names: bool) -> (usize, Vec<Vec<u8>>) {
         let now = now();
-        let mut count = 0;
-        let mut gone = Vec::new();
-        self.keys.retain(|k, e| {
-            if !e.expired(now) {
-                return true;
-            }
-            count += 1;
-            if names {
-                gone.push(k.to_vec());
-            }
-            false
-        });
-        (count, gone)
+        let dead: Vec<Vec<u8>> = (0..self.keys.volatile_len())
+            .filter_map(|j| self.keys.volatile_at(j))
+            .filter_map(|i| self.keys.at(i))
+            .filter(|(_, e)| e.expired(now))
+            .map(|(k, _)| k.to_vec())
+            .collect();
+        for k in &dead {
+            self.keys.remove(k);
+        }
+        let count = dead.len();
+        (count, if names { dead } else { Vec::new() })
     }
 
-    /// Evict one key to make room: a random one, or under `volatile-ttl` the
-    /// soonest to expire of a sample of keys with a deadline. False when
-    /// there is nothing the policy may take.
-    pub fn evict(&mut self, volatile_only: bool) -> bool {
-        const SAMPLES: usize = 16;
-        let n = self.keys.len();
-        if n == 0 {
-            return false;
-        }
-        let pick = if volatile_only {
-            let mut best: Option<(usize, i64)> = None;
-            for _ in 0..SAMPLES.min(n) {
-                let i = (fast_random() % n as u64) as usize;
-                if let Some((_, e)) = self.keys.at(i)
-                    && e.deadline != 0
-                    && best.is_none_or(|(_, d)| e.deadline < d)
-                {
-                    best = Some((i, e.deadline));
-                }
-            }
-            // A sample can miss a few volatile keys among many; look for
-            // any before giving up.
-            best.map(|(i, _)| i)
-                .or_else(|| self.keys.iter().position(|(_, e)| e.deadline != 0))
+    /// Keys the policy may evict here: all of them, or under a `volatile-*`
+    /// policy the ones with a deadline.
+    pub fn evictable(&self, volatile: bool) -> usize {
+        if volatile {
+            self.keys.volatile_len()
         } else {
-            Some((fast_random() % n as u64) as usize)
-        };
-        match pick {
-            Some(i) => {
-                self.keys.remove_at(i);
+            self.keys.len()
+        }
+    }
+
+    /// `evictionPoolPopulate`'s sample: up to `count` keys drawn at random,
+    /// from every key or only the volatile ones, each with its score.
+    pub fn sample(&self, volatile: bool, count: usize, score: Score, out: &mut Vec<Sample>) {
+        let n = self.evictable(volatile);
+        if n == 0 {
+            return;
+        }
+        let now_ms = crate::server::now_ms();
+        for _ in 0..count.min(n) {
+            let j = (fast_random() % n as u64) as usize;
+            let i = if volatile {
+                match self.keys.volatile_at(j) {
+                    Some(i) => i,
+                    None => continue,
+                }
+            } else {
+                j
+            };
+            if let Some((k, e)) = self.keys.at(i) {
+                let score = match score {
+                    Score::Access(t) => t.score(e.lru, now_ms),
+                    Score::Deadline => u64::MAX - e.deadline().max(0) as u64,
+                };
+                out.push(Sample {
+                    score,
+                    key: k.to_vec(),
+                });
+            }
+        }
+    }
+
+    /// Evict `key` if it is still there and, under a `volatile-*` policy,
+    /// still has a deadline; whether it was.
+    pub fn evict_key(&mut self, key: &[u8], volatile: bool) -> bool {
+        match self.keys.get(key) {
+            Some(e) if !volatile || e.deadline() != 0 => {
+                self.keys.remove(key);
                 true
             }
-            None => false,
+            _ => false,
         }
+    }
+
+    /// `allkeys-random` / `volatile-random`: evict one key at random; which.
+    pub fn evict_random(&mut self, volatile: bool) -> Option<Vec<u8>> {
+        let n = self.evictable(volatile);
+        if n == 0 {
+            return None;
+        }
+        let j = (fast_random() % n as u64) as usize;
+        let i = if volatile {
+            self.keys.volatile_at(j)?
+        } else {
+            j
+        };
+        let (k, _) = self.keys.remove_at(i);
+        Some(k.to_vec())
     }
 
     fn members_of(&self, keys: &[Vec<u8>], now: i64) -> Vec<Option<MemSet<'_, A>>> {
@@ -451,12 +535,14 @@ impl<A: Allocator + Clone> Db<A> {
     }
 
     /// `SUNION`'s result set, built as Redis builds it.
-    fn union(&self, keys: &[Vec<u8>]) -> SetBuilder {
+    fn union(&mut self, keys: &[Vec<u8>]) -> SetBuilder {
+        self.touch_all(keys);
         encoding::union(&self.members_of(keys, now()), Limits::current())
     }
 
     /// `SINTER`: the members and the encoding of the set it walked.
-    fn inter(&self, keys: &[Vec<u8>]) -> (Vec<Vec<u8>>, Enc) {
+    fn inter(&mut self, keys: &[Vec<u8>]) -> (Vec<Vec<u8>>, Enc) {
+        self.touch_all(keys);
         let sets = self.members_of(keys, now());
         let walked = sets
             .iter()
@@ -470,7 +556,8 @@ impl<A: Allocator + Clone> Db<A> {
         (vecs(encoding::inter(&sets).into_iter()), walked)
     }
 
-    fn diff(&self, keys: &[Vec<u8>]) -> SetBuilder {
+    fn diff(&mut self, keys: &[Vec<u8>]) -> SetBuilder {
+        self.touch_all(keys);
         let same = keys.len() > 1 && keys[1..].contains(&keys[0]);
         encoding::diff(&self.members_of(keys, now()), same, Limits::current())
     }
@@ -478,7 +565,11 @@ impl<A: Allocator + Clone> Db<A> {
     /// Replace `dst` with a set of `members`, in their order and `enc`; its
     /// size.
     fn store_set(&mut self, dst: &[u8], members: Vec<Vec<u8>>, enc: Enc) -> i64 {
-        self.keys.remove(dst);
+        // Looked up for writing, as `setKey` does: a destination that was
+        // there keeps its (updated) access field.
+        if self.entry(dst).is_some() && members.is_empty() {
+            self.keys.remove(dst);
+        }
         if members.is_empty() {
             return 0;
         }
@@ -554,38 +645,50 @@ impl<A: Allocator + Clone> Store for Db<A> {
         Ok(n)
     }
 
+    // EXISTS, TYPE and the TTL family look up with `LOOKUP_NOTOUCH`.
     fn exists(&mut self, keys: &[Vec<u8>]) -> Out<i64> {
+        Ok(keys.iter().filter(|k| self.lookup(k).is_some()).count() as i64)
+    }
+
+    fn touch(&mut self, keys: &[Vec<u8>]) -> Out<i64> {
         Ok(keys.iter().filter(|k| self.entry(k).is_some()).count() as i64)
     }
 
     fn kind(&mut self, key: &[u8]) -> Out<Option<KeyKind>> {
-        Ok(self.key_kind(key))
+        Ok(self.lookup(key).map(|e| e.value.kind()))
     }
 
     fn kinds(&mut self, keys: &[Vec<u8>]) -> Out<Vec<Option<KeyKind>>> {
-        Ok(keys.iter().map(|k| self.key_kind(k)).collect())
+        Ok(keys
+            .iter()
+            .map(|k| self.lookup(k).map(|e| e.value.kind()))
+            .collect())
     }
 
     fn deadline(&mut self, key: &[u8]) -> Out<Option<Option<i64>>> {
-        Ok(self.entry(key).map(|e| e.deadline()))
+        Ok(self.lookup(key).map(|e| held_deadline(e)))
+    }
+
+    fn access(&mut self, key: &[u8]) -> Out<Option<(u32, Option<i64>)>> {
+        Ok(self.access_of(key))
     }
 
     fn expire(&mut self, key: &[u8], deadline_us: i64, cond: ExpireCond) -> Out<bool> {
         let Some(e) = self.entry(key) else {
             return Ok(false);
         };
-        if !cond.allows(e.deadline(), deadline_us) {
+        if !cond.allows(held_deadline(e), deadline_us) {
             return Ok(false);
         }
         // 0 means no deadline, so the earliest one held is 1.
-        e.deadline = deadline_us.max(1);
+        self.keys.set_deadline(key, deadline_us.max(1));
         Ok(true)
     }
 
     fn persist(&mut self, key: &[u8]) -> Out<bool> {
         Ok(match self.entry(key) {
-            Some(e) if e.deadline != 0 => {
-                e.deadline = 0;
+            Some(e) if e.deadline() != 0 => {
+                self.keys.set_deadline(key, 0);
                 true
             }
             _ => false,
@@ -637,7 +740,8 @@ impl<A: Allocator + Clone> Store for Db<A> {
     fn keyspace(&mut self) -> Out<(i64, i64)> {
         let now = now();
         let live = self.keys.values().filter(|e| !e.expired(now));
-        let (keys, volatile) = live.fold((0, 0), |(k, v), e| (k + 1, v + (e.deadline != 0) as i64));
+        let (keys, volatile) =
+            live.fold((0, 0), |(k, v), e| (k + 1, v + (e.deadline() != 0) as i64));
         Ok((keys, volatile))
     }
 
@@ -686,7 +790,7 @@ impl<A: Allocator + Clone> Store for Db<A> {
                     (Value::Str(v), true) => Some(v.to_vec()),
                     _ => None,
                 };
-                (true, e.deadline, old)
+                (true, e.deadline(), old)
             }
         };
         if (a.nx && exists) || (a.xx && !exists) {
@@ -707,6 +811,7 @@ impl<A: Allocator + Clone> Store for Db<A> {
     }
 
     fn setex(&mut self, key: &[u8], value: &[u8], ttl_ms: i64) -> Out<()> {
+        self.entry(key);
         let deadline = now().saturating_add(ttl_ms.saturating_mul(1000)).max(1);
         self.put_str(key, value, deadline);
         Ok(())
@@ -757,6 +862,7 @@ impl<A: Allocator + Clone> Store for Db<A> {
 
     fn mset(&mut self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Out<()> {
         for (k, v) in pairs {
+            self.entry(k);
             self.put_str(k, v, 0);
         }
         Ok(())
@@ -1652,7 +1758,7 @@ impl<A: Allocator + Clone> crate::stream::StreamStore for Db<A> {
 
     /// Replace the stream's value, keeping the key's deadline.
     fn store(&mut self, key: &[u8], s: &crate::stream::Stream) -> Result<(), Response> {
-        let deadline = self.entry(key).map_or(0, |e| e.deadline);
+        let deadline = self.entry(key).map_or(0, |e| e.deadline());
         let v = self.bytes(&s.encode());
         self.put(key, Value::Stream(v), deadline);
         Ok(())
@@ -1946,7 +2052,76 @@ mod tests {
         assert_eq!(d.keyspace().unwrap(), (2, 2));
         d.set_deadline(b"n", 1);
         assert_eq!(d.sweep_expired(true), (1, vec![b"n".to_vec()]));
-        assert!(d.evict(false));
+        assert_eq!(d.evict_random(false), Some(b"m".to_vec()));
         assert_eq!(int(run(&mut d, "DBSIZE")), 0);
+    }
+
+    const LFU: Tracking = Tracking::Lfu {
+        log_factor: 10,
+        decay_time: 1,
+    };
+
+    fn under(touch: bool, tracking: Tracking) {
+        lru::set_access(lru::Access { touch, tracking });
+    }
+
+    #[test]
+    fn lookups_touch_and_notouch_lookups_do_not() {
+        let mut d = db();
+        under(true, LFU);
+        run(&mut d, "SET k v");
+        let field = |d: &mut Db<Global>| d.access_of(b"k").unwrap().0;
+        assert_eq!(field(&mut d) & 255, 5, "a new key starts at LFU_INIT_VAL");
+        // At 5 any access increments.
+        run(&mut d, "GET k");
+        assert_eq!(field(&mut d) & 255, 6);
+        // EXISTS, TYPE and TTL look without touching.
+        for c in ["EXISTS k", "TYPE k", "TTL k", "PTTL k"] {
+            run(&mut d, c);
+        }
+        assert_eq!(field(&mut d) & 255, 6);
+        // An overwrite keeps the field its lookup updated.
+        let before = field(&mut d) & 255;
+        run(&mut d, "SET k w");
+        assert!(field(&mut d) & 255 >= before);
+        // No touching at all: GET leaves it.
+        under(false, LFU);
+        let held = field(&mut d);
+        run(&mut d, "GET k");
+        assert_eq!(field(&mut d), held);
+        // A rename carries the field.
+        run(&mut d, "RENAME k k2");
+        assert_eq!(d.access_of(b"k2").unwrap().0, held);
+        under(false, Tracking::Lru);
+    }
+
+    #[test]
+    fn volatile_sampling_sees_only_keys_with_a_deadline() {
+        let mut d = db();
+        under(false, Tracking::Lru);
+        for i in 0..200 {
+            run(&mut d, &format!("SET p{i} v"));
+        }
+        for i in 0..5 {
+            run(&mut d, &format!("SET t{i} v EX 1000"));
+        }
+        assert_eq!(d.evictable(true), 5);
+        let mut out = Vec::new();
+        d.sample(true, 50, Score::Deadline, &mut out);
+        assert_eq!(out.len(), 5);
+        assert!(out.iter().all(|s| s.key.starts_with(b"t")));
+        assert!(
+            !d.evict_key(b"p1", true),
+            "volatile-* never takes a persistent key"
+        );
+        assert!(d.evict_key(b"t1", true));
+        while d.evict_random(true).is_some() {}
+        assert_eq!(int(run(&mut d, "DBSIZE")), 200);
+        // PERSIST takes a key out of the volatile set, EXPIRE puts it in.
+        run(&mut d, "EXPIRE p3 100");
+        run(&mut d, "EXPIRE p4 100");
+        run(&mut d, "PERSIST p3");
+        assert_eq!(d.evict_random(true), Some(b"p4".to_vec()));
+        assert_eq!(d.evict_random(true), None);
     }
 }

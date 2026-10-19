@@ -67,8 +67,18 @@ fn run_move(keys: &[(u8, Vec<u8>)], drains: &[u8]) {
 /// commit included (`src/dblock.rs`): what each command needs on its own.
 /// Released before the replies go out.
 fn run_held(cmds: &[(Command, u8)], origins: &[u64], retry_conflicts: bool) -> Vec<Response> {
-    let _held = crate::dblock::hold(crate::dblock::plan_batch(cmds));
-    run_dispatch_batch(cmds, origins, retry_conflicts)
+    let plan = crate::dblock::plan_batch(cmds);
+    let run = || {
+        let _held = crate::dblock::hold(plan);
+        run_dispatch_batch(cmds, origins, retry_conflicts)
+    };
+    // What holds a database exclusive runs as one command does in Redis:
+    // evicted for once, before it starts.
+    if plan.exclusive != 0 {
+        crate::evict::before_run(run)
+    } else {
+        run()
+    }
 }
 
 /// A `Batch` message. `None` when an `EXEC`'s WATCH broke.
@@ -82,11 +92,13 @@ fn run_batch_msg(cmds: Vec<(Command, u8)>, origin: u64, kind: BatchKind) -> Opti
                 .fold(0, |m, ((db, _), _)| m | crate::dblock::bit(*db));
             let plan =
                 crate::dblock::plan_exec(&cmds).union(crate::dblock::Plan::exclusive(watched_dbs));
-            let _held = crate::dblock::hold(plan);
-            if watch_broken(&watched) {
-                return None;
-            }
-            Some(run_dispatch_batch(&cmds, &origins, false))
+            crate::evict::before_run(|| {
+                let _held = crate::dblock::hold(plan);
+                if watch_broken(&watched) {
+                    return None;
+                }
+                Some(run_dispatch_batch(&cmds, &origins, false))
+            })
         }
     }
 }
@@ -322,6 +334,11 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
         // its cron as well as before each command, invalidating keys at
         // random to get back under it.
         crate::tracking::limit_used_slots();
+
+        // Redis's `evictionTimeProc`: past the limit — a `CONFIG SET
+        // maxmemory` below what is held, or a round that ran out of time —
+        // eviction carries on with no command to start it.
+        crate::evict::perform();
 
         // memory+snapshot databases whose interval has passed.
         crate::storage::snapshots_round();
@@ -1082,6 +1099,9 @@ fn conn_loop(
             stat: known,
             rejected: false,
             args: parts.clone(),
+            db,
+            queued: queueing,
+            exec: Vec::new(),
         });
         writer.pending_read = Some(PendingRead {
             slot: client.slot(),
@@ -1141,6 +1161,25 @@ fn conn_loop(
                         flush(&mut writer);
                         continue;
                     }
+                    // An EXEC carrying a command that may grow memory is
+                    // itself refused past the limit (`execCommandAbort`).
+                    let mut at = db;
+                    let oom = queue.iter().flatten().any(|(c, _)| {
+                        if let Command::Select { db: selected } = c {
+                            at = *selected;
+                        }
+                        refused_for_memory(c, at)
+                    });
+                    if oom {
+                        feed_monitors(&parts, db, &client);
+                        queue.clear();
+                        watched.clear();
+                        let e =
+                            format!("EXECABORT Transaction discarded because of: {}", oom_text());
+                        write_error(&mut writer, &e).ok();
+                        flush(&mut writer);
+                        continue;
+                    }
                     // Re-read the shared counters: any worker may have written
                     // one of these keys since WATCH snapshotted it. Checked
                     // again by the dispatcher once it holds the databases.
@@ -1176,6 +1215,9 @@ fn conn_loop(
                         }
                         flush(&mut writer);
                         continue;
+                    }
+                    if let Some(job) = in_flight.as_mut() {
+                        job.exec = lines.clone();
                     }
                     let unblocks: Option<Vec<(u8, Vec<u8>)>> = crate::server::waiters_active()
                         .then(|| {
@@ -1344,6 +1386,15 @@ fn conn_loop(
                         flush(&mut writer);
                     } else {
                         match Command::parse(&parts) {
+                            // `processCommand`'s OOM check, which a queued
+                            // command meets too: refused, and the
+                            // transaction flagged.
+                            Ok(cmd) if refused_for_memory(&cmd, queued_db(&queue, db)) => {
+                                let e = oom_text();
+                                write_error(&mut writer, &e).ok();
+                                queue.push(Err(e));
+                                flush(&mut writer);
+                            }
                             Ok(cmd) => {
                                 queue.push(Ok((cmd, parts.clone())));
                                 reply(&mut writer, |w| write_simple_string(w, "QUEUED"));
@@ -3182,6 +3233,12 @@ struct InFlight {
     stat: Option<usize>,
     rejected: bool,
     args: Vec<Vec<u8>>,
+    /// The database it ran on, for the access fields of a logged one.
+    db: u8,
+    /// Queued inside MULTI: it has not run.
+    queued: bool,
+    /// For an EXEC that ran: each queued command and its database.
+    exec: Vec<(Vec<Vec<u8>>, u8)>,
 }
 
 /// Index of a command in the generated table, which is also its
@@ -3215,8 +3272,52 @@ fn stat_name(parts: &[Vec<u8>]) -> String {
 }
 
 /// Close out a command: commandstats, latency, and the slow log.
+/// Whether a command queued in MULTI, or an EXEC holding it, is refused for
+/// memory: one that may grow a memory database while the arena is past the
+/// limit under `noeviction`. Under an evicting policy the worker evicts
+/// before running it, which a connection thread cannot do, so it is let
+/// through and meets the limit there.
+fn refused_for_memory(cmd: &Command, db: u8) -> bool {
+    crate::storage::slot(db).is_some()
+        && cmd.may_grow()
+        && crate::shm::over_limit()
+        && crate::access::settings().policy == crate::access::Policy::NoEviction
+}
+
+fn oom_text() -> String {
+    match crate::commands::mem_out_of_memory() {
+        Response::Error(e) => e,
+        _ => String::new(),
+    }
+}
+
+/// The database a command queued now will run on: the connection's, or
+/// what a SELECT queued before it chose.
+fn queued_db(queue: &Queue, db: u8) -> u8 {
+    queue
+        .iter()
+        .flatten()
+        .filter_map(|(c, _)| match c {
+            Command::Select { db } => Some(*db),
+            _ => None,
+        })
+        .next_back()
+        .unwrap_or(db)
+}
+
 fn finish(job: InFlight, client: &crate::server::ClientHandle) {
     let usec = job.started.elapsed().as_micros() as u64;
+    // A logged database's keys are touched here, after the command, from
+    // the keys its arguments name (`access::after_command`).
+    if !job.queued && !job.rejected {
+        let no_touch = client.slot().is_some_and(|s| {
+            s.flags.load(std::sync::atomic::Ordering::Relaxed) & crate::server::flag::NO_TOUCH != 0
+        });
+        crate::access::after_command(job.db, &job.args, no_touch);
+        for (line, at) in &job.exec {
+            crate::access::after_command(*at, line, no_touch);
+        }
+    }
     let failed = crate::resp::REPLIED_ERROR.with(|e| e.replace(false));
     if let Some(i) = job.stat {
         crate::server::count_command(i, usec, failed && !job.rejected, job.rejected);

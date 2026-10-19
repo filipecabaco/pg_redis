@@ -711,8 +711,9 @@ client get `BUSY`, on every worker, until it ends or `SCRIPT KILL` /
   original `RPUSH` returns, as in Redis; a blocked client stuck for longer
   than the bound is left to finish on its own. Writes made inside a script do
   not wait.
-- **No replicas or cluster mode.** `WAIT`, `REPLICAOF` and `CLUSTER` answer
-  as a stand-alone server would.
+- **No replicas, cluster mode or modules.** These are out of scope. `WAIT`,
+  `REPLICAOF` and `CLUSTER` answer as a stand-alone server would, and
+  `MODULE` is not accepted. Replication is PostgreSQL's.
 - **ACL users are saved to a table.** Users, rules,
   selectors, the permission checks and their error texts follow Redis 7.2's
   `acl.c`; see [Users and permissions](#users-and-permissions). Where Redis

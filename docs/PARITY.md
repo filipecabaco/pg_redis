@@ -5,9 +5,8 @@
     was closed, kept for the reasoning behind each decision. For current
     behaviour see [Command coverage](command-coverage.md) and the
     [differences list on the home page](index.md#differences). Current
-    numbers: pg_redis accepts 235 of Redis 7.2's 242 commands, and 2 of the
-    2,010 replies the parity harness compares differ, both in float
-    formatting.
+    numbers: pg_redis accepts 235 of Redis 7.2's 242 commands, and none of the
+    2,010 replies the parity harness compares differ from x86-64 Redis 7.2.
 
 What is left between pg_redis and Redis, why the headline number does not say
 so, and what has to be decided before the next block of work starts.
@@ -80,14 +79,19 @@ Reference used here: Redis 7.0.15, 240 top-level commands.
 
 ## Where parity actually stands
 
-**2 differences over 2,010 replies** (87 cases, run on both storage halves).
-Both are float formatting, one per half, and both show only against arm64
-Redis: the last digits of a distance stored by `GEOSEARCHSTORE … STOREDIST`.
-Against x86-64 Redis, which CI runs, there are none. `INCRBYFLOAT` used to
-differ against x86-64 Redis, because it was `f64` here where Redis uses an
-80-bit `long double`; it now computes in the 80-bit format too. Against arm64
-Redis, whose `long double` is 128-bit, it differs instead, and that case is
-not in the baseline. When this section was first written the harness compared
+**No differences over 2,010 replies** against x86-64 Redis 7.2 (87 cases, run
+on both storage halves), the build CI compares with. `INCRBYFLOAT` used to
+differ there, because it was `f64` here where Redis uses an 80-bit
+`long double`; it now computes in the 80-bit format too. Against arm64 Redis
+two cases differ on both storage halves: `INCRBYFLOAT`, whose `long double`
+there is 128-bit and prints back to `4`, and the last digits of a distance
+stored by `GEOSEARCHSTORE … STOREDIST`. Arm64 Redis differs from x86-64 Redis
+in the same way, so these four are kept in the baseline with a note and do not
+fail a run on an arm64 machine. The reference image is the Debian `redis:7.2`,
+on glibc: Alpine's musl `strtold` parses some out-of-range floats differently
+from the glibc Redis most installations run.
+
+When this section was first written the harness compared
 1,394 replies.
 
 That figure covers less than it seems to, in two ways. Both come from what a

@@ -1,5 +1,25 @@
 [
 	{
+		"half": "durable",
+		"case": "how a float counter is printed back",
+		"at": 3,
+		"cmd": "INCRBYFLOAT n2 1.000000000000000005",
+		"kind": "value",
+		"pg_redis": "$19\\n4.00000000000000001\\n",
+		"redis": "$1\\n4\\n",
+		"note": "arm64 Redis only: its long double is 128-bit and the 17-digit print rounds back to 4. pg_redis follows x86-64 Redis, whose 80-bit long double keeps the digit."
+	},
+	{
+		"half": "cache",
+		"case": "how a float counter is printed back",
+		"at": 3,
+		"cmd": "INCRBYFLOAT n2 1.000000000000000005",
+		"kind": "value",
+		"pg_redis": "$19\\n4.00000000000000001\\n",
+		"redis": "$1\\n4\\n",
+		"note": "arm64 Redis only: its long double is 128-bit and the 17-digit print rounds back to 4. pg_redis follows x86-64 Redis, whose 80-bit long double keeps the digit."
+	},
+	{
 		"half": "cache",
 		"case": "GEO",
 		"at": 20,

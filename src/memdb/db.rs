@@ -277,8 +277,11 @@ impl<A: Allocator + Clone> Db<A> {
         }
     }
 
+    /// What a live key holds, without touching it: the type check before a
+    /// command, whose own lookup is the one that touches. Touching here too
+    /// counted every read twice under an LFU policy.
     pub fn key_kind(&mut self, key: &[u8]) -> Option<KeyKind> {
-        self.entry(key).map(|e| e.value.kind())
+        self.lookup(key).map(|e| e.value.kind())
     }
 
     /// The access field of a live key without touching it, and the integer

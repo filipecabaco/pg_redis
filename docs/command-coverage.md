@@ -112,6 +112,7 @@ The limits that apply only to databases in memory are described once, in
 | `FLUSHDB` | ASYNC and SYNC accepted and ignored |
 | `FLUSHALL` | The same, over all sixteen databases, the durable half included |
 | `MOVE` | Across the storage halves too; the TTL moves with the key |
+| `MODULE` | As a Redis with no modules loaded: `LIST` is empty, `LOAD` and `LOADEX` fail as a failed load does |
 | `MIGRATE` | To another Redis or pg_redis, with `COPY`, `REPLACE`, `AUTH`, `AUTH2` and `KEYS`; each key is dumped and restored there, then deleted here |
 | `SORT` | `BY` (with `->field`), `LIMIT`, `GET`, `ASC`/`DESC`, `ALPHA`, `STORE` |
 | `SORT_RO` | `SORT` without `STORE` |
@@ -354,11 +355,10 @@ stops it. A script whose source names `SELECT`, `MOVE`, `COPY`, `SWAPDB` or
 
 ## Not implemented
 
-Redis 7.2 has 242 top-level commands, and pg_redis accepts 236 of them, one
-per row above. The six it does not accept are `PSYNC`, `REPLCONF`,
-`RESTORE-ASKING`, `SYNC`, `MODULE` and `SENTINEL`. The first four are
-replication and cluster-migration internals; `MODULE` and `SENTINEL` belong to
-Redis modules and Redis Sentinel. All of them are out of scope.
+Redis 7.2 has 242 top-level commands, and pg_redis accepts 237 of them, one
+per row above. The five it does not accept are `PSYNC`, `REPLCONF`,
+`RESTORE-ASKING`, `SYNC` and `SENTINEL`: replication and cluster-migration
+internals, and Redis Sentinel. All of them are out of scope.
 
 Commands added after 7.2 are outside that count. Of those, the per-field hash
 TTLs of Redis 7.4 (`HEXPIRE`, `HPEXPIRE`, `HTTL`, `HPTTL`, `HPERSIST`) are not

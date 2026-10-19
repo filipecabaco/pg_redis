@@ -48,6 +48,7 @@ const NAMES: &[&str] = &[
     "FAILOVER",
     "MEMORY",
     "MIGRATE",
+    "MODULE",
 ];
 
 impl Admin {
@@ -138,6 +139,7 @@ pub fn execute(a: &Admin, conn: &mut Conn, data: &mut Data) -> Response {
         "DEBUG" => debug(a, conn, data),
         "MEMORY" => memory(a),
         "MIGRATE" => migrate(a, conn, data),
+        "MODULE" => module(a),
         "LASTSAVE" => Response::Integer(
             server::ctl().map_or(0, |c| c.lastsave.load(std::sync::atomic::Ordering::Relaxed)),
         ),
@@ -1841,6 +1843,33 @@ fn debug_populate(args: &[Vec<u8>], conn: &mut Conn, data: &mut Data) -> Respons
         }
     }
     Response::Ok
+}
+
+/// `MODULE`, as a Redis with no modules loaded answers it: pg_redis loads
+/// none, so `LOAD` fails as a failed load does.
+fn module(a: &Admin) -> Response {
+    match a.sub().as_str() {
+        "LIST" => Response::Value(Value::Array(vec![])),
+        "LOAD" | "LOADEX" => err("ERR Error loading the extension. Please check the server logs."),
+        "UNLOAD" => err("ERR Error unloading module: no such module with that name"),
+        "HELP" => help(&[
+            "MODULE <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+            "LIST",
+            "    Return a list of loaded modules.",
+            "LOAD <path> [<arg> ...]",
+            "    Load a module library from <path>, passing to it any optional arguments.",
+            "LOADEX <path> [[CONFIG NAME VALUE] [CONFIG NAME VALUE]] [ARGS ...]",
+            "    Load a module library from <path>, while passing it module configurations and optional arguments.",
+            "UNLOAD <name>",
+            "    Unload a module.",
+            "HELP",
+            "    Print this help.",
+        ]),
+        other => err(format!(
+            "ERR unknown subcommand '{}'. Try MODULE HELP.",
+            other.to_ascii_lowercase()
+        )),
+    }
 }
 
 /// `MIGRATE host port key|"" destination-db timeout [COPY] [REPLACE]

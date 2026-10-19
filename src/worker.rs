@@ -41,8 +41,9 @@ enum BatchKind {
     /// A transaction (`EXEC`), with the keys its connection WATCHed. It holds
     /// every database it touches, and every watched key's, exclusive until
     /// it has committed, and checks the WATCHes once it holds them, so no
-    /// write lands between that check and the commands.
-    Exec(Vec<((u8, Vec<u8>), Watched)>),
+    /// write lands between that check and the commands. The command lines,
+    /// one per command, go to the slow log as each runs.
+    Exec(Vec<((u8, Vec<u8>), Watched)>, Vec<Vec<Vec<u8>>>),
     /// Probes that need no more than any command does.
     Probe,
 }
@@ -81,12 +82,44 @@ fn run_held(cmds: &[(Command, u8)], origins: &[u64], retry_conflicts: bool) -> V
     }
 }
 
+thread_local! {
+    /// How long each command of the batch now running took, in order.
+    static STEP_USEC: std::cell::RefCell<Vec<i64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The slow log's entries for an `EXEC`: each command it ran that took
+/// `slowlog-log-slower-than` or more, as Redis logs them, never `EXEC`.
+fn slowlog_exec_steps(lines: &[Vec<Vec<u8>>], origin: u64) {
+    let threshold = crate::config::get_i64("slowlog-log-slower-than");
+    if threshold < 0 {
+        return;
+    }
+    let steps = STEP_USEC.with_borrow(Clone::clone);
+    let max_len = crate::config::get_i64("slowlog-max-len").max(0) as usize;
+    for (line, usec) in lines.iter().zip(steps) {
+        if usec < threshold {
+            continue;
+        }
+        let client = crate::server::clients()
+            .into_iter()
+            .find(|c| c.id == origin);
+        let (addr, name) = client.map_or_else(Default::default, |c| (c.addr, c.name));
+        let hide = redacted(line);
+        let args: Vec<Vec<u8>> = line
+            .iter()
+            .zip(hide)
+            .map(|(a, h)| if h { b"(redacted)".to_vec() } else { a.clone() })
+            .collect();
+        crate::server::slowlog_push(&args, usec, &addr, name.as_bytes(), max_len);
+    }
+}
+
 /// A `Batch` message. `None` when an `EXEC`'s WATCH broke.
 fn run_batch_msg(cmds: Vec<(Command, u8)>, origin: u64, kind: BatchKind) -> Option<Vec<Response>> {
     let origins = vec![origin; cmds.len()];
     match kind {
         BatchKind::Probe => Some(run_held(&cmds, &origins, false)),
-        BatchKind::Exec(watched) => {
+        BatchKind::Exec(watched, lines) => {
             let watched_dbs = watched
                 .iter()
                 .fold(0, |m, ((db, _), _)| m | crate::dblock::bit(*db));
@@ -97,7 +130,9 @@ fn run_batch_msg(cmds: Vec<(Command, u8)>, origin: u64, kind: BatchKind) -> Opti
                 if watch_broken(&watched) {
                     return None;
                 }
-                Some(run_dispatch_batch(&cmds, &origins, false))
+                let responses = run_dispatch_batch(&cmds, &origins, false);
+                slowlog_exec_steps(&lines, origin);
+                Some(responses)
             })
         }
     }
@@ -659,7 +694,9 @@ fn run_dispatch_batch(
     // they were: no WATCH is broken on them and no tracking client told.
     // `guarded`: in a subtransaction of its own (`in_subtransaction`), or
     // as a plain statement of a batch that `run_flat` can roll back whole.
+    STEP_USEC.with_borrow_mut(Vec::clear);
     let run_as = |client: &mut pgrx::spi::SpiClient<'_>, cmd: &Command, db: u8, guarded: bool| {
+        let started = Instant::now();
         let before = crate::notify::before(cmd, db, &mut |d, k| exists(Some(&mut *client), d, k));
         let r = if on_mem(cmd, db) {
             cmd.execute_mem(db)
@@ -671,6 +708,7 @@ fn run_dispatch_batch(
         crate::notify::after(before, cmd, db, &r, &mut |d, k| {
             exists(Some(&mut *client), d, k)
         });
+        STEP_USEC.with_borrow_mut(|t| t.push(started.elapsed().as_micros() as i64));
         (r, crate::notify::take_untouched())
     };
     let run = |client: &mut pgrx::spi::SpiClient<'_>, cmd: &Command, db: u8| {
@@ -700,8 +738,10 @@ fn run_dispatch_batch(
             .zip(origins)
             .map(|((cmd, db), origin)| {
                 crate::tracking::set_origin(*origin);
+                let started = Instant::now();
                 let before = crate::notify::before(cmd, *db, &mut |d, k| exists(None, d, k));
                 let r = cmd.execute_mem(*db);
+                STEP_USEC.with_borrow_mut(|t| t.push(started.elapsed().as_micros() as i64));
                 crate::notify::after(before, cmd, *db, &r, &mut |d, k| exists(None, d, k));
                 (r, crate::notify::take_untouched())
             })
@@ -1395,7 +1435,7 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<DispatchMsg>, default_d
                                         tx,
                                         // Checked above; the segments around
                                         // a subscription each run atomically.
-                                        BatchKind::Exec(Vec::new()),
+                                        BatchKind::Exec(Vec::new(), lines.clone()),
                                     ))
                                     .is_err()
                                 {
@@ -1481,7 +1521,15 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<DispatchMsg>, default_d
                             cmds,
                             client.id,
                             resp_tx,
-                            BatchKind::Exec(watches),
+                            BatchKind::Exec(
+                                watches,
+                                lines
+                                    .iter()
+                                    .zip(&refused)
+                                    .filter(|(_, no)| no.is_none())
+                                    .map(|((line, _), _)| line.clone())
+                                    .collect(),
+                            ),
                         ))
                         .is_err()
                     {
@@ -3774,7 +3822,12 @@ fn finish(job: InFlight, client: &crate::server::ClientHandle) {
         }
     }
     let threshold = crate::config::get_i64("slowlog-log-slower-than");
-    if threshold >= 0 && usec as i64 >= threshold && !job.rejected {
+    // An EXEC's commands are logged as they run (`slowlog_exec_steps`).
+    let exec = job
+        .args
+        .first()
+        .is_some_and(|c| c.eq_ignore_ascii_case(b"EXEC"));
+    if threshold >= 0 && usec as i64 >= threshold && !job.rejected && !exec {
         let max_len = crate::config::get_i64("slowlog-max-len").max(0) as usize;
         // The slow log hides passwords where MONITOR does.
         let hide = redacted(&job.args);

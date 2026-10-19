@@ -5,7 +5,7 @@
     was closed, kept for the reasoning behind each decision. For current
     behaviour see [Command coverage](command-coverage.md) and the
     [differences list on the home page](index.md#differences). Current
-    numbers: pg_redis accepts 236 of Redis 7.2's 242 commands, and none of the
+    numbers: pg_redis accepts 237 of Redis 7.2's 242 commands, and none of the
     2,464 replies the parity harness compares differ from x86-64 Redis 7.2.
 
 What is left between pg_redis and Redis, why the headline number does not say
@@ -21,9 +21,9 @@ Re-measure before trusting any table here; the recipe is below and takes two
 minutes.
 
 **Re-measured against Redis 7.2.5 after the parity block.** Redis 7.2 has 242
-top-level commands; pg_redis now accepts **236**. The six missing are the
-replication internals (`PSYNC`, `REPLCONF`, `RESTORE-ASKING`, `SYNC`), `MODULE`
-and `SENTINEL`. `COMMAND COUNT` answers 236
+top-level commands; pg_redis now accepts **237**. The five missing are the
+replication internals (`PSYNC`, `REPLCONF`, `RESTORE-ASKING`, `SYNC`) and
+`SENTINEL`. `COMMAND COUNT` answers 237
 and is derived from the coverage page, not asserted. The block added
 streams, scripting and functions, the blocking commands, the server and
 introspection commands, HyperLogLog, GEO and RESP3, and closed the `ZUNION`
@@ -279,7 +279,7 @@ Measured side by side against the reference:
 | `OBJECT IDLETIME k` | ~~*(nil)*~~ `0`. **Closed.** | `0` |
 | `OBJECT FREQ k` | ~~*(nil)*~~ error unless LFU is on. **Closed.** | error unless LFU is on |
 | `CONFIG GET maxmemory` | ~~*(empty)*~~ the memory limit in bytes. **Closed.** | `maxmemory 0` |
-| `COMMAND COUNT` | ~~`100`~~ ~~**150**~~ ~~**235**~~ **236**, the rows of the coverage page. **Closed.** | `240` (7.0), `242` (7.2) |
+| `COMMAND COUNT` | ~~`100`~~ ~~**150**~~ ~~**235**~~ **237**, the rows of the coverage page. **Closed.** | `240` (7.0), `242` (7.2) |
 | `COMMAND DOCS` / `INFO` / `LIST` | ~~*(empty)*~~ populated from Redis 7.2's command table. **Closed.** | populated |
 | `CLIENT ID` | ~~`0`, always~~ unique per connection. **Closed.** | unique per connection |
 

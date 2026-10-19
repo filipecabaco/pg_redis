@@ -713,7 +713,8 @@ client get `BUSY`, on every worker, until it ends or `SCRIPT KILL` /
   not wait.
 - **No replicas, cluster mode or modules.** These are out of scope. `WAIT`,
   `REPLICAOF` and `CLUSTER` answer as a stand-alone server would, and
-  `MODULE` is not accepted. Replication is PostgreSQL's.
+  `MODULE` answers as a server with no modules loaded. Replication is
+  PostgreSQL's.
 - **ACL users are saved to a table.** Users, rules,
   selectors, the permission checks and their error texts follow Redis 7.2's
   `acl.c`; see [Users and permissions](#users-and-permissions). Where Redis

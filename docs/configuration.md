@@ -6,7 +6,7 @@
 |-----|---------|--------------------|-------------|
 | `redis.port` | `6379` | postmaster | TCP port the Redis listener binds to (1024–65535) |
 | `redis.listen_address` | `127.0.0.1` | postmaster | IP address to bind on. See [Exposing the listener](#exposing-the-listener) before widening this. |
-| `redis.password` | _(none)_ | superuser | When set, clients must `AUTH <password>` before any command. Only superusers (and members of `pg_read_all_settings`) can read it, and `SHOW ALL` leaves it out. |
+| `redis.password` | _(none)_ | superuser | The `default` user's password, Redis's `requirepass`. When set, clients must `AUTH` before any command. Only superusers (and members of `pg_read_all_settings`) can read it, and `SHOW ALL` leaves it out. See [Users](#users). |
 | `redis.database` | `postgres` | postmaster | The database the workers connect to. Run `CREATE EXTENSION pg_redis` in this database. |
 | `redis.default_db` | `0` | superuser | Database new connections start on (0–15). `0` uses the `memory` policy by default, matching Redis's own default database; `8` uses `logged` by default. |
 | `redis.workers` | `4` | postmaster | Number of background worker processes (1–64). Each counts against `max_worker_processes`. |
@@ -23,9 +23,9 @@
 shared memory and the worker pool are sized when the server starts.
 
 Every other setting takes effect on a reload. Each worker reads the configuration again on
-`pg_reload_conf()` (or `SIGHUP`), as a backend does. A new `redis.password` applies to the
-next `AUTH` and to new connections; connections that already authenticated stay
-authenticated, as in Redis. A new `redis.default_db` and `redis.max_connections` apply to new
+`pg_reload_conf()` (or `SIGHUP`), as a backend does. A new `redis.password` becomes the
+`default` user's password, as `CONFIG SET requirepass` does in Redis: it applies to the next
+`AUTH` and to new connections, and connections that already authenticated stay authenticated. A new `redis.default_db` and `redis.max_connections` apply to new
 connections. A new `redis.batch_size`, `redis.snapshot_interval` or `redis.maxmemory_policy`
 applies from the worker's next round. A value set with `CONFIG SET maxmemory-policy` keeps
 precedence over the setting until the server restarts.
@@ -79,6 +79,43 @@ ALTER SYSTEM SET redis.password = 'mysecret';
 ```
 
 Binding a non-loopback address with no password logs a warning at startup.
+
+## Users
+
+pg_redis has Redis 7.2's ACL users: `ACL SETUSER` creates and changes them, `AUTH <user>
+<password>` and `HELLO 3 AUTH <user> <password>` log in as one, and every command is checked
+against the user's rules. Every worker shares the users, and a change applies to the next
+command of every connection.
+
+```bash
+redis-cli -a mysecret ACL SETUSER app on '>app-secret' '~app:*' '&app:*' +@all -@dangerous
+redis-cli -a mysecret ACL SETUSER reader on '>reader-secret' '%R~*' +@read
+redis-cli -a mysecret ACL SAVE
+```
+
+The `default` user is the one a connection starts as. Its password is `redis.password`: with
+none set, `default` is `on nopass`, and connections need no `AUTH`, as in Redis. `CONFIG SET
+requirepass` changes it at runtime.
+
+Users are saved to the table `redis.acl_users`, one row per user: the name, and the rules as
+`ACL LIST` prints them after it, with each password as its SHA-256 (`#<hash>`). `ACL SAVE`
+writes the table and `ACL LOAD` reads it back; the first worker to start loads it. As in Redis,
+`ACL SETUSER` alone changes only the running server, and is lost at a restart unless saved. A
+row written by hand may use `>password`, which is hashed when it is loaded:
+
+```sql
+INSERT INTO redis.acl_users (name, rules)
+VALUES ('ops'::bytea, convert_to('on >ops-secret ~* +@all', 'UTF8'));
+SELECT convert_from(name, 'UTF8') AS name, convert_from(rules, 'UTF8') AS rules
+FROM redis.acl_users;
+```
+
+When the table has a row for `default`, that row is the default user, its password included;
+otherwise `redis.password` is. A reload that changes `redis.password` sets it again. The table
+is included in `pg_dump`. Changing it with SQL takes effect at the next `ACL LOAD` or restart.
+
+The users' rules together may take 1 MiB of shared memory, and the ACL LOG keeps as many
+entries as `acllog-max-len` allows within 512 KiB.
 
 ## Selecting a database per connection
 

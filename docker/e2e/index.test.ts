@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { errorReply, integerReply, RawRedis, scanReply } from "./resp";
+import { decode, errorReply, integerReply, RawRedis, type Resp, scanReply } from "./resp";
 
 const REDIS_HOST = process.env.REDIS_HOST ?? "localhost";
 const REDIS_PORT = process.env.REDIS_PORT ?? "6379";
@@ -4848,5 +4848,242 @@ describe("memory+snapshot", () => {
 		expect(await rows(6)).toBe(0);
 		expect((await raw.bulk("GET", "snap:new"))?.toString()).toBe("v");
 		await raw.send("FLUSHDB");
+	});
+});
+
+describe("ACL", () => {
+	/** A RESP2 map reply as an object. */
+	const asMap = (v: Resp): Record<string, Resp> => {
+		const a = v as Resp[];
+		const out: Record<string, Resp> = {};
+		for (let i = 0; i < a.length; i += 2) out[a[i] as string] = a[i + 1];
+		return out;
+	};
+	const cmd = async (c: RawRedis, ...args: string[]) => decode(await c.send(...args));
+	/** A connection authenticated as `user`. */
+	const as = async (user: string, password: string) => {
+		const c = await new RawRedis().connect({ password: "" });
+		expect(await cmd(c, "AUTH", user, password)).toBe("OK");
+		return c;
+	};
+	let admin: RawRedis;
+	const users = ["acl-app", "acl-ro", "acl-ps", "acl-gone", "acl-saved", "acl-multi", "acl-blk", "acl-sql"];
+
+	beforeAll(async () => {
+		admin = await new RawRedis().connect();
+		await admin.send("ACL", "DELUSER", ...users);
+		await admin.send("ACL", "LOG", "RESET");
+	});
+
+	afterAll(async () => {
+		await admin.send("ACL", "DELUSER", ...users);
+		await sql`DELETE FROM redis.acl_users`;
+		admin.close();
+	});
+
+	test("the default user carries redis.password", async () => {
+		const d = asMap(await cmd(admin, "ACL", "GETUSER", "default"));
+		expect(d.flags).toEqual(["on", "sanitize-payload"]);
+		const hash = new Bun.CryptoHasher("sha256").update(REDIS_PASSWORD).digest("hex");
+		expect(d.passwords).toEqual([hash]);
+		expect(await cmd(admin, "ACL", "WHOAMI")).toBe("default");
+		const c = await new RawRedis().connect({ password: "" });
+		expect(await cmd(c, "AUTH", "default", "wrong")).toEqual({
+			error: "WRONGPASS invalid username-password pair or user is disabled.",
+		});
+		expect(await cmd(c, "AUTH", "default", REDIS_PASSWORD)).toBe("OK");
+		c.close();
+		const log = asMap(((await cmd(admin, "ACL", "LOG", "1")) as Resp[])[0]);
+		expect(log).toMatchObject({ reason: "auth", object: "AUTH", username: "default" });
+	});
+
+	test("SETUSER, GETUSER and LIST describe a user as Redis does", async () => {
+		expect(
+			await cmd(
+				admin,
+				"ACL",
+				"SETUSER",
+				"acl-app",
+				"on",
+				">pw",
+				"~app:*",
+				"%R~shared:*",
+				"&news:*",
+				"+@all",
+				"-@dangerous",
+				"(+get ~sel:*)",
+			),
+		).toBe("OK");
+		const list = (await cmd(admin, "ACL", "LIST")) as string[];
+		expect(list).toContain(
+			"user acl-app on sanitize-payload #30c952fab122c3f9759f02a6d95c3758b246b4fee239957b2d4fee46e26170c4 ~app:* %R~shared:* resetchannels &news:* +@all -@dangerous (~sel:* resetchannels -@all +get)",
+		);
+		const u = asMap(await cmd(admin, "ACL", "GETUSER", "acl-app"));
+		expect(u.commands).toBe("+@all -@dangerous");
+		expect(u.keys).toBe("~app:* %R~shared:*");
+		expect(u.channels).toBe("&news:*");
+		expect((u.selectors as Resp[]).map(asMap)[0].keys).toBe("~sel:*");
+		expect(await cmd(admin, "ACL", "SETUSER", "acl-app", "+nosuch")).toEqual({
+			error: "ERR Error in ACL SETUSER modifier '+nosuch': Unknown command or category name in ACL",
+		});
+	});
+
+	test("commands, keys and channels are refused with Redis's NOPERM texts", async () => {
+		await admin.send("ACL", "LOG", "RESET");
+		const c = await as("acl-app", "pw");
+		expect(await cmd(c, "ACL", "WHOAMI")).toBe("acl-app");
+		expect(await cmd(c, "SET", "app:1", "v")).toBe("OK");
+		expect(await cmd(c, "GET", "shared:1")).toBeNull();
+		expect(await cmd(c, "SET", "shared:1", "v")).toEqual({ error: "NOPERM No permissions to access a key" });
+		expect(await cmd(c, "GET", "other")).toEqual({ error: "NOPERM No permissions to access a key" });
+		expect(await cmd(c, "GET", "sel:1")).toBeNull();
+		expect(await cmd(c, "FLUSHALL")).toEqual({
+			error: "NOPERM User acl-app has no permissions to run the 'flushall' command",
+		});
+		expect(await cmd(c, "PUBLISH", "news:1", "m")).toBe(0);
+		expect(await cmd(c, "PUBLISH", "sport", "m")).toEqual({ error: "NOPERM No permissions to access a channel" });
+		c.close();
+		await admin.send("DEL", "app:1");
+		const log = ((await cmd(admin, "ACL", "LOG")) as Resp[]).map(asMap);
+		expect(log[0]).toMatchObject({ reason: "channel", context: "toplevel", object: "sport", username: "acl-app" });
+		expect(log[1]).toMatchObject({ reason: "command", object: "flushall" });
+		expect(log[2]).toMatchObject({ reason: "key", object: "other" });
+		expect(log[3]).toMatchObject({ reason: "key", object: "shared:1" });
+		expect(log[0]["client-info"]).toContain("user=acl-app");
+		const stats = (await cmd(admin, "INFO", "stats")) as string;
+		expect(stats).toMatch(/acl_access_denied_channel:[1-9]/);
+	});
+
+	test("DRYRUN answers for another user without running anything", async () => {
+		await cmd(admin, "ACL", "SETUSER", "acl-ro", "on", "nopass", "+@read", "%R~r*", "resetchannels");
+		expect(await cmd(admin, "ACL", "DRYRUN", "acl-ro", "GET", "r1")).toBe("OK");
+		expect(await cmd(admin, "ACL", "DRYRUN", "acl-ro", "SET", "r1", "v")).toBe(
+			"User acl-ro has no permissions to run the 'set' command",
+		);
+		expect(await cmd(admin, "ACL", "DRYRUN", "acl-ro", "GET", "x")).toBe(
+			"User acl-ro has no permissions to access the 'x' key",
+		);
+		expect(await cmd(admin, "ACL", "DRYRUN", "nobody", "GET", "x")).toEqual({ error: "ERR User 'nobody' not found" });
+	});
+
+	test("MULTI refuses at queue time and EXEC checks again", async () => {
+		await cmd(admin, "ACL", "SETUSER", "acl-multi", "on", ">pw", "~*", "+multi", "+exec", "+incr", "+get");
+		const c = await as("acl-multi", "pw");
+		expect(await cmd(c, "MULTI")).toBe("OK");
+		expect(await cmd(c, "SET", "k", "v")).toEqual({
+			error: "NOPERM User acl-multi has no permissions to run the 'set' command",
+		});
+		expect(await cmd(c, "EXEC")).toEqual({ error: "EXECABORT Transaction discarded because of previous errors." });
+		expect(await cmd(c, "MULTI")).toBe("OK");
+		expect(await cmd(c, "INCR", "acl:ctr")).toBe("QUEUED");
+		expect(await cmd(c, "GET", "acl:ctr")).toBe("QUEUED");
+		await cmd(admin, "ACL", "SETUSER", "acl-multi", "-incr");
+		const r = (await cmd(c, "EXEC")) as Resp[];
+		expect((r[0] as { error: string }).error).toStartWith(
+			"NOPERM ACLs rules changed between the moment the transaction was accumulated and the EXEC call.",
+		);
+		expect(r[1]).toBeNull();
+		const log = asMap(((await cmd(admin, "ACL", "LOG", "1")) as Resp[])[0]);
+		expect(log).toMatchObject({ context: "multi", object: "incr" });
+		c.close();
+		await admin.send("DEL", "acl:ctr");
+	});
+
+	test("redis.call checks the script caller's permissions", async () => {
+		await cmd(admin, "ACL", "SETUSER", "acl-multi", "+eval", "resetkeys", "~ok:*");
+		const c = await as("acl-multi", "pw");
+		expect(await cmd(c, "EVAL", "return redis.call('get', KEYS[1])", "1", "ok:1")).toBeNull();
+		const r = (await cmd(c, "EVAL", "return redis.call('get', 'secret')", "0")) as { error: string };
+		expect(r.error).toStartWith("ERR ACL failure in script: No permissions to access a key");
+		// false, which Lua returns to the client as nil.
+		expect(await cmd(c, "EVAL", "return redis.acl_check_cmd('get', 'secret')", "0")).toBeNull();
+		expect(await cmd(c, "EVAL", "return redis.acl_check_cmd('get', 'ok:2')", "0")).toBe(1);
+		c.close();
+		const log = asMap(((await cmd(admin, "ACL", "LOG", "1")) as Resp[])[0]);
+		expect(log).toMatchObject({ context: "lua", reason: "key", object: "secret" });
+	});
+
+	test("DELUSER closes the user's connections; off does not", async () => {
+		await cmd(admin, "ACL", "SETUSER", "acl-gone", "on", ">pw", "+@all", "~*");
+		const c = await as("acl-gone", "pw");
+		expect(await cmd(c, "CLIENT", "SETNAME", "acl-gone-conn")).toBe("OK");
+		expect(await cmd(admin, "CLIENT", "LIST")).toMatch(/name=acl-gone-conn .* user=acl-gone /);
+		expect(await cmd(admin, "ACL", "SETUSER", "acl-gone", "off")).toBe("OK");
+		expect(await cmd(c, "PING")).toBe("PONG");
+		expect(await cmd(admin, "ACL", "DELUSER", "acl-gone")).toBe(1);
+		expect(await cmd(admin, "CLIENT", "LIST")).not.toContain("name=acl-gone-conn");
+		expect((await c.send("PING")).length).toBe(0);
+		expect(await cmd(admin, "CLIENT", "KILL", "USER", "acl-gone")).toEqual({ error: "ERR No such user 'acl-gone'" });
+	});
+
+	test("CLIENT KILL USER closes that user's clients", async () => {
+		await cmd(admin, "ACL", "SETUSER", "acl-gone", "on", ">pw", "+@all", "~*");
+		const c = await as("acl-gone", "pw");
+		expect(await cmd(admin, "CLIENT", "KILL", "USER", "acl-gone")).toBe(1);
+		expect((await c.send("PING")).length).toBe(0);
+	});
+
+	test("a subscriber that loses its channel is closed", async () => {
+		await cmd(admin, "ACL", "SETUSER", "acl-ps", "on", ">pw", "+@all", "resetchannels", "&foo:*");
+		const c = await as("acl-ps", "pw");
+		await cmd(c, "CLIENT", "SETNAME", "acl-ps-sub");
+		expect(await cmd(c, "SUBSCRIBE", "foo:1")).toEqual(["subscribe", "foo:1", 1]);
+		// Still allowed: the subscriber stays.
+		await cmd(admin, "ACL", "SETUSER", "acl-ps", "&bar");
+		expect(await cmd(admin, "CLIENT", "LIST")).toContain("name=acl-ps-sub");
+		await cmd(admin, "ACL", "SETUSER", "acl-ps", "resetchannels", "&bar");
+		expect(await cmd(admin, "CLIENT", "LIST")).not.toContain("name=acl-ps-sub");
+		c.close();
+	});
+
+	test("a blocked command is refused when the rules change before it is served", async () => {
+		await cmd(admin, "ACL", "SETUSER", "acl-blk", "on", ">pw", "+@all", "~*");
+		const c = await as("acl-blk", "pw");
+		await admin.send("DEL", "acl:list");
+		const blocked = c.send("BLPOP", "acl:list", "0");
+		await Bun.sleep(100);
+		await cmd(admin, "ACL", "SETUSER", "acl-blk", "resetkeys");
+		await admin.send("LPUSH", "acl:list", "x");
+		expect(decode(await blocked)).toEqual({ error: "NOPERM No permissions to access a key" });
+		c.close();
+		await admin.send("DEL", "acl:list");
+	});
+
+	test("ACL SAVE writes redis.acl_users and ACL LOAD reads it back", async () => {
+		await cmd(admin, "ACL", "SETUSER", "acl-saved", "on", ">pw", "~s:*", "+get");
+		const c = await as("acl-saved", "pw");
+		expect(await cmd(admin, "ACL", "SAVE")).toBe("OK");
+		const rows =
+			await sql`SELECT convert_from(rules, 'UTF8') AS rules FROM redis.acl_users WHERE name = 'acl-saved'::bytea`;
+		expect(rows[0].rules).toContain("#30c952fab122c3f9759f02a6d95c3758b246b4fee239957b2d4fee46e26170c4 ~s:*");
+		expect(await cmd(admin, "ACL", "DELUSER", "acl-saved")).toBe(1);
+		expect(await cmd(admin, "ACL", "GETUSER", "acl-saved")).toBeNull();
+		expect(await cmd(admin, "ACL", "LOAD")).toBe("OK");
+		expect(asMap(await cmd(admin, "ACL", "GETUSER", "acl-saved")).keys).toBe("~s:*");
+		const again = await as("acl-saved", "pw");
+		expect(await cmd(again, "GET", "s:1")).toBeNull();
+		// LOAD replaces every user but default: their clients are closed.
+		expect(await cmd(admin, "ACL", "LOAD")).toBe("OK");
+		expect((await again.send("PING")).length).toBe(0);
+		c.close();
+		// An operator's own row, with a cleartext password, loads too.
+		await sql`INSERT INTO redis.acl_users (name, rules) VALUES ('acl-sql'::bytea, convert_to('on >sqlpw ~* +ping', 'UTF8'))`;
+		expect(await cmd(admin, "ACL", "LOAD")).toBe("OK");
+		const viaSql = await as("acl-sql", "sqlpw");
+		expect(await cmd(viaSql, "PING")).toBe("PONG");
+		viaSql.close();
+		expect(await cmd(admin, "ACL", "WHOAMI")).toBe("default");
+		expect(await cmd(admin, "PING")).toBe("PONG");
+	});
+
+	test("CONFIG SET requirepass sets the default user's password", async () => {
+		expect(await cmd(admin, "CONFIG", "SET", "requirepass", "other")).toBe("OK");
+		const c = await new RawRedis().connect({ password: "" });
+		expect(await cmd(c, "AUTH", REDIS_PASSWORD)).toEqual({
+			error: "WRONGPASS invalid username-password pair or user is disabled.",
+		});
+		expect(await cmd(c, "AUTH", "other")).toBe("OK");
+		expect(await cmd(admin, "CONFIG", "SET", "requirepass", REDIS_PASSWORD)).toBe("OK");
+		c.close();
 	});
 });

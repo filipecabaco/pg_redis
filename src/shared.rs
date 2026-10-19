@@ -38,6 +38,25 @@ unsafe impl Shareable for crate::server::ServerCtl {}
 // SAFETY: atomics only, read and written under its spinlock; zeroed, every
 // slot is free and the lock open.
 unsafe impl Shareable for crate::cursor::CursorTable {}
+// SAFETY: atomics and arrays of atomics; zeroed, the regions are empty and
+// unlocked and the users are the default one alone.
+unsafe impl Shareable for crate::acl::AclCtl {}
+
+/// A `T` on the heap, zeroed: a process's own copy of a block, for when
+/// there is no shared memory.
+pub fn zeroed_box<T: Shareable>() -> Box<T> {
+    let layout = std::alloc::Layout::new::<T>();
+    // SAFETY: `T: Shareable` makes all-zero bytes a valid `T`; the layout is
+    // `T`'s own and not zero-sized (every block has fields), and the pointer
+    // is checked before `Box` takes it.
+    unsafe {
+        let p = std::alloc::alloc_zeroed(layout).cast::<T>();
+        if p.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        Box::from_raw(p)
+    }
+}
 
 impl<T> Block<T> {
     pub const fn new() -> Self {

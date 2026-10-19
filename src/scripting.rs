@@ -468,6 +468,9 @@ thread_local! {
     /// Set while a script's `redis.call` runs its command — Redis's
     /// `CLIENT_SCRIPT`, which a few commands answer differently under.
     static IN_CALL: Cell<bool> = const { Cell::new(false) };
+    /// The ACL user of the client running the script, 0 for none: what
+    /// `redis.call` checks a command against (`scriptVerifyACL`).
+    static CALLER: Cell<u64> = const { Cell::new(0) };
     /// The `rand48` state behind `math.random`.
     static RAND48: Cell<u64> = const { Cell::new(0) };
     /// The functions a library's top level registers during `FUNCTION LOAD`.
@@ -837,7 +840,15 @@ impl Sandbox {
                     Err(e) => return Ok((None, Some(format!("ERR {e}")))),
                 };
                 match command_spec(&argv) {
-                    Some(_) => Ok((Some(true), None)),
+                    Some(_) => {
+                        let caller = CALLER.get();
+                        let ok = caller == 0
+                            || !matches!(
+                                crate::acl::evaluate(caller, &argv),
+                                crate::acl::Verdict::Denied(_)
+                            );
+                        Ok((Some(ok), None))
+                    }
                     None => Ok((
                         None,
                         Some("ERR Invalid command passed to redis.acl_check_cmd()".into()),
@@ -1441,6 +1452,28 @@ pub(crate) fn in_script_call() -> bool {
     IN_CALL.get()
 }
 
+/// Sets [`CALLER`] for one run, from the client that sent it.
+struct CallerGuard;
+
+impl CallerGuard {
+    fn set() -> CallerGuard {
+        let origin = crate::tracking::origin();
+        let serial = if origin == 0 {
+            0
+        } else {
+            crate::acl::session_of(origin).serial
+        };
+        CALLER.set(serial);
+        CallerGuard
+    }
+}
+
+impl Drop for CallerGuard {
+    fn drop(&mut self) {
+        CALLER.set(0);
+    }
+}
+
 struct InCall(bool);
 
 impl Drop for InCall {
@@ -1449,21 +1482,31 @@ impl Drop for InCall {
     }
 }
 
-fn run_from_script(argv: &[Vec<u8>], ctx: &mut CallCtx<'_>) -> Result<Response, &'static str> {
+fn run_from_script(argv: &[Vec<u8>], ctx: &mut CallCtx<'_>) -> Result<Response, String> {
     let _in_call = InCall(IN_CALL.replace(true));
     // Redis's own table, not just what pg_redis serves: a command Redis has
     // and forbids in scripts (CLUSTER) is "not allowed", not "unknown". One it
     // allows but pg_redis lacks fails below, as the unknown command it is.
     let spec = redis_command_spec(argv).ok_or("Unknown Redis command called from script")?;
     if !crate::commands::arity_ok(spec.arity, argv.len()) {
-        return Err("Wrong number of args calling Redis command from script");
+        return Err("Wrong number of args calling Redis command from script".into());
     }
     let has = |f: &str| spec.flags.contains(&f);
     if has("noscript") {
-        return Err("This Redis command is not allowed from script");
+        return Err("This Redis command is not allowed from script".into());
+    }
+    let caller = CALLER.get();
+    if caller != 0 {
+        if let crate::acl::Verdict::Denied(d) = crate::acl::evaluate(caller, argv) {
+            crate::acl::record_denial(&d, crate::acl::Context::Lua, crate::tracking::origin());
+            return Err(format!("ACL failure in script: {}", d.message(false)));
+        }
+        if let Some(e) = crate::acl::sort_denied(caller, argv) {
+            return Ok(Response::Error(e.to_string()));
+        }
     }
     if ctx.read_only && (has("write") || has("may_replicate")) {
-        return Err("Write commands are not allowed from read-only scripts.");
+        return Err("Write commands are not allowed from read-only scripts.".into());
     }
     if has("write") {
         ctx.run.mark_dirty();
@@ -1515,6 +1558,8 @@ fn run_from_script(argv: &[Vec<u8>], ctx: &mut CallCtx<'_>) -> Result<Response, 
                 client: &client,
                 db,
                 reply: crate::admin::ReplyMode::On,
+                session: crate::acl::session_of(crate::tracking::origin()),
+                may_wait: false,
             };
             let host = &mut *ctx.host;
             crate::admin::execute(&a, &mut conn, &mut |c, d| host.exec(d, c))
@@ -2073,6 +2118,7 @@ impl Engine {
                     lua_array(lua, keys).map_err(|e| err(e.to_string()))?,
                     lua_array(lua, args).map_err(|e| err(e.to_string()))?,
                 );
+                let _caller = CallerGuard::set();
                 let run =
                     crate::server::ScriptRunHandle::start(false, f.name.as_bytes(), &inv.argv);
                 let _interrupt = InterruptGuard::set(Interrupt::Run(run.probe()));
@@ -2307,6 +2353,7 @@ fn run_eval(
     if let Err(e) = set {
         return Response::Error(format!("ERR {e}"));
     }
+    let _caller = CallerGuard::set();
     let run = crate::server::ScriptRunHandle::start(true, sha.as_bytes(), &inv.argv);
     let _interrupt = InterruptGuard::set(Interrupt::Run(run.probe()));
     let mut ctx = CallCtx {

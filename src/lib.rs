@@ -3,6 +3,7 @@
 // pubsub, pg, scripting's Lua bridge, and the worker entry point here.
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+pub(crate) mod acl;
 pub(crate) mod admin;
 pub(crate) mod blocking;
 mod commands;
@@ -78,6 +79,7 @@ static ROUTE_CTL: shared::Block<pubsub::RouteCtl> = shared::Block::new();
 static WATCH_CTL: shared::Block<watch::WatchCtl> = shared::Block::new();
 static SERVER_CTL: shared::Block<server::ServerCtl> = shared::Block::new();
 static CURSOR_TABLE: shared::Block<cursor::CursorTable> = shared::Block::new();
+static ACL_CTL: shared::Block<acl::AclCtl> = shared::Block::new();
 
 /// Everything this extension keeps in shared memory, reserved in the
 /// postmaster's request hook.
@@ -90,6 +92,8 @@ fn request_shmem() {
     shared::request(server::server_ctl_size());
     // The SCAN cursors of databases kept in tables.
     shared::request(cursor::cursor_table_size());
+    // The ACL users and log (`acl.rs`).
+    shared::request(acl::ctl_size());
     // The memory engine's arena: reserved at redis.maxmemory, backed by RAM
     // only as it fills.
     shm::request();
@@ -107,6 +111,7 @@ fn attach_shmem() {
         server::init(ctl);
     }
     CURSOR_TABLE.attach(c"pg_redis_cursor_table", cursor::cursor_table_size());
+    ACL_CTL.attach(c"pg_redis_acl", acl::ctl_size());
     shm::startup();
 }
 
@@ -127,6 +132,11 @@ pub(crate) fn server_state() -> Option<&'static server::ServerCtl> {
 /// The SCAN cursor table, once it exists (`cursor.rs`).
 pub(crate) fn cursor_state() -> Option<&'static cursor::CursorTable> {
     CURSOR_TABLE.get()
+}
+
+/// The ACL users and log, once they exist (`acl.rs`).
+pub(crate) fn acl_state() -> Option<&'static acl::AclCtl> {
+    ACL_CTL.get()
 }
 
 /// The WATCH counters, once they exist.
@@ -1009,6 +1019,40 @@ mod tests {
             odd.replace('"', "\"\"")
         ))
         .unwrap();
+    }
+
+    // ───────────────────────────── ACL table ─────────────────────────────────
+
+    /// `ACL SAVE` replaces the rows of `redis.acl_users`; `ACL LOAD` reads
+    /// them back, in name order, as the dispatcher runs both.
+    #[pg_test]
+    fn acl_save_replaces_the_table_and_load_reads_it() {
+        use crate::acl::TableOp;
+        use crate::commands::{Command, Response, Value};
+        let run = |op| Spi::connect_mut(|c| Command::AclTable(op).execute(c, 0));
+        Spi::run("INSERT INTO redis.acl_users VALUES ('stale', 'off')").unwrap();
+        let rows = vec![
+            (b"zed".to_vec(), b"on nopass ~* +@all".to_vec()),
+            (b"amy".to_vec(), b"off -@all".to_vec()),
+        ];
+        assert!(matches!(run(TableOp::Save(rows)), Response::Ok));
+        match run(TableOp::Load) {
+            Response::Value(Value::Array(got)) => {
+                let names: Vec<Vec<u8>> = got
+                    .into_iter()
+                    .map(|r| match r {
+                        Value::Array(mut p) => match p.remove(0) {
+                            Value::Bulk(n) => n,
+                            _ => panic!("a name"),
+                        },
+                        _ => panic!("a row"),
+                    })
+                    .collect();
+                assert_eq!(names, vec![b"amy".to_vec(), b"zed".to_vec()]);
+            }
+            other => panic!("ACL LOAD read {other:?}"),
+        }
+        Spi::run("DELETE FROM redis.acl_users").unwrap();
     }
 
     // ──────────────────────────── SCAN cursors ───────────────────────────────

@@ -72,6 +72,11 @@ pub struct Conn<'a> {
     pub db: u8,
     /// `CLIENT REPLY`: replies are written only while this is `On`.
     pub reply: ReplyMode,
+    /// The ACL user the command runs as.
+    pub session: crate::acl::Session,
+    /// On the connection's own thread, which may wait for the clients an
+    /// ACL change closes; the dispatcher may not.
+    pub may_wait: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -120,7 +125,15 @@ pub fn execute(a: &Admin, conn: &mut Conn, data: &mut Data) -> Response {
         "COMMAND" => command(a),
         "SLOWLOG" => slowlog(a),
         "LATENCY" => latency(a),
-        "ACL" => acl(a),
+        "ACL" => crate::acl::command(
+            &a.args,
+            &crate::acl::Caller {
+                session: conn.session,
+                client_id: conn.client.id,
+                may_wait: conn.may_wait,
+            },
+            data,
+        ),
         "DEBUG" => debug(a, conn, data),
         "MEMORY" => memory(a),
         "LASTSAVE" => Response::Integer(
@@ -425,11 +438,10 @@ fn client_kill(opts: &[Vec<u8>], conn: &Conn) -> Response {
             },
             "ADDR" => targets.retain(|c| c.addr == vs),
             "LADDR" => targets.retain(|c| c.laddr == vs),
-            "USER" => {
-                if vs != "default" {
-                    return err(format!("ERR No such user '{vs}'"));
-                }
-            }
+            "USER" => match crate::acl::serial_of(v) {
+                Some(serial) => targets.retain(|c| c.user_serial == serial),
+                None => return err(format!("ERR No such user '{vs}'")),
+            },
             "TYPE" => match vs.to_ascii_lowercase().as_str() {
                 "normal" => targets.retain(|c| c.flags & server::flag::PUBSUB == 0),
                 "pubsub" => targets.retain(|c| c.flags & server::flag::PUBSUB != 0),
@@ -740,6 +752,7 @@ fn info_section(section: &str, conn: &Conn, data: &mut Data) -> String {
             ]);
         }
         "stats" => {
+            let denied = crate::acl::denied_counts();
             lines.extend([
                 format!(
                     "total_connections_received:{}",
@@ -772,10 +785,10 @@ fn info_section(section: &str, conn: &Conn, data: &mut Data) -> String {
                 "dump_payload_sanitizations:0".into(),
                 format!("total_reads_processed:{}", stat(|c| &c.total_commands)),
                 format!("total_writes_processed:{}", stat(|c| &c.total_commands)),
-                "acl_access_denied_auth:0".into(),
-                "acl_access_denied_cmd:0".into(),
-                "acl_access_denied_key:0".into(),
-                "acl_access_denied_channel:0".into(),
+                format!("acl_access_denied_auth:{}", denied[0]),
+                format!("acl_access_denied_cmd:{}", denied[1]),
+                format!("acl_access_denied_key:{}", denied[2]),
+                format!("acl_access_denied_channel:{}", denied[3]),
             ]);
         }
         "replication" => lines.extend([
@@ -884,7 +897,7 @@ fn fmt_pct(p: f64) -> String {
 // ───────────────────────────────── COMMAND ──────────────────────────────────
 
 /// Commands pg_redis implements, as COMMAND LIST names them, subcommands too.
-fn implemented() -> impl Iterator<Item = &'static CommandSpec> {
+pub(crate) fn implemented() -> impl Iterator<Item = &'static CommandSpec> {
     crate::redis_tables::COMMANDS.iter().filter(|c| {
         let top = if c.container.is_empty() {
             c.name
@@ -943,7 +956,7 @@ fn legacy_range(c: &CommandSpec) -> (i64, i64, i64, bool) {
     (first as i64, last as i64, 1, movable)
 }
 
-const ACL_ORDER: &[&str] = &[
+pub(crate) const ACL_ORDER: &[&str] = &[
     "keyspace",
     "read",
     "write",
@@ -1439,7 +1452,7 @@ fn key_flag_name(f: &str) -> &'static str {
 
 /// `getKeysUsingKeySpecs`: `None` when a spec cannot be followed — unknown,
 /// incomplete, a bad key count, positions past the arguments.
-fn keys_from_specs(
+pub(crate) fn keys_from_specs(
     spec: &CommandSpec,
     argv: &[Vec<u8>],
 ) -> Option<Vec<(usize, Vec<&'static str>)>> {
@@ -1725,93 +1738,6 @@ fn latency(a: &Admin) -> Response {
         other => err(format!(
             "ERR unknown subcommand '{other}'. Try LATENCY HELP."
         )),
-    }
-}
-
-// ─────────────────────────────────── ACL ────────────────────────────────────
-
-/// One user, `default`, with every permission — the only user pg_redis has.
-/// `redis.password` is its password.
-fn acl(a: &Admin) -> Response {
-    let user_line = "user default on nopass sanitize-payload ~* &* +@all";
-    match a.sub().as_str() {
-        "WHOAMI" => bulk("default"),
-        "USERS" => Response::Value(Value::Array(vec![Value::str("default")])),
-        "LIST" => Response::Value(Value::Array(vec![Value::str(user_line)])),
-        "CAT" => match a.args.get(1) {
-            None => Response::Value(Value::Array(
-                ACL_ORDER.iter().map(|c| Value::str(c)).collect(),
-            )),
-            Some(cat) => {
-                let cat = String::from_utf8_lossy(cat).to_ascii_lowercase();
-                if !ACL_ORDER.contains(&cat.as_str()) {
-                    return err(format!("ERR Unknown category '{cat}'"));
-                }
-                Response::Value(Value::Array(
-                    implemented()
-                        .filter(|c| acl_categories(c).contains(&cat.as_str()))
-                        .map(|c| Value::str(c.name))
-                        .collect(),
-                ))
-            }
-        },
-        "GETUSER" => {
-            if !a.args[1].eq_ignore_ascii_case(b"default") {
-                return Response::Null;
-            }
-            Response::Value(Value::Map(vec![
-                (
-                    Value::str("flags"),
-                    Value::Array(vec![
-                        Value::str("on"),
-                        Value::str("nopass"),
-                        Value::str("sanitize-payload"),
-                    ]),
-                ),
-                (Value::str("passwords"), Value::Array(vec![])),
-                (Value::str("commands"), Value::str("+@all")),
-                (Value::str("keys"), Value::str("~*")),
-                (Value::str("channels"), Value::str("&*")),
-                (Value::str("selectors"), Value::Array(vec![])),
-            ]))
-        }
-        "LOG" => match a.args.get(1) {
-            Some(r) if r.eq_ignore_ascii_case(b"RESET") => Response::Ok,
-            _ => Response::Value(Value::Array(vec![])),
-        },
-        "GENPASS" => {
-            let bits = a
-                .args
-                .get(1)
-                .and_then(|v| int(v))
-                .unwrap_or(256)
-                .clamp(1, 4096) as usize;
-            let hex: String = (0..bits.div_ceil(4))
-                .map(|_| format!("{:x}", crate::memdb::fast_random() & 0xf))
-                .collect();
-            bulk(hex)
-        }
-        "DRYRUN" => Response::Ok,
-        "SETUSER" | "DELUSER" | "LOAD" | "SAVE" => {
-            err("ERR pg_redis has a single user, default, configured with redis.password")
-        }
-        "HELP" => help(&[
-            "ACL <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
-            "CAT [<category>]",
-            "    List all commands that belong to <category>, or all command categories",
-            "    when no category is specified.",
-            "GETUSER <username>",
-            "    Get the user's details.",
-            "LIST",
-            "    Show users details in config file format.",
-            "USERS",
-            "    List all the registered usernames.",
-            "WHOAMI",
-            "    Return the current connection username.",
-            "HELP",
-            "    Print this help.",
-        ]),
-        other => err(format!("ERR unknown subcommand '{other}'. Try ACL HELP.")),
     }
 }
 

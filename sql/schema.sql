@@ -284,6 +284,16 @@ CREATE TABLE IF NOT EXISTS redis.pubsub_routes (
     tbl     TEXT NOT NULL
 );
 
+-- ACL users (src/acl.rs), as ACL SAVE writes them and ACL LOAD and worker
+-- start read them: one row per user, its rules as ACL LIST prints them after
+-- the name. Passwords are only ever stored as their SHA-256 (`#<hash>`); a row
+-- written by hand may use `>password`, hashed when it is loaded. Bytes, like
+-- every name Redis allows.
+CREATE TABLE IF NOT EXISTS redis.acl_users (
+    name  BYTEA PRIMARY KEY,
+    rules BYTEA NOT NULL
+);
+
 -- Helper to create a target table for pub/sub routing.
 -- The table must have `channel BYTEA` and `payload BYTEA` columns to receive routed messages.
 CREATE OR REPLACE FUNCTION redis.create_pubsub_table(p_schema text, p_tbl text)

@@ -19,11 +19,11 @@ The limits that apply only to databases in memory are described once, in
 | `PING` |  |
 | `ECHO` |  |
 | `SELECT` | Also accepts the names `cache` (db 0) and `durable` (db 8) |
-| `AUTH` | Validated against `redis.password`; a no-op when that is unset |
-| `HELLO` | `HELLO 3` switches the connection to RESP3 replies and pub/sub push frames |
+| `AUTH` | `AUTH <password>` for the `default` user, whose password is `redis.password`, and `AUTH <user> <password>` for any ACL user; failures go to `ACL LOG` |
+| `HELLO` | `HELLO 3` switches the connection to RESP3 replies and pub/sub push frames; `AUTH <user> <password>` and `SETNAME` as in Redis, the last of each winning |
 | `RESET` |  |
 | `QUIT` |  |
-| `CLIENT` | `ID`, `INFO`, `LIST`, `KILL`, `GETNAME`/`SETNAME`, `SETINFO`, `REPLY`, `PAUSE`/`UNPAUSE`, `UNBLOCK`, `NO-EVICT`, `NO-TOUCH`, across every worker; `TRACKING` (standard, `BCAST`, `OPTIN`/`OPTOUT`, `NOLOOP`, `REDIRECT`), `CACHING`, `GETREDIR`, `TRACKINGINFO` |
+| `CLIENT` | `ID`, `INFO`, `LIST`, `KILL`, `GETNAME`/`SETNAME`, `SETINFO`, `REPLY`, `PAUSE`/`UNPAUSE`, `UNBLOCK`, `NO-EVICT`, `NO-TOUCH`, across every worker; `LIST` and `INFO` show each client's `user=`, `KILL USER` closes a user's clients; `TRACKING` (standard, `BCAST`, `OPTIN`/`OPTOUT`, `NOLOOP`, `REDIRECT`), `CACHING`, `GETREDIR`, `TRACKINGINFO` |
 | `COMMAND` | With no subcommand, Redis 7.2's command-table entry for every command on this page. `INFO`, `DOCS`, `LIST`, `GETKEYS` and `GETKEYSANDFLAGS` answer from the same table, for the same commands; `COUNT` reports the number of rows on this page |
 | `CONFIG` | `GET`/`SET` over Redis 7.2's parameter table, validated as Redis validates; most parameters describe Redis internals and change nothing here. `RESETSTAT`; `REWRITE` reports no config file |
 | `INFO` | Every section; `commandstats`, `errorstats` and `latencystats` are counted across workers |
@@ -35,7 +35,7 @@ The limits that apply only to databases in memory are described once, in
 |---------|-------|
 | `SLOWLOG` | `GET`, `LEN`, `RESET`, honouring `slowlog-log-slower-than` and `slowlog-max-len` |
 | `LATENCY` | `HISTOGRAM` from per-command latencies; no spike sampling, so `LATEST` and `HISTORY` are empty |
-| `ACL` | A single user, `default`, with every permission; `WHOAMI`, `USERS`, `LIST`, `CAT`, `GETUSER`, `LOG`, `GENPASS` |
+| `ACL` | Redis 7.2's users, rules, selectors and checks on every command, script call and `EXEC`; `SETUSER`, `GETUSER`, `DELUSER`, `LIST`, `USERS`, `WHOAMI`, `CAT`, `GENPASS`, `LOG`, `DRYRUN`, `HELP`; `SAVE` and `LOAD` write and read `redis.acl_users` in place of an ACL file |
 | `DEBUG` | `SLEEP`, `SET-ACTIVE-EXPIRE`, `PROTOCOL`; `RELOAD` and the tuning subcommands are accepted |
 | `LASTSAVE` | Unix time, in seconds, of the last snapshot of a `memory+snapshot` database, or of the last `SAVE` or `BGSAVE` that found none to take. Before either, the server's start |
 | `SAVE` | Snapshots every `memory+snapshot` database before replying. With none, there is nothing to save, since `logged` databases are already in PostgreSQL and `memory` ones keep no disk image |

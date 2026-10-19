@@ -131,6 +131,12 @@ pub struct ClientSlot {
     /// A pub/sub slot another connection subscribed to this one's tracking
     /// channel for it to take over, or `HANDOFF_NONE` / `HANDOFF_CLOSED`.
     pub track_handoff: AtomicI32,
+    /// The serial of the ACL user the client is authenticated as.
+    pub user_serial: AtomicU64,
+    /// Set when the client's user lost channel permissions: a subscriber
+    /// checks its subscriptions and closes if one is no longer allowed, then
+    /// clears it.
+    pub acl_recheck: AtomicU32,
     /// `BCAST` prefixes, NUL-separated, behind `seq`.
     track_prefixes: Field<TRACK_PREFIXES_LEN>,
     name: Field<NAME_LEN>,
@@ -389,6 +395,9 @@ impl ClientHandle {
             s.unblock.store(0, Ordering::Relaxed);
             s.track_listening.store(0, Ordering::Relaxed);
             s.track_handoff.store(HANDOFF_NONE, Ordering::Relaxed);
+            s.user_serial
+                .store(crate::acl::DEFAULT_SERIAL, Ordering::Relaxed);
+            s.acl_recheck.store(0, Ordering::Relaxed);
             s.id.store(id, Ordering::Release);
         }
         ClientHandle { id, slot }
@@ -397,6 +406,32 @@ impl ClientHandle {
     pub fn killed(&self) -> bool {
         self.slot
             .is_some_and(|s| s.kill.load(Ordering::Relaxed) != 0)
+    }
+
+    /// Close this connection once the command now running has replied.
+    pub fn kill(&self) {
+        if let Some(s) = self.slot {
+            s.kill.store(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The ACL user the client now runs as.
+    pub fn set_user(&self, serial: u64) {
+        if let Some(s) = self.slot {
+            s.user_serial.store(serial, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether a channel-permission check was asked for.
+    pub fn acl_recheck_asked(&self) -> bool {
+        self.slot
+            .is_some_and(|s| s.acl_recheck.load(Ordering::Acquire) != 0)
+    }
+
+    pub fn acl_recheck_done(&self) {
+        if let Some(s) = self.slot {
+            s.acl_recheck.store(0, Ordering::Release);
+        }
     }
 
     /// The size of the command now being run; 0 between commands.
@@ -511,12 +546,31 @@ pub struct ClientInfo {
     pub lib_name: String,
     pub lib_ver: String,
     pub qbuf: u32,
+    pub user_serial: u64,
+    pub user: String,
     slot: &'static ClientSlot,
 }
 
 impl ClientInfo {
     pub fn kill(&self) {
         self.slot.kill.store(1, Ordering::Relaxed);
+    }
+
+    /// Whether this client was told to close and is still there.
+    pub fn killed(&self) -> bool {
+        self.slot.id.load(Ordering::Acquire) == self.id
+            && self.slot.kill.load(Ordering::Relaxed) != 0
+    }
+
+    /// Have a subscriber check its subscriptions against its user's
+    /// channel permissions.
+    pub fn request_acl_recheck(&self) {
+        self.slot.acl_recheck.store(1, Ordering::Release);
+    }
+
+    pub fn acl_recheck_pending(&self) -> bool {
+        self.slot.id.load(Ordering::Acquire) == self.id
+            && self.slot.acl_recheck.load(Ordering::Acquire) != 0
     }
 
     /// `CLIENT UNBLOCK`: end this client's wait, if it is waiting.
@@ -561,7 +615,7 @@ impl ClientInfo {
             f.push('N');
         }
         format!(
-            "id={} addr={} laddr={} fd={} name={} age={} idle={} flags={} db={} sub={} psub={} ssub=0 multi={} qbuf={} qbuf-free=0 argv-mem=0 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd={} user=default redir=-1 resp={} lib-name={} lib-ver={}",
+            "id={} addr={} laddr={} fd={} name={} age={} idle={} flags={} db={} sub={} psub={} ssub=0 multi={} qbuf={} qbuf-free=0 argv-mem=0 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd={} user={} redir=-1 resp={} lib-name={} lib-ver={}",
             self.id,
             self.addr,
             self.laddr,
@@ -576,6 +630,7 @@ impl ClientInfo {
             self.multi,
             self.qbuf,
             self.cmd,
+            self.user,
             self.resp,
             self.lib_name,
             self.lib_ver,
@@ -621,6 +676,8 @@ pub fn clients() -> Vec<ClientInfo> {
                 lib_name: text(lib_name),
                 lib_ver: text(lib_ver),
                 qbuf: s.qbuf.load(Ordering::Relaxed),
+                user_serial: s.user_serial.load(Ordering::Relaxed),
+                user: crate::acl::name_of(s.user_serial.load(Ordering::Relaxed)),
                 slot: s,
             }
         })

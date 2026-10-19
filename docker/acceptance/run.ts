@@ -30,11 +30,13 @@ const SKIPFILE = `${HERE}skip.txt`;
 /**
  * Every unit a server with Redis's full command set should pass when driven
  * from outside. Left out: the units Redis itself tags external:skip at the
- * top — they reconfigure, restart or replicate the server under test (acl,
- * aofrw, auth, client-eviction, limits, maxmemory, obuf-limits, pubsubshard,
- * shutdown, wait) — and the ones that measure Redis's own allocator or
- * internals rather than behaviour (memefficiency, oom-score-adj, querybuf,
- * replybufsize, violations, tls).
+ * top — they reconfigure, restart or replicate the server under test (aofrw,
+ * client-eviction, limits, maxmemory, obuf-limits, pubsubshard, shutdown,
+ * wait) — and the ones that measure Redis's own allocator or internals rather
+ * than behaviour (memefficiency, oom-score-adj, querybuf, replybufsize,
+ * violations, tls). acl, acl-v2 and auth are in, with the tag lifted from
+ * their first server block (`UNTAG`): those blocks only change users and the
+ * password, which pg_redis can undo between units (`resetConfig`).
  */
 const UNITS = [
 	"unit/type/string",
@@ -73,6 +75,8 @@ const UNITS = [
 	"unit/networking",
 	"unit/other",
 	"unit/auth",
+	"unit/acl",
+	"unit/acl-v2",
 	"unit/quit",
 ];
 
@@ -88,6 +92,21 @@ const DENY_TAGS = [
 	"needs:reset",
 	"needs:config-maxmemory",
 ];
+
+/**
+ * The server blocks whose `external:skip` tag is lifted. Their later blocks
+ * need an ACL file, a `user` directive or a restart, and stay skipped.
+ */
+const UNTAG: Record<string, [string, string]> = {
+	"unit/acl": ['start_server {tags {"acl external:skip"}} {', 'start_server {tags {"acl"}} {'],
+	"unit/acl-v2": ['start_server {tags {"acl external:skip"}} {', 'start_server {tags {"acl"}} {'],
+	"unit/auth": ['start_server {tags {"auth external:skip"}} {', 'start_server {tags {"auth"}} {'],
+};
+for (const [unit, [from, to]] of Object.entries(UNTAG)) {
+	const path = `tests/${unit}.tcl`;
+	const text = await Bun.file(path).text();
+	if (text.includes(from)) await Bun.write(path, text.replace(from, to));
+}
 
 const HALVES = {
 	durable: [] as string[],
@@ -119,21 +138,45 @@ const ANSI = /\x1b\[[0-9;]*m/g;
  * after it. Put back what pg_redis acts on, as a fresh server would have it.
  */
 async function resetConfig(): Promise<void> {
-	const cmd = ["CONFIG", "SET", "maxmemory", "0", "maxmemory-policy", "noeviction"];
-	const wire = `*${cmd.length}\r\n${cmd.map((a) => `$${a.length}\r\n${a}\r\n`).join("")}`;
-	await new Promise<void>((resolve) => {
+	// The users a unit created go, the default user and the ACL settings go
+	// back to a fresh server's.
+	const users = (await roundTrip([["ACL", "USERS"]]))
+		.split("\r\n")
+		.filter((l, i, all) => i > 0 && all[i - 1].startsWith("$"))
+		.filter((u) => u !== "default");
+	const cmds: string[][] = [
+		["CONFIG", "SET", "maxmemory", "0", "maxmemory-policy", "noeviction"],
+		["CONFIG", "SET", "requirepass", "", "acllog-max-len", "128", "acl-pubsub-default", "resetchannels"],
+		["ACL", "SETUSER", "default", "reset", "on", "nopass", "~*", "&*", "+@all"],
+		["ACL", "LOG", "RESET"],
+	];
+	if (users.length > 0) cmds.push(["ACL", "DELUSER", ...users]);
+	await roundTrip(cmds);
+}
+
+/** Send `cmds` on one connection and return every reply's bytes, read up to
+ * the PONG of a PING sent after them. */
+async function roundTrip(cmds: string[][]): Promise<string> {
+	const wire = [...cmds, ["PING"]]
+		.map((cmd) => `*${cmd.length}\r\n${cmd.map((a) => `$${Buffer.byteLength(a)}\r\n${a}\r\n`).join("")}`)
+		.join("");
+	return await new Promise<string>((resolve) => {
+		let got = "";
 		Bun.connect({
 			hostname: HOST,
 			port: Number(PORT),
 			socket: {
 				open: (s) => void s.write(wire),
-				data: (s) => {
-					s.end();
-					resolve();
+				data: (s, chunk) => {
+					got += Buffer.from(chunk).toString();
+					if (got.endsWith("+PONG\r\n") || got.includes("-NOAUTH")) {
+						s.end();
+						resolve(got);
+					}
 				},
-				close: () => resolve(),
-				error: () => resolve(),
-				connectError: () => resolve(),
+				close: () => resolve(got),
+				error: () => resolve(got),
+				connectError: () => resolve(got),
 			},
 		});
 	});

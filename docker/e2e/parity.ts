@@ -1527,6 +1527,74 @@ type Difference = {
 	note?: string;
 };
 
+// ACL: users, their descriptions, refusals and DRYRUN. Each case puts the
+// connection back on the default user and deletes what it made.
+c(
+	"ACL users described",
+	["ACL", "DELUSER", "par-a", "par-b"],
+	["ACL", "SETUSER", "par-a", "on", ">pw", "~app:*", "%R~ro:*", "%W~wo:*", "&ch:*", "+@all", "-@dangerous", "-client|kill", "+select|0"],
+	["ACL", "SETUSER", "par-a", "(+get ~sel:*)", "(-@all +set resetchannels &x)"],
+	["ACL", "GETUSER", "par-a"],
+	["ACL", "SETUSER", "par-b", "reset", "+@hash", "-hdel", "+@hash", "allkeys"],
+	["ACL", "LIST"],
+	["ACL", "USERS"],
+	["ACL", "GETUSER", "nobody"],
+	["ACL", "DELUSER", "par-a", "par-b", "nobody"],
+	["ACL", "DELUSER", "default"],
+);
+c(
+	"ACL SETUSER errors",
+	["ACL", "SETUSER", "par-e", "+nosuch"],
+	["ACL", "SETUSER", "par-e", "+config|get|x"],
+	["ACL", "SETUSER", "par-e", "+get|key1|key2"],
+	["ACL", "SETUSER", "par-e", "(+get", "~a"],
+	["ACL", "SETUSER", "par-e", "(nonsense)"],
+	["ACL", "SETUSER", "par-e", "<nopass"],
+	["ACL", "SETUSER", "par-e", "#abc"],
+	["ACL", "SETUSER", "par-e", "~*", "~a"],
+	["ACL", "SETUSER", "par e"],
+	["ACL", "GETUSER", "par-e"],
+	["ACL", "DELUSER", "par-e"],
+);
+c(
+	"ACL DRYRUN",
+	["ACL", "SETUSER", "par-d", "+@all", "%R~read*", "%W~write*", "%RW~rw*", "resetchannels", "&chan"],
+	["ACL", "DRYRUN", "par-d", "GET", "read"],
+	["ACL", "DRYRUN", "par-d", "GET", "write"],
+	["ACL", "DRYRUN", "par-d", "SET", "write", "v", "GET"],
+	["ACL", "DRYRUN", "par-d", "COPY", "read", "write"],
+	["ACL", "DRYRUN", "par-d", "EVAL", "", "1", "read"],
+	["ACL", "DRYRUN", "par-d", "SORT", "read", "STORE", "read"],
+	["ACL", "DRYRUN", "par-d", "PUBLISH", "chan", "m"],
+	["ACL", "DRYRUN", "par-d", "PUBLISH", "other", "m"],
+	["ACL", "DRYRUN", "par-d", "SET", "v"],
+	["ACL", "DRYRUN", "par-d", "NOSUCH"],
+	["ACL", "DRYRUN", "nobody", "GET", "k"],
+	["ACL", "DELUSER", "par-d"],
+);
+c(
+	"ACL refusals as another user",
+	["ACL", "SETUSER", "par-u", "on", ">pw", "~k:*", "+get", "+set", "+multi", "+exec", "+acl|whoami", "+auth"],
+	["AUTH", "par-u", "wrong"],
+	["AUTH", "par-u", "pw"],
+	["ACL", "WHOAMI"],
+	["SET", "k:1", "v"],
+	["GET", "other"],
+	["DEL", "k:1"],
+	["PUBLISH", "c", "m"],
+	["MULTI"],
+	["GET", "nope"],
+	["EXEC"],
+	["AUTH", "default", "testpass"],
+	["ACL", "DELUSER", "par-u"],
+	["AUTH", "a", "b", "c"],
+	["ACL", "WHOAMI", "extra"],
+	["ACL", "CAT", "nosuch"],
+	["ACL", "CAT", "a", "b"],
+	["ACL", "GENPASS", "0"],
+	["ACL", "LOG", "nope"],
+);
+
 const REPLY_TIMEOUT_MS = Number(process.env.PARITY_TIMEOUT_MS ?? 5000);
 
 /**

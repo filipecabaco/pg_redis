@@ -453,8 +453,20 @@ client get `BUSY`, on every worker, until it ends or `SCRIPT KILL` /
   original `RPUSH` returns, as in Redis; a blocked client stuck for longer
   than the bound is left to finish on its own. Writes made inside a script do
   not wait.
-- **No ACL users, replicas or cluster mode.** `ACL`, `WAIT`, `REPLICAOF` and
-  `CLUSTER` answer as a single-user, stand-alone server would.
+- **No replicas or cluster mode.** `WAIT`, `REPLICAOF` and `CLUSTER` answer
+  as a stand-alone server would.
+- **ACL users live in shared memory and are saved to a table.** Users, rules,
+  selectors, the permission checks and their error texts follow Redis 7.2's
+  `acl.c`; see [Users and permissions](#users-and-permissions). Where Redis
+  reads and writes an ACL file, `ACL LOAD` and `ACL SAVE` read and write
+  `redis.acl_users`, so they work on every server, and the acceptance test
+  that expects them to fail without an ACL file does not pass. The users'
+  rules together may take 1 MiB, and the ACL LOG 512 KiB; each log entry keeps
+  the first 1,024 bytes of its object, username and client info. A queued
+  `AUTH` inside `MULTI` answers `OK` at `EXEC` without changing the user. A
+  blocked command is checked again each time it is retried (every 50 ms, and
+  on each write to its keys), where Redis checks it again only when a write
+  serves it.
 - **Client tracking keeps its table in shared memory, 16,384 (key, client)
   pairs across every client.** Past that, or past `tracking-table-max-keys`
   when it is set lower, a tracked key picked at random is invalidated to make
@@ -1211,3 +1223,63 @@ write-up is in [PARITY.md](PARITY.md#tier-1-commands-we-have-that-behave-differe
   See [phase 5](#phase-5-missing-commands).
 - **How far `FLUSHALL` reaches:** all sixteen databases, as in Redis, the
   durable half included. Also [phase 5](#phase-5-missing-commands).
+
+## Users and permissions
+
+`src/acl.rs` follows Redis 7.2's `acl.c`. A user has flags (`on`/`off`,
+`nopass`, the sanitize-payload pair), SHA-256 password hashes and a list of
+selectors, the root one first. A selector holds a command bitmap with one bit
+per entry of the generated command table (`redis_tables.rs`) and one more
+that only `+@all` sets, for "commands added later"; the first arguments
+allowed with `+cmd|arg`; key patterns with read and write flags; channel
+patterns; and the command rules in the order they still apply, which is how
+`ACL GETUSER` and `ACL LIST` describe the bitmap back, compacted as Redis
+compacts them. Categories are each command's explicit ones plus the ones its
+flags imply, so `+@write` covers what Redis's does.
+
+**Shared state.** The live users are in a shared-memory block, one per
+server: each user's `ACL LIST` description and a serial that stays with the
+user until it is deleted, behind a lock, with a version counter. Every
+connection thread checks the counter before each command (one atomic load);
+when it moved, the process parses the descriptions once and every thread
+uses that copy. A change takes the lock, applies the rules to a copy of the
+user (so a refused rule changes nothing), writes the users back and bumps the
+counter, so the next command on every worker sees it. The ACL LOG is a second
+locked region in the same block. Each connection's slot in the client table
+records its user's serial, which is what `CLIENT LIST` shows as `user=`,
+what `CLIENT KILL USER` matches, and how the dispatcher finds the user of a
+queued command or a script.
+
+**Enforcement.** A connection checks every command after its name and arity
+and after the `NOAUTH` gate, before it is parsed further, run or queued, the
+order `processCommand` uses: a refused command inside `MULTI` flags the
+transaction. `EXEC` checks each queued command again and answers Redis's
+"ACLs rules changed" error for the ones no longer allowed. A RESP2
+subscriber's commands are checked in its subscribe loop. A script's
+`redis.call` checks the calling client's user on the dispatcher, with the
+error `ACL failure in script: ...`, and `redis.acl_check_cmd` answers for the
+same user. Keys come from the command's key specs, read for `ACCESS` and
+write for `INSERT`, `DELETE` and `UPDATE`, or from the command's own key
+finder where its specs cannot be followed (`SORT`, `MIGRATE`, `EVAL` with a
+bad key count), as `getKeysFromCommandWithSpecs` does. Channels are those of
+`PUBLISH`, `SPUBLISH` and the subscribe commands; a `PSUBSCRIBE` pattern is
+compared with the user's patterns literally. `SORT ... BY` and `GET` need
+read access to every key, as in Redis.
+
+**Changes and clients.** `ACL DELUSER` closes the deleted user's clients,
+and `ACL LOAD` the clients of every user but `default`, as Redis frees them.
+When `ACL SETUSER` takes channel permissions from a user, each of its
+subscribers checks its own subscriptions and closes if one is no longer
+allowed. `off` and `resetpass` close nothing, as in Redis. A connection
+thread waits up to a second for the clients it closed to go before it
+replies; inside `EXEC` the dispatcher does not wait.
+
+**Persistence.** `ACL SAVE` replaces the rows of `redis.acl_users` with one
+row per user (name, and the description after it); `ACL LOAD` reads them
+back, checking every row first and changing nothing if one is wrong, with
+`ACLLoadFromFile`'s messages (the row number stands for the line). The first
+worker to start loads the table before anyone is served. `ACL SETUSER`
+changes only the live users, as it does in Redis without `ACL SAVE`.
+`redis.password` is the default user's password: applied at start unless the
+table has a row for `default`, again on a reload that changes it, and
+`CONFIG SET requirepass` sets it at runtime, as `updateRequirePass` does.

@@ -5,9 +5,8 @@
     was closed, kept for the reasoning behind each decision. For current
     behaviour see [Command coverage](command-coverage.md) and the
     [differences list on the home page](index.md#differences). Current
-    numbers: pg_redis accepts 235 of Redis 7.2's 242 commands, and 2 of the
-    2,010 replies the parity harness compares differ, both in float
-    formatting.
+    numbers: pg_redis accepts 235 of Redis 7.2's 242 commands, and none of the
+    2,010 replies the parity harness compares differ from x86-64 Redis 7.2.
 
 What is left between pg_redis and Redis, why the headline number does not say
 so, and what has to be decided before the next block of work starts.
@@ -80,13 +79,20 @@ Reference used here: Redis 7.0.15, 240 top-level commands.
 
 ## Where parity actually stands
 
-**2 differences over 2,010 replies** (87 cases, run on both storage halves).
-Both are float formatting, one per half, and which pair shows depends on the
-reference Redis's build. Against x86 Redis it is `INCRBYFLOAT`, which is `f64`
-here where Redis uses an 80-bit `long double`. Against arm64 Redis it is the
-last digits of a distance stored by `GEOSEARCHSTORE … STOREDIST`. The baseline
-holds all four entries. When this section was first written the harness
-compared 1,394 replies.
+**No differences over 2,010 replies** against x86-64 Redis 7.2 (87 cases, run
+on both storage halves), the build CI compares with. `INCRBYFLOAT` used to
+differ there, because it was `f64` here where Redis uses an 80-bit
+`long double`; it now computes in the 80-bit format too. Against arm64 Redis
+two cases differ on both storage halves: `INCRBYFLOAT`, whose `long double`
+there is 128-bit and prints back to `4`, and the last digits of a distance
+stored by `GEOSEARCHSTORE … STOREDIST`. Arm64 Redis differs from x86-64 Redis
+in the same way, so these four are kept in the baseline with a note and do not
+fail a run on an arm64 machine. The reference image is the Debian `redis:7.2`,
+on glibc: Alpine's musl `strtold` parses some out-of-range floats differently
+from the glibc Redis most installations run.
+
+When this section was first written the harness compared
+1,394 replies.
 
 That figure covers less than it seems to, in two ways. Both come from what a
 differential harness can do, and neither is a flaw in this one:
@@ -112,8 +118,8 @@ fifth, found later, follows the table.
 
 | Gap | Half | Status |
 |---|---|---|
-| `INCRBYFLOAT` precision — `f64` against Redis's `long double` | both | **Accepted.** Two of the baseline's four entries, one per half; differs against x86 Redis only. See [phase 2](IMPLEMENTATION.md#phase-2-ranges-shapes-and-ties) |
-| GEO distance stored by `GEOSEARCHSTORE … STOREDIST` — last-digit `f64` rounding | both | **Accepted.** The other two baseline entries, one per half; differs against arm64 Redis only, and x86 Redis matches |
+| `INCRBYFLOAT` precision — `f64` against Redis's `long double` | both | **Fixed.** `INCRBYFLOAT` and `HINCRBYFLOAT` compute in the x87 80-bit format and match x86-64 Redis digit for digit. Against arm64 Redis, whose `long double` is 128-bit, the last digit can differ. See [phase 2](IMPLEMENTATION.md#phase-2-ranges-shapes-and-ties) |
+| GEO distance stored by `GEOSEARCHSTORE … STOREDIST` — last-digit `f64` rounding | both | **Accepted.** The baseline's two entries, one per half; differs against arm64 Redis only, and x86 Redis matches |
 | An expired collection outlives its expiry: `TYPE` answers `none` while `LLEN` still reports the old count, until the sweep runs | both | **Fixed.** It affected both halves and more than one command; see [below](#the-stale-collection-read-was-bigger-than-this-table-said) |
 | `SCAN`/`KEYS` return the whole keyspace in one reply, cursor always 0 | both | **Fixed** for `SCAN`, `HSCAN`, `SSCAN` and `ZSCAN`: real cursors on both halves. See [Incremental cursors](#incremental-cursors) below. `KEYS` returns everything in one reply, as in Redis |
 | `RANDOMKEY` returns the first live key the KV scan reaches, and consults the collection metas only when there is none | ~~memory~~ both | **Fixed**, and it was worse than this row said. The durable half read `kv_N` alone, so a database holding only collections answered *nil* while `DBSIZE` counted them, which is a wrong answer. Both halves now draw uniformly over every live key: the durable half with a five-table `UNION` under `ORDER BY random()`, the memory half with a single-pass reservoir over the KV scan and the collection names. An expired-but-unswept collection is excluded on both. The e2e `RANDOMKEY` describes pin all three properties per half |

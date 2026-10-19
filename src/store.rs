@@ -20,6 +20,7 @@ use pgrx::spi::SpiClient;
 use crate::commands::{
     Command, ExpireCond, GetExExpiry, LexBound, RangeBy, Response, ScoreBound, format_score,
 };
+use crate::longdouble::LongDouble;
 use crate::memdb::KeyKind;
 use crate::plans::Kept;
 
@@ -131,7 +132,7 @@ pub trait Store {
     /// `value` is not empty.
     fn setrange(&mut self, key: &[u8], offset: i64, value: &[u8]) -> Out<i64>;
     fn incrby(&mut self, key: &[u8], delta: i64) -> Out<Num<i64>>;
-    fn incrbyfloat(&mut self, key: &[u8], delta: f64) -> Out<Num<String>>;
+    fn incrbyfloat(&mut self, key: &[u8], delta: LongDouble) -> Out<Num<String>>;
     /// Set or clear one bit; what it was.
     fn setbit(&mut self, key: &[u8], offset: i64, on: bool) -> Out<bool>;
 
@@ -155,7 +156,7 @@ pub trait Store {
     fn hdel(&mut self, key: &[u8], fields: &[Vec<u8>]) -> Out<i64>;
     fn hincrby(&mut self, key: &[u8], field: &[u8], delta: i64) -> Out<Num<i64>>;
     /// The new value as Redis spells it.
-    fn hincrbyfloat(&mut self, key: &[u8], field: &[u8], delta: f64) -> Out<Num<String>>;
+    fn hincrbyfloat(&mut self, key: &[u8], field: &[u8], delta: LongDouble) -> Out<Num<String>>;
 
     // ── sets ──
     fn sadd(&mut self, key: &[u8], members: &[Vec<u8>]) -> Out<i64>;
@@ -395,7 +396,15 @@ pub fn run(cmd: &Command, store: &mut dyn Store) -> Option<Response> {
             None => Ok(Response::Error("ERR decrement would overflow".into())),
             Some(d) => store.incrby(key, d).map(integer_reply),
         },
-        Command::IncrByFloat { key, delta } => store.incrbyfloat(key, *delta).map(|n| match n {
+        // Refused here, after the type check, as Redis orders it. Redis
+        // reads the stored value first, but a bad one gets the same error.
+        Command::IncrByFloat { delta: None, .. } => {
+            Ok(Response::Error("ERR value is not a valid float".into()))
+        }
+        Command::IncrByFloat {
+            key,
+            delta: Some(delta),
+        } => store.incrbyfloat(key, *delta).map(|n| match n {
             Num::Value(text) => Response::BulkString(text.into_bytes()),
             Num::NotNumber => Response::Error("ERR value is not a valid float".into()),
             Num::Overflow => Response::Error("ERR increment would produce NaN or Infinity".into()),
@@ -1606,7 +1615,7 @@ impl Store for SqlStore<'_, '_> {
 
     /// As `hincrbyfloat`: seeded if missing, locked, summed in Rust and
     /// written back, spelt as the memory half spells it.
-    fn incrbyfloat(&mut self, key: &[u8], delta: f64) -> Out<Num<String>> {
+    fn incrbyfloat(&mut self, key: &[u8], delta: LongDouble) -> Out<Num<String>> {
         let db = self.db;
         self.client
             .update_kept(
@@ -1625,17 +1634,10 @@ impl Store for SqlStore<'_, '_> {
             .ok()
             .flatten()
             .unwrap_or_default();
-        let Some(base) = std::str::from_utf8(&current)
-            .ok()
-            .and_then(|t| t.parse::<f64>().ok())
-        else {
-            return Ok(Num::NotNumber);
+        let text = match crate::longdouble::increment(Some(&current), delta) {
+            Num::Value(text) => text,
+            refused => return Ok(refused),
         };
-        let sum = base + delta;
-        if !sum.is_finite() {
-            return Ok(Num::Overflow);
-        }
-        let text = crate::memdb::format_float(sum);
         self.client
             .update_kept(
                 &format!("UPDATE redis.kv_{db} SET value = $2 WHERE key = $1"),
@@ -1845,7 +1847,7 @@ impl Store for SqlStore<'_, '_> {
     /// is missing — so there is a row to lock even for a new field — then
     /// locked, read and written back. The sum is formatted the way Redis
     /// spells it, which SQL's float text is not.
-    fn hincrbyfloat(&mut self, key: &[u8], field: &[u8], delta: f64) -> Out<Num<String>> {
+    fn hincrbyfloat(&mut self, key: &[u8], field: &[u8], delta: LongDouble) -> Out<Num<String>> {
         let db = self.db;
         let args: &[DatumWithOid] = &[key.into(), field.into()];
         self.client
@@ -1871,18 +1873,10 @@ impl Store for SqlStore<'_, '_> {
             .ok()
             .flatten()
             .unwrap_or_default();
-        let base = match std::str::from_utf8(&current)
-            .ok()
-            .and_then(|t| t.parse::<f64>().ok())
-        {
-            Some(v) if v.is_finite() => v,
-            _ => return Ok(Num::NotNumber),
+        let text = match crate::longdouble::increment(Some(&current), delta) {
+            Num::Value(text) => text,
+            refused => return Ok(refused),
         };
-        let sum = base + delta;
-        if !sum.is_finite() {
-            return Ok(Num::Overflow);
-        }
-        let text = crate::memdb::format_float(sum);
         self.client
             .update_kept(
                 &format!("UPDATE redis.hash_{db} SET value = $3 WHERE key = $1 AND field = $2"),

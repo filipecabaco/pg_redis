@@ -16,11 +16,9 @@ use allocator_api2::alloc::Allocator;
 use super::deque::Deque;
 use super::dict::{Dict, Seed};
 use super::zset::ZSet;
-use super::{
-    Bytes, KeyKind, bytes_in, fast_random, format_float, parse_stored_float, parse_stored_int,
-    random_picks, range_bounds,
-};
+use super::{Bytes, KeyKind, bytes_in, fast_random, parse_stored_int, random_picks, range_bounds};
 use crate::commands::{ExpireCond, GetExExpiry, KeyDump, LexBound, Response, ScoreBound};
+use crate::longdouble::{LongDouble, increment};
 use crate::store::{Incr, LSet, Num, Out, SetArgs, SetDone, Store, ZaddOpts};
 
 /// `proto-max-bulk-len`: no string grows past this.
@@ -720,25 +718,18 @@ impl<A: Allocator + Clone> Store for Db<A> {
         Ok(Num::Value(n))
     }
 
-    fn incrbyfloat(&mut self, key: &[u8], delta: f64) -> Out<Num<String>> {
+    fn incrbyfloat(&mut self, key: &[u8], delta: LongDouble) -> Out<Num<String>> {
         let existed = self.string(key).is_some();
         let v = self.string_mut(key)?;
-        let current = if existed {
-            parse_stored_float(v)
-        } else {
-            Some(0.0)
-        };
-        let Some(current) = current else {
-            return Ok(Num::NotNumber);
-        };
-        let n = current + delta;
-        if !n.is_finite() {
-            if !existed {
-                self.keys.remove(key);
+        let text = match increment(existed.then_some(&v[..]), delta) {
+            Num::Value(text) => text,
+            refused => {
+                if !existed {
+                    self.keys.remove(key);
+                }
+                return Ok(refused);
             }
-            return Ok(Num::Overflow);
-        }
-        let text = format_float(n);
+        };
         v.clear();
         v.extend_from_slice(text.as_bytes());
         Ok(Num::Value(text))
@@ -857,22 +848,16 @@ impl<A: Allocator + Clone> Store for Db<A> {
         Ok(Num::Value(n))
     }
 
-    fn hincrbyfloat(&mut self, key: &[u8], field: &[u8], delta: f64) -> Out<Num<String>> {
+    fn hincrbyfloat(&mut self, key: &[u8], field: &[u8], delta: LongDouble) -> Out<Num<String>> {
         let a = self.keys.alloc();
         let h = self.hash_mut(key)?;
-        let current = match h.get(field) {
-            Some(v) => match parse_stored_float(v) {
-                Some(c) => c,
-                None => return Ok(Num::NotNumber),
-            },
-            None => 0.0,
+        let text = match increment(h.get(field).map(|v| &v[..]), delta) {
+            Num::Value(text) => text,
+            refused => {
+                self.tidy(key);
+                return Ok(refused);
+            }
         };
-        let n = current + delta;
-        if !n.is_finite() {
-            self.tidy(key);
-            return Ok(Num::Overflow);
-        }
-        let text = format_float(n);
         h.insert(field, bytes_in(text.as_bytes(), a));
         Ok(Num::Value(text))
     }

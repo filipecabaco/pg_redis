@@ -3655,6 +3655,59 @@ async function fanOut<T>(
 /** Both storage halves, by the name `SELECT` takes. */
 const HALVES = ["cache", "durable"] as const;
 
+// Redis adds floats in C `long double`, the x87 80-bit format on x86-64, and
+// prints 17 decimal places: digits a 64-bit double drops. Both halves compute
+// it the same way, on memory db 0 and on logged db 8.
+describe("Float increments in long double", () => {
+	afterAll(async () => {
+		await raw.send("SELECT", "durable");
+	});
+
+	for (const db of ["0", "8"]) {
+		test(`db ${db}: INCRBYFLOAT keeps the digits x86-64 Redis keeps`, async () => {
+			await raw.send("SELECT", db);
+			await raw.send("SET", "ld:n2", "3");
+			expect(
+				(await raw.bulk("INCRBYFLOAT", "ld:n2", "1.000000000000000005"))?.toString(),
+			).toBe("4.00000000000000001");
+			expect((await raw.bulk("GET", "ld:n2"))?.toString()).toBe("4.00000000000000001");
+			expect((await raw.bulk("INCRBYFLOAT", "ld:n2", "0x1p-2"))?.toString()).toBe(
+				"4.25000000000000001",
+			);
+			await raw.send("DEL", "ld:n2");
+		});
+
+		test(`db ${db}: HINCRBYFLOAT keeps them too`, async () => {
+			await raw.send("SELECT", db);
+			await raw.send("HSET", "ld:h", "n2", "3");
+			expect(
+				(await raw.bulk("HINCRBYFLOAT", "ld:h", "n2", "1.000000000000000005"))?.toString(),
+			).toBe("4.00000000000000001");
+			expect((await raw.bulk("HGET", "ld:h", "n2"))?.toString()).toBe(
+				"4.00000000000000001",
+			);
+			await raw.send("DEL", "ld:h");
+		});
+
+		test(`db ${db}: a bad increment is refused after the type check`, async () => {
+			await raw.send("SELECT", db);
+			await raw.send("DEL", "ld:list", "ld:none");
+			await raw.send("RPUSH", "ld:list", "a");
+			expect((await raw.send("INCRBYFLOAT", "ld:list", "abc")).toString()).toMatch(
+				/^-WRONGTYPE/,
+			);
+			expect((await raw.send("INCRBYFLOAT", "ld:none", "abc")).toString()).toBe(
+				"-ERR value is not a valid float\r\n",
+			);
+			expect((await raw.send("INCRBYFLOAT", "ld:none", "inf")).toString()).toBe(
+				"-ERR increment would produce NaN or Infinity\r\n",
+			);
+			expect(integerReply(await raw.send("EXISTS", "ld:none"))).toBe(0);
+			await raw.send("DEL", "ld:list");
+		});
+	}
+});
+
 describe("Concurrent clients", () => {
 	const WRITERS = 8;
 	const PER_WRITER = 25;

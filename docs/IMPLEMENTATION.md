@@ -919,14 +919,20 @@ comes after this and is bounded by it: a change that buys throughput by
 widening a parity or security gap is not worth making.
 
 **2 differences over 1,394 replies**, down from 189. Every phase is done: 197
-closed, and a sharper harness added 10 along the way. Both survivors are the
-same accepted one, once per half: `INCRBYFLOAT` is `f64` where Redis uses
-`long double` (see [phase 2](#phase-2-ranges-shapes-and-ties)). The harness has
-grown since, to 2,010 replies, and still finds 2 differences, both float
-formatting: `INCRBYFLOAT` against x86 Redis, and the last digits of a
-`GEOSEARCHSTORE … STOREDIST` distance against arm64 Redis.
+closed, and a sharper harness added 10 along the way. Both survivors were the
+same one, once per half: `INCRBYFLOAT` computed in `f64` where Redis uses
+`long double`. That is fixed now (see
+[phase 2](#phase-2-ranges-shapes-and-ties)). The harness has grown since, to
+2,010 replies. Against x86-64 Redis, the build CI compares with, it finds no
+difference. Against arm64 Redis it finds two per half: the last digits of a
+`GEOSEARCHSTORE … STOREDIST` distance, and `INCRBYFLOAT`, because arm64 Redis
+has a 128-bit `long double`.
 
-The gate fails only on a *new* difference, so these two do not trip it.
+The gate fails only on a *new* difference. The baseline keeps the two GEO
+entries, noted as arm64-only, so they do not trip it. The `INCRBYFLOAT` case
+is not in it, so a local run on an arm64 machine reports it as new; check a
+float change against x86-64 Redis instead, in CI or with
+`scripts/gen_longdouble_cases.exs`.
 
 #### The plan
 
@@ -1015,11 +1021,25 @@ of two: both backends read the same `Command`.
   client asking for a list back no longer gets a nil string.
 - **Tie-break.** `zset_meta_member_added` compares members when scores are
   equal, which costs one `hash_search` on the tie and nothing otherwise.
-- **Float precision: accepted and left unfixed.** `INCRBYFLOAT` is `f64` where Redis
-  uses `long double`, so `3 + 1.000000000000000005` is `4` here and
-  `4.00000000000000001` there. 80-bit arithmetic is not available in stable Rust
-  without a dependency, and `float8` is what the SQL half stores. The two
-  differences stay in the baseline as a record.
+- **Float precision.** `INCRBYFLOAT` and `HINCRBYFLOAT` were `f64`, where
+  Redis uses C `long double`, so `3 + 1.000000000000000005` was `4` here and
+  `4.00000000000000001` in Redis on x86-64. They now compute as x86-64 Redis
+  does, in the x87 80-bit format, in `src/longdouble.rs`, which both halves
+  call. Parsing follows glibc's `strtold` as Redis's `string2ld` uses it:
+  decimal, hex floats and `inf`/`infinity`, rounded to nearest by the
+  `rustc_apfloat` crate, with NaN, overflow and underflow to zero refused. The
+  sum is rounded to nearest, and the result is printed as `%.17Lf` prints it,
+  from the exact binary value, then trimmed as `ld2string` trims it.
+  `scripts/gen_longdouble_cases.exs` records about 4,900 replies from x86-64
+  Redis 7.2 into `tests/fixtures/`, and a unit test replays them; every one
+  matches. The reference is the Debian image (glibc). The Alpine image (musl)
+  differs on 13 of them, all past the 80-bit range, where musl's `strtold`
+  does not report the overflow or underflow and for some hex floats returns a
+  wrong value. Redis on arm64 has a 128-bit
+  `long double` and can print other last digits.
+- **Increment order.** `INCRBYFLOAT` with an increment that is not a float now
+  checks the key's type first, as Redis does, so a list key answers
+  `WRONGTYPE`.
 
 #### Phase 3: error wording
 

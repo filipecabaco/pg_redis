@@ -132,6 +132,31 @@ pub fn flags_write(flags: i64) -> bool {
     flags < 0 || flags as u32 & FLAG_EVAL_COMPAT != 0 || flags as u32 & FLAG_NO_WRITES == 0
 }
 
+pub const NOREPLICAS: &str = "NOREPLICAS Not enough good replicas to write.";
+
+/// `scriptPrepareForRun`'s refusals, for a script declared with flags (the
+/// flagless pre-7.0 form is checked command by command instead): one that
+/// may write, with too few replicas, or past `maxmemory` without
+/// `allow-oom`.
+fn refused_before_run(flags: u32, compat: bool) -> Option<Response> {
+    if compat || flags & FLAG_NO_WRITES != 0 {
+        return None;
+    }
+    if crate::server::too_few_replicas() {
+        return Some(Response::Error(NOREPLICAS.into()));
+    }
+    if flags & FLAG_ALLOW_OOM == 0 && !crate::evict::make_room() {
+        return Some(crate::commands::mem_out_of_memory());
+    }
+    None
+}
+
+/// Whether the commands a script runs may grow memory past `maxmemory`:
+/// `allow-oom`, which `no-writes` implies.
+fn allows_oom(flags: u32, compat: bool) -> bool {
+    !compat && flags & (FLAG_ALLOW_OOM | FLAG_NO_WRITES) != 0
+}
+
 /// The flags an `EVAL` body declares, read straight from its shebang.
 pub fn body_flags(body: &[u8]) -> i64 {
     shebang_flags(body).map_or(-1, |(f, _)| f as i64)
@@ -1514,6 +1539,15 @@ fn run_from_script(argv: &[Vec<u8>], ctx: &mut CallCtx<'_>) -> Result<Response, 
     if has("noscript") && !crate::server::deny_scripts_disabled() {
         return Err("This Redis command is not allowed from script".into());
     }
+    // `scriptCall`'s refusals of a write with too few replicas, and of a
+    // command that may grow memory past `maxmemory` unless the script allows
+    // it: the command's error, raised in the script.
+    if has("write") && crate::server::too_few_replicas() {
+        return Ok(Response::Error(NOREPLICAS.into()));
+    }
+    if has("denyoom") && !crate::evict::make_room() {
+        return Ok(crate::commands::mem_out_of_memory());
+    }
     let caller = CALLER.get();
     if caller != 0 {
         if let crate::acl::Verdict::Denied(d) = crate::acl::evaluate(caller, argv) {
@@ -2307,6 +2341,9 @@ impl Engine {
                 if f.flags & FLAG_NO_WRITES == 0 && inv.ro {
                     return Err(err(RO_WITH_WRITE_FLAG.into()));
                 }
+                if let Some(refused) = refused_before_run(f.flags, false) {
+                    return Err(refused);
+                }
                 let read_only = inv.ro || f.flags & FLAG_NO_WRITES != 0;
                 let lua = &engine.sb.lua;
                 let (k, a) = (
@@ -2323,7 +2360,10 @@ impl Engine {
                     read_only,
                     run: &run,
                 };
-                Ok(engine.sb.call(&f.func, Some(k), Some(a), &f.name, &mut ctx))
+                let allow = allows_oom(f.flags, false);
+                Ok(crate::evict::allowing_oom(allow, || {
+                    engine.sb.call(&f.func, Some(k), Some(a), &f.name, &mut ctx)
+                }))
             }
             ScriptCmd::FunctionLoad { replace, code } => {
                 let engine = self.func_engine(host)?;
@@ -2539,6 +2579,9 @@ fn run_eval(
     if !compat && flags & FLAG_NO_WRITES == 0 && inv.ro {
         return Response::Error(RO_WITH_WRITE_FLAG.into());
     }
+    if let Some(refused) = refused_before_run(flags, compat) {
+        return refused;
+    }
     let read_only = inv.ro || (!compat && flags & FLAG_NO_WRITES != 0);
     let lua = &engine.sb.lua;
     let set = (|| {
@@ -2557,7 +2600,9 @@ fn run_eval(
         read_only,
         run: &run,
     };
-    engine.sb.call(&f, None, None, sha, &mut ctx)
+    crate::evict::allowing_oom(allows_oom(flags, compat), || {
+        engine.sb.call(&f, None, None, sha, &mut ctx)
+    })
 }
 
 // ───────────────────────────────── SHA-1 ────────────────────────────────────

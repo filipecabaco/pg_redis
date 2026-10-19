@@ -50,13 +50,30 @@ thread_local! {
     static NEXT_SLOT: Cell<usize> = const { Cell::new(0) };
     /// Inside [`before_run`]: whether its round left room.
     static RUN_ROOM: Cell<Option<bool>> = const { Cell::new(None) };
+    /// Inside a script declared `allow-oom`: its commands may grow memory
+    /// past the limit.
+    static ALLOW_OOM: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run `f`, a script's body, with its commands let past `maxmemory` when
+/// `allow` (`allow-oom`, or `no-writes`, which implies it).
+pub fn allowing_oom<R>(allow: bool, f: impl FnOnce() -> R) -> R {
+    /// Puts the outer value back, on unwinding too.
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ALLOW_OOM.set(self.0);
+        }
+    }
+    let _restore = Restore(ALLOW_OOM.replace(allow));
+    f()
 }
 
 /// Before a command: evict what the policy allows. False when the command,
 /// if it may grow memory, must be refused. Inside a transaction or script,
 /// the answer of the round before it, with nothing evicted.
 pub fn make_room() -> bool {
-    RUN_ROOM.get().unwrap_or_else(|| perform() != Evict::Fail)
+    ALLOW_OOM.get() || RUN_ROOM.get().unwrap_or_else(|| perform() != Evict::Fail)
 }
 
 /// Run `f`, a transaction, script or multi-step command, after one round of

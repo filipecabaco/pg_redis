@@ -278,6 +278,7 @@ fn is_rejection(msg: &str) -> bool {
         "NOPERM",
         "OOM command not allowed",
         "BUSY ",
+        "NOREPLICAS",
     ]
     .iter()
     .any(|p| msg.starts_with(p))

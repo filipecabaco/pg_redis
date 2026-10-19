@@ -1597,6 +1597,13 @@ pub fn deny_scripts_disabled() -> bool {
     ctl().is_some_and(|c| c.deny_scripts_disabled.load(Ordering::Relaxed) != 0)
 }
 
+/// `min-replicas-to-write` set with a lag limit: this server has no
+/// replicas, so too few to write, as Redis's `checkGoodReplicasStatus` finds.
+pub fn too_few_replicas() -> bool {
+    crate::config::get_i64("min-replicas-to-write") > 0
+        && crate::config::get_i64("min-replicas-max-lag") > 0
+}
+
 /// Whether keys are expired in the background, which `DEBUG
 /// SET-ACTIVE-EXPIRE 0` turns off.
 pub fn active_expire() -> bool {

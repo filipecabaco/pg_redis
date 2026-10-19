@@ -1237,6 +1237,17 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<DispatchMsg>, default_d
             continue;
         }
 
+        // `min-replicas-to-write` with no replicas to count: a write is
+        // refused as Redis's `processCommand` refuses it, queued or not.
+        if crate::server::too_few_replicas() && crate::scripting::flagged(&parts, "write") {
+            let msg = crate::scripting::NOREPLICAS;
+            if multi {
+                queue.push(Err(msg.to_string()));
+            }
+            reply(&mut writer, |w| write_error(w, msg));
+            continue;
+        }
+
         // RESET and QUIT act immediately even inside MULTI, as in Redis.
         if multi && !matches!(cmd_name.as_str(), "RESET" | "QUIT") {
             match cmd_name.as_str() {

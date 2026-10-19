@@ -991,7 +991,7 @@ in its own process, so a unit that aborts takes only itself down.
   denied by tag; tests needing a real `maxmemory` run on the memory half only.
   Tests needing `DEBUG` run: it answers `OBJECT`, `POPULATE`, `PROTOCOL`,
   `SLEEP` and `SET-ACTIVE-EXPIRE`, and `RELOAD` and `LOADAOF` leave the data
-  as it was. `maxmemory`, `obuf-limits` and `pubsubshard`, `external:skip`
+  as it was. `info`, `maxmemory`, `obuf-limits` and `pubsubshard`, `external:skip`
   throughout, run from a copy without the tag and without the blocks that
   start a replica or read the replication stream (`REWRITTEN` in `run.ts`).
   `--ignore-encoding` and `--ignore-digest` turn off the assertions about

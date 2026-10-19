@@ -34,8 +34,8 @@ const SKIPFILE = `${HERE}skip.txt`;
  * client-eviction, limits, shutdown, wait) — and
  * the ones that measure Redis's own allocator or internals rather than
  * behaviour (memefficiency, oom-score-adj, querybuf, replybufsize,
- * violations, tls). maxmemory, obuf-limits and pubsubshard run, in part,
- * through `REWRITTEN` below. acl,
+ * violations, tls). info, maxmemory, obuf-limits and pubsubshard run, in
+ * part, through `REWRITTEN` below. acl,
  * acl-v2 and auth are in, with the tag lifted from their first server block
  * (`UNTAG`): those blocks only change users and the password, which pg_redis
  * can undo between units (`resetConfig`).
@@ -99,6 +99,10 @@ const REWRITTEN: Record<string, { halves: Half[]; drop: RegExp[] }> = {
 		drop: [/test_slave_buffers/, /attach_to_replication_stream/, /proc init_test/],
 	},
 	// Every block runs: the tag is the file's, not its tests'.
+	"unit/info": {
+		halves: ["memory", "durable"],
+		drop: [],
+	},
 	"unit/obuf-limits": {
 		halves: ["memory", "durable"],
 		drop: [],

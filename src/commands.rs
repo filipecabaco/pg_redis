@@ -3761,7 +3761,9 @@ impl Command {
         // The type check and the command under one lock, so no other worker
         // can change the key between them. What `store::run` does not know,
         // streams aside, runs after the lock is released: the SQL fallback
-        // comes back here for each sub-command of a composite.
+        // comes back here for each sub-command of a composite, which the
+        // database's server-wide lock, held exclusive, keeps whole
+        // (`src/dblock.rs`).
         // Whatever an earlier caller left unreported is not this command's.
         crate::memdb::take_reaped();
         let ran = crate::shm::with_db(slot, |m| {

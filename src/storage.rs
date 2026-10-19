@@ -774,7 +774,15 @@ pub fn snapshots_round() {
         {
             continue;
         }
+        // Shared, like a command: the snapshot falls between scripts and
+        // transactions on the database, never inside one. While one holds it
+        // the snapshot waits for a later round rather than for the lock.
+        let Some(held) = crate::dblock::try_hold_shared(db) else {
+            t.snapshot_busy[db as usize].store(0, Ordering::Release);
+            continue;
+        };
         BackgroundWorker::transaction(|| Spi::connect_mut(|c| take_snapshot(c, db, s)));
+        drop(held);
         saved(db);
         t.snapshot_busy[db as usize].store(0, Ordering::Release);
     }

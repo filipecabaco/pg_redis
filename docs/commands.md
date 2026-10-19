@@ -189,17 +189,19 @@ limit is checked before the command runs, so a refused write changes nothing.
 | Command | Behaviour |
 |---------|-----------|
 | `MULTI` | Begin a transaction block; subsequent commands are queued |
-| `EXEC` | Run the queued commands with no other command from the same worker between them; returns nil if a `WATCH`ed key changed |
+| `EXEC` | Run the queued commands with no other client's command on their databases between them; returns nil if a `WATCH`ed key changed |
 | `DISCARD` | Discard the queued commands and exit the transaction block |
 | `WATCH key [key ...]` | Mark keys to watch; if any are modified before `EXEC`, the transaction aborts |
 | `UNWATCH` | Clear all watched keys |
 
-Atomicity is per worker. The server runs a pool of workers (`redis.workers`),
-and each worker's dispatcher runs the queued commands as one batch, so no
-other command that worker serves runs in between. Commands served by other
-workers can interleave with them, where in Redis nothing can. `EVAL` and
-`FCALL` scripts have the same guarantee. See
-[known differences from Redis](IMPLEMENTATION.md#known-differences-from-redis).
+The server runs a pool of workers (`redis.workers`), and each database has a
+lock in shared memory that all of them share. Ordinary commands hold it
+shared and run in parallel. `EXEC` holds every database its queue touches
+exclusive until the transaction has committed, so no other client's command
+on those databases runs in between, on any worker, as in Redis. Other
+databases are not affected. `EVAL` and `FCALL` scripts, and commands built
+from several steps such as `ZUNIONSTORE`, hold their database the same way.
+See [Atomicity across workers](IMPLEMENTATION.md#atomicity-across-workers).
 
 Commands queued inside `MULTI` receive `QUEUED` responses. Runtime errors inside `EXEC` (e.g. `INCR` on a non-integer) are returned as per-command errors without aborting the remaining commands: on a table-backed database each command runs in its own subtransaction, so a failure rolls back that command only.
 

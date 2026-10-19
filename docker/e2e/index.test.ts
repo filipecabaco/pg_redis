@@ -5174,3 +5174,236 @@ describe("memory+snapshot", () => {
 		await raw.send("FLUSHDB");
 	});
 });
+
+// A script, an EXEC and a multi-step command hold their database for their
+// whole run, on every worker: the listener spreads connections over the
+// workers, so these clients run on all of them at once.
+describe("Atomicity across workers", () => {
+	const CLIENTS = 16;
+	const ROUNDS = 40;
+	const connect = (n = CLIENTS) =>
+		Promise.all(Array.from({ length: n }, () => new RawRedis().connect()));
+	const closeAll = (conns: RawRedis[]) => {
+		for (const c of conns) c.close();
+	};
+	/** An EXEC's raw reply with no nil and no error in it. */
+	const execOk = (r: Buffer) => {
+		const s = r.toString();
+		return s.startsWith("*") && !s.startsWith("*-1") && !s.includes("\r\n-");
+	};
+
+	afterAll(async () => {
+		await raw.send("SELECT", "durable");
+	});
+
+	const RMW =
+		"local v = tonumber(redis.call('GET', KEYS[1]) or '0') " +
+		"redis.call('SET', KEYS[1], tostring(v + 1)) return v + 1";
+
+	for (const db of ["0", "8"]) {
+		test(`db ${db}: a read-modify-write script loses no increment`, async () => {
+			const key = `atomic:${db}:script`;
+			await raw.send("SELECT", db);
+			await raw.send("DEL", key);
+			const conns = await connect();
+			const errors: string[] = [];
+			try {
+				await Promise.all(
+					conns.map(async (c) => {
+						await c.send("SELECT", db);
+						for (let i = 0; i < ROUNDS; i++) {
+							const e = errorReply(await c.send("EVAL", RMW, "1", key));
+							if (e) errors.push(e);
+						}
+					}),
+				);
+			} finally {
+				closeAll(conns);
+			}
+			expect(errors).toEqual([]);
+			expect((await raw.bulk("GET", key))?.toString()).toBe(String(CLIENTS * ROUNDS));
+			await raw.send("DEL", key);
+		}, 60_000);
+
+		// No WATCH: the GET and the SET are separate commands, and only the
+		// transaction holding the database keeps another one out between them.
+		// Each EXEC reads the token the one before it wrote, so if they run one
+		// at a time every token is read exactly once.
+		test(`db ${db}: MULTI GET/SET transactions run one at a time`, async () => {
+			const key = `atomic:${db}:multi`;
+			await raw.send("SELECT", db);
+			await raw.send("SET", key, "start");
+			const conns = await connect();
+			const read: string[] = [];
+			const interleaved: string[] = [];
+			try {
+				await Promise.all(
+					conns.map(async (c, n) => {
+						await c.send("SELECT", db);
+						for (let i = 0; i < ROUNDS; i++) {
+							await c.send("MULTI");
+							await c.send("GET", key);
+							await c.send("SET", key, `t${n}:${i}`);
+							await c.send("GET", key);
+							const [before, , after] = await c.array("EXEC");
+							// Nothing ran between the SET and the GET after it.
+							if (after?.toString() !== `t${n}:${i}`) interleaved.push(`t${n}:${i}`);
+							read.push(before?.toString() ?? "");
+						}
+					}),
+				);
+			} finally {
+				closeAll(conns);
+			}
+			expect(interleaved).toEqual([]);
+			const last = (await raw.bulk("GET", key))?.toString() ?? "";
+			const written = new Set<string>(["start"]);
+			for (let n = 0; n < CLIENTS; n++)
+				for (let i = 0; i < ROUNDS; i++) written.add(`t${n}:${i}`);
+			// Two transactions that read the same token both ran their GET
+			// before either SET: a lost update.
+			expect(new Set(read).size).toBe(read.length);
+			expect(new Set([...read, last])).toEqual(written);
+			await raw.send("DEL", key);
+		}, 60_000);
+	}
+
+	test("a script on db 0 holds db 0 on every worker and leaves db 1 alone", async () => {
+		const LONG_MS = 1500;
+		const script = await new RawRedis().connect();
+		const db1 = await connect(8);
+		const db0 = await connect(8);
+		try {
+			await script.send("SELECT", "0");
+			await script.send("DEL", "atomic:busy");
+			for (const c of db1) await c.send("SELECT", "1");
+			for (const c of db0) await c.send("SELECT", "0");
+			const busy =
+				"local s = redis.call('TIME') local t0 = s[1] * 1000000 + s[2] " +
+				"repeat local n = redis.call('TIME') " +
+				"until n[1] * 1000000 + n[2] - t0 > tonumber(ARGV[1]) * 1000 " +
+				"redis.call('SET', KEYS[1], 'done') return 1";
+			const started = performance.now();
+			const running = script.send("EVAL", busy, "1", "atomic:busy", String(LONG_MS));
+			await Bun.sleep(200);
+			// Commands on db 1 go ahead on the workers not running the script.
+			// The one running it serves nobody until it ends, as before.
+			const fast = await Promise.all(
+				db1.map(async (c, i) => {
+					const t = performance.now();
+					await c.send("SET", `atomic:free:${i}`, "x");
+					await c.send("GET", `atomic:free:${i}`);
+					return performance.now() - t;
+				}),
+			);
+			// Commands on db 0 wait for the script on every worker, and see
+			// what it wrote.
+			const seen = await Promise.all(
+				db0.map(async (c) => {
+					const r = await c.bulk("GET", "atomic:busy");
+					return { at: performance.now() - started, value: r?.toString() };
+				}),
+			);
+			expect(errorReply(await running)).toBeNull();
+			expect(Math.min(...fast)).toBeLessThan(500);
+			for (const s of seen) {
+				expect(s.value).toBe("done");
+				expect(s.at).toBeGreaterThan(LONG_MS - 100);
+			}
+			await script.send("DEL", "atomic:busy");
+			for (const [i, c] of db1.entries()) await c.send("DEL", `atomic:free:${i}`);
+		} finally {
+			script.close();
+			closeAll(db1);
+			closeAll(db0);
+		}
+	}, 30_000);
+
+	test("SWAPDB, MOVE, and SELECT in MULTI and in scripts under load", async () => {
+		const [A, B, L] = ["3", "4", "11"];
+		const KEYS = 60;
+		const ROUND = 25;
+		for (const db of [A, B, L]) {
+			await raw.send("SELECT", db);
+			await raw.send("FLUSHDB");
+		}
+		await raw.send("SELECT", A);
+		for (let i = 0; i < KEYS; i++) await raw.send("SET", `mv:${i}`, "v");
+
+		// Starts on the higher database and selects the lower one.
+		const crossScript =
+			`redis.call('SELECT', '${L}') redis.call('INCR', 'xs') ` +
+			`redis.call('SELECT', '${A}') redis.call('INCR', 'xs') return 1`;
+		const errors: string[] = [];
+		const check = (r: Buffer) => {
+			const e = errorReply(r);
+			if (e) errors.push(e);
+		};
+		const conns = await connect();
+		try {
+			await Promise.all(
+				conns.map(async (c, n) => {
+					for (let i = 0; i < ROUND; i++) {
+						switch (n % 4) {
+							case 0:
+								await c.send("SELECT", A);
+								check(await c.send("SWAPDB", A, B));
+								break;
+							case 1: {
+								// In A or B, wherever SWAPDB left it, or already
+								// moved by another client: MOVE answers 0 then.
+								const k = `mv:${(n * ROUND + i) % KEYS}`;
+								await c.send("SELECT", (n + i) % 2 ? A : B);
+								check(await c.send("MOVE", k, L));
+								await c.send("SELECT", L);
+								check(await c.send("MOVE", k, A));
+								break;
+							}
+							case 2: {
+								await c.send("SELECT", A);
+								await c.send("MULTI");
+								await c.send("SELECT", L);
+								await c.send("INCR", "ym");
+								await c.send("SELECT", A);
+								await c.send("INCR", "ym");
+								const r = await c.send("EXEC");
+								if (!execOk(r)) errors.push(r.toString());
+								break;
+							}
+							case 3:
+								await c.send("SELECT", L);
+								check(await c.send("EVAL", crossScript, "0"));
+								break;
+						}
+					}
+				}),
+			);
+		} finally {
+			closeAll(conns);
+		}
+		expect(errors).toEqual([]);
+
+		const count = async (db: string, key: string) => {
+			await raw.send("SELECT", db);
+			const v = await raw.bulk("GET", key);
+			return v ? Number(v.toString()) : 0;
+		};
+		const per = (CLIENTS / 4) * ROUND;
+		// Every increment landed once: in L, and in A or B as SWAPDB left them.
+		for (const key of ["xs", "ym"]) {
+			expect(await count(L, key)).toBe(per);
+			expect((await count(A, key)) + (await count(B, key))).toBe(per);
+		}
+		// MOVE and SWAPDB move keys; none is lost or doubled.
+		let total = 0;
+		for (const db of [A, B, L]) {
+			await raw.send("SELECT", db);
+			total += (await raw.array("KEYS", "mv:*")).length;
+		}
+		expect(total).toBe(KEYS);
+		for (const db of [A, B, L]) {
+			await raw.send("SELECT", db);
+			await raw.send("FLUSHDB");
+		}
+	}, 120_000);
+});

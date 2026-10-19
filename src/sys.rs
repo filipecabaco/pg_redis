@@ -107,3 +107,12 @@ pub fn os_name() -> String {
         u.machine().to_string_lossy()
     )
 }
+
+/// Wake every process sleeping in [`futex_wait`] on `word`.
+#[cfg(target_os = "linux")]
+pub fn futex_wake_all(word: &AtomicU32) {
+    let _ = rustix::thread::futex::wake(word, rustix::thread::futex::Flags::empty(), u32::MAX);
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn futex_wake_all(_word: &AtomicU32) {}

@@ -319,15 +319,16 @@ claiming and lag. Streams keep Redis's node layout, so approximate trimming and
 | Command | Notes |
 |---------|-------|
 | `MULTI` |  |
-| `EXEC` | No other command from the same worker runs between the queued ones; other workers' commands can interleave. On a table-backed database each queued command runs in its own subtransaction |
+| `EXEC` | Holds every database the queue touches exclusive, so no other client's command on them runs between the queued ones, on any worker. On a table-backed database each queued command runs in its own subtransaction |
 | `DISCARD` |  |
 | `WATCH` | Requires `shared_preload_libraries`; see Transactions in Commands |
 | `UNWATCH` |  |
 
 ## Scripting and functions
 
-Lua 5.1, run whole on the dispatcher, so a script is atomic against every
-other command its worker serves. `redis.call` reaches both storage halves and
+Lua 5.1, run whole on the dispatcher, holding its database exclusive, so no
+other client's command on that database runs on any worker until the script
+ends. `redis.call` reaches both storage halves and
 any database a script `SELECT`s. The libraries are Redis's own: `cjson`,
 `cmsgpack`, `struct` and `bit` come from its C sources. Globals are read-only,
 as in Redis. The script cache and the function libraries are shared by every
@@ -335,7 +336,7 @@ worker through `redis.scripts` and `redis.functions`.
 
 | Command | Notes |
 |---------|-------|
-| `EVAL` | Shebang flags (`#!lua flags=no-writes,...`) honoured; atomic per worker, as below |
+| `EVAL` | Shebang flags (`#!lua flags=no-writes,...`) honoured; atomic across workers, as below |
 | `EVALSHA` |  |
 | `EVAL_RO` |  |
 | `EVALSHA_RO` |  |
@@ -346,8 +347,9 @@ worker through `redis.scripts` and `redis.functions`.
 
 A script past `busy-reply-threshold` (default 5 s) makes every other client
 get BUSY, on every worker, until it ends or `SCRIPT KILL` / `FUNCTION KILL`
-stops it. Atomicity is per worker: on the memory half a script's sub-commands
-take their own locks, so another worker's commands can interleave with them.
+stops it. A script whose source names `SELECT`, `MOVE`, `COPY`, `SWAPDB` or
+`FLUSHALL` holds every database while it runs; see
+[Atomicity across workers](IMPLEMENTATION.md#atomicity-across-workers).
 
 ## Not implemented
 

@@ -198,3 +198,24 @@ pub fn transaction_or_abort<T>(body: impl FnOnce() -> Option<T>) -> Option<T> {
     }
     value
 }
+
+static ON_EXIT: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Run `f` as this process exits through `proc_exit`, a FATAL error's exit
+/// included: what releases the database locks (`src/dblock.rs`) when nothing
+/// unwound to their guards. One callback per process; a second call is
+/// ignored.
+pub fn before_exit(f: fn()) {
+    if ON_EXIT.set(f).is_err() {
+        return;
+    }
+    extern "C-unwind" fn run(_code: std::ffi::c_int, _arg: pg_sys::Datum) {
+        if let Some(f) = ON_EXIT.get() {
+            f();
+        }
+    }
+    // SAFETY: registers a callback with no argument to free; `run` touches
+    // nothing but a Rust static and the atomics `f` reads. PostgreSQL calls it
+    // once, on the main thread, while shared memory is still attached.
+    unsafe { pg_sys::before_shmem_exit(Some(run), pg_sys::Datum::from(0usize)) };
+}

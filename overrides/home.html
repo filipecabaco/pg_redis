@@ -56,7 +56,8 @@
   <div class="pr-wrap">
     <dl class="pr-stats">
       <div><dt>235<small>/242</small></dt><dd>Redis 7.2 commands accepted</dd></div>
-      <div><dt>0<small>/2,250</small></dt><dd>replies that differ from Redis 7.2 on x86-64</dd></div>
+      <div><dt>0<small>/2,464</small></dt><dd>replies that differ from Redis 7.2 on x86-64</dd></div>
+      <div><dt>3,938</dt><dd>of Redis's own acceptance tests pass</dd></div>
       <div><dt>3</dt><dd>storage policies, set per database</dd></div>
       <div><dt>RESP2 + 3</dt><dd>works with stock clients</dd></div>
     </dl>
@@ -250,8 +251,8 @@ maxmemory_policy:allkeys-random</span></code></pre>
   </div>
   <p class="pr-proof">
     Redis's own Tcl acceptance suite and a reply-by-reply diff against Redis 7.2 both run in
-    CI. pg_redis matches Redis on both, apart from a few minor deviations
-    <a href="#differences">listed below</a>.
+    CI, on both storage halves, and a test that passes is not allowed to stop passing. The
+    deviations that remain are <a href="#differences">listed below</a>.
     <a href="{{ 'command-coverage/' | url }}">See every command</a>
   </p>
 </section>
@@ -291,8 +292,8 @@ redis-cli PING   <span class="o"># PONG</span></code></pre>
 <section class="pr-section pr-diff" id="differences">
   <h2 class="pr-h2">Where it differs from Redis</h2>
   <p class="pr-sub">
-    pg_redis passes the same tests as Redis: Redis's own Tcl acceptance suite, and a diff of
-    every reply against Redis 7.2. These are the deviations that remain.
+    Measured against Redis's own Tcl acceptance suite and a diff of every reply against
+    Redis 7.2. These are the deviations that remain.
     <a href="{{ 'IMPLEMENTATION/#known-differences-from-redis' | url }}">Full detail</a>
   </p>
   <div class="pr-diff__grid">

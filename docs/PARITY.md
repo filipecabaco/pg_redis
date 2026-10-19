@@ -6,7 +6,7 @@
     behaviour see [Command coverage](command-coverage.md) and the
     [differences list on the home page](index.md#differences). Current
     numbers: pg_redis accepts 235 of Redis 7.2's 242 commands, and none of the
-    2,250 replies the parity harness compares differ from x86-64 Redis 7.2.
+    2,464 replies the parity harness compares differ from x86-64 Redis 7.2.
 
 What is left between pg_redis and Redis, why the headline number does not say
 so, and what has to be decided before the next block of work starts.
@@ -79,7 +79,7 @@ Reference used here: Redis 7.0.15, 240 top-level commands.
 
 ## Where parity actually stands
 
-**No differences over 2,250 replies** against x86-64 Redis 7.2 (93 cases, run
+**No differences over 2,464 replies** against x86-64 Redis 7.2 (100 cases, run
 on both storage halves), the build CI compares with. `INCRBYFLOAT` used to
 differ there, because it was `f64` here where Redis uses an 80-bit
 `long double`; it now computes in the 80-bit format too. Against arm64 Redis

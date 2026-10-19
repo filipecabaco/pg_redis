@@ -3322,7 +3322,11 @@ impl Write for ConnWriter {
         };
         if hard > 0 {
             self.held.extend_from_slice(buf);
-            if self.held.len() > crate::pubsub::REPLY_CHUNK + hard {
+            // Redis counts what is past its static buffer in the 16 KB blocks
+            // it allocates for it, and closes the client at the limit.
+            let chunk = crate::pubsub::REPLY_CHUNK;
+            let listed = self.held.len().saturating_sub(chunk).div_ceil(chunk) * chunk;
+            if listed >= hard {
                 self.held = Vec::new();
                 self.broken = true;
             }

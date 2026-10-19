@@ -1845,6 +1845,20 @@ fn debug_populate(args: &[Vec<u8>], conn: &mut Conn, data: &mut Data) -> Respons
     Response::Ok
 }
 
+/// No key in any database and no function loaded.
+fn dataset_empty(conn: &mut Conn, data: &mut Data) -> bool {
+    let no_keys = (0..crate::commands::NUM_DBS as u8)
+        .all(|d| matches!(data(Command::DbSize, d), Response::Integer(0)));
+    let functions =
+        Command::parse(vec![b"FUNCTION".to_vec(), b"LIST".to_vec()]).map(|c| data(c, conn.db));
+    let no_functions = match functions {
+        Ok(Response::Value(Value::Array(v))) => v.is_empty(),
+        Ok(Response::Array(v)) => v.is_empty(),
+        _ => true,
+    };
+    no_keys && no_functions
+}
+
 /// `MODULE`, as a Redis with no modules loaded answers it: pg_redis loads
 /// none, so `LOAD` fails as a failed load does.
 fn module(a: &Admin) -> Response {
@@ -2042,10 +2056,17 @@ fn debug(a: &Admin, conn: &mut Conn, data: &mut Data) -> Response {
             }
             Response::Ok
         }
-        // Reloading is a no-op: nothing here lives only in a dump, or in an
-        // append-only file to load again.
-        "RELOAD"
-        | "LOADAOF"
+        // Reloading keeps the data as it is: nothing here lives only in a
+        // dump. But NOFLUSH without MERGE loads over what is there, which
+        // Redis refuses for any key or function already present.
+        "RELOAD" => {
+            let has = |o: &[u8]| a.args[1..].iter().any(|x| x.eq_ignore_ascii_case(o));
+            if has(b"NOFLUSH") && !has(b"MERGE") && !dataset_empty(conn, data) {
+                return err("ERR Error trying to load the RDB dump, check server logs.");
+            }
+            Response::Ok
+        }
+        "LOADAOF"
         | "JMAP"
         | "CHANGE-REPL-ID"
         | "LOG"

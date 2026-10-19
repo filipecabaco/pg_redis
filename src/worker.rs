@@ -836,6 +836,8 @@ pub(crate) fn watch_targets(cmd: &Command, db: u8) -> Option<Vec<(u8, Vec<u8>)>>
         // A flush breaks the WATCH on every key that existed, through the
         // flush epoch, not the per-key counters.
         Command::FlushDb | Command::FlushAll => Some(Vec::new()),
+        // SWAPDB breaks the WATCH on the keys it moved itself.
+        Command::Composite(crate::composite::Op::SwapDb { .. }) => Some(Vec::new()),
         // A composite names the database of each key it may write.
         Command::Composite(op) if op.touches_everything() => None,
         Command::Composite(op) => Some(owned(op.write_targets(db))),

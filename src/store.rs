@@ -1699,15 +1699,15 @@ impl Store for SqlStore<'_, '_> {
     fn dbsize(&mut self) -> Out<i64> {
         let db = self.db;
         let sql = format!(
+            // Every key held, expired or not, as Redis's dictionary counts
+            // them until they are reaped.
             "SELECT count(DISTINCT key)::bigint FROM ( \
-                 SELECT key FROM redis.kv_{db} WHERE (expires_at IS NULL OR expires_at > now()) \
-                 UNION ALL \
-                 SELECT c.key FROM (SELECT DISTINCT key FROM redis.hash_{db} \
-                                    UNION SELECT DISTINCT key FROM redis.list_{db} \
-                                    UNION SELECT DISTINCT key FROM redis.set_{db} \
-                                    UNION SELECT DISTINCT key FROM redis.zset_{db} \
-                                    UNION SELECT key FROM redis.stream_{db}) c \
-                  WHERE NOT EXISTS (SELECT 1 FROM redis.expiry_{db} e WHERE e.key = c.key AND e.expires_at <= now()) \
+                 SELECT key FROM redis.kv_{db} \
+                 UNION ALL SELECT DISTINCT key FROM redis.hash_{db} \
+                 UNION ALL SELECT DISTINCT key FROM redis.list_{db} \
+                 UNION ALL SELECT DISTINCT key FROM redis.set_{db} \
+                 UNION ALL SELECT DISTINCT key FROM redis.zset_{db} \
+                 UNION ALL SELECT key FROM redis.stream_{db} \
              ) u"
         );
         self.int("DBSIZE", &sql, &[])
@@ -1717,13 +1717,12 @@ impl Store for SqlStore<'_, '_> {
         let db = self.db;
         let sql = format!(
             "SELECT \
-               (SELECT count(*) FROM redis.kv_{db} WHERE expires_at IS NULL OR expires_at > now()) \
+               (SELECT count(*) FROM redis.kv_{db}) \
                + (SELECT count(*) FROM (SELECT key FROM redis.hash_{db} UNION SELECT key FROM redis.list_{db} \
                     UNION SELECT key FROM redis.set_{db} UNION SELECT key FROM redis.zset_{db} \
-                    UNION SELECT key FROM redis.stream_{db}) c \
-                  WHERE NOT EXISTS (SELECT 1 FROM redis.expiry_{db} e WHERE e.key = c.key AND e.expires_at <= now())), \
-               (SELECT count(*) FROM redis.kv_{db} WHERE expires_at > now()) \
-               + (SELECT count(*) FROM redis.expiry_{db} WHERE expires_at > now())"
+                    UNION SELECT key FROM redis.stream_{db}) c), \
+               (SELECT count(*) FROM redis.kv_{db} WHERE expires_at IS NOT NULL) \
+               + (SELECT count(*) FROM redis.expiry_{db})"
         );
         let tbl = self
             .client

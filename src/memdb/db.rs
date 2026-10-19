@@ -735,16 +735,17 @@ impl<A: Allocator + Clone> Store for Db<A> {
         Ok((next, out))
     }
 
+    /// Every key held, as Redis's dictionary counts them: one past its
+    /// deadline counts until it is reaped.
     fn dbsize(&mut self) -> Out<i64> {
-        let now = now();
-        Ok(self.keys.values().filter(|e| !e.expired(now)).count() as i64)
+        Ok(self.keys.values().count() as i64)
     }
 
     fn keyspace(&mut self) -> Out<(i64, i64)> {
-        let now = now();
-        let live = self.keys.values().filter(|e| !e.expired(now));
-        let (keys, volatile) =
-            live.fold((0, 0), |(k, v), e| (k + 1, v + (e.deadline() != 0) as i64));
+        let (keys, volatile) = self
+            .keys
+            .values()
+            .fold((0, 0), |(k, v), e| (k + 1, v + (e.deadline() != 0) as i64));
         Ok((keys, volatile))
     }
 

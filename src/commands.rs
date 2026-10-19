@@ -4176,6 +4176,11 @@ impl Command {
     /// overwrite replaces the row and its deadline both, so needs nothing.
     fn lazily_expires(&self) -> Vec<&[u8]> {
         match self {
+            // `DEL` looks its keys up, expiring them, then deletes what is
+            // left: an expired key is not counted as deleted.
+            Command::Del { keys } | Command::Unlink { keys } => {
+                keys.iter().map(Vec::as_slice).collect()
+            }
             Command::Set {
                 key,
                 nx,

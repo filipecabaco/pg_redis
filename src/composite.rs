@@ -1772,6 +1772,15 @@ fn run_swapdb(exec: &mut Runner, a: u8, b: u8) -> Result<Response, Response> {
         restore_db(exec, b, &in_b)?;
         return Err(refusal);
     }
+    // `touchAllWatchedKeysInDb`: a WATCH breaks on a key that was live on
+    // either side, and on no other. One missing or expired on both did not
+    // change.
+    if let Some(ctl) = crate::watch_state() {
+        for (key, _, _) in in_a.iter().chain(&in_b) {
+            crate::watch::bump(ctl, a, key);
+            crate::watch::bump(ctl, b, key);
+        }
+    }
     Ok(Response::Ok)
 }
 

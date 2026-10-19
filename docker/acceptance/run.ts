@@ -151,7 +151,10 @@ async function unitPath(unit: string): Promise<string> {
 		.map((c) => c.join("\n"))
 		.filter((c) => !rw.drop.some((re) => re.test(c)))
 		.join("\n")
-		.replaceAll(/\s*"?external:skip"?/g, "");
+		// A tag of its own (`"external:skip"`) or one inside a quoted list
+		// (`"pubsubshard external:skip"`), whose closing quote stays.
+		.replaceAll(/\s*"external:skip"/g, "")
+		.replaceAll(/\s+external:skip/g, "");
 	const name = `unit/pg_redis/${unit.replace(/^unit\//, "")}`;
 	await Bun.write(`tests/${name}.tcl`, kept);
 	return name;
@@ -210,6 +213,8 @@ async function resetConfig(): Promise<void> {
 		.filter((u) => u !== "default");
 	const cmds: string[][] = [
 		["CONFIG", "SET", "maxmemory", "0", "maxmemory-policy", "noeviction"],
+		// obuf-limits leaves its own when a test fails before restoring it.
+		["CONFIG", "SET", "client-output-buffer-limit", "normal 0 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60"],
 		// The encoding thresholds, which the hash, set and zset files change
 		// for a test and leave for the next file's fresh server to forget.
 		[

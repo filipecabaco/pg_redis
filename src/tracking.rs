@@ -717,12 +717,14 @@ pub fn invalidate(keys: &[Vec<u8>], origin: u64) {
     }
 }
 
-/// A flush: every tracking client is told every key is gone.
+/// A flush: every tracking client is told every key is gone, and the table
+/// is emptied whether or not anyone tracks now, as Redis frees it on every
+/// flush (`trackingInvalidateKeysOnFlush`).
 pub fn invalidate_all() {
+    clear_table();
     if !server::tracking_active() {
         return;
     }
-    clear_table();
     for c in server::clients() {
         if server::slot_of(c.id).is_some_and(|s| s.tracking.load(Ordering::Relaxed) & ON != 0) {
             send(c.id, Message::Flush);

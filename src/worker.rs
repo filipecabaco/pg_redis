@@ -793,10 +793,11 @@ fn run_dispatch_batch(
             }
         }
     }
+    // A flush empties the tracking table even with nobody tracking now.
+    if flushed {
+        crate::tracking::invalidate_all();
+    }
     if tracking {
-        if flushed {
-            crate::tracking::invalidate_all();
-        }
         for (origin, keys) in written {
             crate::tracking::invalidate(&keys, origin);
         }
@@ -971,6 +972,9 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<DispatchMsg>, default_d
     client.set_proto(2);
 
     'conn: loop {
+        // Replies wait for the rest of a pipeline only while its commands
+        // are being answered.
+        writer.more_input = false;
         if let Some(job) = in_flight.take() {
             // Normally done as the reply was flushed; here for one that
             // never was.
@@ -1796,6 +1800,7 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<DispatchMsg>, default_d
                 };
                 let keys: Vec<Vec<u8>> = sc.keys().into_iter().map(|k| k.to_vec()).collect();
                 let group = sc.name == "XREADGROUP";
+                writer.send_now();
                 let outcome = wait_blocked(
                     &parser,
                     &client,
@@ -1855,6 +1860,7 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<DispatchMsg>, default_d
                 // A blocked command is checked again each time it is retried,
                 // as Redis reprocesses it: the rules may have changed.
                 let refused = std::cell::Cell::new(false);
+                writer.send_now();
                 let outcome = wait_blocked(
                     &parser,
                     &client,
@@ -2141,8 +2147,8 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<DispatchMsg>, default_d
     drop(client);
     if writer.quit_reply {
         write_simple_string(&mut writer, "OK").ok();
-        writer.flush().ok();
     }
+    writer.send_now();
 }
 
 /// When an ACL change took channel permissions from this client's user:
@@ -3193,6 +3199,14 @@ impl Write for ConnWriter {
 }
 
 impl ConnWriter {
+    /// Send what is held now, whatever follows in the pipeline: before the
+    /// client blocks, and as the connection ends. Redis writes a blocked or
+    /// departing client's replies then too.
+    fn send_now(&mut self) {
+        self.more_input = false;
+        self.flush().ok();
+    }
+
     fn send_held(&mut self) -> io::Result<()> {
         if self.held.is_empty() {
             return Ok(());

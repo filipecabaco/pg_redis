@@ -1093,6 +1093,13 @@ impl<A: Allocator + Clone> Store for Db<A> {
         Ok(self.encoding_of(key))
     }
 
+    fn zset_to_skiplist(&mut self, key: &[u8]) -> Out<()> {
+        if let Some((_, enc)) = self.zset_enc(key) {
+            *enc = Enc::Skiplist;
+        }
+        Ok(())
+    }
+
     // ── sets ──
 
     fn sadd(&mut self, key: &[u8], members: &[Vec<u8>]) -> Out<i64> {

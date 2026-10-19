@@ -1300,7 +1300,16 @@ fn run_sort(exec: &mut Runner, db: u8, spec: &SortSpec) -> Result<Response, Resp
     let mut elems: Vec<Vec<u8>> = match kind.as_str() {
         "list" => items(ok(call(exec, db, &[b"LRANGE", &spec.key, b"0", b"-1"]))?),
         "set" => items(ok(call(exec, db, &[b"SMEMBERS", &spec.key]))?),
-        "zset" => items(ok(call(exec, db, &[b"ZRANGE", &spec.key, b"0", b"-1"]))?),
+        // "Destructively convert encoded sorted sets for SORT."
+        "zset" => {
+            ok(exec(
+                db,
+                Command::ZsetToSkiplist {
+                    key: spec.key.clone(),
+                },
+            ))?;
+            items(ok(call(exec, db, &[b"ZRANGE", &spec.key, b"0", b"-1"]))?)
+        }
         "none" => vec![],
         _ => {
             return Err(Response::Error(

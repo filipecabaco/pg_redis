@@ -1,4 +1,4 @@
-//! The shared heap pub/sub and client tracking live in.
+//! The shared heap pub/sub, client tracking and the ACL users live in.
 //!
 //! Redis keeps a subscriber's subscriptions and its undelivered messages in
 //! ordinary heap memory, so neither has a fixed size: a channel name, a
@@ -11,8 +11,8 @@
 //!
 //! So this is one region of PostgreSQL's main shared segment, sized by
 //! `redis.pubsub_memory`, holding a header, a talc allocator behind a spin
-//! lock, and one [`Root`] built in it at startup: the pub/sub registry and
-//! the tracking table. [`PubHeap`] is a zero-sized handle to that allocator
+//! lock, and one [`Root`] built in it at startup: the pub/sub registry, the
+//! tracking table and the ACL users and log. [`PubHeap`] is a zero-sized handle to that allocator
 //! for collections. The operating
 //! system backs a page only once it is touched, so the region costs what is
 //! queued and subscribed, up to the size.
@@ -85,13 +85,21 @@ pub fn request() {
 pub struct Root {
     pub pubsub: crate::pubsub::Slots,
     pub tracking: Shared<crate::tracking::Table>,
+    /// The ACL users' descriptions and the ACL LOG (`acl.rs`).
+    pub acl: [Shared<HVec<u8>>; 2],
 }
+
+pub type HVec<T> = allocator_api2::vec::Vec<T, PubHeap>;
 
 impl Root {
     fn new() -> Root {
         Root {
             pubsub: crate::pubsub::Slots::new(),
             tracking: Shared::new(crate::tracking::Table::new()),
+            acl: [
+                Shared::new(HVec::new_in(PubHeap)),
+                Shared::new(HVec::new_in(PubHeap)),
+            ],
         }
     }
 }

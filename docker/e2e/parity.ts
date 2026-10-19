@@ -647,6 +647,20 @@ c(
 	["SMEMBERS", "lo"],
 );
 c(
+	"SORT makes a sorted set a skiplist, and it stays one",
+	["ZADD", "zs", "3", "c", "1", "a", "2", "b"],
+	["OBJECT", "ENCODING", "zs"],
+	["SORT", "zs", "ALPHA"],
+	["OBJECT", "ENCODING", "zs"],
+	["ZRANGE", "zs", "0", "-1", "WITHSCORES"],
+	["ZADD", "zr", "1", "x"],
+	["SORT_RO", "zr", "BY", "nosort"],
+	["OBJECT", "ENCODING", "zr"],
+	["ZREM", "zr", "x"],
+	["ZADD", "zr", "1", "y"],
+	["OBJECT", "ENCODING", "zr"],
+);
+c(
 	"a set converted to a hashtable stays one",
 	["SADD", "big", ...many(200, (i) => [`m${i}`])],
 	["OBJECT", "ENCODING", "big"],

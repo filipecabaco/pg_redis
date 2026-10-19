@@ -23,7 +23,7 @@ use std::hash::{BuildHasher, RandomState};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::commands::{Response, Value};
-use crate::pubheap::{PubHeap, Shared, catching};
+use crate::pubheap::{HVec, PubHeap, Shared, catching};
 use crate::server;
 
 pub const ON: u32 = 1;
@@ -149,8 +149,6 @@ pub fn frame(payload: &[u8], proto: u8) -> Option<(&'static str, Value)> {
 }
 
 // ──────────────────────────────── the table ─────────────────────────────────
-
-type HVec<T> = allocator_api2::vec::Vec<T, PubHeap>;
 
 /// A tracked key and the clients that read it since it last changed.
 struct Entry {

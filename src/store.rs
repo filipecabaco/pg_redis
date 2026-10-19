@@ -173,6 +173,9 @@ pub trait Store {
     /// The encoding Redis would have given the hash, set or sorted set at
     /// `key` (`memdb::encoding`); `None` when there is none.
     fn collection_encoding(&mut self, key: &[u8]) -> Out<Option<Enc>>;
+    /// `zsetConvert(zobj, OBJ_ENCODING_SKIPLIST)`: the sorted set at `key`
+    /// becomes a skiplist, as `SORT` makes it before reading it.
+    fn zset_to_skiplist(&mut self, key: &[u8]) -> Out<()>;
 
     // ── sets ──
     fn sadd(&mut self, key: &[u8], members: &[Vec<u8>]) -> Out<i64>;
@@ -338,6 +341,7 @@ pub fn run(cmd: &Command, store: &mut dyn Store) -> Option<Response> {
         Command::RandomKey => store.random_key().map(bulk_or_nil),
         Command::FlushDb => store.flushdb().map(|()| Response::Ok),
         Command::ObjectEncoding { key } => object_encoding(store, key),
+        Command::ZsetToSkiplist { key } => store.zset_to_skiplist(key).map(|()| Response::Ok),
         Command::ObjectAccess { key, field } => object_access(store, key, *field),
         Command::ObjectOther => Ok(Response::Null),
 
@@ -2382,6 +2386,14 @@ impl Store for SqlStore<'_, '_> {
         }
         self.sync_enc("HINCRBYFLOAT", key, &pre, KeyKind::Hash, enc, false)?;
         Ok(Num::Value(text))
+    }
+
+    fn zset_to_skiplist(&mut self, key: &[u8]) -> Out<()> {
+        if self.kind(key)? == Some(KeyKind::Zset) {
+            let row = enc_row(KeyKind::Zset, Enc::Skiplist, false);
+            put_enc_row(self.client, self.db, key, row).map_err(|e| failed("SORT", e))?;
+        }
+        Ok(())
     }
 
     /// The row, or what the contents imply, read no further than a packed

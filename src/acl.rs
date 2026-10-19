@@ -8,9 +8,10 @@
 //! flags and channel patterns. `ACL GETUSER` and `ACL LIST` describe a user
 //! the way Redis does, from the ordered rules it was given.
 //!
-//! Every worker shares the users: the live set is kept in shared memory
-//! ([`AclCtl`]) as the `ACL LIST` description of each user, with a version
-//! counter. A process parses the description once per version and every
+//! Every worker shares the users: the live set is kept in the shared heap
+//! (`pubheap.rs`) as the `ACL LIST` description of each user, with a version
+//! counter in [`AclCtl`]. Like Redis, nothing bounds the users or the log
+//! but memory and `acllog-max-len`. A process parses the description once per version and every
 //! connection thread checks the counter (one atomic load) before each
 //! command, so a change made through any worker applies to the next command
 //! of every connection. Changes take the region's lock: read, change, write
@@ -24,13 +25,6 @@ use std::sync::{Arc, LazyLock, RwLock};
 
 use crate::commands::{Response, Value};
 use crate::redis_tables::{COMMANDS, CommandSpec};
-
-/// Bytes the users' descriptions may take together, in shared memory.
-pub const USERS_BYTES: usize = 1 << 20;
-/// Bytes the ACL LOG's entries may take together; the oldest go first.
-pub const LOG_BYTES: usize = 1 << 19;
-/// Longest object, username and client-info an ACL LOG entry keeps.
-const LOG_FIELD_MAX: usize = 1024;
 
 const WORDS: usize = 8;
 /// The bit `+@all` and `allcommands` set and nothing else does: whether the
@@ -1280,14 +1274,26 @@ pub fn sha256_hex(data: &[u8]) -> String {
 
 // ───────────────────────────── shared state ─────────────────────────────────
 
-/// A byte region in shared memory behind a lock, with a version counter
-/// readers check without it.
+/// A byte blob behind a lock, with a version counter readers check without
+/// it. The bytes are blob `B` of the shared heap.
 #[repr(C)]
-pub struct Region<const N: usize> {
+pub struct Region<const B: usize> {
     lock: AtomicU32,
     version: AtomicU64,
-    len: AtomicU32,
-    bytes: [AtomicU8; N],
+}
+
+const USERS: usize = 0;
+const LOG: usize = 1;
+
+/// The blobs without a shared heap — no `shared_preload_libraries`, and unit
+/// tests that build none: this process's own.
+static LOCAL_BLOBS: [std::sync::Mutex<Vec<u8>>; 2] = [
+    std::sync::Mutex::new(Vec::new()),
+    std::sync::Mutex::new(Vec::new()),
+];
+
+fn local_blob(b: usize) -> std::sync::MutexGuard<'static, Vec<u8>> {
+    LOCAL_BLOBS[b].lock().unwrap_or_else(|e| e.into_inner())
 }
 
 struct Held<'a>(&'a AtomicU32);
@@ -1298,7 +1304,7 @@ impl Drop for Held<'_> {
     }
 }
 
-impl<const N: usize> Region<N> {
+impl<const B: usize> Region<B> {
     fn lock(&self) -> Held<'_> {
         let mut spins = 0u32;
         while self
@@ -1318,31 +1324,42 @@ impl<const N: usize> Region<N> {
 
     /// Under the lock.
     fn read(&self) -> Vec<u8> {
-        let n = (self.len.load(Ordering::Relaxed) as usize).min(N);
-        (0..n)
-            .map(|i| self.bytes[i].load(Ordering::Relaxed))
-            .collect()
+        match crate::pubheap::root() {
+            Some(root) => root.acl[B].lock().to_vec(),
+            None => local_blob(B).clone(),
+        }
     }
 
-    /// Under the lock. False when it does not fit.
+    /// Under the lock. False when the shared heap has no room for it; the
+    /// blob is then as it was.
     fn write(&self, data: &[u8]) -> bool {
-        if data.len() > N {
-            return false;
+        let written = match crate::pubheap::root() {
+            Some(root) => crate::pubheap::catching(|| {
+                let mut v =
+                    crate::pubheap::HVec::with_capacity_in(data.len(), crate::pubheap::PubHeap);
+                v.extend_from_slice(data);
+                // The old bytes are let go once the blob's lock is.
+                let old = std::mem::replace(&mut *root.acl[B].lock(), v);
+                drop(old);
+            })
+            .is_some(),
+            None => {
+                *local_blob(B) = data.to_vec();
+                true
+            }
+        };
+        if written {
+            self.version.fetch_add(1, Ordering::AcqRel);
         }
-        for (i, &b) in data.iter().enumerate() {
-            self.bytes[i].store(b, Ordering::Relaxed);
-        }
-        self.len.store(data.len() as u32, Ordering::Relaxed);
-        self.version.fetch_add(1, Ordering::AcqRel);
-        true
+        written
     }
 }
 
 /// The ACL state every worker shares.
 #[repr(C)]
 pub struct AclCtl {
-    users: Region<USERS_BYTES>,
-    log: Region<LOG_BYTES>,
+    users: Region<USERS>,
+    log: Region<LOG>,
     next_serial: AtomicU64,
     log_next_id: AtomicU64,
     /// 0 before the users are loaded from `redis.acl_users`, 1 while one
@@ -1533,9 +1550,7 @@ fn mutate<R>(
         .entry(b"default".to_vec())
         .or_insert_with(User::default_user);
     if !ctl.users.write(&serialize(&users)) {
-        return Err(format!(
-            "ERR the ACL rules of all users together would exceed pg_redis's limit of {USERS_BYTES} bytes"
-        ));
+        return Err("OOM shared memory is full; raise redis.pubsub_memory".to_string());
     }
     let after = Arc::new(State::from_users(
         ctl.users.version.load(Ordering::Acquire),
@@ -1882,7 +1897,6 @@ struct Entry {
 }
 
 fn put(out: &mut Vec<u8>, b: &[u8]) {
-    let b = &b[..b.len().min(LOG_FIELD_MAX)];
     out.extend_from_slice(&(b.len() as u32).to_le_bytes());
     out.extend_from_slice(b);
 }
@@ -1953,15 +1967,14 @@ fn record(reason: Reason, context: Context, object: &[u8], username: &[u8], clie
     let cinfo = client_info(client_id).into_bytes();
     let max = crate::config::get_i64("acllog-max-len").max(0) as usize;
     let now = crate::server::now_ms();
-    let trunc = |b: &[u8]| b[..b.len().min(LOG_FIELD_MAX)].to_vec();
     let _held = ctl.log.lock();
     let mut entries = decode_entries(&ctl.log.read());
     let found = entries.iter().take(10).position(|e| {
         e.reason == reason.code()
             && e.context == context.code()
             && (e.ctime - now).abs() <= 60_000
-            && e.object == trunc(object)
-            && e.username == trunc(username)
+            && e.object[..] == *object
+            && e.username[..] == *username
     });
     match found {
         Some(i) => {
@@ -1979,10 +1992,10 @@ fn record(reason: Reason, context: Context, object: &[u8], username: &[u8], clie
                     count: 1,
                     reason: reason.code(),
                     context: context.code(),
-                    object: trunc(object),
-                    username: trunc(username),
+                    object: object.to_vec(),
+                    username: username.to_vec(),
                     ctime: now,
-                    cinfo: trunc(&cinfo),
+                    cinfo,
                     entry_id: id,
                     created: now,
                 },
@@ -1990,12 +2003,7 @@ fn record(reason: Reason, context: Context, object: &[u8], username: &[u8], clie
             entries.truncate(max);
         }
     }
-    let mut bytes = encode_entries(&entries);
-    while bytes.len() > LOG_BYTES && !entries.is_empty() {
-        entries.pop();
-        bytes = encode_entries(&entries);
-    }
-    ctl.log.write(&bytes);
+    ctl.log.write(&encode_entries(&entries));
 }
 
 fn log_entries() -> Vec<Entry> {

@@ -150,6 +150,7 @@ pub fn mode(cmd: &crate::commands::Command, origin: u64) -> Access {
             | C::ExpireTime { .. }
             | C::PExpireTime { .. }
             | C::ObjectEncoding { .. }
+            | C::ZsetToSkiplist { .. }
             | C::ObjectAccess { .. }
             | C::ObjectOther
             | C::MemoryUsage { .. }

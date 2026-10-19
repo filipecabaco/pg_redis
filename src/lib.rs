@@ -311,9 +311,9 @@ pub extern "C-unwind" fn _PG_init() {
 
     GucRegistry::define_int_guc(
         c"redis.pubsub_memory",
-        c"Memory pub/sub and client tracking may use",
-        c"Holds every subscription, every undelivered pub/sub message and the client \
-          tracking table, without per-name or per-message limits. A subscriber is \
+        c"Memory pub/sub, client tracking and ACL users may use",
+        c"Holds every subscription, every undelivered pub/sub message, the client \
+          tracking table and the ACL users and log, without per-name or per-message limits. A subscriber is \
           disconnected by client-output-buffer-limit pubsub, as in Redis. Reserved at \
           startup but backed by RAM only as it fills. Requires restart.",
         &PUBSUB_MEMORY,

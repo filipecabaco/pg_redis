@@ -821,6 +821,11 @@ pub enum Command {
     ObjectEncoding {
         key: Vec<u8>,
     },
+    /// No command of its own: `SORT` converting the sorted set it reads to a
+    /// skiplist, as Redis's does.
+    ZsetToSkiplist {
+        key: Vec<u8>,
+    },
     /// `OBJECT REFCOUNT | IDLETIME | FREQ`.
     ObjectAccess {
         key: Vec<u8>,
@@ -3581,6 +3586,7 @@ impl Command {
             | Command::RandomKey
             | Command::FlushDb
             | Command::ObjectEncoding { .. }
+            | Command::ZsetToSkiplist { .. }
             | Command::ObjectAccess { .. }
             | Command::ObjectOther => {
                 Response::Error("ERR internal error: command not routed to store".to_string())

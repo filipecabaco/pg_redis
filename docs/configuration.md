@@ -13,6 +13,7 @@
 | `redis.max_connections` | `128` | superuser | Max simultaneous Redis clients per worker, so the server accepts up to `redis.workers` times this many |
 | `redis.batch_size` | `64` | superuser | Max commands coalesced into one transaction (1–256); `1` disables batching |
 | `redis.maxmemory` | `256MB` | postmaster | The memory engine's equivalent of Redis's `maxmemory`. Past it, a write that could grow memory is refused with `OOM` unless `redis.maxmemory_policy` evicts enough first. Reserved at startup (plus a quarter, at least 32 MB, of headroom) but backed by RAM only as data fills it. `CONFIG SET maxmemory` changes the limit at runtime, never past this. |
+| `redis.pubsub_memory` | `128MB` | postmaster | The shared heap for pub/sub subscriptions and undelivered messages, the client tracking table, and the ACL users and log. Nothing in it has a size limit of its own, as in Redis; a command that needs more than is left gets `OOM`. Reserved at startup but backed by RAM only as it fills. A slow subscriber is disconnected by `client-output-buffer-limit pubsub` long before that, as in Redis. |
 | `redis.maxmemory_policy` | `noeviction` | superuser | What memory mode does past `redis.maxmemory`, with Redis's eight values: `noeviction` (refuse the write, as in Redis), `allkeys-lru`, `allkeys-lfu`, `allkeys-random`, `volatile-lru`, `volatile-lfu`, `volatile-random` or `volatile-ttl`. Any other value is refused. `CONFIG SET maxmemory-policy` changes it at runtime, and `CONFIG SET maxmemory-samples`, `lfu-log-factor`, `lfu-decay-time` and `maxmemory-eviction-tenacity` tune it as in Redis. See [the limit and eviction](./IMPLEMENTATION.md#the-limit-and-eviction). |
 | `redis.snapshot_interval` | `60` | sighup | Seconds between snapshots of a `memory+snapshot` database (1–86400). See [Storage policies](./STORAGE.md). |
 
@@ -114,8 +115,8 @@ When the table has a row for `default`, that row is the default user, its passwo
 otherwise `redis.password` is. A reload that changes `redis.password` sets it again. The table
 is included in `pg_dump`. Changing it with SQL takes effect at the next `ACL LOAD` or restart.
 
-The users' rules together may take 1 MiB of shared memory, and the ACL LOG keeps as many
-entries as `acllog-max-len` allows within 512 KiB.
+Users and the ACL LOG live in the shared heap `redis.pubsub_memory` sizes. As in Redis, there
+is no limit on users or rules, and the log keeps `acllog-max-len` entries.
 
 ## Selecting a database per connection
 

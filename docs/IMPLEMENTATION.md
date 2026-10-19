@@ -709,14 +709,12 @@ client get `BUSY`, on every worker, until it ends or `SCRIPT KILL` /
   not wait.
 - **No replicas or cluster mode.** `WAIT`, `REPLICAOF` and `CLUSTER` answer
   as a stand-alone server would.
-- **ACL users live in shared memory and are saved to a table.** Users, rules,
+- **ACL users are saved to a table.** Users, rules,
   selectors, the permission checks and their error texts follow Redis 7.2's
   `acl.c`; see [Users and permissions](#users-and-permissions). Where Redis
   reads and writes an ACL file, `ACL LOAD` and `ACL SAVE` read and write
   `redis.acl_users`, so they work on every server, and the acceptance test
-  that expects them to fail without an ACL file does not pass. The users'
-  rules together may take 1 MiB, and the ACL LOG 512 KiB; each log entry keeps
-  the first 1,024 bytes of its object, username and client info. A queued
+  that expects them to fail without an ACL file does not pass. A queued
   `AUTH` inside `MULTI` answers `OK` at `EXEC` without changing the user. A
   blocked command is checked again each time it is retried (every 50 ms, and
   on each write to its keys), where Redis checks it again only when a write
@@ -744,9 +742,6 @@ client get `BUSY`, on every worker, until it ends or `SCRIPT KILL` /
   from quicklist back to listpack only once it is down to one node of half the
   size limit. pg_redis does not keep quicklist nodes, and reports `listpack`
   as soon as the elements fit one node.
-- **`SORT` leaves a sorted set's encoding alone.** Redis converts a listpack
-  sorted set to a skiplist when `SORT` or `SORT_RO` reads it; here it stays a
-  listpack.
 
 ---
 

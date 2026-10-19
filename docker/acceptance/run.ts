@@ -244,6 +244,8 @@ async function resetConfig(): Promise<void> {
 		["CONFIG", "SET", "requirepass", "", "acllog-max-len", "128", "acl-pubsub-default", "resetchannels"],
 		["ACL", "SETUSER", "default", "reset", "on", "nopass", "~*", "&*", "+@all"],
 		["ACL", "LOG", "RESET"],
+		// A test that turns background expiry off and then fails leaves it off.
+		["DEBUG", "SET-ACTIVE-EXPIRE", "1"],
 	];
 	if (users.length > 0) cmds.push(["ACL", "DELUSER", ...users]);
 	await roundTrip(cmds);

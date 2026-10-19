@@ -209,7 +209,8 @@ pub trait Store {
     // ── sorted sets ──
     /// Every pair, in order, under the conditions: how many were added — or,
     /// with CH, added or changed.
-    fn zadd(&mut self, key: &[u8], pairs: &[(f64, Vec<u8>)], opts: ZaddOpts) -> Out<i64>;
+    /// Members added, and members added or whose score changed.
+    fn zadd(&mut self, key: &[u8], pairs: &[(f64, Vec<u8>)], opts: ZaddOpts) -> Out<(i64, i64)>;
     fn zadd_incr(&mut self, key: &[u8], member: &[u8], delta: f64, opts: ZaddOpts) -> Out<Incr>;
     fn zrem(&mut self, key: &[u8], members: &[Vec<u8>]) -> Out<i64>;
     fn zscore(&mut self, key: &[u8], member: &[u8]) -> Out<Option<f64>>;
@@ -571,12 +572,19 @@ pub fn run(cmd: &Command, store: &mut dyn Store) -> Option<Response> {
             if *incr {
                 let (delta, member) = &pairs[0];
                 store.zadd_incr(key, member, *delta, opts).map(|r| match r {
-                    Incr::Score(s) => score(s),
+                    Incr::Score(s) => {
+                        crate::dirty::add(1);
+                        score(s)
+                    }
                     Incr::Skipped => Response::Null,
                     Incr::NotANumber => Response::Error(crate::commands::NAN_SCORE.into()),
                 })
             } else {
-                store.zadd(key, pairs, opts).map(Response::Integer)
+                // `server.dirty += added + updated`, whatever CH answers.
+                store.zadd(key, pairs, opts).map(|(added, changed)| {
+                    crate::dirty::add(changed.max(0) as u64);
+                    Response::Integer(if *ch { changed } else { added })
+                })
             }
         }
         Command::ZIncrBy {
@@ -2933,7 +2941,7 @@ impl Store for SqlStore<'_, '_> {
         )
     }
 
-    fn zadd(&mut self, key: &[u8], pairs: &[(f64, Vec<u8>)], o: ZaddOpts) -> Out<i64> {
+    fn zadd(&mut self, key: &[u8], pairs: &[(f64, Vec<u8>)], o: ZaddOpts) -> Out<(i64, i64)> {
         let db = self.db;
         let l = Limits::current();
         // Redis sizes the sorted set by the pairs named, repeats included,
@@ -2992,7 +3000,7 @@ impl Store for SqlStore<'_, '_> {
             }
             self.sync_enc("ZADD", key, &pre, KeyKind::Zset, enc, false)?;
         }
-        Ok(if o.ch { added + changed } else { added })
+        Ok((added, added + changed))
     }
 
     /// A new member is inserted outright; an existing one is locked, and its

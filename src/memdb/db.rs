@@ -1300,9 +1300,9 @@ impl<A: Allocator + Clone> Store for Db<A> {
 
     // ── sorted sets ──
 
-    fn zadd(&mut self, key: &[u8], pairs: &[(f64, Vec<u8>)], o: ZaddOpts) -> Out<i64> {
+    fn zadd(&mut self, key: &[u8], pairs: &[(f64, Vec<u8>)], o: ZaddOpts) -> Out<(i64, i64)> {
         if o.xx && self.zset(key).is_none() {
-            return Ok(0);
+            return Ok((0, 0));
         }
         let l = Limits::current();
         let first = pairs.first().map_or(0, |(_, m)| m.len());
@@ -1338,7 +1338,7 @@ impl<A: Allocator + Clone> Store for Db<A> {
             }
         }
         self.tidy(key);
-        Ok(if o.ch { changed } else { added })
+        Ok((added, changed))
     }
 
     fn zadd_incr(&mut self, key: &[u8], member: &[u8], delta: f64, o: ZaddOpts) -> Out<Incr> {

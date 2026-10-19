@@ -134,7 +134,6 @@ pub fn of(cmd: &Command, reply: &Response) -> u64 {
         | Command::LRem { .. }
         | Command::SAdd { .. }
         | Command::SRem { .. }
-        | Command::ZAdd { .. }
         | Command::ZRem { .. }
         | Command::ZRemRangeByRank { .. }
         | Command::ZRemRangeByScore { .. }

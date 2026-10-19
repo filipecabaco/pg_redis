@@ -719,6 +719,30 @@ describe("List", () => {
 		await raw.send("SELECT", "durable");
 	});
 
+	// LPUSH grows a list down through negative positions. A renumber parks
+	// rows at pos + 2^62 and brings back those at or past 2^62, which missed
+	// every parked row that had started below zero: the next LINSERT hit
+	// the primary key. Redis's list.tcl opens with this sequence.
+	for (const half of ["cache", "durable"]) {
+		test(`LINSERT and LREM on a list built by LPUSH (${half})`, async () => {
+			await raw.send("SELECT", half);
+			await raw.send("DEL", "lpushins");
+			await raw.send("LPUSH", "lpushins", "a", "b", "c", "d");
+			for (const [i, v] of ["e", "f", "g", "j"].entries()) {
+				expect(
+					(await raw.send("LINSERT", "lpushins", "AFTER", "d", v)).toString(),
+				).toBe(`:${5 + i}\r\n`);
+			}
+			expect(
+				(await raw.send("LREM", "lpushins", "0", "g")).toString(),
+			).toBe(":1\r\n");
+			for (const want of ["d", "j", "f", "e", "c", "b", "a"]) {
+				expect(await raw.bulk("LPOP", "lpushins")).toEqual(Buffer.from(want));
+			}
+			await raw.send("SELECT", "durable");
+		});
+	}
+
 	// LREM removed the right elements but left holes, and readers walk
 	// positions contiguously from min_pos — so the tail became unreachable and
 	// the list silently lost its last element.

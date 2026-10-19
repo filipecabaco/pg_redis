@@ -33,7 +33,12 @@ mlua-sys = { version = "0.13.0", features = ["lua51", "vendored"] }
 [dev-dependencies]
 pgrx-tests = "=0.18.0"
 # Fuzz harnesses (src/fuzz.rs): run as tests on stable, under libFuzzer with cargo-bolero.
-bolero = "=0.13.7"
+# Held below bolero-generator-derive 0.13.5, which pins `indexmap = "=2.11.2"`
+# and so blocks any dependency needing a newer indexmap (pgrx 0.19 does, via
+# toml 1). The two generator crates are listed only to hold that line.
+bolero = "=0.13.4"
+bolero-generator = "=0.13.5"
+bolero-generator-derive = "=0.13.4"
 
 [profile.dev]
 panic = "unwind"
@@ -51,4 +56,4 @@ cc = "1"
 # Not referenced from Rust: build.rs reads the Lua headers' path from
 # DEP_LUA_INCLUDE, which Cargo only hands to crates that depend on mlua-sys
 # directly.
-ignored = ["mlua-sys"]
+ignored = ["mlua-sys", "bolero-generator", "bolero-generator-derive"]

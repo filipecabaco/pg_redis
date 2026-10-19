@@ -176,19 +176,31 @@ pub mod sql {
         format!("{}, ", ctes.join(", "))
     }
 
-    /// Empty every table of the named databases. `TRUNCATE` rather than
-    /// `DELETE`: it does not build a dead tuple per row, and these tables are
-    /// being emptied whole.
+    /// Empty every table of the named databases, in one statement.
+    ///
+    /// `DELETE`, not `TRUNCATE`. `TRUNCATE` takes each table's ACCESS
+    /// EXCLUSIVE lock in turn, so it deadlocked with any transaction already
+    /// writing one of those tables and about to write another: the expiry
+    /// sweep, every second, which starts at `expiry_N`. A `DELETE`'s lock
+    /// conflicts with no other writer's. The expiry rows go first (the main
+    /// statement runs before the CTEs), in the sweep's order.
     pub fn flush_dbs(dbs: &[usize]) -> String {
-        let tables: Vec<String> = dbs
+        let Some((first, rest)) = dbs.split_first() else {
+            return "SELECT 1".to_string();
+        };
+        let ctes: Vec<String> = dbs
             .iter()
             .flat_map(|db| {
-                ["kv", "hash", "list", "set", "zset", "stream", "expiry"]
+                ["kv", "hash", "list", "set", "zset", "stream"]
                     .iter()
-                    .map(move |t| format!("redis.{t}_{db}"))
+                    .map(move |t| format!("{t}{db} AS (DELETE FROM redis.{t}_{db})"))
             })
+            .chain(
+                rest.iter()
+                    .map(|db| format!("expiry{db} AS (DELETE FROM redis.expiry_{db})")),
+            )
             .collect();
-        format!("TRUNCATE {}", tables.join(", "))
+        format!("WITH {} DELETE FROM redis.expiry_{first}", ctes.join(", "))
     }
 
     /// One statement per database for the background sweep: the strings whose

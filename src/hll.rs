@@ -94,16 +94,15 @@ pub fn murmur64a(key: &[u8], seed: u64) -> u64 {
     const M: u64 = 0xc6a4a7935bd1e995;
     const R: u32 = 47;
     let mut h = seed ^ (key.len() as u64).wrapping_mul(M);
-    let mut chunks = key.chunks_exact(8);
-    for c in &mut chunks {
-        let mut k = u64::from_le_bytes(c.try_into().expect("8 bytes"));
+    let (chunks, rest) = key.as_chunks::<8>();
+    for c in chunks {
+        let mut k = u64::from_le_bytes(*c);
         k = k.wrapping_mul(M);
         k ^= k >> R;
         k = k.wrapping_mul(M);
         h ^= k;
         h = h.wrapping_mul(M);
     }
-    let rest = chunks.remainder();
     if !rest.is_empty() {
         for (i, &b) in rest.iter().enumerate() {
             h ^= (b as u64) << (8 * i);

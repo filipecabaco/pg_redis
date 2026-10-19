@@ -2561,6 +2561,11 @@ fn list_ends(db: u8) -> String {
 /// row, and a renumber in place would collide with itself half way.
 const PARK: i64 = 1 << 62;
 
+/// Where parked rows start. Positions go negative as `LPUSH` grows a list
+/// down, so a parked row can sit just under `PARK`: anything past half of it
+/// is parked, since no list's positions come near ±2^61.
+const PARKED: i64 = PARK / 2;
+
 impl SqlStore<'_, '_> {
     /// Move every element of `key` at or after `from` up by `by`, in two
     /// passes through `PARK`.
@@ -2575,7 +2580,7 @@ impl SqlStore<'_, '_> {
         self.client
             .update_kept(
                 &format!(
-                    "UPDATE redis.list_{db} SET pos = pos - {PARK} WHERE key = $1 AND pos >= {PARK}"
+                    "UPDATE redis.list_{db} SET pos = pos - {PARK} WHERE key = $1 AND pos >= {PARKED}"
                 ),
                 &[key.into()],
             )
@@ -2600,7 +2605,7 @@ impl SqlStore<'_, '_> {
         self.client
             .update_kept(
                 &format!(
-                    "UPDATE redis.list_{db} SET pos = pos - {PARK} WHERE key = $1 AND pos >= {PARK}"
+                    "UPDATE redis.list_{db} SET pos = pos - {PARK} WHERE key = $1 AND pos >= {PARKED}"
                 ),
                 &[key.into()],
             )

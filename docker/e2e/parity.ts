@@ -1492,6 +1492,12 @@ type Difference = {
 	kind: string;
 	pg_redis: string;
 	redis: string;
+	/**
+	 * Why it is accepted. An entry with a note survives `--update-baseline`
+	 * even when it does not differ today: some differences belong to one
+	 * architecture's Redis build, and the baseline must hold both.
+	 */
+	note?: string;
 };
 
 const REPLY_TIMEOUT_MS = Number(process.env.PARITY_TIMEOUT_MS ?? 5000);
@@ -1597,8 +1603,21 @@ for (const half of ["cache", "durable"]) {
 const key = (d: Difference) => `${d.half} | ${d.case} | ${d.at} | ${d.cmd}`;
 const commands = cases.reduce((n, k) => n + k.cmds.length, 0) * 2;
 
+const recorded = async (): Promise<Difference[]> => {
+	try {
+		return await Bun.file(BASELINE).json();
+	} catch {
+		return [];
+	}
+};
+
 if (updating) {
-	const baseline = differences.map((d) => ({ ...d }));
+	const before = new Map((await recorded()).map((d) => [key(d), d]));
+	const today = new Set(differences.map(key));
+	const baseline = [
+		...differences.map((d) => ({ ...d, note: before.get(key(d))?.note })),
+		...[...before.values()].filter((d) => d.note && !today.has(key(d))),
+	];
 	await Bun.write(BASELINE, `${JSON.stringify(baseline, null, "\t")}\n`);
 	console.log(
 		`recorded ${baseline.length} differences over ${commands} replies`,
@@ -1606,16 +1625,17 @@ if (updating) {
 	process.exit(0);
 }
 
-const known = new Map<string, Difference>();
-try {
-	for (const d of await Bun.file(BASELINE).json()) known.set(key(d), d);
-} catch {
+const known = new Map((await recorded()).map((d) => [key(d), d]));
+if (known.size === 0) {
 	console.error(`no baseline at ${BASELINE}; run with --update-baseline`);
 }
 
 const fresh = differences.filter((d) => !known.has(key(d)));
 const seen = new Set(differences.map(key));
-const fixed = [...known.values()].filter((d) => !seen.has(key(d)));
+// A noted entry missing today is the other architecture's, not a fix.
+const fixed = [...known.values()].filter(
+	(d) => !d.note && !seen.has(key(d)),
+);
 
 const show = (title: string, ds: Difference[]) => {
 	if (ds.length === 0) return;

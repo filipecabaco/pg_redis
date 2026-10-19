@@ -1,12 +1,33 @@
 [
 	{
 		"half": "cache",
+		"case": "how a float counter is printed back",
+		"at": 3,
+		"cmd": "INCRBYFLOAT n2 1.000000000000000005",
+		"kind": "value",
+		"pg_redis": "$1\\n4\\n",
+		"redis": "$19\\n4.00000000000000001\\n",
+		"note": "x86 Redis: long double is 80-bit there, so it keeps digits an f64 drops. On arm64 Redis prints 4 too."
+	},
+	{
+		"half": "durable",
+		"case": "how a float counter is printed back",
+		"at": 3,
+		"cmd": "INCRBYFLOAT n2 1.000000000000000005",
+		"kind": "value",
+		"pg_redis": "$1\\n4\\n",
+		"redis": "$19\\n4.00000000000000001\\n",
+		"note": "x86 Redis: long double is 80-bit there, so it keeps digits an f64 drops. On arm64 Redis prints 4 too."
+	},
+	{
+		"half": "cache",
 		"case": "GEO",
 		"at": 20,
 		"cmd": "ZRANGE dst 0 -1 WITHSCORES",
 		"kind": "value",
 		"pg_redis": "*4\\n$7\\nCatania\\n$16\\n56.4412578701582\\n$7\\nPalermo\\n$18\\n190.44242984775784\\n",
-		"redis": "*4\\n$7\\nCatania\\n$17\\n56.44125787015819\\n$7\\nPalermo\\n$18\\n190.44242984775792\\n"
+		"redis": "*4\\n$7\\nCatania\\n$17\\n56.44125787015819\\n$7\\nPalermo\\n$18\\n190.44242984775792\\n",
+		"note": "arm64 Redis only: gcc fuses multiply-adds there, moving the last digits. x86 Redis matches pg_redis."
 	},
 	{
 		"half": "durable",
@@ -15,6 +36,7 @@
 		"cmd": "ZRANGE dst 0 -1 WITHSCORES",
 		"kind": "value",
 		"pg_redis": "*4\\n$7\\nCatania\\n$16\\n56.4412578701582\\n$7\\nPalermo\\n$18\\n190.44242984775784\\n",
-		"redis": "*4\\n$7\\nCatania\\n$17\\n56.44125787015819\\n$7\\nPalermo\\n$18\\n190.44242984775792\\n"
+		"redis": "*4\\n$7\\nCatania\\n$17\\n56.44125787015819\\n$7\\nPalermo\\n$18\\n190.44242984775792\\n",
+		"note": "arm64 Redis only: gcc fuses multiply-adds there, moving the last digits. x86 Redis matches pg_redis."
 	}
 ]

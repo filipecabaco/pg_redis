@@ -637,8 +637,8 @@ fn pairs_of(mut items: Vec<Vec<u8>>) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
         return None;
     }
     let mut out = Vec::with_capacity(items.len() / 2);
-    for chunk in items.chunks_exact_mut(2) {
-        out.push((std::mem::take(&mut chunk[0]), std::mem::take(&mut chunk[1])));
+    for [k, v] in items.as_chunks_mut::<2>().0 {
+        out.push((std::mem::take(k), std::mem::take(v)));
     }
     Some(out)
 }

@@ -278,7 +278,11 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                 let (count, keys) = if let Some(slot) = crate::storage::slot(db) {
                     crate::shm::with_db(slot, |m| m.sweep_expired(names)).unwrap_or_default()
                 } else if sql_tables_exist {
-                    let keys: Vec<Vec<u8>> = BackgroundWorker::transaction(|| {
+                    // A client's write can deadlock with the sweep, which
+                    // deletes across a database's tables in one statement.
+                    // Losing that is no reason to stop the worker: roll back,
+                    // and the next tick sweeps the same keys.
+                    let keys: Vec<Vec<u8>> = crate::pg::transaction_or_abort(|| {
                         Spi::connect_mut(|client| {
                             client
                                 .update(
@@ -286,13 +290,14 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                                     None,
                                     &[],
                                 )
+                                .ok()
                                 .map(|t| {
                                     t.filter_map(|r| r.get::<Vec<u8>>(1).ok().flatten())
                                         .collect()
                                 })
-                                .unwrap_or_default()
                         })
-                    });
+                    })
+                    .unwrap_or_default();
                     (keys.len(), keys)
                 } else {
                     (0, Vec::new())

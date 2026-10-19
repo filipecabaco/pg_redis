@@ -97,6 +97,14 @@ thread_local! {
     /// event, INFO's `expired_keys`, a tracking invalidation — and that is
     /// done outside the database's lock, by whoever ran the command.
     static REAPED: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Set for a command run during CLIENT PAUSE: a key past its deadline
+    /// reads as gone but is not deleted, as Redis pauses expiry with writes.
+    static EXPIRY_PAUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the commands this thread runs next may delete expired keys.
+pub fn pause_expiry(paused: bool) {
+    EXPIRY_PAUSED.set(paused);
 }
 
 /// The keys expired on access since the last call.
@@ -262,8 +270,10 @@ impl<A: Allocator + Clone> Db<A> {
     /// `entry` with `LOOKUP_NOTOUCH`: expires, never touches.
     fn lookup(&mut self, key: &[u8]) -> Option<&mut Entry<A>> {
         if self.keys.get(key)?.expired(now()) {
-            self.keys.remove(key);
-            REAPED.with_borrow_mut(|r| r.push(key.to_vec()));
+            if !EXPIRY_PAUSED.get() {
+                self.keys.remove(key);
+                REAPED.with_borrow_mut(|r| r.push(key.to_vec()));
+            }
             return None;
         }
         self.keys.get_mut(key)

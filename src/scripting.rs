@@ -138,14 +138,14 @@ pub const NOREPLICAS: &str = "NOREPLICAS Not enough good replicas to write.";
 /// flagless pre-7.0 form is checked command by command instead): one that
 /// may write, with too few replicas, or past `maxmemory` without
 /// `allow-oom`.
-fn refused_before_run(flags: u32, compat: bool) -> Option<Response> {
+fn refused_before_run(flags: u32, compat: bool, host: &mut dyn Host) -> Option<Response> {
     if compat || flags & FLAG_NO_WRITES != 0 {
         return None;
     }
     if crate::server::too_few_replicas() {
         return Some(Response::Error(NOREPLICAS.into()));
     }
-    if flags & FLAG_ALLOW_OOM == 0 && !crate::evict::make_room() {
+    if flags & FLAG_ALLOW_OOM == 0 && !host.room_to_write() {
         return Some(crate::commands::mem_out_of_memory());
     }
     None
@@ -470,6 +470,11 @@ pub trait Host {
     fn delete_library(&mut self, name: &str);
     fn flush_libraries(&mut self);
     fn on_commit(&mut self, f: fn());
+    /// Whether a write may grow memory now: false past `maxmemory` with
+    /// nothing the policy may evict.
+    fn room_to_write(&mut self) -> bool {
+        true
+    }
     fn on_abort(&mut self, f: fn());
 }
 
@@ -1539,14 +1544,12 @@ fn run_from_script(argv: &[Vec<u8>], ctx: &mut CallCtx<'_>) -> Result<Response, 
     if has("noscript") && !crate::server::deny_scripts_disabled() {
         return Err("This Redis command is not allowed from script".into());
     }
-    // `scriptCall`'s refusals of a write with too few replicas, and of a
-    // command that may grow memory past `maxmemory` unless the script allows
-    // it: the command's error, raised in the script.
+    // `scriptCall`'s refusal of a write with too few replicas: the command's
+    // error, raised in the script.
+    // (A command that may grow memory meets `maxmemory` where it runs, as
+    // every command does.)
     if has("write") && crate::server::too_few_replicas() {
         return Ok(Response::Error(NOREPLICAS.into()));
-    }
-    if has("denyoom") && !crate::evict::make_room() {
-        return Ok(crate::commands::mem_out_of_memory());
     }
     let caller = CALLER.get();
     if caller != 0 {
@@ -2341,7 +2344,7 @@ impl Engine {
                 if f.flags & FLAG_NO_WRITES == 0 && inv.ro {
                     return Err(err(RO_WITH_WRITE_FLAG.into()));
                 }
-                if let Some(refused) = refused_before_run(f.flags, false) {
+                if let Some(refused) = refused_before_run(f.flags, false, host) {
                     return Err(refused);
                 }
                 let read_only = inv.ro || f.flags & FLAG_NO_WRITES != 0;
@@ -2579,7 +2582,7 @@ fn run_eval(
     if !compat && flags & FLAG_NO_WRITES == 0 && inv.ro {
         return Response::Error(RO_WITH_WRITE_FLAG.into());
     }
-    if let Some(refused) = refused_before_run(flags, compat) {
+    if let Some(refused) = refused_before_run(flags, compat, host) {
         return refused;
     }
     let read_only = inv.ro || (!compat && flags & FLAG_NO_WRITES != 0);

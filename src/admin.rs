@@ -302,8 +302,13 @@ fn client(a: &Admin, conn: &mut Conn) -> Response {
             };
             if let Some(c) = server::ctl() {
                 use std::sync::atomic::Ordering::Relaxed;
+                // `pauseClients`: the new mode, and the later of the two ends.
                 c.pause_writes_only.store(writes as u32, Relaxed);
-                c.pause_until_ms.store(server::now_ms() + ms, Relaxed);
+                let until = server::now_ms() + ms;
+                let current = c.pause_until_ms.load(Relaxed);
+                if !server::paused() || current < until {
+                    c.pause_until_ms.store(until, Relaxed);
+                }
             }
             Response::Ok
         }

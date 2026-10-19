@@ -3916,6 +3916,7 @@ impl Command {
         // (`src/dblock.rs`).
         // Whatever an earlier caller left unreported is not this command's.
         crate::memdb::take_reaped();
+        crate::memdb::pause_expiry(crate::server::paused());
         let ran = crate::access::with_mode(access, || {
             crate::shm::with_db(slot, |m| {
                 self.run_on_db(m).or_else(|| match self {
@@ -4147,7 +4148,8 @@ impl Command {
     /// access — the `expired` event, INFO's expired_keys, and an
     /// invalidation for whoever tracks them.
     fn reap_keys(client: &mut SpiClient<'_>, db: u8, keys: &[&[u8]]) {
-        if keys.is_empty() {
+        // CLIENT PAUSE pauses expiry too: the rows stay until it ends.
+        if keys.is_empty() || crate::server::paused() {
             return;
         }
         let arg: Vec<Option<Vec<u8>>> = keys.iter().map(|k| Some(k.to_vec())).collect();
@@ -4864,6 +4866,10 @@ struct SqlHost<'c, 'conn> {
 }
 
 impl crate::scripting::Host for SqlHost<'_, '_> {
+    fn room_to_write(&mut self) -> bool {
+        crate::evict::make_room()
+    }
+
     fn exec(&mut self, db: u8, cmd: Command) -> Response {
         Command::route(self.client, db, cmd)
     }

@@ -121,15 +121,17 @@ in shared memory (`src/dblock.rs`). Only the dispatchers take them.
 - **Scripts that change database lock every database.** A script's databases
   are only known as it runs. The rule: a script whose source names `SELECT`,
   `MOVE`, `COPY`, `SWAPDB` or `FLUSHALL` as a whole word, in any case and
-  anywhere (a comment counts), holds all sixteen; any other script holds the
-  database it starts on. An `EVALSHA` or `FCALL` this worker has not compiled
-  yet also holds all sixteen, once. A script that still reaches a database it
-  does not hold, through a command name built at run time, gets that lock only
-  if it is free: the call fails with an error rather than wait, because the
-  script's transaction may already hold row locks that the other holder needs.
-  The trade-off is that a script naming one of those commands runs alone on
-  the whole server, as every script does in Redis, and that the run-time
-  case can fail under load instead of waiting.
+  anywhere (a comment counts), holds all sixteen, and so does one with a
+  `redis.call` or `redis.pcall` whose command name is not a plain string
+  literal (read from `ARGV`, built with `..`, or called through a local
+  alias); any other script holds the database it starts on. An `EVALSHA` or
+  `FCALL` this worker has not compiled yet also holds all sixteen, once. A
+  script that still reaches a database it does not hold, by a call the source
+  hides (`redis['call']`), gets that lock only if it is free: the call fails
+  with an error rather than wait, because the script's transaction may
+  already hold row locks that the other holder needs. The trade-off is that a
+  script holding all sixteen runs alone on the whole server, as every script
+  does in Redis.
 - **Writers are preferred.** Once an exclusive request waits, no new shared
   holder gets in, so a stream of commands cannot starve a script.
 - **What is never held.** A connection waiting for its client, a blocking
@@ -691,12 +693,14 @@ client get `BUSY`, on every worker, until it ends or `SCRIPT KILL` /
 
 ### Known differences from Redis
 
-- **A script that builds a command name at run time can be refused a
-  database.** A script whose source does not name `SELECT`, `MOVE`, `COPY`,
-  `SWAPDB` or `FLUSHALL` holds only its own database; if it reaches another
-  one anyway, the call fails with an error while another client uses that
-  database ([Atomicity across workers](#atomicity-across-workers)). Redis
-  runs it. A RESP3 `MULTI` that subscribes runs in segments around each
+- **A script that hides how it calls Redis can be refused a database.** A
+  script holds only its own database when its source names every command it
+  runs with a string literal and none of them is `SELECT`, `MOVE`, `COPY`,
+  `SWAPDB` or `FLUSHALL`; any other script holds every database, as every
+  script does in Redis. One that reaches `redis.call` some way the source
+  does not show (`redis['call']`) and then another database fails that call
+  while another client uses the database
+  ([Atomicity across workers](#atomicity-across-workers)). Redis runs it. A RESP3 `MULTI` that subscribes runs in segments around each
   subscription command, each segment atomic on its own.
 - **Blocked clients are served before the writer replies, within a bound.**
   Redis serves the clients a write unblocks inside that write. Here they live

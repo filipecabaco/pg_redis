@@ -2103,23 +2103,104 @@ pub fn reaches_other_dbs(cmd: &ScriptCmd) -> bool {
     }
 }
 
-/// Whether Lua source names, as a whole word in any case, a command that
-/// reaches another database. Comments and strings count too: a false match
-/// only locks more than needed.
+/// Whether Lua source may reach a database other than the one it starts on:
+/// it names, as a whole word in any case, a command that does, or it runs a
+/// command whose name it does not spell out. Comments and strings count too:
+/// a false match only locks more than needed.
 fn names_other_db(src: &[u8]) -> bool {
     const WORDS: [&[u8]; 5] = [b"select", b"move", b"copy", b"swapdb", b"flushall"];
     let word = |b: &u8| b.is_ascii_alphanumeric() || *b == b'_';
     src.split(|b| !word(b))
         .any(|w| WORDS.iter().any(|x| w.eq_ignore_ascii_case(x)))
+        || names_commands_at_run_time(src)
+}
+
+/// Whether some `redis.call` or `redis.pcall` (or `server.…`) takes a
+/// command name that is not a plain string literal: one built at run time,
+/// read from `ARGV`, or called through another name. Such a script can run
+/// any command, so it holds every database, as every script does in Redis.
+fn names_commands_at_run_time(src: &[u8]) -> bool {
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let skip_ws = |mut j: usize| {
+        while src.get(j).is_some_and(u8::is_ascii_whitespace) {
+            j += 1;
+        }
+        j
+    };
+    let mut i = 0;
+    while i < src.len() {
+        let len = [b"pcall".as_slice(), b"call"]
+            .iter()
+            .find(|w| src[i..].starts_with(w))
+            .map_or(0, |w| w.len());
+        let whole = len > 0
+            && (i == 0 || !word(src[i - 1]))
+            && !src.get(i + len).copied().is_some_and(word);
+        let after_dot = src[..i].iter().rev().find(|b| !b.is_ascii_whitespace()) == Some(&b'.');
+        if !whole || !after_dot {
+            i += 1;
+            continue;
+        }
+        let mut j = skip_ws(i + len);
+        let paren = src.get(j) == Some(&b'(');
+        if paren {
+            j = skip_ws(j + 1);
+        }
+        let Some(end) = lua_string_end(src, j) else {
+            return true;
+        };
+        // In parentheses the name is the first argument, alone: `'sel' ..
+        // 'ect'` builds one.
+        if paren && !matches!(src.get(skip_ws(end)), Some(b',' | b')')) {
+            return true;
+        }
+        i = end;
+    }
+    false
+}
+
+/// Where the Lua string literal starting at `j` ends: quoted, or a long
+/// bracket `[[ … ]]` / `[==[ … ]==]`. `None` when no literal starts there.
+fn lua_string_end(src: &[u8], j: usize) -> Option<usize> {
+    match *src.get(j)? {
+        q @ (b'\'' | b'"') => {
+            let mut k = j + 1;
+            while k < src.len() {
+                match src[k] {
+                    b'\\' => k += 2,
+                    c if c == q => return Some(k + 1),
+                    _ => k += 1,
+                }
+            }
+            None
+        }
+        b'[' => {
+            let eqs = src[j + 1..].iter().take_while(|&&b| b == b'=').count();
+            if src.get(j + 1 + eqs) != Some(&b'[') {
+                return None;
+            }
+            let close: Vec<u8> = std::iter::once(b']')
+                .chain(std::iter::repeat_n(b'=', eqs))
+                .chain(std::iter::once(b']'))
+                .collect();
+            let body = j + 2 + eqs;
+            src[body..]
+                .windows(close.len())
+                .position(|w| w == close.as_slice())
+                .map(|p| body + p + close.len())
+        }
+        _ => None,
+    }
 }
 
 /// The error a script gets when it reaches a database another client holds.
 fn reach_error(db: u8) -> String {
     format!(
         "ERR this script reached database {db}, which another client is using. \
-         A script that names SELECT, MOVE, COPY, SWAPDB or FLUSHALL in its source \
-         locks every database before it starts; one that builds those names at \
-         run time cannot wait for the lock"
+         A script that names SELECT, MOVE, COPY, SWAPDB or FLUSHALL in its source, \
+         or runs a command it does not name with a string literal, locks every \
+         database before it starts; this one reached it in a way that could not \
+         be seen ahead"
     )
 }
 
@@ -2626,6 +2707,12 @@ mod tests {
             "redis.call('swapdb', 0, 1)",
             "redis.call('FlushAll')",
             "-- select\nreturn 1",
+            "return redis.call(ARGV[1], KEYS[1])",
+            "local c = redis.call return c('get', 'k')",
+            "redis.pcall('sel' .. 'ect', 1)",
+            "redis.call(unpack(ARGV))",
+            "server.call(cmd)",
+            "redis.call('get', 'k') redis.call(name)",
         ] {
             assert!(names_other_db(src.as_bytes()), "{src}");
         }
@@ -2635,6 +2722,12 @@ mod tests {
             "redis.call('SMOVE', 'a', 'b', 'm')",
             "local remove = 1 local selected = 2 return remove + selected",
             "redis.call('FLUSHDB')",
+            "redis.call( \"incr\" , KEYS[1])",
+            "redis.call([[get]], 'k')",
+            "redis.call([==[get]==], 'k')",
+            "redis.call 'ping'",
+            "local ok = pcall(function() return 1 end) return redis.pcall('get', 'x')",
+            "redis.call('set', 'k', 'it\\'s')",
         ] {
             assert!(!names_other_db(src.as_bytes()), "{src}");
         }

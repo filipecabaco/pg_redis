@@ -372,7 +372,12 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
         }
         // Redis expires nothing while clients are paused: the keys wait for
         // the pause to end.
-        if last_expiry_scan.elapsed() >= Duration::from_secs(1) && !crate::server::paused() {
+        // `DEBUG SET-ACTIVE-EXPIRE 0` stops it, leaving keys to expire as
+        // they are read.
+        if last_expiry_scan.elapsed() >= Duration::from_secs(1)
+            && !crate::server::paused()
+            && crate::server::active_expire()
+        {
             last_expiry_scan = Instant::now();
             // redis.kv_* only exist where CREATE EXTENSION has run, and the
             // worker connects to redis.database, which commonly has not. A

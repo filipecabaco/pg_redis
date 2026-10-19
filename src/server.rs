@@ -1586,6 +1586,12 @@ pub fn mark_saved() {
     }
 }
 
+/// Whether keys are expired in the background, which `DEBUG
+/// SET-ACTIVE-EXPIRE 0` turns off.
+pub fn active_expire() -> bool {
+    ctl().is_none_or(|c| c.active_expire.load(Ordering::Relaxed) != 0)
+}
+
 pub fn tracking_active() -> bool {
     ctl().is_some_and(|c| c.tracking_clients.load(Ordering::Relaxed) > 0)
 }

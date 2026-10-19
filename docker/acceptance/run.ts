@@ -144,7 +144,11 @@ async function unitPath(unit: string): Promise<string> {
 	for (const line of source.split("\n")) {
 		// A top-level block starts at the left margin; its closing brace and
 		// the lines inside it do not.
-		if (chunks.length === 0 || (/^\S/.test(line) && !/^}/.test(line))) chunks.push([]);
+		// A block opened by a line of its own that the next line nests in
+		// (`start_server {...} {` twice, for a replica) is one block.
+		const prev = chunks[chunks.length - 1];
+		const opener = prev?.length === 1 && /\{\s*$/.test(prev[0]);
+		if (chunks.length === 0 || (/^\S/.test(line) && !/^}/.test(line) && !opener)) chunks.push([]);
 		chunks[chunks.length - 1].push(line);
 	}
 	const kept = chunks

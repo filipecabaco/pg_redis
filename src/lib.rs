@@ -137,6 +137,19 @@ pub(crate) fn watch_state() -> Option<&'static watch::WatchCtl> {
 
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
+    // PostgreSQL refuses a restart-only setting defined after startup with a
+    // FATAL, which used to end any session that loaded the library without
+    // preloading it: CREATE EXTENSION, or a pg_restore of a database that
+    // has the extension. Outside preloading they are defined as superuser
+    // settings; nothing reads them then.
+    let preloading = pg::preloading();
+    let restart_only = || {
+        if preloading {
+            GucContext::Postmaster
+        } else {
+            GucContext::Suset
+        }
+    };
     GucRegistry::define_int_guc(
         c"redis.port",
         c"TCP port for the Redis protocol listener",
@@ -145,7 +158,7 @@ pub extern "C-unwind" fn _PG_init() {
         1024,
         65535,
         // Bound once at worker start; a reload cannot move the listener.
-        GucContext::Postmaster,
+        restart_only(),
         GucFlags::default(),
     );
 
@@ -182,7 +195,7 @@ pub extern "C-unwind" fn _PG_init() {
         &NUM_WORKERS,
         1,
         64,
-        GucContext::Postmaster,
+        restart_only(),
         GucFlags::default(),
     );
 
@@ -193,7 +206,7 @@ pub extern "C-unwind" fn _PG_init() {
           go through PostgreSQL authentication, so widening this exposes every redis.* \
           table to anything that can reach the port. Set redis.password as well.",
         &LISTEN_ADDRESS,
-        GucContext::Postmaster,
+        restart_only(),
         GucFlags::default(),
     );
 
@@ -233,12 +246,11 @@ pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_string_guc(
         c"redis.database",
         c"Database name for pg_redis workers",
-        c"Used when the extension is loaded via shared_preload_libraries, where no \
-          database is selected at startup. Workers connect to this database by name. \
-          Ignored when loaded via CREATE EXTENSION (workers use that database's OID). \
-          Default: 'postgres'.",
+        c"The database the workers started with the server connect to by name. Run \
+          CREATE EXTENSION pg_redis there. Workers added with redis.add_workers connect \
+          to the database they are called from. Default: 'postgres'.",
         &DATABASE,
-        GucContext::Postmaster,
+        restart_only(),
         GucFlags::default(),
     );
 
@@ -262,9 +274,15 @@ pub extern "C-unwind" fn _PG_init() {
         &MAXMEMORY,
         8,
         i32::MAX,
-        GucContext::Postmaster,
+        restart_only(),
         GucFlags::UNIT_MB,
     );
+
+    // Shared memory and the listener's workers exist only when preloaded;
+    // the extension script tells whoever creates it otherwise.
+    if !preloading {
+        return;
+    }
 
     shared::install_hooks(request_shmem, attach_shmem);
 
@@ -305,6 +323,11 @@ pub extern "C-unwind" fn pg_redis_worker_main(arg: pg_sys::Datum) {
 fn add_workers(n: i32) -> i32 {
     if !pg::is_superuser() {
         error!("permission denied: superuser required");
+    }
+    if server_state().is_none() {
+        error!(
+            "pg_redis is not in shared_preload_libraries: add it there and restart to start the Redis listener"
+        );
     }
     let schema_exists =
         Spi::get_one::<bool>("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'redis')")

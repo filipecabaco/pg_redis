@@ -13,6 +13,10 @@
 //! over workers. It has [`SLOTS`] entries, each guarded by one spinlock, and
 //! the least recently used is taken when none is free.
 //!
+//! Each entry also keeps the step before the latest, so a client that resends
+//! its previous cursor, as one retrying after a lost reply does, resumes where
+//! that cursor left off, as it would in Redis. An older cursor starts over.
+//!
 //! An entry keeps at most [`BOUND_LEN`] bytes of the key; a longer key is kept
 //! as its prefix. Resuming after a prefix of the last key can only return
 //! some keys again, never skip one. A token this table does not know, because
@@ -44,6 +48,22 @@ pub struct Slot {
     /// The bound's length, and `INCLUSIVE`.
     meta: AtomicU32,
     bytes: [AtomicU8; BOUND_LEN],
+    /// The step before: its token (0 for none) and its bound.
+    prev_token: AtomicU64,
+    prev_meta: AtomicU32,
+    prev_bytes: [AtomicU8; BOUND_LEN],
+}
+
+fn read_bound(meta: &AtomicU32, bytes: &[AtomicU8; BOUND_LEN]) -> Bound {
+    let meta = meta.load(Ordering::Relaxed);
+    let len = (meta & !INCLUSIVE) as usize;
+    Bound {
+        key: bytes[..len.min(BOUND_LEN)]
+            .iter()
+            .map(|b| b.load(Ordering::Relaxed))
+            .collect(),
+        inclusive: meta & INCLUSIVE != 0,
+    }
 }
 
 /// Pointer-free and valid zeroed: every slot free, the lock open.
@@ -122,19 +142,18 @@ impl CursorTable {
         }
         let s = &self.slots[slot_of(token)];
         let _held = Locked::new(self);
-        if s.token.load(Ordering::Relaxed) != token || s.scope.load(Ordering::Relaxed) != scope {
+        if s.scope.load(Ordering::Relaxed) != scope {
             return None;
         }
+        let bound = if s.token.load(Ordering::Relaxed) == token {
+            read_bound(&s.meta, &s.bytes)
+        } else if s.prev_token.load(Ordering::Relaxed) == token {
+            read_bound(&s.prev_meta, &s.prev_bytes)
+        } else {
+            return None;
+        };
         s.used.store(self.tick(), Ordering::Relaxed);
-        let meta = s.meta.load(Ordering::Relaxed);
-        let len = (meta & !INCLUSIVE) as usize;
-        Some(Bound {
-            key: s.bytes[..len.min(BOUND_LEN)]
-                .iter()
-                .map(|b| b.load(Ordering::Relaxed))
-                .collect(),
-            inclusive: meta & INCLUSIVE != 0,
-        })
+        Some(bound)
     }
 
     /// Record that the iteration `prev` (0 for a new one) of `scope` resumes
@@ -144,12 +163,20 @@ impl CursorTable {
     pub fn save(&self, prev: u64, scope: u64, bound: &Bound, random: u64) -> u64 {
         debug_assert!(bound.key.len() <= BOUND_LEN);
         let _held = Locked::new(self);
-        let i = if prev != 0 && self.slots[slot_of(prev)].token.load(Ordering::Relaxed) == prev {
-            slot_of(prev)
-        } else {
-            self.victim()
-        };
+        let reuse = prev != 0 && self.slots[slot_of(prev)].token.load(Ordering::Relaxed) == prev;
+        let i = if reuse { slot_of(prev) } else { self.victim() };
         let s = &self.slots[i];
+        if reuse {
+            // The step `prev` named stays resumable for a client that resends it.
+            s.prev_token.store(prev, Ordering::Relaxed);
+            s.prev_meta
+                .store(s.meta.load(Ordering::Relaxed), Ordering::Relaxed);
+            for (to, from) in s.prev_bytes.iter().zip(&s.bytes) {
+                to.store(from.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+        } else {
+            s.prev_token.store(0, Ordering::Relaxed);
+        }
         // 51 random bits above the slot, at least one of them set, and the
         // top bit clear: non-zero, and positive for a client that parses the
         // cursor as a signed integer.
@@ -195,6 +222,7 @@ impl CursorTable {
         let _held = Locked::new(self);
         if s.token.load(Ordering::Relaxed) == token {
             s.token.store(0, Ordering::Relaxed);
+            s.prev_token.store(0, Ordering::Relaxed);
         }
     }
 }
@@ -317,6 +345,9 @@ mod tests {
                     used: AtomicU64::new(0),
                     meta: AtomicU32::new(0),
                     bytes: std::array::from_fn(|_| AtomicU8::new(0)),
+                    prev_token: AtomicU64::new(0),
+                    prev_meta: AtomicU32::new(0),
+                    prev_bytes: std::array::from_fn(|_| AtomicU8::new(0)),
                 });
                 Box::new(CursorTable {
                     lock: AtomicU32::new(0),
@@ -326,6 +357,42 @@ mod tests {
             })
             .and_then(|t| t.join().map_err(|_| std::io::Error::other("panicked")))
             .expect("build the table")
+    }
+
+    /// A client that resends its previous cursor, as one retrying after a
+    /// lost reply does, gets the page that cursor named again, not a restart.
+    #[test]
+    fn the_previous_cursor_resumes_where_it_left_off() {
+        let t = table();
+        let keys: std::collections::BTreeSet<Vec<u8>> = (0..100u8).map(|i| vec![b'k', i]).collect();
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut page = |cursor| {
+            step(Some(&*t), cursor, 7, 10, rng.next(), |r, l| {
+                Ok::<_, ()>(fetch_from(&keys, r, l))
+            })
+            .unwrap()
+        };
+        let (c1, _) = page(0);
+        let (c2, second) = page(c1);
+        let (_c3, _) = page(c2);
+        // c2 is now the step before the latest: resending it repeats its page.
+        let (_, again) = page(c2);
+        assert_eq!(again, page_rows_after(&keys, &second));
+        // c1 is older than that, so it starts over from the first key.
+        let (_, restarted) = page(c1);
+        assert_eq!(
+            restarted.first().map(|(k, _)| k.clone()),
+            keys.iter().next().cloned()
+        );
+    }
+
+    /// The rows of the page that follows `prev`, read straight from the keys.
+    fn page_rows_after(
+        keys: &std::collections::BTreeSet<Vec<u8>>,
+        prev: &[(Vec<u8>, ())],
+    ) -> Vec<(Vec<u8>, ())> {
+        let last = &prev.last().expect("a page").0;
+        fetch_from(keys, &Range::After(last.clone()), Some(10))
     }
 
     /// A sorted set of keys standing in for a table, read as `fetch` does.
@@ -464,11 +531,12 @@ mod tests {
         for (cursor, scope) in [(token, 2), (12345, 1), (u64::MAX, 1), (7, 1)] {
             assert_eq!(first(cursor, scope, &keys).1[0].0, b"k00");
         }
-        // ...which its own scope resumes. Sent again after that, it is spent.
+        // ...which its own scope resumes. Sent again after that, as a client
+        // retrying a lost reply would, it gives the same page again.
         let (next, page) = first(token, 1, &keys);
         assert_eq!(page[0].0, b"k10");
         assert_ne!(next, token);
-        assert_eq!(first(token, 1, &keys).1[0].0, b"k00");
+        assert_eq!(first(token, 1, &keys).1[0].0, b"k10");
         keys.clear();
         assert_eq!(first(0, 1, &keys).0, 0);
     }

@@ -37,6 +37,15 @@ pub fn reload_config() {
     unsafe { pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP) }
 }
 
+/// Whether the library is being loaded from `shared_preload_libraries`, at
+/// postmaster start: the one time shared memory can be requested, static
+/// background workers registered and restart-only settings defined.
+pub fn preloading() -> bool {
+    // SAFETY: a plain read of a backend-global flag PostgreSQL sets while it
+    // processes shared_preload_libraries; no preconditions.
+    unsafe { pg_sys::process_shared_preload_libraries_in_progress }
+}
+
 /// The database this backend is connected to.
 pub fn database_oid() -> pg_sys::Oid {
     // SAFETY: a plain read of a backend-local global, set once at connection

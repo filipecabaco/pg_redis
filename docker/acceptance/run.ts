@@ -367,6 +367,10 @@ for (const half of Object.keys(HALVES) as Half[]) {
 			`  (${counts.skip} skipped)${r.aborted ? "  ABORTED" : ""}`;
 		console.log(`  ${line}`);
 		if (r.aborted) console.log(`      ${r.aborted}`);
+		// Which tests failed, by name: the baseline holds only those passing.
+		for (const [test, outcome] of r.tests) {
+			if (outcome === "err") console.log(`      ✗ ${test}`);
+		}
 		summary.push(`${half.padEnd(8)} ${line}`);
 	}
 }

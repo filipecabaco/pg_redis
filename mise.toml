@@ -102,7 +102,7 @@ run = [
 
 [tasks.acceptance]
 description = "Run Redis's own Tcl test suite against pg_redis (both halves), gated on the baseline"
-env = { PG_REDIS_PASSWORD = "" }
+env = { PG_REDIS_PASSWORD = "", PG_REDIS_DEFAULT_DB = "0" }
 run = [
   "docker compose -f docker-compose.yml -f docker-compose.noports.yml --profile acceptance up --build --abort-on-container-exit --exit-code-from acceptance",
   "docker compose --profile acceptance down -v",
@@ -110,7 +110,7 @@ run = [
 
 [tasks.acceptance-update]
 description = "Re-record the acceptance baseline after tests start passing (or a regression is accepted)"
-env = { PG_REDIS_PASSWORD = "" }
+env = { PG_REDIS_PASSWORD = "", PG_REDIS_DEFAULT_DB = "0" }
 run = [
   "docker compose -f docker-compose.yml -f docker-compose.noports.yml --profile acceptance run --build --rm -v $PWD/docker/acceptance:/opt/redis/acceptance acceptance bun run acceptance/run.ts --update-baseline",
   "docker compose --profile acceptance down -v",

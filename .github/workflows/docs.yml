@@ -55,7 +55,9 @@ jobs:
           cd /tmp/snowglobe
           grep "linux_arm64.tar.gz" SHA256SUMS | sha256sum -c -
           tar -xzf "snowglobe_${SNOWGLOBE_VERSION}_linux_arm64.tar.gz"
-          sudo install snowglobe /usr/local/bin/snowglobe
+          # The archive holds a directory named after itself, binary inside.
+          sudo install "snowglobe_${SNOWGLOBE_VERSION}_linux_arm64/snowglobe" /usr/local/bin/snowglobe
+          snowglobe --version
 
       - name: Build the extension image (arm64)
         run: docker build -t pg_redis:alpine-arm64 .

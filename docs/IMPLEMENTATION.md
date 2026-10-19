@@ -39,28 +39,33 @@ never reach the dispatcher and cost nothing but the parse.
 ### Command path
 
 ```
-socket ─> resp::parse ─> Command::parse ─┬─> execute_mem   (shared memory, db 0–7 in memory mode)
-                                         └─> execute_spi   (SPI + SQL, everything else)
+socket ─> resp::parse ─> Command::parse ─┬─> execute_mem ─┐  (memory policies)
+                                         └─> execute_spi ─┤  (table policies)
+                                                          └─> store::run ─> MemStore | SqlStore
 ```
 
 `Command` is a single enum covering every supported command. Parsing is
 separated from execution so the parser can be unit-tested without a PostgreSQL
 instance, and so size limits can be checked *before* anything is written — see
-[Limits](#7-limits).
+[Limits](#7-limits). Both paths hand the command to `store::run`, where each
+data command is written once against the database's backend; see
+[Commands written once](STORAGE.md#commands-written-once-phase-5).
 
 ### The 16 databases
 
-Databases mirror Redis's model and split into two contiguous halves.
+Databases mirror Redis's model. Each has a storage policy — `memory`,
+`memory+snapshot` or `logged` — changeable while the server runs,
+data and all ([Storage policies](STORAGE.md)). The defaults are two contiguous
+halves:
 
-| DB | Name | Backend | Durability |
+| DB | Name | Default backend | Durability |
 |---|---|---|---|
-| 0–7 | `cache` (0) | shared memory, or UNLOGGED tables | Lost on restart |
+| 0–7 | `cache` (0) | shared memory | Lost on restart |
 | 8–15 | `durable` (8) | WAL-logged tables | Survives crashes |
 
 `SELECT` accepts the numbers and the two names. `redis.default_db` (default 0)
-chooses where new connections start. The halves are contiguous rather than
-odd/even because `execute_mem` indexes the shared-memory tables with the raw
-database number; a unit test pins that correspondence.
+chooses where new connections start. A database in memory occupies one of the
+sixteen shared-memory slots — not necessarily the slot of its own number.
 
 ### Batching and transaction isolation
 
@@ -80,39 +85,35 @@ executed through SPI per command, which for a plain `SET` cost more than the
 
 ## 2. Storage backends
 
-The ephemeral half has two, chosen by `redis.storage_mode` (a `postmaster`-scope
-GUC — changing it needs a restart). The durable half is always WAL-logged.
+Two: the shared-memory engine, and WAL-logged tables reached through SPI. A
+database's policy picks one — `memory` and `memory+snapshot` the first,
+`logged` the second ([Storage policies](STORAGE.md)).
 
-| | `memory` (default) | `auto` | durable (8–15) |
-|---|---|---|---|
-| Storage for db 0–7 | Shared-memory HTAB per data type | UNLOGGED tables | — |
-| Transaction | None | `BEGIN`/`COMMIT` per batch | per batch |
-| SPI overhead | None | Yes | Yes |
-| WAL | No | No | Yes |
-| Survives crash | No | No (UNLOGGED, truncated) | Yes |
-| Replication | No | No | Yes |
-| SQL-visible | No — `SELECT * FROM redis.kv_0` returns nothing | Yes | Yes |
-| Max keys | `redis.mem_max_entries` per type per db | Unlimited (disk) | Unlimited |
-| Shared memory at the default | ~58 MiB, reserved at start | None | None |
-| Max value | 64 KiB | Unlimited (TOAST) | Unlimited |
-| Max key | 512 bytes | Unlimited | Unlimited |
-| Max hash field / set member | 512 bytes | Unlimited | Unlimited |
+| | `memory` (default 0–7) | `logged` (default 8–15) |
+|---|---|---|
+| Storage | A shared-memory dictionary per database | WAL-logged tables |
+| Transaction | None | `BEGIN`/`COMMIT` per batch |
+| SPI overhead | None | Yes |
+| WAL | No (`memory+snapshot`: the snapshot) | Yes |
+| Survives crash | No (`memory+snapshot`: to the last snapshot) | Yes |
+| Replication | No | Yes |
+| SQL-visible | No — `SELECT * FROM redis.kv_0` returns nothing | Yes |
+| Max data | `redis.maxmemory` (256 MB), backed as it fills | Disk |
+| Max value | 512 MiB, as Redis | ~1 GB (TOAST) |
 
 ### SQL schema
 
-Both SPI backends use the same shape in the `redis` schema, one table per data
-type per database; 0–7 `UNLOGGED`, 8–15 logged.
+The tables live in the `redis` schema, one per data type per database, every
+one WAL-logged. A database's tables stay empty while its data is in memory.
 
 ```sql
 CREATE SCHEMA redis;
 
 -- Key-value (pattern repeats for db 0–15)
-CREATE UNLOGGED TABLE redis.kv_0 (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
-CREATE         TABLE redis.kv_8 (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
+CREATE TABLE redis.kv_0 (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
 
 -- Hash (same pattern)
-CREATE UNLOGGED TABLE redis.hash_0 (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
-CREATE         TABLE redis.hash_8 (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
+CREATE TABLE redis.hash_0 (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
 ```
 
 Every column is `BYTEA`, never `TEXT`. Redis keys, values, fields and members
@@ -137,430 +138,103 @@ sweep; a unit test asserts it exists on all sixteen.
 
 ## 3. The shared-memory backend
 
-All of `src/mem.rs`. Eight databases, ten tables each, and six LWLocks per
-database — one per data type, with each meta table covered by its type's lock,
-plus one for the key directory. So a write to db 0 never blocks a write to db 2,
-and the hash table never blocks the list table.
+`src/memdb` holds the data and `src/shm.rs` the memory it lives in.
+[Storage policies](STORAGE.md#growable-shared-memory-phase-6) has the design;
+this is how it is put together.
 
-Every one of them is taken through `htab::LockGuard`, which releases on the way
-out of scope. There were 226 hand-written acquire/release calls before, and
-twenty-six functions had between two and five release points each — one per way
-out. Missing one is not subtle: the worker wedges on its next command, which is
-what `HINCRBY` on a non-integer field used to do. Two rules the guard does not
-enforce, so they are written down instead:
+### One database, one dictionary
 
-- **The directory's lock is innermost** — see [The key
-  directory](#the-key-directory).
-- **A guard may not be held across a call that takes a lock**, because an
-  LWLock is not re-entrant. `LPUSHX` checking the list exists and then calling
-  `mem_lpush` is the shape that bites; it scopes the check so the guard is gone
-  before the call. `KEYS` does the same before reading the four meta tables.
+A `memdb::Db` is a dictionary from key to `Entry { value, deadline }`, the
+value one of six variants — a string's bytes, a stream's serialised bytes, a
+list, a hash, a set or a sorted set. One key holds one value, so `WRONGTYPE`
+is a match on the variant and replacing a key of another type (`SET` over a
+list) is an ordinary insert.
 
-### Tables and entry layouts
-
-Ten HTABs per database, created with `ShmemInitHash` during
-`shmem_startup_hook`, all `HASH_BLOBS` and `HASH_FIXED_SIZE`.
-
-| Table | Entries | Entry | HTAB key | Size at the default |
-|---|---|---:|---|---:|
-| KV | `mem_max_entries` | `KvEntry` 232 B | 16 B key hash | 16.06 MiB |
-| Key directory | see below | `DirEntry` 32 B | 16 B key hash | 11.03 MiB |
-| Hash | half | `HashEntry` 160 B | 16 B key hash + 16 B field hash | 5.83 MiB |
-| Zset | half | `ZsetEntry` 96 B | 16 B key hash + 16 B member hash | 3.77 MiB |
-| List | half | `ListEntry` 96 B | 16 B hash + 8 B position | 3.77 MiB |
-| Set | half | `SetEntry` 88 B | 16 B key hash + 16 B member hash | 3.55 MiB |
-| Zset meta | half | `ZsetMeta` 120 B | 16 B key hash | 4.56 MiB |
-| List meta | half | `ListMeta` 88 B | 16 B key hash | 3.55 MiB |
-| Set meta | half | `CountMeta` 72 B | 16 B key hash | 3.05 MiB |
-| Hash meta | half | `CountMeta` 72 B | 16 B key hash | 3.05 MiB |
-
-"half" is `mem_max_entries / 2`, floored at 256. Sizes are dynahash's own
-`hash_estimate_size` — the bucket array, the segment directory and the
-per-element header — multiplied across eight databases. That call replaced a
-hand-rolled `× 5/4 + 8 KiB`, which was 20% short: the postmaster refused to
-start the first time a table wanted three times the entries. A unit test pins
-every entry size, because each one is multiplied by `mem_max_entries` across
-eight databases and requested *before* the postmaster starts — growing one
-carelessly turns "slower" into "does not boot".
-
-The meta tables exist so `ZCARD`, `SCARD`, `HLEN`, `LLEN`, `ZPOPMIN`/`ZPOPMAX`
-and `LPUSH`/`RPUSH` are O(1) rather than a scan of the entry table. The set and
-hash tables need nothing per key but a count, so they share one `CountMeta`.
-
-They also hold **the key's own name** — 40 bytes inline, the tail chained into
-that type's existing pool, the way a `KvEntry` holds its key. Nothing else here
-writes a collection's name down: the entry tables key on `(key hash, member)`
-and the directory on a hash alone, so before this `KEYS` and `SCAN` could see
-strings and nothing else while `DBSIZE` counted every type. One entry per key
-per type, so the four meta tables between them name every key that is not a
-string, and `KEYS` is a scan of those four plus the KV table.
-
-The name is written best-effort: it is not the only copy of anything, so a pool
-with no room costs the key its place in `KEYS` and nothing else, with a warning
-logged. Refusing the write instead would have to undo members already stored.
-`reserve_member_chunks` counts the name's chunks alongside the member's, so a
-pool that is not already exhausted has the room.
-
-**A meta entry owns that chain.** Every removal — `remove_count_meta`,
-`remove_meta`, `remove_zset_meta`, and `remove_meta_of` on the `DEL` and
-eviction paths — hands it back before the entry goes. Missing one is not a leak
-that shows up later: the next occupant of that slot inherits a head pointing
-into the free list, and the worker aborts. Which is what it did, once.
-`removing_a_meta_entry_releases_its_name_chain` drives all four against real
-tables; it exists because that bug was found by a crash and fixed without one.
-
-### An entry must not outlive the chunks it names
-
-The rule above is not about meta entries. It is about **dynahash**, and it
-applies to every table here.
-
-A removed element goes on dynahash's own free list holding the bytes it had. The
-next key to land in that slot gets them, and `value_free` reads exactly one
-field before deciding to release: a `value_len` past the inline slot. So an
-entry removed without its chains being cleared arms the *next* write of an
-unrelated key to release chunks it does not own.
-
-`FLUSHDB` broke this for every table at once, and the shape is worth keeping in
-mind because it looks correct. `flush_table` removes every entry and then calls
-`pool_init`, which reformats the whole pool — so not walking the chains
-individually is right, and freeing them one at a time would be wasted work. What
-it missed is that the *entries* still name chunks the reformat has just handed
-back. A later write into a recycled slot released one of those chains a second
-time, which splices the free list onto itself: a cycle, and a `free_count`
-inflated by however many nodes the walk crossed. `pool_alloc` trusts that count.
-
-The symptom is not a corrupt reply. It is a **segfault in a different command,
-on a different connection, some time later** — and because the crashing process
-is a background worker, PostgreSQL takes the whole instance down with it. Two
-things now stand between a mistake and that outcome:
-
-- `flush_table` **zeroes each entry past its key** before removing it. All-zero
-  is what `ShmemInitHash` hands out, so a recycled element is indistinguishable
-  from a fresh one — which is the state every entry path is already written
-  against. Clearing the length and head fields by name would work too, and was
-  the first fix; zeroing is shorter, needs no per-type function, and cannot be
-  out of date when a field is added.
-- `pool_alloc` bounds its walk by the pool's capacity, not only by `free_count`.
-  The count says *whether* to allocate; only the links say where to stop. A
-  short list against a count that disagrees is now a refused write with the free
-  list untouched, which a caller can survive.
-
-`flushing_a_table_leaves_no_entry_naming_freed_chunks` reproduces the recycle
-deterministically — dynahash hands back the element just freed — and asserts the
-free list is walkable, acyclic and the length its count claims.
-
-### The key directory
-
-The five tables that hold data are keyed independently and none of them asks the
-others, which is how one key came to hold a string and a list and a set at once,
-and why only a string could carry an expiry. The directory is the one table that knows
-what a key *is*: `(key hash) → {kind, expires_at}`, one entry per live key.
-
-- `TYPE`, `EXISTS` and `TTL` are one lookup in it, where `TYPE` used to probe
-  five tables under five locks in turn.
-- A write to a key of another kind is refused with `WRONGTYPE`, and the handful
-  of commands Redis lets through — `SET` and the `*STORE` destinations — clear
-  what was there first.
-- It holds every expiry, so a list, set, hash or sorted set can carry a TTL. A
-  string keeps a second copy in its `KvEntry`, which is what the `GET` path
-  reads without taking a second lock; every write of one goes through
-  `kv_write_full_value`, so the two cannot drift.
-- The expiry sweep reads it rather than the KV table, and so reaches every type.
-
-It is sized `mem_max_entries + 4 × half` — every table can fill independently,
-and a member table's worst case is one key per entry — so the directory is never
-what runs out first. A refusal the operator cannot act on is worse than the
-2.5 MiB that sizing costs over one entry per KV slot.
-
-**Lock order: the directory's LWLock is the innermost one.** A path already
-holding a table's lock may take it; nothing may take a table's lock while
-holding it. Every `dir_*` helper acquires and releases it, so callers hold
-nothing extra.
-
-The directory does not store key bytes — a hash is all it holds. That is why
-`KEYS` reads the four meta tables rather than this one: see [Tables and entry
-layouts](#tables-and-entry-layouts). Storing names here instead would have cost
-~22 MB against the metas' 6 MB, because the directory is sized for every table
-filling independently and a third of its entries are strings, whose names the KV
-table already holds.
-
-### Key hashing
-
-**Every table indexes on a 128-bit keyed SipHash-2-4 of the Redis key**, not on
-the key bytes, and the hash, set and zset tables hash their member the same way
-— their HTAB key is 32 bytes, `(key hash, member hash)`. The key material is
-drawn from `pg_strong_random` once per postmaster, so a client cannot craft two
-keys that collide and merge their contents. Shared memory does not survive a
-restart, so neither does the key, and it never has to match anything on disk.
-
-Nothing keys on the Redis key bytes. A full copy of the key in each entry would
-dominate a collection — 512 bytes against a `SetEntry`'s 88, repeated for every
-member — and the tables never need the bytes: every access is a comparison
-against a key the caller already holds.
-
-The bytes an entry *does* keep are the ones a client asks for back: the KV
-table's key, because `KEYS`, `SCAN` and `RANDOMKEY` return real keys, and the
-member of a hash, set or zset, because `HGETALL`, `SMEMBERS`, `SPOP` and
-`ZRANGE` do. Both are stored the same way — an inline prefix and a pooled tail,
-described below.
-
-No table is `HASH_STRINGS`, and none may become one: dynahash compares string
-keys with `strncmp`, which makes two keys agreeing up to their first NUL byte
-the same key.
-
-### How a KV entry stores its key
-
-`KvEntry` keys on the hash and keeps the key bytes alongside it, laid out the
-way a value is — an inline prefix with the tail chained through the same chunk
-pool:
-
-```
-KvEntry  = key hash 16 | key_inline 128 | value_inline 64 | expires_at 8
-                       | key_len 4 | key_overflow 4 | value_len 4 | overflow 4
-```
-
-`INLINE_KEY_LEN` is 128, and the reason is the pool rather than the entry. Eight
-bytes of `KvEntry` is 640 KiB of shared memory (8192 entries × 8 databases ×
-5/4), so the prefix costs 10 MiB. At 64 it would cost 5 MiB — but a key of
-65–128 bytes would then take a chunk, and `myapp:prod:session:<uuid>` is 60 to
-90 bytes, so a full table of entirely ordinary keys would claim every chunk in
-the pool and leave nothing for any value past its own 64-byte inline slot. At
-128 the same cliff sits at 129 bytes, which conventional keys do not reach.
-
-A longer key still works, at one chunk per 64 bytes over:
-
-| Key length | Chunks per key | Keys before the pool is empty |
-|---:|---:|---:|
-| ≤ 128 bytes | 0 | 8,192 (the table's own limit) |
-| 129–192 | 1 | 8,192, with no pool left for values |
-| 193–256 | 2 | 4,096 |
-| 449–512 | 6 | 1,365 |
-
-### How a collection entry stores its member
-
-The same shape, at a different size:
-
-```
-SetEntry  = key hash 16 | member hash 16 | member_inline 48 | member_len 4 | member_overflow 4
-ZsetEntry = the same, plus score 8
-HashEntry = key hash 16 | field hash 16 | field_inline 48 | value_inline 64
-                        | field_len 4 | field_overflow 4 | value_len 4 | overflow 4
-```
-
-`INLINE_MEMBER_LEN` is 48, not the key's 128, and the arithmetic behind it is
-different in both directions. These tables hold `mem_max_entries / 2` entries,
-so eight bytes of entry costs 320 KiB rather than the KV table's 640 KiB — but
-the cliff that forced the key prefix up to 128 does not exist here. That cliff
-was keys competing with values for one slab: a key past its prefix takes a chunk
-the values need. The set and zset pools hold *only* members and carry one chunk
-per entry slot, so a table entirely full of members of 49–112 bytes still fits —
-each takes exactly the chunk its own entry paid for. The hash pool carries two
-chunks per entry slot, so the same table of fields still leaves one chunk each
-for the values. 48 covers what members are: a UUID is 36 bytes.
-
-The set and zset tables had no pool before this; they have one each rather than
-one shared, because those two tables are covered by *different* LWLocks and a
-shared free list would have two writers that never exclude each other.
-
-### Lookups verify the key
-
-Because an entry holds the bytes it hashed, `kv_find` and `kv_enter` — and
-`member_find` and `member_enter` for the three collection tables — compare what
-is stored against what was asked for. A mismatch reads as "absent" and refuses
-the write, so a hash collision cannot return or overwrite another key's value or
-another member's. It has its own error rather than an OOM, because raising
-`mem_max_entries` is the obvious response to an OOM and does nothing for a
-collision:
-
-```
-ERR key or member hash collides with a different one already stored; rename it, or use SELECT durable.
-```
-
-The cost is a length test plus, at most, a compare of the inline prefix against
-bytes the lookup has already pulled into cache; only a key or member longer than
-its prefix and matching on both goes as far as walking the pool. Unreachable in
-practice at `mem_max_entries` entries per database — it exists because the
-alternative is to write over what is already there, silently. The collection
-tables could not do this while the member *was* their HTAB key: two colliding
-members were one entry, with nowhere to put the loser.
-
-### The chunk pool
-
-One slab per KV, hash, list, set and zset table per database — 40 in all —
-carved out of a single `ShmemInitStruct` allocation and indexed by stride.
-
-```
-[ValPool header][next: u32 × capacity][data: u8 × capacity × 64]
-```
-
-`capacity` is `mem_max_entries` chunks of `CHUNK_LEN` = 64 bytes for the three
-pools values spill into, and half that — one chunk per entry slot — for the two
-that hold members and nothing else. The `next` array doubles as the free list
-*and* as the chain of a stored value, so a chunk is on exactly one of the two at
-any moment and no separate bitmap has to be kept in step. Allocating *n* chunks
-takes a prefix of the free list — one pointer moved, not *n*. Freeing returns a
-chain in one splice.
-
-A byte string of length *n* occupies `ceil((n - inline) / 64)` chunks, where
-`inline` is 64 for a value, 128 for a KV key and 48 for a member. Anything
-shorter than its inline slot costs no chunk at all — which covers most of what a
-cache holds; `redis-benchmark` writes 3-byte values.
-
-**Chunk lifecycle is the easiest thing here to get wrong.** The chain head lives
-in the entry, so the release must happen while the entry is still there. Every
-removal goes through `remove_valued` (or `list_remove_at` and `zset_remove_at`,
-its bare-HTAB twins). A `KvEntry` owns *two* chains, so its `kv_free` releases
-the value chain and the key chain; a `HashEntry` owns two as well, its value's
-and its field's. A path that calls `hash_search(HASH_REMOVE)` on any of the five
-tables directly leaks silently until the pool runs dry.
-
-### Value and key size limits
-
-```
-max value = min(64 KiB, 64 + (redis.mem_max_entries / 8) × 64 bytes)
-```
-
-which is **65,536 bytes** at the default, where the two bounds meet:
-
-- **An eighth of the pool.** A pool is shared by every value in its table, so one
-  value must not be able to take all of it.
-- **64 KiB outright.** Every read copies the value out of shared memory while the
-  table's LWLock is held, so an unbounded value would hold a whole database still
-  for the length of one memcpy. That ceiling holds however large the pool is
-  configured, so raising `mem_max_entries` buys capacity, not longer values.
-
-Keys, hash fields and set members are capped at 512 bytes for the same kind of
-reason — how much of the shared pool one of them may take. At the cap a member
-is eight chunks of a pool holding nothing but members, so it can never claim
-more of it than a value may claim of its own.
-
-Anything over a limit is **rejected, never truncated**, and the check runs
-before the command executes so a refusal never leaves a partial write behind:
-
-```
-ERR key exceeds redis.storage_mode='memory' limit of 512 bytes (use SELECT durable for unbounded values)
-ERR hash field or set member exceeds redis.storage_mode='memory' limit of 512 bytes (use SELECT durable for unbounded values)
-ERR value exceeds redis.storage_mode='memory' limit of 65536 bytes (use SELECT durable for unbounded values)
-```
-
-Truncation is the one failure mode worse than an error, and it is what the fixed
-member arrays actually did. Storage was never the problem — the composite key
-NUL-padded the member and dynahash compared all 128 bytes, so `SADD s "a\0one"`
-and `SADD s "a\0two"` were two entries. The *readback* truncated: five sites
-scanned the array for its first NUL, so `SMEMBERS` returned `"a"` twice, and
-`SPOP` returned a string that was not in the set. `HGETALL` and `ZRANGE` did the
-same to fields and zset members. Length-prefixing removed the failure mode along
-with the array; db 8 never had it, which is why the end-to-end suite could not
-see it from the durable half.
-
-### When a table fills
-
-`redis.maxmemory_policy`, named after Redis's setting:
-
-| Policy | Behaviour |
+| Type | Structure |
 |---|---|
-| `noeviction` (default, as in Redis) | The write is refused with `OOM command not allowed when used memory > 'maxmemory'`. Nothing already stored is lost, and a multi-key write stores nothing at all — see below. |
-| `allkeys-random` | Entries are evicted to make room. Collections go **whole** — never half-present — and the key being written is never chosen, so a single key larger than its own table still reports OOM. |
-| `volatile-ttl` | Only keys carrying an expiry, soonest first. Falls back to refusing if none do. |
+| Keyspace, hash, set | `dict::Dict`: entries in a dense `Vec`, found through a hashbrown `HashTable` of positions. Dense storage gives a random entry in O(1) — `RANDOMKEY`, `SRANDMEMBER`, `SPOP` and eviction sampling — and removal swaps the last entry into the hole. Keys hash with SipHash under a per-postmaster random key, so a client cannot aim keys at one bucket. |
+| List | `deque::Deque`: two stacks back to back, the head reversed. Pushes and pops at either end are O(1) amortised, indexing is O(1). |
+| Sorted set | `zset::ZSet`: a `Dict` from member to score beside the members in `(score, member)` order, kept as sorted blocks of up to 256. An insert moves at most one block; a rank or a score bound costs a walk over the blocks plus a binary search in one. |
 
-Expired entries are reclaimed before any live key is considered, under every
-policy. Eviction costs one `hash_seq_search`, so it frees `EVICT_BATCH` = 64
-entries at a time and amortises the scan over the next 64 inserts. Under
-`noeviction` it returns immediately without scanning anything.
+Every collection is generic over its allocator (`allocator_api2`). The server
+gives them `shm::Shm`; the unit tests the ordinary heap, which is how the
+whole engine — down to full command lines through `store::run` — is tested
+without PostgreSQL.
 
-A full table has never been able to take the server down: every insert uses
-`HASH_ENTER_NULL`, never `HASH_ENTER`. On a `HASH_FIXED_SIZE` table dynahash
-answers a full table by raising `out of shared memory`, which unwinds by
-longjmp — past the Rust error handling that looks like it covers it — and kills
-the worker.
+### The arena
 
-The **pool** can run dry before the entries do. That is reported as the same
-OOM, and `reserve_chunks` (`kv_reserve` for the KV table, which must budget for
-the key as well as the value) asks eviction for room the same way. It has to run
-*before* the entry exists, because eviction may remove any entry in the table
-including the one about to be written.
+`shm::startup` takes one region of the main shared segment: a header (the
+hash key, the limit, the use counters, one LWLock per database and one for
+the allocator, and the sixteen `Db`s) followed by the heap, which talc
+manages. `Shm` is a zero-sized handle: allocating takes the allocator lock,
+asks talc, and counts the bytes.
 
-**A multi-key write is priced before any of it runs.** `MSET`, `SADD`,
-`HSET`, `ZADD` and the pushes ask `mem_room_for_*` whether the table and its
-pool can take the whole command; a table that cannot refuses it outright, where
-storing the first few keys and then reporting OOM is what Redis does not do.
-Whether a *single* key fits is still only knowable at the insert, and a
-single-key command has nothing to be partial about. The check costs one lookup
-per key, so it runs only for commands carrying more than one, and only under
-`noeviction` — under the other policies the insert path makes room as it goes
-and a refusal here would reject a command that would have succeeded. It counts
-only the keys actually absent, so a full table still takes an `MSET` that
-overwrites.
+The region is `redis.maxmemory` plus headroom, reserved when PostgreSQL
+starts. The operating system backs a page of it only when it is first
+written, so the arena costs what the data does. Freed memory goes back to
+talc for the next allocation, not to the operating system — resident size
+stays at its high-water mark, as Redis's does under jemalloc. With
+`huge_pages` in use, the whole region is huge pages from the start.
 
-A refused write records *why* in a single thread-local `Refusal`, read once per
-command by `execute_mem` and turned into either the OOM reply or the collision
-one. Threading a result out through all 68 `mem_*` entry points — whose return
-types are `bool`, `i64`, `Result<i64, String>`, `Vec<..>` and more — was the
-alternative. A worker dispatches one command at a time on one thread, so the
-flag cannot cross commands.
+### What makes it sound
+
+The collections hold plain pointers into the arena, which is safe only
+because of three things `shm.rs` guarantees, and the only `unsafe` in the
+engine is there:
+
+- **One address everywhere.** The main segment is mapped by the postmaster
+  before it forks, so every process sees it at the same address. The header
+  records where it was built and `shm::attach` refuses to start a worker that
+  finds it anywhere else.
+- **One holder at a time.** A database is reached only through
+  `shm::with_db`, under its exclusive LWLock, so the `&mut Db` it hands out is
+  the only reference in any process. A thread-local flag refuses a nested
+  `with_db` — an LWLock is not re-entrant, and the second acquire would wait
+  forever. The allocator's lock is innermost: nothing holding it takes
+  another.
+- **Failure unwinds.** When talc has no block to give, `Shm` unwinds with an
+  `OutOfMemory` payload rather than returning an error, which the
+  collections' infallible methods would turn into an abort of the whole
+  backend. `with_db` catches the unwind and the command answers `OOM`. The
+  collections are panic-safe, so a write cut short leaves the database
+  consistent, and the lock is released on the way out like any other.
+
+### One lock per command
+
+`Command::execute_mem` checks the limit, then runs the type check and the
+command inside one `with_db`. Nothing another worker does can land between
+the type check and the write, or between the two halves of an
+`LMOVE`. What `store::run` does not know runs after the lock is released —
+composites re-enter `execute_mem` once per sub-command.
 
 ### Expiry
 
-`KvEntry` carries `expires_at` in microseconds since the epoch, 0 for none. Reads
-treat an expired entry as absent and delete it lazily; a background sweep also
-walks each database once a second and removes what it finds, returning the
-chunks. Only the KV table has expiry — Redis's TTLs are per key, and a
-collection's key lives in its meta.
+An entry's deadline is microseconds since the epoch, 0 for none. Any access
+to a key past its deadline removes it on the way (`Db::entry`), and the
+worker's once-a-second sweep removes the rest, reporting their names when
+keyspace notifications or tracking want them.
 
-### Lists
+### The limit and eviction
 
-List elements are keyed on `(key hash, position)` with positions spaced
-`LIST_POS_STEP` = 1024 apart, so `LPUSH` and `RPUSH` are O(1) — they take the
-next position outside the current range from the meta.
+Before a write that could grow memory — every write but the removals, Redis's
+`denyoom` — `shm::make_room` compares the arena's use with the limit. Under
+it, the command runs, and may overshoot into the headroom. Over it:
 
-Readers walk positions as `min_pos + i * LIST_POS_STEP`, so an in-place removal
-leaves a hole that silently truncates the list at the first gap while the count
-still reports the full length. `LREM`, `LINSERT` and `LTRIM` therefore go
-through a read-modify-write that renumbers the whole list from a fresh base —
-O(n) on commands that were already O(n).
-
-### Sizing `redis.mem_max_entries`
-
-This one number scales the whole reservation, so it is the only knob that
-decides how much memory the extension takes. Measured as `SHOW
-shared_memory_size` on PostgreSQL 17 at otherwise default settings:
-
-| `redis.mem_max_entries` | `shared_memory_size` |
+| `redis.maxmemory_policy` | What happens |
 |---|---|
-| 256 | 215 MB |
-| 4,096 | 248 MB |
-| **8,192 (default)** | **286 MB** |
-| 10,240 | 306 MB |
-| 12,288 | 325 MB |
-| 16,384 | 360 MB |
-| 32,768 | 510 MB |
+| `noeviction` (default, as in Redis) | The write is refused with `OOM command not allowed when used memory > 'maxmemory'`. Reads and removals still run. |
+| `allkeys-random` | Random keys are evicted, collections whole, across the memory databases until use is under the limit. |
+| `volatile-ttl` | Of a sample of keys, the one with a deadline that comes soonest is evicted, until use is under the limit or no key has a deadline. |
 
-PostgreSQL's own share is roughly the 214 MB floor; the rest is the extension.
-It also sets the size of each pool, and with it the value and member caps above.
-
-The default was halved from 16,384 when the key limit grew to 512 bytes, and
-four rounds of shrinking the entries have not paid that back: the last two
-freed 28 MB and 11 MB, where doubling the setting costs 74 MB. Raising it is
-supported — it buys pool capacity as well as key capacity — but it is a
-memory-budget decision, not something the entry layout funds.
-
-### How the reservation got here
-
-| | `shared_memory_size` | What changed |
-|---|---|---|
-| Composite key hashing | 587 → 413 MB | Hash, set, zset and list entries key on a 128-bit hash instead of carrying a 512-byte copy of the Redis key |
-| Chunked value pool | 413 → 308 MB | Three fixed overflow tables became one 64-byte-chunk slab per table; the value cap went 512 B → 64 KiB |
-| KV key hashing | 308 → 280 MB | The last table storing keys verbatim; `KvEntry` 592 → 232 bytes |
-| Member hashing | 280 → 269 MB | The five fixed member arrays: `ZsetMeta` 304 → 72 bytes, `HashEntry` 216 → 160, `SetEntry` 144 → 88, `ZsetEntry` 152 → 96, against 4.25 MiB of new pools for the set and zset tables |
-| The key directory | 269 → 280 MB | Two tables added — the directory at 11.03 MiB and a hash meta at 1.53 MiB — against about 2 MiB the exact `hash_estimate_size` reclaimed from the old 5/4 guess |
-| Collection names | 280 → **286 MB** | 40 bytes of name in each of the four meta entries, so `KEYS` can see a key that is not a string. In the directory instead it would have been ~22 MB: that table is sized for 24,576 keys per database against the metas' 16,384, and ~8,192 of those are strings whose names the KV table already holds |
+`CONFIG SET maxmemory` changes the limit for every worker, never past what
+the arena was sized for; `CONFIG SET maxmemory-policy` changes the policy.
 
 ---
 
 ## 4. Pub/Sub
 
-Pub/sub is independent of `storage_mode` and always allocated — it needs
-`shared_preload_libraries`, not memory mode.
+Pub/sub is independent of storage policies and always allocated — it needs
+only `shared_preload_libraries`.
 
 Each subscribing connection claims one of 256 slots. A slot holds a ring buffer
 of 256 messages and the connection's subscriptions (16 channels and 16 patterns).
@@ -655,7 +329,17 @@ not have to. **That direction is safe; the reverse would not be.**
 
 ## 6. The RESP layer
 
-RESP2, with `HELLO 3` negotiating RESP3 push frames for pub/sub.
+RESP2 by default; `HELLO 3` switches a connection to RESP3.
+
+RESP3 changes how a reply is framed, not what it holds, so commands keep
+answering in one shape and `resp3.rs` reframes the reply for a RESP3 client,
+command by command, following Redis 7.2's reply code. `HGETALL` and
+`CONFIG GET` become maps; `SMEMBERS`, `SINTER`, `SUNION`, `SDIFF` and
+`SPOP` with a count become sets; scores become doubles, and `WITHSCORES`
+lists become `[member, score]` pairs; `XREAD` becomes a map from stream to
+entries; `INFO` and `CLIENT LIST` become verbatim text; every nil is the one
+RESP3 null. Pub/sub messages are push frames. A command the table does not
+name is framed the same in both protocols.
 
 | Bound | Value | Why |
 |---|---|---|
@@ -673,56 +357,120 @@ Error replies carry their own code when they have one. `write_error` prefixes
 `ERR` only for messages that do not already start with a code from
 `ERROR_CODES`, so an OOM goes out as `-OOM ...` — which is what clients match on.
 
+### Scripting
+
+`EVAL` and `FCALL` run Lua 5.1 on the dispatcher, whole, so a script is atomic
+against every other command its worker serves. `redis.call` builds an
+ordinary command and routes it like a composite command's sub-commands, so one
+script reads and writes both storage halves. The environment is Redis's:
+`cjson`, `cmsgpack`, `struct` and `bit` are Redis's own C sources, compiled by
+`build.rs` from `vendor/redis-lua/`; replies convert to Lua and back by Redis's
+rules; errors carry the script and line as Redis reports them. Redis's Lua is
+patched to make tables read-only; here every protected table is an empty proxy
+whose metatable forwards reads and refuses writes, so the same "Attempt to
+modify a readonly table" comes back without patching Lua.
+
+Each worker has its own Lua states, so what must be shared lives in SQL: the
+script cache in `redis.scripts` (unlogged — it is a cache, as in Redis) and the
+function libraries in `redis.functions` (logged — Redis persists them in its
+RDB). A change bumps a generation counter in shared memory once its
+transaction commits, and each worker rebuilds its copy when it sees the
+counter move. A script that runs past `busy-reply-threshold` makes every other
+client get `BUSY`, on every worker, until it ends or `SCRIPT KILL` /
+`FUNCTION KILL` stops it.
+
+### Known differences from Redis
+
+- **Atomicity is per worker.** A script, a `MULTI`, or a composite command
+  holds its own dispatcher; on the memory half its sub-commands take their own
+  locks, so another worker's commands can interleave with them. Redis is one
+  thread, so nothing interleaves.
+- **Blocked clients are served before the writer replies, within a bound.**
+  Redis serves the clients a write unblocks inside that write. Here they live
+  on other threads and workers, so a write that touches a key someone is
+  blocked on waits — up to 500 ms — until each of them has tried against it,
+  and a served client that moves an element does the same for its
+  destination. Chains of `BLMOVE`s, and cycles of them, complete before the
+  original `RPUSH` returns, as in Redis; a blocked client stuck for longer
+  than the bound is left to finish on its own. Writes made inside a script do
+  not wait.
+- **No ACL users, replicas or cluster mode.** `ACL`, `WAIT`, `REPLICAOF` and
+  `CLUSTER` answer as a single-user, stand-alone server would.
+- **Client tracking keeps its table in shared memory, 16,384 (key, client)
+  pairs across every client.** Past that — or past `tracking-table-max-keys`
+  when set lower — a tracked key picked at random is invalidated to make
+  room, as Redis does at its own limit. Keys longer than 128 bytes are
+  tracked by hash only; when one is picked to make room, the client holding
+  it gets a flush (the "every key" invalidation) instead of the key's name.
+  A RESP3 client that invalidations are redirected to receives them as push
+  messages with no subscription of its own; the connection that sets up the
+  redirect hands it a pub/sub slot to receive them on.
+- **Eviction is silent.** A key evicted under `redis.maxmemory_policy` sends
+  no `evicted` notification and no client-tracking invalidation. Keyspace
+  notifications otherwise follow `notify-keyspace-events` event for
+  event, `expired` included for both lazy and background expiry.
+- **No access clock and no dirty counter.** `OBJECT IDLETIME` and `OBJECT
+  FREQ` answer nil, because keeping a last-access time would turn every read
+  on the durable half into a write; `rdb_changes_since_last_save` stays 0.
+  `SAVE`, `BGSAVE` and `LASTSAVE` act on `memory+snapshot` databases' snapshots
+  ([Storage policies](STORAGE.md#snapshots-phase-4)).
+- **Small hashes and sets keep insertion order only until a removal.** Redis
+  returns a listpack-encoded hash's fields — and a small set's members — in
+  the order they were added, and keeps that order across deletions. The
+  memory half keeps insertion order too, but a removal moves the last entry
+  into the hole; the durable half returns the table's order. Redis documents
+  both as unordered, but a client can observe the difference.
+
 ---
 
 ## 7. Limits
 
-Everything the memory-mode backend refuses, in one place. The durable half
-(8–15) has none of them and is bounded only by disk; `auto` has none of the
-shared-memory ones.
+Everything pg_redis bounds that Redis does not, in one place.
 
 | | Limit | Where it comes from |
 |---|---|---|
-| Key | 512 bytes | Share of the chunk pool |
-| Value | 64 KiB | An eighth of the pool, capped by the copy-under-lock ceiling |
-| Hash field / set member | 512 bytes | Share of the chunk pool |
-| Keys per type per database | `redis.mem_max_entries` | Fixed-size HTAB |
-| Channel / pattern | 255 bytes | Fixed slot |
+| Memory-mode data | `redis.maxmemory` | The arena, sized at start ([§3](#the-limit-and-eviction)) |
+| Channel / pattern | 255 bytes | Fixed pub/sub slot |
 | Pub/sub payload | 512 bytes | Fixed ring slot |
 | Bulk string on the wire | 512 MiB | RESP parser, matches Redis |
 
-Redis caps a string at 512 MiB and places no limit at all on key or field
-length. pg_redis honours the protocol limit at the parser, so **the durable half
-matches Redis** — values there are bounded only by PostgreSQL's ~1 GB per-field
-TOAST limit. The memory-mode limits are lower because shared memory is a
-fixed-size region sized at postmaster start, so nothing in it can grow on
-demand. That is a property of the backend, not of the protocol: switch the
-database to `auto`, or use `SELECT durable`, and the same command is stored
-exactly as Redis would store it.
+Keys, fields, members and values are as long as Redis allows on both halves:
+512 MiB a string, at the parser. The durable half is otherwise bounded by
+disk, and by PostgreSQL's ~1 GB per-field TOAST limit.
 
 ---
 
 ## 8. Performance
 
-Requests/second on Docker, Apple M-series, `redis-benchmark -n 50000 -c 200`
-against the default database.
+Requests per second, higher is better. `redis-benchmark`, 50 clients, 64-byte
+values over 100,000 random keys, median of 5 runs. Each server runs alone on the
+same 4 pinned CPUs with the load generator on 6 others, Docker on an Apple M5 Pro,
+PostgreSQL 17 with `redis.workers=4`. `mise run bench-suite` reproduces it and
+writes the full report, value sizes, client counts, pipelining and a memtier mix
+included, to `docker/bench/results/`.
 
-| Command | Redis 7 | memory | SPI/unlogged | SPI/logged |
-|---------|--------:|-------:|-------------:|-----------:|
-| PING    | 234,000 | 112,000 | 113,000 | 103,000 |
-| GET     | 243,000 | 106,000 |  85,000 |  92,000 |
-| SET     | 224,000 | 103,000 |  22,000 |  12,000 |
-| INCR    | 253,000 | 116,000 |  32,000 |  14,000 |
-| HSET    | 227,000 |  83,000 |  26,000 |  13,000 |
-| ZADD    | 185,000 | 118,000 |  15,000 |   7,000 |
-| SADD    | 194,000 |  82,000 |  71,000 |  66,000 |
-| SPOP    | 183,000 | 116,000 |  51,000 |  64,000 |
-| ZPOPMIN | 183,000 | 118,000 |  48,000 |  47,000 |
+| Command | Redis 7.2 | Redis 7.2, AOF everysec | memory | memory+snapshot | logged |
+|---------|----------:|------------------------:|-------:|----------------:|-------:|
+| SET     | 225,734 | 219,539 | 182,315 | 184,843 |   6,374 |
+| GET     | 229,885 | 227,273 | 187,970 | 188,501 | 121,065 |
+| INCR    | 228,311 | 223,714 | 187,617 | 188,324 |   4,609 |
+| LPUSH   | 217,865 | 211,640 | 186,916 | 187,793 |   3,004 |
+| LPOP    | 208,117 | 215,750 | 187,793 | 189,394 |   1,323 |
+| SADD    | 226,501 | 226,244 | 182,482 | 186,741 |   8,486 |
+| SPOP    | 228,311 | 227,790 | 192,123 | 190,840 |  18,018 |
+| HSET    | 225,989 | 221,484 | 179,211 | 178,094 |   5,890 |
+| ZADD    | 226,757 | 216,920 | 175,593 | 175,439 |   6,368 |
+| ZPOPMIN | 227,015 | 229,095 | 192,493 | 191,571 |   3,308 |
+| MSET    | 196,657 | 146,199 | 100,959 | 103,520 |   3,391 |
+| memtier 1:10, 256 B | 360,804 | 347,290 | 245,948 | 241,851 | 14,581 |
 
-`redis-benchmark` writes 3-byte values, which never leave the 64-byte inline
-slot — so the table above says nothing about the chunk pool.
-`mise run bench-value-sizes` sweeps 3/63/64/65/200/512/4096/65536 bytes for
-that. `mise run bench-high-write` (8 workers, `batch_size=256`) spreads
+`logged` writes commit to the WAL, so they measure the disk more than this
+code: on Docker Desktop the same `SET` measured 6,374 and 15,309 per second in
+two groups of one run. Compare `logged` writes across runs only by their order
+of magnitude.
+
+`redis-benchmark` writes 3-byte values; `mise run bench-value-sizes` sweeps
+3/63/64/65/200/512/4096/65536 bytes for larger ones. `mise run bench-high-write` (8 workers, `batch_size=256`) spreads
 connections across more dispatchers.
 
 ### Pub/Sub
@@ -763,10 +511,11 @@ afterwards.
 
 ### Benchmarking without fooling yourself
 
-- **Point the benchmark at db 0 with `storage_mode=memory`.** The compose default
-  is `redis.default_db=8`, the WAL-logged half — a benchmark that forgets this
+- **Point the benchmark at db 0.** The compose default is
+  `redis.default_db=8`, the WAL-logged half — a benchmark that forgets this
   measures fsync and reports ~500 requests/second for everything.
-  `bench-value-sizes` and `bench-report` set both; `bench` does not, by design.
+  `bench-value-sizes` and `bench-report` set it; `bench` does not, by design.
+  `bench-suite` names each policy's database explicitly.
 - **`redis-benchmark` never clears `mylist`.** Its `lpush`, `rpush` and `lrange`
   tests build the list up over the whole run, and `-n 20000` is past what a list
   table holds at the default, so the run ends in the OOM the server is supposed
@@ -795,54 +544,39 @@ better than the absolute numbers. `mise run bench-report` runs it locally.
 
 ## 9. Testing
 
-Three layers covering different code. Running one is not running the others.
+Layers covering different code. Running one is not running the others.
 
 | Layer | Command | What it actually covers |
 |---|---|---|
 | Unit | `mise run test-unit` | Pure functions: parsing, key layout, limits, SipHash, the pool — no PostgreSQL |
 | pgrx | `mise run test-pg` | **The SPI path only** — never the shared-memory backend |
-| End-to-end | `mise run e2e` | Everything, in whichever storage mode the server runs |
+| End-to-end | `mise run e2e` | Everything: databases 0–7 in memory, 8–15 in tables, and moves between them |
 | Parity | `mise run parity` | Every reply, diffed against a real Redis, on both halves |
+| Acceptance | `mise run acceptance` | Redis's own Tcl test suite, on both halves |
 
 **The gap in the middle is the important one.** `cargo pgrx test` never reaches
-the shared-memory tables. Its cluster *does* preload the library — `pg_test`'s
-`postgresql_conf_options` sets `shared_preload_libraries = 'pg_redis'`, which is
-what lets `watch_counters_are_visible_through_shared_memory` run — but it leaves
-`redis.storage_mode` at its `auto` default, and both the shmem request and
-`mem_init_tables` are gated on `memory`. So every HTAB in `mem.rs` is null
-there, and every `ctl_accessor!` returns a null pointer. Four bugs reached a
-branch that way. Run both storage modes for anything touching `mem.rs`; CI does:
+the memory engine: its tests run SQL against the tables directly, not commands
+through a worker. Run the e2e suite for anything touching `src/memdb` or
+`src/shm.rs`; one run covers both backends, since databases 0–7 default to
+memory and 8–15 to tables.
 
-```bash
-mise run e2e                              # storage_mode=auto
-PG_REDIS_STORAGE_MODE=memory mise run e2e # the shared-memory backend
-```
+What the e2e suite cannot reach cheaply, the unit tests do: `src/memdb` is
+generic over its allocator, so `cargo test --lib` drives every collection
+against a reference model, and full command lines through `store::run`
+against a `Db` on the ordinary heap — no PostgreSQL, no shared memory.
 
-**A `#[pg_test]` can still reach the table code**, without the storage mode and
-without the postmaster's startup hook, by building the table it needs locally:
-`hash_create` with the same `keysize`/`entrysize` gives a backend-local HTAB
-that `SharedTable` wraps unchanged, and the chunk pool runs on a `Vec<u64>`
-because it only ever touches the bytes it was handed. That is how the meta and
-flush tests drive the real removal paths. Two things it has to get right, both
-of which are differences from shared memory rather than from dynahash:
+**Name a `#[pg_test]` module `tests`.** pgrx resolves every `#[pg_test]` to the
+`tests` schema (`framework.rs`: `let schema = "tests"`), so a module called
+anything else compiles and then fails at the call. `pg_tests` is worse than
+wrong: `#[pg_schema]` turns it into a schema name, and PostgreSQL reserves the
+`pg_` prefix, so `CREATE EXTENSION` fails and *every* test in the run reports
+"Could not obtain test mutex" instead.
 
-- **Ask for zeroed memory.** `ShmemInitHash` hands out zeroed shared memory and
-  the entry code depends on it — `value_write` frees whatever chain the slot
-  names before writing, so an uninitialised `value_len` releases a garbage chunk
-  index. Pass `alloc: palloc0` with `HASH_ALLOC`.
-- **Name the module `tests`.** pgrx resolves every `#[pg_test]` to the `tests`
-  schema (`framework.rs`: `let schema = "tests"`), so a module called anything
-  else compiles and then fails at the call. `pg_tests` is worse than wrong:
-  `#[pg_schema]` turns it into a schema name, and PostgreSQL reserves the `pg_`
-  prefix, so `CREATE EXTENSION` fails and *every* test in the run reports
-  "Could not obtain test mutex" instead.
-
-One constraint on the plain `#[test]`s in `mem.rs`: they may not call anything
-that reaches PostgreSQL. `cargo test --lib` links a binary with no PostgreSQL
-symbols to resolve against, and it only gets away with that because everything
-FFI is dead code there — a `#[pg_test]` body is not linked into it. Calling
-`meta_name_write` from a unit test is enough to break the link, because it can
-`warning!`; call `value_write` and check the chunk accounting instead.
+One constraint on the plain `#[test]`s: they may not call anything that
+reaches PostgreSQL. `cargo test --lib` links a binary with no PostgreSQL
+symbols to resolve against, and it only gets away with that because
+everything FFI is dead code there. `src/memdb` calls none; `src/shm.rs` is
+where the FFI is, and is not unit-tested for that reason.
 
 ### Parity against a real Redis
 
@@ -880,6 +614,50 @@ Differences are classified — `value`, `error-vs-value`, `error-code`,
 **CI gates on new differences only.** A gate on zero differences would fail on
 every run today, and one that failed always would be turned off.
 
+### Redis's own acceptance suite
+
+Parity diffs the commands someone thought to write down. Redis gates its own
+releases on the Tcl suite under `tests/unit`, and that suite can drive any
+server as an external one (`--host`/`--port`), so `docker/acceptance` runs it
+against pg_redis — fetched at a pinned tag (7.2.5, the last BSD-licensed 7.x),
+not vendored, with one patch: `FUNCTION FLUSH` at the top of every block is
+made tolerant, because an error there aborts the whole block before its first
+test.
+
+```bash
+mise run acceptance          # gate: fails when a test in the baseline stops passing
+mise run acceptance-update   # re-record the baseline after tests start passing
+```
+
+Two passes, one per half: the suite's default `SELECT 9` reaches the SQL
+tables, and `--singledb` (database 0) the shared-memory ones. Each unit runs
+in its own process, so a unit that aborts takes only itself down.
+
+- **A ratchet, like parity.** `docker/acceptance/baseline.json` lists the tests
+  that pass today, per half and unit. The gate fails when one of them stops
+  passing; the run lists the ones that started passing so the baseline moves
+  forward. Most of the suite fails for a missing command (`BLPOP`, `BITOP`,
+  `SSCAN`, `OBJECT FREQ`, ...), and gating on that would be gating on the
+  roadmap.
+- **What is left out, on purpose.** Whole units for command families that do
+  not exist here (streams, geo, HyperLogLog, scripting, ...), and the units
+  that reconfigure or restart the server under test, which Redis itself tags
+  `external:skip`. Tests needing `DEBUG`, replication, `SAVE` or a real
+  `maxmemory` are denied by tag. `--ignore-encoding` and `--ignore-digest`
+  turn off the assertions about Redis's internal encodings.
+- **`skip.txt` is for hangs only.** A failing test belongs in the baseline,
+  where it stays visible. Two groups hang instead of failing, and each entry
+  says why — the pipelining one is a real defect, not a gap.
+- **No password.** The Tcl client cannot `AUTH`, so the profile runs with
+  `PG_REDIS_PASSWORD` empty; CI does the same.
+
+It found what the hand-written layers could not, because nobody had written
+the expectation down: an unknown-command error echoing a newline that desynced
+the connection, `SELECT` inside `MULTI` ignored, `EXPIRE`'s `NX`/`XX`/`GT`/`LT`
+silently dropped, `SUNION` of a string and a set answering the set on the SQL
+half, `EXPIREAT k 0` making a memory-half key persistent, and protocol errors
+closing the connection without saying why.
+
 ### Running the e2e suite without Docker
 
 `docker compose --profile e2e up` is the supported path, but `bun` runs the same
@@ -892,7 +670,6 @@ initdb -D "$PGDATA" -U postgres -A trust
 cat >> "$PGDATA/postgresql.conf" <<'CONF'
 listen_addresses = 'localhost'
 shared_preload_libraries = 'pg_redis'
-redis.storage_mode = 'memory'      # or 'auto' — run both
 redis.port = 6379
 redis.database = 'postgres'
 redis.default_db = 8
@@ -974,9 +751,8 @@ running; only the assert-enabled build has to be compiled.
 
 ### Traps
 
-- **A `describe` that does not `SELECT cache` runs on db 8**, the durable half,
-  whatever `storage_mode` says — so it says nothing about the shared-memory
-  backend. The "Binary safety" describe sat there for its whole life and passed
+- **A `describe` that does not `SELECT cache` runs on db 8**, the durable half
+  — so it says nothing about the shared-memory backend. The "Binary safety" describe sat there for its whole life and passed
   while memory mode collapsed two NUL-containing keys onto one entry. Put
   memory-mode tests in a describe that selects `cache`, and confirm they *fail*
   against `main` before believing they cover anything.
@@ -1192,9 +968,9 @@ other tables per write. It closed two things that looked separate:
 Both were the same missing object: nothing knew what a key was. Each type had
 its own table, keyed independently, and no one asked the others.
 
-**The shared-memory half** gained a tenth HTAB — see [the key
-directory](#the-key-directory) for its layout, its sizing and the lock order it
-imposes. The hash table also gained the count meta the set table already had,
+**The shared-memory half** gained a tenth HTAB, a key directory — since
+replaced, with the rest of the fixed tables, by one dictionary per database
+([§3](#one-database-one-dictionary)). The hash table also gained the count meta the set table already had,
 which is what tells the directory its last field has gone, and makes `HLEN` a
 lookup rather than a scan of the whole database's hash table.
 
@@ -1275,7 +1051,7 @@ cache entry to a durable row, and `DB 0` brings one back. That is the one place
 `dump_key` into a form neither backend stores and writes through `restore_key`
 into whichever the destination names — the only command that has to, which is
 why the pair exists at all and why `COPY` is routed to the SPI path whatever
-the storage mode.
+the databases' policies.
 
 **`OBJECT ENCODING` reports Redis's representation, not ours.** `int`,
 `embstr`, `raw`, `listpack`, `quicklist`, `intset`, `hashtable`, `skiplist`,
@@ -1334,25 +1110,12 @@ over every live key — the durable half with a five-table `UNION` under
 scan and the collection names, expired-but-unswept keys excluded on both. The
 write-up is in [PARITY.md](PARITY.md#tier-1--commands-we-have-that-behave-differently).
 
-### `ZPOPMIN` is O(entries in the database)
-
-Not the meta lookup, which is O(1) — the *refresh* after it. Removing the
-minimum leaves the meta unable to name the new one without looking, so
-`refresh_zset_meta` scans the whole zset table of that database once per element
-popped. `ZREM` and every `ZREMRANGEBY*` pay it too. `redis-benchmark`'s
-`zpopmin` runs against a nearly empty table and never shows it. A skip list or a
-score-ordered index is the fix, and it is a data-structure change rather than a
-patch.
 
 ### Settled, so not on this list
 
-- **`redis.mem_max_entries` stays at 8192** — see
-  [Sizing](#sizing-redismem_max_entries). Measured, not assumed.
-- **Sharding the shared-memory LWLocks**, for the reason above.
-- **The five fixed member arrays** — gone; members are length-prefixed like
-  keys. See [How a collection entry stores its member](#how-a-collection-entry-stores-its-member).
-- **Multi-key writes under OOM** — priced whole before they run. See
-  [When a table fills](#when-a-table-fills).
+- **Fixed-size shared-memory tables** — replaced by the arena and one
+  dictionary per database ([§3](#3-the-shared-memory-backend)), which took the
+  entry limits, the 64 KiB value cap and the per-table locks with them.
 - **A SQL error killing the worker** — `INCR` past `bigint`'s ceiling raised
   out of the dispatcher and ended the process; four of those ended the Redis
   endpoint. `in_subtransaction` catches now, and the reply matches Redis.

@@ -2,40 +2,50 @@
 //! two-byte format version, and a CRC-64 of everything before it.
 //!
 //! The two directions are deliberately asymmetric. What we *emit* is the
-//! narrowest set of encodings a real Redis 7.0 accepts — raw strings, plain
-//! sets and hashes, binary-double sorted sets, and lists as quicklists of
-//! plain nodes — because a payload only has to be valid, not identical to the
-//! one Redis itself would build. Byte identity is not even possible: a
-//! hashtable-backed set serialises in iteration order, which is seeded per
-//! process. What we *accept* is wider: everything 7.0 emits, which for small
-//! collections means listpacks, plus intsets, LZF-compressed and
-//! integer-packed strings, and the ASCII-double sorted sets of older
-//! servers.
+//! narrowest set of encodings a real Redis 7.2 accepts — raw strings, plain
+//! sets and hashes, binary-double sorted sets, lists as quicklists of plain
+//! nodes, and streams as Redis lays them out — because a payload only has to
+//! be valid, not identical to the one Redis itself would build. Byte identity
+//! is not even possible: a hashtable-backed set serialises in iteration
+//! order, which is seeded per process. What we *accept* is wider: everything
+//! 7.2 emits, which for small collections means listpacks, plus intsets,
+//! LZF-compressed and integer-packed strings, the ASCII-double sorted sets of
+//! older servers, and the stream formats of 5.0 and 7.0.
 //!
-//! The version footer is 10 — what Redis 7.0.15 writes — and anything newer
-//! is refused, exactly as 7.0.15 refuses it. So a payload from a 7.2 server
-//! fails here with the same error it would get replaying into 7.0, and one
-//! of ours restores into a real 7.0 unmodified. Formats 7.0 accepts only for
-//! pre-7 compatibility — ziplists, zipmaps, v1 quicklists — are refused as a
-//! bad format rather than half-supported; the error is honest and the
-//! encodings have not been written by any server since 6.x.
+//! The version footer is 11 — what Redis 7.2.5, the version this server
+//! reports, writes — and anything newer is refused, exactly as 7.2.5 refuses
+//! it. So a payload from a 7.4 server fails here with the same error it would
+//! get replaying into 7.2, and one of ours restores into a real 7.2
+//! unmodified. Formats 7.2 accepts only for pre-7 compatibility — ziplists,
+//! zipmaps, v1 quicklists — are refused as a bad format rather than
+//! half-supported; the error is honest and the encodings have not been
+//! written by any server since 6.x.
+#![forbid(unsafe_code)]
 
 use crate::commands::KeyDump;
 
-/// What Redis 7.0.15 stamps on every payload it emits, and the newest this
+/// What Redis 7.2.5 stamps on every payload it emits, and the newest this
 /// module admits.
-const RDB_VERSION: u16 = 10;
+const RDB_VERSION: u16 = 11;
 
 // The object-type bytes this module speaks, by their names in rdb.h.
 const TYPE_STRING: u8 = 0;
+/// The type byte earlier pg_redis builds wrote for a stream, unused by
+/// Redis: the payload is the stream's own serialised value (`stream.rs`).
+/// Still read, so those payloads restore; no longer written.
+const TYPE_PG_REDIS_STREAM: u8 = 0xF5;
 const TYPE_SET: u8 = 2;
 const TYPE_ZSET: u8 = 3;
 const TYPE_HASH: u8 = 4;
 const TYPE_ZSET_2: u8 = 5;
 const TYPE_SET_INTSET: u8 = 11;
+const TYPE_STREAM_LISTPACKS: u8 = 15;
 const TYPE_HASH_LISTPACK: u8 = 16;
 const TYPE_ZSET_LISTPACK: u8 = 17;
 const TYPE_LIST_QUICKLIST_2: u8 = 18;
+const TYPE_STREAM_LISTPACKS_2: u8 = 19;
+const TYPE_SET_LISTPACK: u8 = 20;
+const TYPE_STREAM_LISTPACKS_3: u8 = 21;
 
 const QUICKLIST_NODE_PLAIN: u64 = 1;
 const QUICKLIST_NODE_PACKED: u64 = 2;
@@ -111,6 +121,146 @@ fn write_string(out: &mut Vec<u8>, s: &[u8]) {
     out.extend_from_slice(s);
 }
 
+/// A stream ID as the radix tree keys it, and as PELs store it: 128 bits,
+/// big-endian, so byte order is ID order.
+fn write_id(out: &mut Vec<u8>, id: crate::stream::StreamId) {
+    out.extend_from_slice(&id.ms.to_be_bytes());
+    out.extend_from_slice(&id.seq.to_be_bytes());
+}
+
+/// `rdbSaveObject`'s stream branch, format 11: the nodes as (master ID,
+/// listpack) pairs, the metadata, then each group with its PEL and its
+/// consumers, each consumer with the IDs it owns.
+fn write_stream(out: &mut Vec<u8>, s: &crate::stream::RdbStream) {
+    write_len(out, s.nodes.len() as u64);
+    for n in &s.nodes {
+        let mut key = Vec::with_capacity(16);
+        write_id(&mut key, n.master);
+        write_string(out, &key);
+        write_string(out, &listpack_build(&n.elements));
+    }
+    write_len(out, s.length);
+    write_len(out, s.last_id.ms);
+    write_len(out, s.last_id.seq);
+    let (first, max_deleted, added) = s.meta.unwrap_or_default();
+    write_len(out, first.ms);
+    write_len(out, first.seq);
+    write_len(out, max_deleted.ms);
+    write_len(out, max_deleted.seq);
+    write_len(out, added);
+    write_len(out, s.groups.len() as u64);
+    for g in &s.groups {
+        write_string(out, &g.name);
+        write_len(out, g.last_id.ms);
+        write_len(out, g.last_id.seq);
+        write_len(out, g.entries_read.unwrap_or(u64::MAX));
+        write_len(out, g.pel.len() as u64);
+        for (id, delivery_time, delivery_count) in &g.pel {
+            write_id(out, *id);
+            out.extend_from_slice(&delivery_time.to_le_bytes());
+            write_len(out, *delivery_count);
+        }
+        write_len(out, g.consumers.len() as u64);
+        for c in &g.consumers {
+            write_string(out, &c.name);
+            out.extend_from_slice(&c.seen_time.to_le_bytes());
+            out.extend_from_slice(&c.active_time.unwrap_or(c.seen_time).to_le_bytes());
+            write_len(out, c.pel.len() as u64);
+            for id in &c.pel {
+                write_id(out, *id);
+            }
+        }
+    }
+}
+
+/// The integer a listpack stores a string as, when it spells one exactly as
+/// `lpStringToInt64` demands: no sign but `-`, no leading zero, no `-0`.
+fn lp_int_value(s: &[u8]) -> Option<i64> {
+    if s.is_empty() || s.len() > 20 {
+        return None;
+    }
+    let t = std::str::from_utf8(s).ok()?;
+    let digits = t.strip_prefix('-').unwrap_or(t);
+    if digits.is_empty() || !digits.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    if (digits.len() > 1 && digits.starts_with('0')) || t == "-0" {
+        return None;
+    }
+    t.parse().ok()
+}
+
+/// The bytes `lpEncodeBacklen` spends on an entry of `l` bytes.
+fn backlen_size(l: usize) -> usize {
+    match l {
+        0..=127 => 1,
+        128..=16382 => 2,
+        16383..=2097150 => 3,
+        2097151..=268435454 => 4,
+        _ => 5,
+    }
+}
+
+/// A listpack of `elements`, each in the encoding `lpAppend` picks for it:
+/// integers in the narrowest width that holds them, strings behind the
+/// shortest length prefix, every entry followed by its own length.
+fn listpack_build(elements: &[Vec<u8>]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for e in elements {
+        let start = body.len();
+        match lp_int_value(e) {
+            Some(v) if (0..=127).contains(&v) => body.push(v as u8),
+            Some(v) if (-4096..=4095).contains(&v) => {
+                let u = (v as u16) & 0x1fff;
+                body.push(0xc0 | (u >> 8) as u8);
+                body.push(u as u8);
+            }
+            Some(v) if i16::try_from(v).is_ok() => {
+                body.push(0xf1);
+                body.extend_from_slice(&(v as i16).to_le_bytes());
+            }
+            Some(v) if (-(1 << 23)..(1 << 23)).contains(&v) => {
+                body.push(0xf2);
+                body.extend_from_slice(&(v as i32).to_le_bytes()[..3]);
+            }
+            Some(v) if i32::try_from(v).is_ok() => {
+                body.push(0xf3);
+                body.extend_from_slice(&(v as i32).to_le_bytes());
+            }
+            Some(v) => {
+                body.push(0xf4);
+                body.extend_from_slice(&v.to_le_bytes());
+            }
+            None if e.len() < 64 => {
+                body.push(0x80 | e.len() as u8);
+                body.extend_from_slice(e);
+            }
+            None if e.len() < 4096 => {
+                body.push(0xe0 | (e.len() >> 8) as u8);
+                body.push(e.len() as u8);
+                body.extend_from_slice(e);
+            }
+            None => {
+                body.push(0xf0);
+                body.extend_from_slice(&(e.len() as u32).to_le_bytes());
+                body.extend_from_slice(e);
+            }
+        }
+        let l = body.len() - start;
+        let n = backlen_size(l);
+        for i in (0..n).rev() {
+            let b = ((l >> (7 * i)) & 127) as u8;
+            body.push(if i == n - 1 { b } else { b | 128 });
+        }
+    }
+    let mut out = Vec::with_capacity(body.len() + 7);
+    out.extend_from_slice(&((body.len() + 7) as u32).to_le_bytes());
+    out.extend_from_slice(&(elements.len().min(u16::MAX as usize) as u16).to_le_bytes());
+    out.extend_from_slice(&body);
+    out.push(0xff);
+    out
+}
+
 /// One key's value as a `RESTORE`-ready payload: object, version, CRC.
 pub fn serialize(dump: &KeyDump) -> Vec<u8> {
     let mut out = Vec::new();
@@ -143,6 +293,11 @@ pub fn serialize(dump: &KeyDump) -> Vec<u8> {
                 write_string(&mut out, f);
                 write_string(&mut out, v);
             }
+        }
+        KeyDump::Stream(v) => {
+            out.push(TYPE_STREAM_LISTPACKS_3);
+            let s = crate::stream::Stream::decode(v).expect("a stored stream decodes");
+            write_stream(&mut out, &s.to_rdb());
         }
         KeyDump::Zset(pairs) => {
             out.push(TYPE_ZSET_2);
@@ -257,6 +412,103 @@ impl<'a> Reader<'a> {
     fn binary_double(&mut self) -> Option<f64> {
         Some(f64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
+
+    /// `rdbLoadMillisecondTime`: eight little-endian bytes.
+    fn millis(&mut self) -> Option<i64> {
+        Some(i64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+
+    fn raw_id(&mut self) -> Option<crate::stream::StreamId> {
+        let b = self.take(16)?;
+        Some(crate::stream::StreamId {
+            ms: u64::from_be_bytes(b[..8].try_into().ok()?),
+            seq: u64::from_be_bytes(b[8..].try_into().ok()?),
+        })
+    }
+
+    fn len_id(&mut self) -> Option<crate::stream::StreamId> {
+        Some(crate::stream::StreamId {
+            ms: self.plain_len()?,
+            seq: self.plain_len()?,
+        })
+    }
+
+    /// `rdbLoadObject`'s stream branch, for any of the three formats: 15
+    /// lacks the deletion metadata and the group read counters, and 15 and
+    /// 19 the consumers' active times.
+    fn stream(&mut self, t: u8) -> Option<crate::stream::RdbStream> {
+        use crate::stream::{RdbConsumer, RdbGroup, RdbNode, RdbStream};
+        let v2 = t >= TYPE_STREAM_LISTPACKS_2;
+        let mut nodes = Vec::new();
+        for _ in 0..self.plain_len()? {
+            let key = self.string()?;
+            if key.len() != 16 {
+                return None;
+            }
+            let master = Reader { data: &key, pos: 0 }.raw_id()?;
+            let lp = self.string()?;
+            let elements = listpack_entries(&lp)?;
+            if elements.is_empty() {
+                return None;
+            }
+            nodes.push(RdbNode {
+                master,
+                elements,
+                bytes: lp.len(),
+            });
+        }
+        let length = self.plain_len()?;
+        let last_id = self.len_id()?;
+        let meta = if v2 {
+            Some((self.len_id()?, self.len_id()?, self.plain_len()?))
+        } else {
+            None
+        };
+        let mut groups = Vec::new();
+        for _ in 0..self.plain_len()? {
+            let name = self.string()?;
+            let last_id = self.len_id()?;
+            let entries_read = if v2 { Some(self.plain_len()?) } else { None };
+            let mut pel = Vec::new();
+            for _ in 0..self.plain_len()? {
+                pel.push((self.raw_id()?, self.millis()?, self.plain_len()?));
+            }
+            let mut consumers = Vec::new();
+            for _ in 0..self.plain_len()? {
+                let name = self.string()?;
+                let seen_time = self.millis()?;
+                let active_time = if t >= TYPE_STREAM_LISTPACKS_3 {
+                    Some(self.millis()?)
+                } else {
+                    None
+                };
+                let mut ids = Vec::new();
+                for _ in 0..self.plain_len()? {
+                    ids.push(self.raw_id()?);
+                }
+                consumers.push(RdbConsumer {
+                    name,
+                    seen_time,
+                    active_time,
+                    pel: ids,
+                });
+            }
+            groups.push(RdbGroup {
+                name,
+                last_id,
+                entries_read,
+                pel,
+                consumers,
+            });
+        }
+        Some(RdbStream {
+            nodes,
+            length,
+            last_id,
+            meta,
+            groups,
+        })
+    }
 }
 
 fn itoa(n: i64) -> Vec<u8> {
@@ -354,14 +606,7 @@ fn listpack_entries(blob: &[u8]) -> Option<Vec<Vec<u8>>> {
         out.push(element);
         // Entries end with their own length, so the list walks backwards
         // too; readers going forwards only have to skip it.
-        let backlen = match entry_len {
-            l if l <= 127 => 1,
-            l if l < 16384 => 2,
-            l if l < 1 << 21 => 3,
-            l if l < 1 << 28 => 4,
-            _ => 5,
-        };
-        p += entry_len + backlen;
+        p += entry_len + backlen_size(entry_len);
     }
     Some(out)
 }
@@ -416,6 +661,11 @@ fn scored_of(items: Vec<Vec<u8>>) -> Option<Vec<(Vec<u8>, f64)>> {
 fn object(r: &mut Reader<'_>) -> Option<KeyDump> {
     let dump = match r.u8()? {
         TYPE_STRING => KeyDump::String(r.string()?),
+        TYPE_PG_REDIS_STREAM => {
+            let v = r.string()?;
+            crate::stream::Stream::decode(&v)?;
+            KeyDump::Stream(v)
+        }
         TYPE_SET => {
             let n = r.plain_len()?;
             let mut items = Vec::with_capacity(n.min(4096) as usize);
@@ -448,6 +698,11 @@ fn object(r: &mut Reader<'_>) -> Option<KeyDump> {
             KeyDump::Zset(pairs)
         }
         TYPE_SET_INTSET => KeyDump::Set(intset_entries(&r.string()?)?),
+        TYPE_SET_LISTPACK => KeyDump::Set(listpack_entries(&r.string()?)?),
+        t @ (TYPE_STREAM_LISTPACKS | TYPE_STREAM_LISTPACKS_2 | TYPE_STREAM_LISTPACKS_3) => {
+            let s = crate::stream::Stream::from_rdb(r.stream(t)?)?;
+            KeyDump::Stream(s.encode())
+        }
         TYPE_HASH_LISTPACK => KeyDump::Hash(pairs_of(listpack_entries(&r.string()?)?)?),
         TYPE_ZSET_LISTPACK => KeyDump::Zset(scored_of(listpack_entries(&r.string()?)?)?),
         TYPE_LIST_QUICKLIST_2 => {
@@ -476,11 +731,12 @@ fn object(r: &mut Reader<'_>) -> Option<KeyDump> {
         KeyDump::Set(v) => v.is_empty(),
         KeyDump::Hash(v) => v.is_empty(),
         KeyDump::Zset(v) => v.is_empty(),
+        KeyDump::Stream(_) => false,
     };
     (!empty).then_some(dump)
 }
 
-/// The reverse of `serialize`, over anything a Redis up to 7.0 emits.
+/// The reverse of `serialize`, over anything a Redis up to 7.2 emits.
 pub fn deserialize(payload: &[u8]) -> Result<KeyDump, RestoreError> {
     if payload.len() < 11 {
         return Err(RestoreError::Envelope);
@@ -498,9 +754,74 @@ pub fn deserialize(payload: &[u8]) -> Result<KeyDump, RestoreError> {
     object(&mut r).ok_or(RestoreError::Format)
 }
 
+// ───────────────────────────── Functions ────────────────────────────────────
+
+/// `RDB_OPCODE_FUNCTION2`: one library's code follows as a string.
+const OPCODE_FUNCTION2: u8 = 245;
+/// The opcode of the format 7.0's release candidates wrote.
+const OPCODE_FUNCTION_PRE_GA: u8 = 246;
+
+/// `FUNCTION DUMP`'s payload: each library's code behind its opcode, then the
+/// version and CRC that close every DUMP payload.
+pub fn functions_dump(codes: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for code in codes {
+        out.push(OPCODE_FUNCTION2);
+        write_string(&mut out, code);
+    }
+    out.extend_from_slice(&RDB_VERSION.to_le_bytes());
+    let crc = crc64(&out);
+    out.extend_from_slice(&crc.to_le_bytes());
+    out
+}
+
+/// The library codes in a `FUNCTION RESTORE` payload, or the error Redis
+/// answers with.
+pub fn functions_restore(payload: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    let envelope = || "ERR DUMP payload version or checksum are wrong".to_string();
+    if payload.len() < 10 {
+        return Err(envelope());
+    }
+    let body_end = payload.len() - 10;
+    let version = u16::from_le_bytes(payload[body_end..body_end + 2].try_into().unwrap());
+    let crc = u64::from_le_bytes(payload[body_end + 2..].try_into().unwrap());
+    if version > RDB_VERSION || crc != crc64(&payload[..body_end + 2]) {
+        return Err(envelope());
+    }
+    let mut r = Reader {
+        data: &payload[..body_end],
+        pos: 0,
+    };
+    let mut codes = Vec::new();
+    while r.pos < body_end {
+        match r.u8() {
+            Some(OPCODE_FUNCTION2) => {}
+            Some(OPCODE_FUNCTION_PRE_GA) => {
+                return Err("ERR Pre-GA function format not supported".into());
+            }
+            Some(_) => return Err("ERR given type is not a function".into()),
+            None => return Err("ERR can not read data type".into()),
+        }
+        codes.push(
+            r.string()
+                .ok_or("ERR failed loading the given functions payload")?,
+        );
+    }
+    Ok(codes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn functions_payload_round_trips() {
+        let codes = vec![b"#!lua name=a\n".to_vec(), vec![b'x'; 300]];
+        assert_eq!(functions_restore(&functions_dump(&codes)).ok(), Some(codes));
+        let mut bad = functions_dump(&[b"x".to_vec()]);
+        bad[1] ^= 1;
+        assert!(functions_restore(&bad).unwrap_err().contains("checksum"));
+    }
 
     /// The check-value every CRC-64/XZ implementation agrees on. A wrong
     /// polynomial, direction or final xor all fail here.
@@ -554,11 +875,11 @@ mod tests {
         payload[0] ^= 0x01;
         assert!(matches!(deserialize(&payload), Err(RestoreError::Envelope)));
 
-        // Version 11 with its checksum recomputed: the envelope is sound and
-        // still refused, exactly as 7.0.15 refuses payloads from 7.2.
+        // Version 12 with its checksum recomputed: the envelope is sound and
+        // still refused, exactly as 7.2.5 refuses payloads from 7.4.
         let mut payload = serialize(&KeyDump::String(b"x".to_vec()));
         let body_end = payload.len() - 10;
-        payload[body_end] = 11;
+        payload[body_end] = 12;
         let crc = crc64(&payload[..body_end + 2]);
         let crc_at = body_end + 2;
         payload[crc_at..].copy_from_slice(&crc.to_le_bytes());

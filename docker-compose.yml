@@ -19,10 +19,15 @@ services:
         -c redis.default_db=${PG_REDIS_DEFAULT_DB:-8}
         -c redis.workers=${PG_REDIS_WORKERS:-4}
         -c redis.batch_size=${PG_REDIS_BATCH_SIZE:-64}
-        -c redis.storage_mode=${PG_REDIS_STORAGE_MODE:-auto}
-        -c redis.password=testpass
+        -c redis.password=${PG_REDIS_PASSWORD-testpass}
+    # Healthy means both listeners are up: PostgreSQL accepting connections
+    # is not the same as the pg_redis workers having bound their port, and a
+    # suite that connects in between fails with ECONNREFUSED before any test.
+    # PostgreSQL is asked over TCP: the image's first-boot init runs a
+    # temporary server, pg_redis and all, on the Unix socket alone, and a
+    # suite let in then is cut off when it stops for the real start.
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres && nc -z 127.0.0.1 6379"]
       interval: 2s
       timeout: 5s
       retries: 15
@@ -56,6 +61,19 @@ services:
       REDIS_REF_PASSWORD: testpass
     command: ["bun", "run", "parity.ts"]
     profiles: ["parity"]
+
+  # Redis's own Tcl suite, against pg_redis as an external server. Its client
+  # cannot AUTH, so run this profile with PG_REDIS_PASSWORD set to empty, and
+  # with PG_REDIS_DEFAULT_DB=0 so its --singledb pass reaches the memory half.
+  acceptance:
+    build: ./docker/acceptance
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PG_REDIS_HOST: postgres
+      PG_REDIS_PORT: "6379"
+    profiles: ["acceptance"]
 
   clients:
     build: ./docker/clients

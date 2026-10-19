@@ -1,0 +1,313 @@
+{% extends "main.html" %}
+
+{#- The landing page. index.md selects this with `template: home.html`; its
+    markdown body is not rendered here, so the README-style copy lives in the
+    docs pages and this file carries the pitch. -#}
+
+{% block tabs %}
+{{ super() }}
+<section class="pr-hero">
+  <div class="pr-wrap pr-hero__grid">
+    <div class="pr-hero__copy">
+      <p class="pr-eyebrow">PostgreSQL extension · Rust + pgrx · PG 15–18</p>
+      <h1 class="pr-hero__title">Redis, spoken&nbsp;by&nbsp;Postgres.</h1>
+      <p class="pr-hero__lede">
+        pg_redis runs a Redis server inside PostgreSQL. Point any Redis client
+        at port 6379, and choose per database where the data lives: shared
+        memory, memory with snapshots, or tables you can query, join and back
+        up. Change it while clients keep writing.
+      </p>
+      <div class="pr-hero__actions">
+        <a class="pr-btn pr-btn--primary" href="#try-it">Try it in your browser</a>
+        <a class="pr-btn pr-btn--ghost" href="{{ 'installation/' | url }}">Install</a>
+        <a class="pr-btn pr-btn--ghost" href="{{ config.repo_url }}">
+          {% include ".icons/fontawesome/brands/github.svg" %} View on GitHub
+        </a>
+      </div>
+    </div>
+
+    <div class="pr-term" aria-label="redis-cli and psql against the same server">
+      <div class="pr-term__bar"><span></span><span></span><span></span><em>one server, two protocols</em></div>
+      <pre class="pr-term__body"><code><span class="c"># any Redis client, port 6379</span>
+<span class="p">$</span> redis-cli
+<span class="p">&gt;</span> SELECT durable
+<span class="o">OK</span>
+<span class="p">&gt;</span> HSET user:42 name Ada plan pro
+<span class="o">(integer) 2</span>
+
+<span class="c"># the same data, from SQL</span>
+<span class="p">$</span> psql
+<span class="p">=#</span> SELECT convert_from(field, 'UTF8') AS field,
+          convert_from(value, 'UTF8') AS value
+     FROM redis.hash_8 WHERE key = 'user:42';
+<span class="o"> field | value
+-------+-------
+ name  | Ada
+ plan  | pro</span></code></pre>
+    </div>
+  </div>
+
+  <div class="pr-wrap">
+    <dl class="pr-stats">
+      <div><dt>235<small>/242</small></dt><dd>Redis 7.2 commands accepted</dd></div>
+      <div><dt>2<small>/2,010</small></dt><dd>replies that differ from Redis</dd></div>
+      <div><dt>3</dt><dd>storage policies, set per database</dd></div>
+      <div><dt>RESP2 + 3</dt><dd>works with stock clients</dd></div>
+    </dl>
+  </div>
+</section>
+{% endblock %}
+
+{% block content %}
+<section class="pr-section pr-demo" id="try-it" data-demo="{{ 'demo/' | url }}" data-state="idle">
+  <h2 class="pr-h2">Try it, in this tab</h2>
+  <p class="pr-sub">
+    A real PostgreSQL 17 with pg_redis loaded, on an emulated Linux machine running in your
+    browser. No server behind it. Write a key to memory, snapshot it, move the database into
+    tables while it is in use, then change the key from SQL.
+  </p>
+
+  <div class="pr-demo__grid">
+    <div class="pr-demo__rail" role="group" aria-label="Guided steps">
+      <div class="pr-phase">
+        <p class="pr-phase__name"><code>memory</code> write a key</p>
+        <ol class="pr-steps">
+        <li><button type="button" class="pr-step is-next" data-pane="redis" data-cmd='SET greeting "hello from postgres"'><span class="pr-step__pane">redis</span><code>SET greeting "hello from postgres"</code><em>db 0, in shared memory</em></button></li>
+        <li><button type="button" class="pr-step" data-pane="sql" data-cmd="SELECT * FROM redis.policies() WHERE db IN (0, 8);"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>SELECT * FROM redis.policies() …;</code><em>db 0 is memory, db 8 is logged</em></button></li>
+        </ol>
+      </div>
+      <div class="pr-phase">
+        <p class="pr-phase__name"><code>memory+snapshot</code> snapshot it</p>
+        <ol class="pr-steps">
+        <li><button type="button" class="pr-step" data-pane="sql" data-cmd="SELECT redis.set_policy(0, 'memory+snapshot');"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>SELECT redis.set_policy(0, 'memory+snapshot');</code><em>still memory, now snapshotted</em></button></li>
+        <li><button type="button" class="pr-step" data-pane="redis" data-cmd="SAVE"><span class="pr-step__pane">redis</span><code>SAVE</code><em>take the snapshot now</em></button></li>
+        <li><button type="button" class="pr-step" data-pane="sql" data-cmd="SELECT s.db, convert_from(s.key, 'UTF8') AS key, t.taken_at FROM redis.snapshot s JOIN redis.snapshot_taken t USING (db);"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>SELECT … FROM redis.snapshot …;</code><em>the snapshot is a logged row</em></button></li>
+        </ol>
+      </div>
+      <div class="pr-phase">
+        <p class="pr-phase__name"><code>logged</code> move it into tables</p>
+        <ol class="pr-steps">
+        <li><button type="button" class="pr-step" data-pane="sql" data-cmd="SELECT redis.set_policy(0, 'logged');"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>SELECT redis.set_policy(0, 'logged');</code><em>move db 0 into tables, live</em></button></li>
+        <li><button type="button" class="pr-step" data-pane="redis" data-cmd="GET greeting"><span class="pr-step__pane">redis</span><code>GET greeting</code><em>still there, moved on touch</em></button></li>
+        <li><button type="button" class="pr-step" data-pane="sql" data-cmd="SELECT convert_from(key, 'UTF8') AS key, convert_from(value, 'UTF8') AS value FROM redis.kv_0;"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>SELECT … FROM redis.kv_0;</code><em>now it is a row</em></button></li>
+        <li><button type="button" class="pr-step" data-pane="sql" data-cmd="UPDATE redis.kv_0 SET value = convert_to('hello from SQL', 'UTF8') WHERE key = 'greeting';"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>UPDATE redis.kv_0 SET value = …</code><em>change it from SQL</em></button></li>
+        <li><button type="button" class="pr-step" data-pane="redis" data-cmd="GET greeting"><span class="pr-step__pane">redis</span><code>GET greeting</code><em>Redis sees the update</em></button></li>
+        </ol>
+      </div>
+    </div>
+
+    <div class="pr-demo__stage" tabindex="0" aria-label="Live terminal: redis-cli and psql">
+      <div class="pr-term__bar">
+        <span></span><span></span><span></span>
+        <em class="pr-demo__status" role="status">not started</em>
+      </div>
+      <div class="pr-demo__screen">
+        <div class="pr-demo__poster" aria-hidden="true">
+          <div><b>redis-cli :6379</b><code>127.0.0.1:6379&gt; <i></i></code></div>
+          <div><b>psql :5432</b><code>sql=#</code></div>
+        </div>
+        <button type="button" class="pr-btn pr-btn--primary pr-demo__boot">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11l9-5.5z"/></svg>
+          Boot Postgres here
+        </button>
+        <p class="pr-demo__note">About 40 MB, once. Then it runs offline, sandboxed in the tab.</p>
+      </div>
+    </div>
+  </div>
+  <p class="pr-proof">
+    Click a step to type it, or type into either pane yourself. <kbd>alt</kbd>+<kbd>1</kbd> and
+    <kbd>alt</kbd>+<kbd>2</kbd> switch panes. Built with <a href="https://github.com/filipecabaco/snowglobe">snowglobe</a>.
+  </p>
+</section>
+
+<section class="pr-section" id="storage">
+  <h2 class="pr-h2">Storage, chosen per database</h2>
+  <p class="pr-sub">
+    Each of the 16 databases has its own policy. By default 0–7 are ephemeral and 8–15 durable,
+    and <code>SELECT cache</code> and <code>SELECT durable</code> still pick one of each. Any of
+    them can change at runtime.
+  </p>
+  <div class="pr-policies">
+    <article class="pr-policy">
+      <header><code>memory</code><span class="pr-tag">default 0–7</span></header>
+      <p>Shared memory, no transaction on the hot path. Built for sessions, rate limits and memoised queries.</p>
+      <dl><div><dt>Survives a crash</dt><dd class="no">no</dd></div><div><dt>Replicated</dt><dd class="no">no</dd></div><div><dt>Visible to SQL</dt><dd class="no">no</dd></div></dl>
+    </article>
+    <article class="pr-policy">
+      <header><code>memory+snapshot</code></header>
+      <p>Memory, copied to a logged table every <code>redis.snapshot_interval</code> seconds and reloaded at startup. Redis's RDB, inside Postgres.</p>
+      <dl><div><dt>Survives a crash</dt><dd class="part">to the last snapshot</dd></div><div><dt>Replicated</dt><dd class="part">the snapshot</dd></div><div><dt>Visible to SQL</dt><dd class="part">the snapshot</dd></div></dl>
+    </article>
+    <article class="pr-policy pr-policy--accent">
+      <header><code>logged</code><span class="pr-tag">default 8–15</span></header>
+      <p>WAL-logged tables. Every write is a row, streamed to your replicas and covered by the backups you already take.</p>
+      <dl><div><dt>Survives a crash</dt><dd class="yes">yes</dd></div><div><dt>Replicated</dt><dd class="yes">yes</dd></div><div><dt>Visible to SQL</dt><dd class="yes">yes</dd></div></dl>
+    </article>
+  </div>
+
+  <div class="pr-move">
+    <div>
+      <h3>Moves while you use it</h3>
+      <p>Changing a policy between memory and tables moves the data online. Each key moves the
+        moment a command touches it, and a background sweep moves the rest. Clients keep reading
+        and writing throughout, and no key is lost on the way. Between <code>memory</code> and
+        <code>memory+snapshot</code> nothing moves at all.</p>
+      <a href="{{ 'STORAGE/' | url }}">How migration works</a>
+    </div>
+<pre class="pr-code"><code><span class="c">-- every database, its policy, and any move in progress</span>
+SELECT * FROM redis.policies();
+
+<span class="c">-- make db 3 durable; its keys follow</span>
+SELECT redis.set_policy(3, 'logged');
+
+<span class="c">-- keep db 0 in memory, but snapshot it</span>
+SELECT redis.set_policy(0, 'memory+snapshot');</code></pre>
+  </div>
+</section>
+
+<section class="pr-section pr-memory">
+  <div>
+    <h2 class="pr-h2">Memory, the way Redis does it</h2>
+    <p class="pr-sub">
+      The memory engine grows with your data up to <code>redis.maxmemory</code>, 256 MB by
+      default. The space is reserved at startup, but it only takes RAM as keys fill it.
+    </p>
+    <ul>
+      <li>Keys and values up to 512 MB, as in Redis, and all 16 databases can be in memory at once.</li>
+      <li>Past the limit, a write gets <code>OOM</code>, or keys are evicted per <code>maxmemory-policy</code>: <code>noeviction</code>, <code>allkeys-random</code> or <code>volatile-ttl</code>.</li>
+      <li>Every memory command runs under one lock, so each is fully atomic. Sorted sets keep an ordered index, so <code>ZRANGE</code>, <code>ZRANK</code> and <code>ZPOPMIN</code> don't scan.</li>
+      <li>Written in safe Rust. The only <code>unsafe</code> code is one small module, and running out of memory returns <code>OOM</code> instead of crashing.</li>
+    </ul>
+  </div>
+<pre class="pr-code"><code><span class="p">&gt;</span> CONFIG SET maxmemory 16mb
+<span class="o">OK</span>
+<span class="p">&gt;</span> CONFIG SET maxmemory-policy allkeys-random
+<span class="o">OK</span>
+<span class="p">&gt;</span> INFO memory
+<span class="o"># Memory
+used_memory:604
+used_memory_peak:631
+maxmemory:16777216
+maxmemory_policy:allkeys-random</span></code></pre>
+</section>
+
+<section class="pr-section">
+  <h2 class="pr-h2">Throughput</h2>
+  <p class="pr-sub">
+    Requests per second, higher is better: <strong>230k/s</strong> is 230,000 commands answered
+    every second. <code>redis-benchmark</code>, 50 clients, 64-byte values over 100,000 random
+    keys, median of 5 runs. Each server pinned to the same 4 CPUs, Docker on Apple Silicon.
+    <code>memory+snapshot</code> runs within 2% of <code>memory</code>.
+    <a href="{{ 'IMPLEMENTATION/#8-performance' | url }}">Full table and tuning</a>
+  </p>
+  <div class="pr-bench" role="table" aria-label="Requests per second by command, in thousands">
+    <div class="pr-bench__legend" aria-hidden="true">
+      <span class="k k--redis">Redis 7.2</span>
+      <span class="k k--mem">pg_redis memory</span>
+      <span class="k k--wal">pg_redis logged</span>
+    </div>
+    {% set top = 230 %}
+    {% set rows = [
+      ("SET",   226, 182, 6.4),
+      ("GET",   230, 188, 121),
+      ("INCR",  228, 188, 4.6),
+      ("LPUSH", 218, 187, 3.0),
+      ("SADD",  227, 182, 8.5),
+      ("HSET",  226, 179, 5.9),
+      ("ZADD",  227, 176, 6.4),
+    ] %}
+    {% for name, r, m, w in rows %}
+    <div class="pr-bench__row" role="row">
+      <span class="pr-bench__cmd" role="rowheader">{{ name }}</span>
+      <div class="pr-bench__bars" role="cell">
+        <i class="b b--redis" style="--v: {{ r / top }}"><b>{{ r }}k/s</b></i>
+        <i class="b b--mem" style="--v: {{ m / top }}"><b>{{ m }}k/s</b></i>
+        <i class="b b--wal" style="--v: {{ w / top }}"><b>{{ w }}k/s</b></i>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="pr-section">
+  <h2 class="pr-h2">More than <code>GET</code> and <code>SET</code></h2>
+  <div class="pr-features">
+    <div><h3>Every core type</h3><p>Strings, hashes, lists, sets and sorted sets, written once for memory and tables, so every policy gives the same replies and errors.</p></div>
+    <div><h3>Streams</h3><p><code>XADD</code>, consumer groups, <code>XREADGROUP</code>, <code>XAUTOCLAIM</code>.</p></div>
+    <div><h3>Pub/Sub</h3><p>Channels, patterns and RESP3 push frames, fanned out across every worker.</p></div>
+    <div><h3>Lua &amp; Functions</h3><p><code>EVAL</code>, <code>EVALSHA</code>, <code>FUNCTION LOAD</code>, running on an embedded Lua 5.1.</p></div>
+    <div><h3>Transactions</h3><p><code>MULTI</code>/<code>EXEC</code> and optimistic <code>WATCH</code>, plus the blocking commands: <code>BLPOP</code>, <code>BZPOPMIN</code>, <code>XREAD BLOCK</code>.</p></div>
+    <div><h3>The long tail</h3><p>HyperLogLog, GEO, client-side caching with <code>CLIENT TRACKING</code>, <code>OBJECT</code>, <code>SCAN</code>, <code>SLOWLOG</code>.</p></div>
+  </div>
+  <p class="pr-proof">
+    At parity with Redis on Redis's own Tcl acceptance suite and on a reply-by-reply diff
+    against Redis 7.2, both run in CI, apart from a few minor deviations
+    <a href="#differences">listed below</a>.
+    <a href="{{ 'command-coverage/' | url }}">See every command</a>
+  </p>
+</section>
+
+<section class="pr-section pr-install">
+  <div>
+    <h2 class="pr-h2">Install</h2>
+    <p class="pr-sub">
+      The extension listens on its own port, so it has to be preloaded.
+      Add it to <code>shared_preload_libraries</code>, restart, and create it.
+    </p>
+    <a class="pr-btn pr-btn--primary" href="{{ 'installation/' | url }}">Installation guide</a>
+  </div>
+<pre class="pr-code"><code><span class="c"># build and install into the active Postgres</span>
+cargo pgrx install --release --features pg17
+
+<span class="c"># postgresql.conf</span>
+shared_preload_libraries = 'pg_redis'
+
+<span class="c"># after a restart</span>
+psql -c 'CREATE EXTENSION pg_redis'
+redis-cli PING   <span class="o"># PONG</span></code></pre>
+</section>
+
+<section class="pr-section pr-limits">
+  <h2 class="pr-h2">Good to know</h2>
+  <ul>
+    <li>The Redis port does not go through <code>pg_hba.conf</code>. It binds to <code>127.0.0.1</code> by default; <a href="{{ 'configuration/#exposing-the-listener' | url }}">set a password before widening it</a>.</li>
+    <li>Memory databases share one arena of <code>redis.maxmemory</code>, reserved at server start. Raising it needs a restart; <code>CONFIG SET maxmemory</code> can only lower it.</li>
+    <li>A command's first touch of a key that hasn't moved yet pays for the move, and a command that needs the whole database (<code>KEYS</code>, <code>SCAN</code>, <code>FLUSHDB</code>) finishes the migration first.</li>
+    <li>It needs <code>shared_preload_libraries</code> and a superuser, so it runs where you control the server, not on managed Postgres that doesn't offer it.</li>
+  </ul>
+</section>
+
+<section class="pr-section pr-diff" id="differences">
+  <h2 class="pr-h2">Where it differs from Redis</h2>
+  <p class="pr-sub">
+    pg_redis passes the same tests as Redis: Redis's own Tcl acceptance suite, and a diff of
+    every reply against Redis 7.2. These are the deviations that remain.
+    <a href="{{ 'IMPLEMENTATION/#known-differences-from-redis' | url }}">Full detail</a>
+  </p>
+  <div class="pr-diff__grid">
+    <div>
+      <h3>Behaviour</h3>
+      <ul>
+        <li><strong>Atomicity is per worker.</strong> Each command is atomic, but the commands inside a script or <code>MULTI</code> can interleave with other workers' commands. Redis runs on one thread, so nothing interleaves.</li>
+        <li><strong>Blocked clients are served just after the write.</strong> A write that unblocks <code>BLPOP</code> clients waits up to 500 ms for them to be served, where Redis serves them inside the write.</li>
+        <li><strong>Small hashes and sets keep insertion order only until a removal.</strong> Redis documents both as unordered, but a client can see the difference.</li>
+        <li><strong>No access clock.</strong> <code>OBJECT IDLETIME</code> and <code>OBJECT FREQ</code> return nil, since tracking reads would turn every read on a table into a write.</li>
+        <li><strong>A stand-alone server, with one user.</strong> <code>REPLICAOF</code>, <code>WAIT</code>, <code>CLUSTER</code> and <code>ACL</code> answer as Redis would with no replicas, no cluster and only the <code>default</code> user. Replication is PostgreSQL's.</li>
+        <li><strong>GEO distances can differ in the last digit</strong> of a stored float. It is the only difference the reply diff still finds.</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Limits</h3>
+      <dl class="pr-limits-table">
+        <div><dt>Memory databases</dt><dd><code>redis.maxmemory</code>, shared</dd></div>
+        <div><dt>Keys and values</dt><dd>512 MB, as in Redis</dd></div>
+        <div><dt>Values in tables</dt><dd>~1 GB per field, PostgreSQL's TOAST limit</dd></div>
+        <div><dt>Pub/sub channel or pattern</dt><dd>255 bytes</dd></div>
+        <div><dt>Pub/sub message</dt><dd>512 bytes</dd></div>
+        <div><dt>Client-side caching</dt><dd>16,384 tracked key–client pairs</dd></div>
+      </dl>
+    </div>
+  </div>
+</section>
+<script src="{{ 'javascripts/demo.js' | url }}" defer></script>
+{% endblock %}

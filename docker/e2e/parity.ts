@@ -95,6 +95,55 @@ function elements(reply: Buffer): string[] {
 	return out;
 }
 
+/** A RESP2 reply as a tree: arrays nest, every other reply is its raw token. */
+type Node = string | Node[];
+
+function readNode(b: Buffer, at: number): [Node, number] {
+	const h = b.indexOf("\r\n", at);
+	const kind = String.fromCharCode(b[at]);
+	const head = b.subarray(at + 1, h).toString("latin1");
+	if (kind === "*") {
+		const n = Number(head);
+		if (n < 0) return ["*-1", h + 2];
+		const out: Node[] = [];
+		let cur = h + 2;
+		for (let i = 0; i < n; i++) {
+			const [x, next] = readNode(b, cur);
+			out.push(x);
+			cur = next;
+		}
+		return [out, cur];
+	}
+	if (kind === "$") {
+		const n = Number(head);
+		if (n < 0) return ["$-1", h + 2];
+		return [`$${b.subarray(h + 2, h + 2 + n).toString("latin1")}`, h + 2 + n + 2];
+	}
+	return [kind + head, h + 2];
+}
+
+const showNode = (n: Node): string => (Array.isArray(n) ? `[${n.map(showNode).join(",")}]` : n);
+const sortedNodes = (ns: Node[]) => [...ns].sort((a, b) => (showNode(a) < showNode(b) ? -1 : 1));
+
+/**
+ * `FUNCTION LIST` with its two orders taken out: Redis keeps libraries, and
+ * each library's functions, in dicts whose hash it seeds at random on start
+ * (`dictSetHashFunctionSeed`), so two Redis processes disagree on both.
+ */
+function functionList(reply: Buffer): string {
+	const [libs] = readNode(reply, 0);
+	if (!Array.isArray(libs)) return showNode(libs);
+	return showNode(
+		sortedNodes(
+			libs.map((lib) =>
+				Array.isArray(lib)
+					? lib.map((v, i) => (i > 0 && lib[i - 1] === "$functions" && Array.isArray(v) ? sortedNodes(v) : v))
+					: lib,
+			),
+		),
+	);
+}
+
 /**
  * A clock reading, reduced to what is stable: Redis answers -2 for a key that
  * is gone, -1 for one with no expiry, and a positive number otherwise. Comparing
@@ -117,6 +166,9 @@ function normalize(cmd: Cmd, reply: Buffer): string {
 	}
 	if (UNORDERED.has(name) && reply[0] === 0x2a) {
 		return `*[${elements(reply).sort().join("|")}]`;
+	}
+	if (name === "FUNCTION" && cmd[1]?.toUpperCase() === "LIST" && reply[0] === 0x2a) {
+		return functionList(reply);
 	}
 	return reply.toString("latin1").replace(/\r\n/g, "\\n");
 }
@@ -1099,6 +1151,334 @@ c(
 	["RESTORE", "fresh", "-1", "garbage"],
 	["RESTORE", "fresh", "notanumber", "garbage"],
 	["EXISTS", "fresh"],
+);
+
+// ──────────────────── Commands built from other commands ────────────────────
+// composite.rs: one implementation for both halves, so these are the cases
+// that show it reaches each backend the same way.
+
+c(
+	"LCS",
+	["SET", "a", "ohmytext"],
+	["SET", "b", "mynewtext"],
+	["LCS", "a", "b"],
+	["LCS", "a", "b", "LEN"],
+	["LCS", "a", "b", "IDX"],
+	["LCS", "a", "b", "IDX", "MINMATCHLEN", "4", "WITHMATCHLEN"],
+	["LCS", "a", "missing"],
+	["LCS", "a", "b", "LEN", "IDX"],
+	["RPUSH", "l", "x"],
+	["LCS", "a", "l"],
+);
+c(
+	"BITOP and BITPOS",
+	["SET", "a", "\xff\xf0"],
+	["SET", "b", "\x0f"],
+	["BITOP", "AND", "d", "a", "b"],
+	["GET", "d"],
+	["BITOP", "OR", "d", "a", "b", "missing"],
+	["BITOP", "XOR", "d", "a", "b"],
+	["BITOP", "NOT", "d", "a"],
+	["GET", "d"],
+	["BITOP", "NOT", "d", "a", "b"],
+	["BITOP", "NAND", "d", "a"],
+	["BITOP", "AND", "empty", "missing"],
+	["EXISTS", "empty"],
+	["SET", "p", "\x00\xff\xf0"],
+	["BITPOS", "p", "1"],
+	["BITPOS", "p", "0"],
+	["BITPOS", "p", "1", "2"],
+	["BITPOS", "p", "1", "2", "-1", "BYTE"],
+	["BITPOS", "p", "1", "7", "15", "BIT"],
+	["BITPOS", "p", "0", "1", "1"],
+	["BITPOS", "missing", "0"],
+	["BITPOS", "missing", "1"],
+	["BITPOS", "p", "2"],
+);
+c(
+	"BITFIELD",
+	["BITFIELD", "bf", "SET", "u8", "0", "255", "GET", "u8", "0", "GET", "i8", "0"],
+	["BITFIELD", "bf", "INCRBY", "u2", "100", "1", "OVERFLOW", "SAT", "INCRBY", "u2", "102", "1"],
+	["BITFIELD", "bf", "OVERFLOW", "FAIL", "INCRBY", "i8", "#3", "200"],
+	["BITFIELD", "bf", "SET", "i16", "#1", "-300", "GET", "i16", "#1"],
+	["GET", "bf"],
+	["BITFIELD_RO", "bf", "GET", "u4", "4"],
+	["BITFIELD_RO", "bf", "SET", "u4", "4", "1"],
+	["BITFIELD", "bf", "GET", "u64", "0"],
+	["SET", "ttl", "x", "EX", "100"],
+	["BITFIELD", "ttl", "SET", "u8", "8", "65"],
+	["TTL", "ttl"],
+);
+c(
+	"ZRANGESTORE, LMPOP, ZMPOP",
+	["ZADD", "z", "1", "a", "2", "b", "3", "c"],
+	["ZRANGESTORE", "dst", "z", "0", "1"],
+	["ZRANGE", "dst", "0", "-1", "WITHSCORES"],
+	["ZRANGESTORE", "dst", "z", "(1", "+inf", "BYSCORE", "LIMIT", "0", "1"],
+	["ZRANGE", "dst", "0", "-1"],
+	["ZRANGESTORE", "dst", "missing", "0", "-1"],
+	["EXISTS", "dst"],
+	["RPUSH", "l2", "x", "y", "z"],
+	["LMPOP", "2", "l1", "l2", "LEFT"],
+	["LMPOP", "2", "l1", "l2", "RIGHT", "COUNT", "5"],
+	["LMPOP", "1", "l2", "LEFT"],
+	["LMPOP", "0", "l2", "LEFT"],
+	["ZMPOP", "1", "z", "MIN", "COUNT", "2"],
+	["ZMPOP", "1", "z", "MAX"],
+	["ZMPOP", "1", "z", "MAX"],
+);
+c(
+	"MOVE",
+	["SET", "mk", "v", "EX", "100"],
+	["MOVE", "mk", "3"],
+	["EXISTS", "mk"],
+	["MOVE", "mk", "3"],
+	["SET", "mk", "again"],
+	["MOVE", "mk", "3"],
+	["GET", "mk"],
+	["MOVE", "mk", "99"],
+);
+c(
+	"SORT",
+	["RPUSH", "nums", "3", "1", "2", "10"],
+	["SORT", "nums"],
+	["SORT", "nums", "DESC", "LIMIT", "1", "2"],
+	["SORT", "nums", "ALPHA"],
+	["SET", "w_1", "30"],
+	["SET", "w_2", "20"],
+	["SET", "w_3", "10"],
+	["SORT", "nums", "BY", "w_*"],
+	["SORT", "nums", "BY", "nosort", "GET", "#", "GET", "w_*"],
+	["HSET", "h_1", "f", "b"],
+	["HSET", "h_2", "f", "a"],
+	["SORT", "nums", "BY", "h_*->f", "ALPHA", "GET", "h_*->f"],
+	["SORT", "nums", "STORE", "sorted"],
+	["LRANGE", "sorted", "0", "-1"],
+	["SORT_RO", "nums", "STORE", "x"],
+	["RPUSH", "words", "b", "a"],
+	["SORT", "words"],
+	["SET", "str", "x"],
+	["SORT", "str"],
+);
+c(
+	"HSCAN, SSCAN, ZSCAN",
+	["HSET", "h", "foo", "1", "bar", "2"],
+	["HSCAN", "h", "0", "MATCH", "f*"],
+	["SADD", "s", "foo"],
+	["SSCAN", "s", "0"],
+	["ZADD", "z", "1.5", "foo"],
+	["ZSCAN", "z", "0", "COUNT", "100"],
+	["SSCAN", "missing", "0"],
+	["SSCAN", "s", "notacursor"],
+	["SSCAN", "h", "0"],
+);
+c(
+	"HyperLogLog",
+	["PFADD", "hll", "foo", "bar", "zap"],
+	["PFADD", "hll", "zap"],
+	["PFCOUNT", "hll"],
+	["GET", "hll"],
+	["PFADD", "hll2", "a", "b", "c", "foo"],
+	["PFCOUNT", "hll", "hll2"],
+	["PFMERGE", "merged", "hll", "hll2"],
+	["PFCOUNT", "merged"],
+	["GET", "merged"],
+	["PFADD", "empty"],
+	["GET", "empty"],
+	["PFDEBUG", "ENCODING", "hll"],
+	["PFDEBUG", "DECODE", "hll"],
+	["PFDEBUG", "TODENSE", "hll"],
+	["PFDEBUG", "ENCODING", "hll"],
+	["PFCOUNT", "hll"],
+	["SET", "notahll", "x"],
+	["PFCOUNT", "notahll"],
+	["PFADD", "notahll", "x"],
+	["RPUSH", "alist", "x"],
+	["PFCOUNT", "alist"],
+);
+
+c(
+	"GEO",
+	["GEOADD", "Sicily", "13.361389", "38.115556", "Palermo", "15.087269", "37.502669", "Catania"],
+	["GEOADD", "Sicily", "NX", "CH", "13.0", "38.0", "Palermo", "12.758489", "38.788135", "edge1"],
+	["GEOADD", "Sicily", "200", "100", "bad"],
+	["GEOADD", "Sicily", "NX", "XX", "1", "1", "x"],
+	["GEODIST", "Sicily", "Palermo", "Catania"],
+	["GEODIST", "Sicily", "Palermo", "Catania", "km"],
+	["GEODIST", "Sicily", "Palermo", "missing"],
+	["GEODIST", "Sicily", "Palermo", "Catania", "parsecs"],
+	["GEOHASH", "Sicily", "Palermo", "Catania", "missing"],
+	["GEOPOS", "Sicily", "Palermo", "missing"],
+	["GEORADIUS", "Sicily", "15", "37", "200", "km"],
+	["GEORADIUS", "Sicily", "15", "37", "200", "km", "WITHDIST", "WITHCOORD", "WITHHASH", "ASC"],
+	["GEORADIUS", "Sicily", "15", "37", "200", "km", "COUNT", "1"],
+	["GEORADIUSBYMEMBER", "Sicily", "Palermo", "200", "km", "DESC"],
+	["GEORADIUSBYMEMBER", "Sicily", "missing", "200", "km"],
+	["GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYBOX", "400", "400", "km", "ASC", "WITHDIST"],
+	["GEOSEARCH", "Sicily", "FROMMEMBER", "Palermo", "BYRADIUS", "100", "km"],
+	["GEOSEARCH", "Sicily", "BYRADIUS", "100", "km"],
+	["GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "ANY"],
+	["GEOSEARCHSTORE", "dst", "Sicily", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "STOREDIST"],
+	["ZRANGE", "dst", "0", "-1", "WITHSCORES"],
+	["GEORADIUS", "Sicily", "15", "37", "200", "km", "STORE", "dst2"],
+	["ZRANGE", "dst2", "0", "-1", "WITHSCORES"],
+	["GEOSEARCH", "missing", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km"],
+	["SET", "notgeo", "x"],
+	["GEOPOS", "notgeo", "a"],
+);
+
+// ──────────────────────── Scripting and functions ───────────────────────────
+// FLUSHALL leaves scripts and libraries alone, so every case clears both.
+
+c(
+	"EVAL converts replies both ways",
+	["SCRIPT", "FLUSH"],
+	["EVAL", "return 'hello'", "0"],
+	["EVAL", "return 100.5", "0"],
+	["EVAL", "return {1,2,3,'ciao',{1,2}}", "0"],
+	["EVAL", "return {ok='fine'}", "0"],
+	["EVAL", "return {err='ERR this is an error'}", "0"],
+	["EVAL", "return redis.error_reply('MY_CODE custom msg')", "0"],
+	["EVAL", "return redis.status_reply('MY_OK')", "0"],
+	["EVAL", "return true", "0"],
+	["EVAL", "return false", "0"],
+	["EVAL", "return nil", "0"],
+	["EVAL", "return {KEYS[1], KEYS[2], ARGV[1]}", "2", "a", "b", "c"],
+	["SET", "k", "v"],
+	["EVAL", "return redis.call('get', KEYS[1])", "1", "k"],
+	["EVAL", "local t = redis.call('set', 'x', 'y'); return t['ok']", "0"],
+	["EVAL", "return redis.pcall('incr', KEYS[1])['err']", "1", "k"],
+	["RPUSH", "l", "a", "b", "c"],
+	["EVAL", "local r = redis.call('lrange', KEYS[1], 0, -1); return {#r, r[1]}", "1", "l"],
+	["EVAL", "return redis.call('get', 'missing') == false", "0"],
+);
+c(
+	"EVAL errors carry the script and the line",
+	["SCRIPT", "FLUSH"],
+	["SET", "k", "v"],
+	["EVAL", "return redis.call('incr', KEYS[1])", "1", "k"],
+	["EVAL", "\nreturn redis.call('incr', KEYS[1])", "1", "k"],
+	["EVAL", "return redis.call()", "0"],
+	["EVAL", "return redis.call('nosuchcommand')", "0"],
+	["EVAL", "return redis.call('get', 'a', 'b')", "0"],
+	["EVAL", "return redis.call('ping', {})", "0"],
+	["EVAL", "return redis.call('cluster', 'info')", "0"],
+	["EVAL", "return a", "0"],
+	["EVAL", "a = 10", "0"],
+	["EVAL", "error('boom')", "0"],
+	["EVAL", "error({err='CUSTOM failure'})", "0"],
+	["EVAL", "return (", "0"],
+	["EVAL", "return 1", "2", "a"],
+	["EVAL", "return 1", "-1"],
+	["EVAL", "return 1", "x"],
+	["EVAL_RO", "return redis.call('set', 'x', 'y')", "0"],
+	["EVAL_RO", "#!lua\nreturn 1", "0"],
+	["EVAL_RO", "#!lua flags=no-writes\nreturn 1", "0"],
+	["EVAL", "#!lua flags=bogus\nreturn 1", "0"],
+	["EVAL", "#!python\nreturn 1", "0"],
+);
+c(
+	"Script cache",
+	["SCRIPT", "FLUSH"],
+	["SCRIPT", "LOAD", "return 'cached'"],
+	["EVALSHA", "dbc1a9c3d3d42f2a4cbd6b3ef87e74e08a68dedf", "0"],
+	["SCRIPT", "EXISTS", "dbc1a9c3d3d42f2a4cbd6b3ef87e74e08a68dedf", "ffffffffffffffffffffffffffffffffffffffff"],
+	["EVALSHA", "DBC1A9C3D3D42F2A4CBD6B3EF87E74E08A68DEDF", "0"],
+	["EVALSHA_RO", "dbc1a9c3d3d42f2a4cbd6b3ef87e74e08a68dedf", "0"],
+	["EVALSHA", "ffffffffffffffffffffffffffffffffffffffff", "0"],
+	["EVALSHA", "notasha", "0"],
+	["SCRIPT", "LOAD", "return ("],
+	["SCRIPT", "FLUSH", "BOGUS"],
+	["SCRIPT", "FLUSH"],
+	["SCRIPT", "EXISTS", "dbc1a9c3d3d42f2a4cbd6b3ef87e74e08a68dedf"],
+);
+c(
+	"Lua libraries",
+	["SCRIPT", "FLUSH"],
+	["EVAL", "return cjson.encode({1, 2, 'three'})", "0"],
+	["EVAL", "return cjson.decode('{\"a\": [1, 2]}').a[2]", "0"],
+	["EVAL", "return table.concat(cjson.decode('[0.0, -5e3, -1, 0.3e-3, 1023.2, 0e10]'), ' ')", "0"],
+	["EVAL", "local e = cmsgpack.pack({1, 'a', 0.1}) return #e", "0"],
+	["EVAL", "return cmsgpack.unpack(cmsgpack.pack('round trip'))", "0"],
+	["EVAL", "return bit.bxor(0xff, 0x0f)", "0"],
+	["EVAL", "return struct.unpack('>I2', struct.pack('>I2', 258))", "0"],
+	["EVAL", "return redis.sha1hex('Pizza & Mandolino')", "0"],
+	["EVAL", "math.randomseed(10); return tostring(math.random())", "0"],
+	["EVAL", "return loadstring(string.dump(function() return 1 end))", "0"],
+	["EVAL", "cjson.encode = nil", "0"],
+	["EVAL", "print('x')", "0"],
+);
+c(
+	"Functions",
+	["FUNCTION", "FLUSH"],
+	["FUNCTION", "LOAD", "#!lua name=lib\nredis.register_function('echo', function(keys, args) return args[1] end)\nredis.register_function{function_name='ro', callback=function() return 1 end, flags={'no-writes'}, description='read only'}"],
+	["FCALL", "echo", "0", "hi"],
+	["FCALL", "ECHO", "0", "case"],
+	["FCALL_RO", "ro", "0"],
+	["FCALL_RO", "echo", "0"],
+	["FCALL", "missing", "0"],
+	["FCALL", "echo", "x"],
+	["FCALL", "echo", "5"],
+	["FUNCTION", "LIST"],
+	["FUNCTION", "LIST", "WITHCODE", "LIBRARYNAME", "l*"],
+	["FUNCTION", "LIST", "LIBRARYNAME"],
+	["FUNCTION", "LOAD", "#!lua name=lib\nredis.register_function('echo', function() end)"],
+	["FUNCTION", "LOAD", "#!lua name=other\nredis.register_function('echo', function() end)"],
+	["FUNCTION", "LOAD", "#!lua name=empty\nlocal x = 1"],
+	["FUNCTION", "LOAD", "#!lua name=globals\nlocal x = string.len('a')"],
+	["FUNCTION", "LOAD", "#!lua name=bad-name\nredis.register_function('f', function() end)"],
+	["FUNCTION", "LOAD", "#!lua\nredis.register_function('f', function() end)"],
+	["FUNCTION", "LOAD", "no shebang"],
+	["FUNCTION", "LOAD", "#!lua name=x foo=bar\n"],
+	["FUNCTION", "LOAD", "#!lua name=syntax\nredis.register_function("],
+	["FUNCTION", "LOAD", "#!lua name=args\nredis.register_function('f')"],
+	["FUNCTION", "LOAD", "#!lua name=flags\nredis.register_function{function_name='f', callback=function() end, flags={'bogus'}}"],
+	["FUNCTION", "DELETE", "missing"],
+	["FUNCTION", "DELETE", "lib"],
+	["FCALL", "echo", "0", "gone"],
+	["FUNCTION", "RESTORE", "bogus"],
+	["FUNCTION", "RESTORE", "x", "SOMETIMES"],
+	["FUNCTION", "FLUSH", "BOGUS"],
+	["FUNCTION", "FLUSH"],
+);
+c(
+	"Sharded pub/sub, outside subscribe mode",
+	["SPUBLISH", "chan", "msg"],
+	["SPUBLISH", "chan"],
+	["PUBSUB", "SHARDCHANNELS"],
+	["PUBSUB", "SHARDCHANNELS", "c*"],
+	["PUBSUB", "SHARDNUMSUB", "chan", "other"],
+	["PUBSUB", "SHARDNUMSUB"],
+	["SUNSUBSCRIBE", "chan"],
+	["SUNSUBSCRIBE"],
+	["SSUBSCRIBE"],
+);
+c(
+	"Sorted-set arithmetic over plain sets",
+	["ZADD", "z", "1", "a", "2", "b"],
+	["SADD", "s", "b", "c"],
+	["ZUNIONSTORE", "u", "2", "z", "s", "WEIGHTS", "2", "3"],
+	["ZRANGE", "u", "0", "-1", "WITHSCORES"],
+	["ZINTERSTORE", "i", "2", "z", "s", "AGGREGATE", "MAX"],
+	["ZRANGE", "i", "0", "-1", "WITHSCORES"],
+	["ZDIFFSTORE", "d", "2", "z", "s"],
+	["ZRANGE", "d", "0", "-1", "WITHSCORES"],
+	["ZUNION", "2", "z", "s", "WITHSCORES"],
+	["ZINTER", "2", "s", "z", "WITHSCORES"],
+	["ZDIFF", "2", "s", "z", "WITHSCORES"],
+	["ZINTERCARD", "2", "z", "s"],
+	["ZADD", "inf", "inf", "x", "-inf", "y"],
+	["ZUNIONSTORE", "n", "2", "inf", "inf", "WEIGHTS", "1", "-1"],
+	["ZRANGE", "n", "0", "-1", "WITHSCORES"],
+	["ZUNIONSTORE", "w", "2", "z", "s", "WITHSCORES"],
+	["ZDIFFSTORE", "w", "1", "z", "WEIGHTS", "2"],
+	["ZINTERCARD", "3", "z"],
+	["ZINTERCARD", "1", "z", "LIMIT", "x"],
+	["ZUNION", "0", "z"],
+	["ZUNIONSTORE", "e", "1", "missing"],
+	["EXISTS", "e"],
+	["SET", "str", "x"],
+	["ZUNION", "2", "z", "str"],
 );
 
 // ────────────────────────────────── Runner ──────────────────────────────────

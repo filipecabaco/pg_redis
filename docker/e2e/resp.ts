@@ -19,6 +19,11 @@ export class RawRedis {
 	private socket!: Awaited<ReturnType<typeof Bun.connect>>;
 	private buffer = Buffer.alloc(0);
 	private waiters: Array<(b: Buffer) => void> = [];
+	/** Bytes not yet taken by the socket. Bun's `write` takes what fits and
+	 * returns how much; the rest waits for `drain`. A multi-megabyte request
+	 * sent in one `write` was cut short, and the server waited for the
+	 * remainder forever. */
+	private pending: Buffer[] = [];
 
 	async connect(opts: RawRedisOptions = {}) {
 		const host = opts.host ?? process.env.REDIS_HOST ?? "localhost";
@@ -32,6 +37,7 @@ export class RawRedis {
 					this.buffer = Buffer.concat([this.buffer, Buffer.from(chunk)]);
 					this.drain();
 				},
+				drain: () => this.flush(),
 				error: () => {},
 				close: () => {},
 			},
@@ -58,8 +64,21 @@ export class RawRedis {
 			parts.push(Buffer.from(`$${b.length}\r\n`), b, Buffer.from("\r\n"));
 		}
 		const done = new Promise<Buffer>((resolve) => this.waiters.push(resolve));
-		this.socket.write(Buffer.concat(parts));
+		this.pending.push(Buffer.concat(parts));
+		if (this.pending.length === 1) this.flush();
 		return done;
+	}
+
+	private flush() {
+		while (this.pending.length > 0) {
+			const head = this.pending[0];
+			const n = this.socket.write(head);
+			if (n < head.length) {
+				this.pending[0] = head.subarray(Math.max(n, 0));
+				return;
+			}
+			this.pending.shift();
+		}
 	}
 
 	/** The elements of a multi-bulk reply, with nil elements as null. */

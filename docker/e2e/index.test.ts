@@ -13,18 +13,10 @@ const sql = new Bun.sql(DATABASE_URL);
 let client: Bun.RedisClient;
 
 let raw: RawRedis;
-/** True when databases 0-7 are served from shared memory rather than tables. */
-let memoryMode = false;
 
 beforeAll(async () => {
 	client = new Bun.RedisClient(redisUrl);
 	raw = await new RawRedis().connect();
-	// Aliased: `SHOW redis.storage_mode` names the column "redis.storage_mode",
-	// dot and all, so destructuring by `storage_mode` silently yields undefined
-	// and every memory-mode assertion below takes the wrong branch.
-	const [{ mode }] =
-		await sql`SELECT current_setting('redis.storage_mode') AS mode`;
-	memoryMode = mode === "memory";
 });
 
 afterAll(async () => {
@@ -346,14 +338,10 @@ describe("Hash", () => {
 	});
 
 	test("HGETALL", async () => {
-		expect(await client.hgetall("myhash")).toEqual([
-			"f1",
-			"v1",
-			"f2",
-			"v2",
-			"f3",
-			"v3",
-		]);
+		// Bun negotiates RESP3, where HGETALL is a map, as Redis replies.
+		expect(await client.hgetall("myhash")).toEqual(
+			{ f1: "v1", f2: "v2", f3: "v3" },
+		);
 	});
 
 	test("HDEL single", async () => {
@@ -365,7 +353,7 @@ describe("Hash", () => {
 	});
 
 	test("HGETALL after del", async () => {
-		expect(await client.hgetall("myhash")).toEqual(["f2", "v2", "f3", "v3"]);
+		expect(await client.hgetall("myhash")).toEqual({ f2: "v2", f3: "v3" });
 	});
 
 	test("HDEL multi", async () => {
@@ -469,15 +457,16 @@ describe("Server", () => {
 		expect(info).toContain("redis_version");
 	});
 
-	test("COMMAND returns empty array", async () => {
-		expect(await client.send("COMMAND", [])).toEqual([]);
+	test("COMMAND describes every accepted command", async () => {
+		const all = (await client.send("COMMAND", [])) as unknown[];
+		expect(all.length).toBe(await client.send("COMMAND", ["COUNT"]));
 	});
 
 	// The number of rows in docs/command-coverage.md, which a unit test pins
 	// to the parser in both directions. A change here means a command was
 	// added or removed: update the page and this number together.
 	test("COMMAND COUNT reports the number of accepted commands", async () => {
-		expect(await client.send("COMMAND", ["COUNT"])).toBe(149);
+		expect(await client.send("COMMAND", ["COUNT"])).toBe(235);
 	});
 });
 
@@ -1112,13 +1101,13 @@ describe("Sorted Set", () => {
 		expect(
 			await client.send("ZADD", ["zadd-z", "1", "a", "2", "b", "3", "c"]),
 		).toBe(3);
-		expect(await client.send("ZSCORE", ["zadd-z", "b"])).toBe("2");
+		expect(await client.send("ZSCORE", ["zadd-z", "b"])).toBe(2);
 		expect(await client.send("ZCARD", ["zadd-z"])).toBe(3);
 	});
 
 	test("ZADD upsert returns added count only, updates existing score", async () => {
 		expect(await client.send("ZADD", ["zadd-z", "5", "a"])).toBe(0);
-		expect(await client.send("ZSCORE", ["zadd-z", "a"])).toBe("5");
+		expect(await client.send("ZSCORE", ["zadd-z", "a"])).toBe(5);
 	});
 
 	test("ZADD CH returns count of added + changed", async () => {
@@ -1143,38 +1132,34 @@ describe("Sorted Set", () => {
 		expect(
 			await client.send("ZADD", ["zadd-nx", "NX", "5", "a", "2", "b"]),
 		).toBe(1);
-		expect(await client.send("ZSCORE", ["zadd-nx", "a"])).toBe("1");
+		expect(await client.send("ZSCORE", ["zadd-nx", "a"])).toBe(1);
 
 		await client.send("ZADD", ["zadd-xx", "1", "a"]);
 		expect(
 			await client.send("ZADD", ["zadd-xx", "XX", "2", "a", "3", "b"]),
 		).toBe(0);
-		expect(await client.send("ZSCORE", ["zadd-xx", "a"])).toBe("2");
+		expect(await client.send("ZSCORE", ["zadd-xx", "a"])).toBe(2);
 		expect(await client.send("ZSCORE", ["zadd-xx", "b"])).toBeNull();
 	});
 
 	test("ZADD GT only raises score, LT only lowers score", async () => {
 		await client.send("ZADD", ["zadd-gt", "5", "a"]);
 		await client.send("ZADD", ["zadd-gt", "GT", "3", "a"]);
-		expect(await client.send("ZSCORE", ["zadd-gt", "a"])).toBe("5");
+		expect(await client.send("ZSCORE", ["zadd-gt", "a"])).toBe(5);
 		await client.send("ZADD", ["zadd-gt", "GT", "10", "a"]);
-		expect(await client.send("ZSCORE", ["zadd-gt", "a"])).toBe("10");
+		expect(await client.send("ZSCORE", ["zadd-gt", "a"])).toBe(10);
 
 		await client.send("ZADD", ["zadd-lt", "5", "a"]);
 		await client.send("ZADD", ["zadd-lt", "LT", "10", "a"]);
-		expect(await client.send("ZSCORE", ["zadd-lt", "a"])).toBe("5");
+		expect(await client.send("ZSCORE", ["zadd-lt", "a"])).toBe(5);
 		await client.send("ZADD", ["zadd-lt", "LT", "1", "a"]);
-		expect(await client.send("ZSCORE", ["zadd-lt", "a"])).toBe("1");
+		expect(await client.send("ZSCORE", ["zadd-lt", "a"])).toBe(1);
 	});
 
 	test("ZADD INCR returns new score", async () => {
 		await client.send("DEL", ["zadd-incr"]);
-		expect(await client.send("ZADD", ["zadd-incr", "INCR", "5", "a"])).toBe(
-			"5",
-		);
-		expect(await client.send("ZADD", ["zadd-incr", "INCR", "3", "a"])).toBe(
-			"8",
-		);
+		expect(await client.send("ZADD", ["zadd-incr", "INCR", "5", "a"])).toBe(5);
+		expect(await client.send("ZADD", ["zadd-incr", "INCR", "3", "a"])).toBe(8);
 	});
 
 	test("ZADD INCR NX returns nil for existing member", async () => {
@@ -1197,13 +1182,13 @@ describe("Sorted Set", () => {
 		await client.send("ZADD", ["zmscore-z", "1", "a", "2", "b"]);
 		expect(
 			await client.send("ZMSCORE", ["zmscore-z", "a", "missing", "b"]),
-		).toEqual(["1", null, "2"]);
+		).toEqual([1, null, 2]);
 	});
 
 	test("ZINCRBY increments score (creates member if absent)", async () => {
-		expect(await client.send("ZINCRBY", ["zincrby-z", "5", "a"])).toBe("5");
-		expect(await client.send("ZINCRBY", ["zincrby-z", "3", "a"])).toBe("8");
-		expect(await client.send("ZINCRBY", ["zincrby-z", "-2", "a"])).toBe("6");
+		expect(await client.send("ZINCRBY", ["zincrby-z", "5", "a"])).toBe(5);
+		expect(await client.send("ZINCRBY", ["zincrby-z", "3", "a"])).toBe(8);
+		expect(await client.send("ZINCRBY", ["zincrby-z", "-2", "a"])).toBe(6);
 	});
 
 	// ZINCRBY's return value alone says nothing about the metadata. A member
@@ -1212,17 +1197,12 @@ describe("Sorted Set", () => {
 	// of the key — so assert through all three.
 	test("a member ZINCRBY creates is counted and can be popped", async () => {
 		await client.send("DEL", ["zincrby-meta"]);
-		expect(await client.send("ZINCRBY", ["zincrby-meta", "5", "alice"])).toBe(
-			"5",
-		);
+		expect(await client.send("ZINCRBY", ["zincrby-meta", "5", "alice"])).toBe(5);
 		expect(await client.send("ZCARD", ["zincrby-meta"])).toBe(1);
 		expect(await client.send("ZRANGE", ["zincrby-meta", "0", "-1"])).toEqual([
 			"alice",
 		]);
-		expect(await client.send("ZPOPMIN", ["zincrby-meta"])).toEqual([
-			"alice",
-			"5",
-		]);
+		expect(await client.send("ZPOPMIN", ["zincrby-meta"])).toEqual(["alice", 5]);
 		expect(await client.send("ZCARD", ["zincrby-meta"])).toBe(0);
 
 		// A member added afterwards must not inherit a count the pop left wrong.
@@ -1237,14 +1217,14 @@ describe("Sorted Set", () => {
 		await client.send("DEL", ["zincrby-ext"]);
 		await client.send("ZADD", ["zincrby-ext", "1", "a", "2", "b", "3", "c"]);
 		// `a` overtakes `c`: the max moves to a member that was neither.
-		expect(await client.send("ZINCRBY", ["zincrby-ext", "10", "a"])).toBe("11");
-		expect(await client.send("ZPOPMAX", ["zincrby-ext"])).toEqual(["a", "11"]);
+		expect(await client.send("ZINCRBY", ["zincrby-ext", "10", "a"])).toBe(11);
+		expect(await client.send("ZPOPMAX", ["zincrby-ext"])).toEqual(["a", 11]);
 		// `b` is now the min; drop it below and the min has to follow.
-		expect(await client.send("ZINCRBY", ["zincrby-ext", "-5", "b"])).toBe("-3");
-		expect(await client.send("ZPOPMIN", ["zincrby-ext"])).toEqual(["b", "-3"]);
+		expect(await client.send("ZINCRBY", ["zincrby-ext", "-5", "b"])).toBe(-3);
+		expect(await client.send("ZPOPMIN", ["zincrby-ext"])).toEqual(["b", -3]);
 		// And the min moving *off* a member re-derives from the entries.
 		expect(await client.send("ZCARD", ["zincrby-ext"])).toBe(1);
-		expect(await client.send("ZPOPMIN", ["zincrby-ext"])).toEqual(["c", "3"]);
+		expect(await client.send("ZPOPMIN", ["zincrby-ext"])).toEqual(["c", 3]);
 		await client.send("DEL", ["zincrby-ext"]);
 	});
 
@@ -1253,12 +1233,9 @@ describe("Sorted Set", () => {
 		await client.send("DEL", ["zaddincr-meta"]);
 		expect(
 			await client.send("ZADD", ["zaddincr-meta", "INCR", "7", "solo"]),
-		).toBe("7");
+		).toBe(7);
 		expect(await client.send("ZCARD", ["zaddincr-meta"])).toBe(1);
-		expect(await client.send("ZPOPMAX", ["zaddincr-meta"])).toEqual([
-			"solo",
-			"7",
-		]);
+		expect(await client.send("ZPOPMAX", ["zaddincr-meta"])).toEqual(["solo", 7]);
 		await client.send("DEL", ["zaddincr-meta"]);
 	});
 
@@ -1334,10 +1311,14 @@ describe("Sorted Set", () => {
 		]);
 	});
 
-	test("ZRANGE WITHSCORES interleaves member and score", async () => {
+	// Under RESP3 a scored reply is a list of [member, score] pairs.
+	test("ZRANGE WITHSCORES pairs each member with its score", async () => {
 		expect(
 			await client.send("ZRANGE", ["zrange-z", "0", "1", "WITHSCORES"]),
-		).toEqual(["a", "1", "b", "2"]);
+		).toEqual([
+			["a", 1],
+			["b", 2],
+		]);
 	});
 
 	test("ZRANGE REV reverses order", async () => {
@@ -1405,18 +1386,16 @@ describe("Sorted Set", () => {
 
 	test("ZPOPMIN removes lowest-score member", async () => {
 		await client.send("ZADD", ["zpopmin-z", "1", "a", "2", "b", "3", "c"]);
-		const popped = (await client.send("ZPOPMIN", ["zpopmin-z"])) as string[];
-		expect(popped).toEqual(["a", "1"]);
+		expect(await client.send("ZPOPMIN", ["zpopmin-z"])).toEqual(["a", 1]);
 		expect(await client.send("ZCARD", ["zpopmin-z"])).toBe(2);
 	});
 
 	test("ZPOPMAX with count returns top N", async () => {
 		await client.send("ZADD", ["zpopmax-z", "1", "a", "2", "b", "3", "c"]);
-		const popped = (await client.send("ZPOPMAX", [
-			"zpopmax-z",
-			"2",
-		])) as string[];
-		expect(popped).toEqual(["c", "3", "b", "2"]);
+		expect(await client.send("ZPOPMAX", ["zpopmax-z", "2"])).toEqual([
+			["c", 3],
+			["b", 2],
+		]);
 		expect(await client.send("ZCARD", ["zpopmax-z"])).toBe(1);
 	});
 
@@ -1427,13 +1406,14 @@ describe("Sorted Set", () => {
 		expect(await client.send("ZCARD", ["zrand-z"])).toBe(3);
 	});
 
-	test("ZRANDMEMBER WITHSCORES returns interleaved pairs", async () => {
+	test("ZRANDMEMBER WITHSCORES returns [member, score] pairs", async () => {
 		const out = (await client.send("ZRANDMEMBER", [
 			"zrand-z",
 			"2",
 			"WITHSCORES",
-		])) as string[];
-		expect(out.length).toBe(4);
+		])) as [string, number][];
+		expect(out.length).toBe(2);
+		for (const [, score] of out) expect(typeof score).toBe("number");
 	});
 
 	test("ZREMRANGEBYRANK removes indexes inclusively", async () => {
@@ -1505,7 +1485,11 @@ describe("Sorted Set", () => {
 		).toBe(3);
 		expect(
 			await client.send("ZRANGE", ["zunion-dst", "0", "-1", "WITHSCORES"]),
-		).toEqual(["a", "1", "c", "4", "b", "5"]);
+		).toEqual([
+			["a", 1],
+			["c", 4],
+			["b", 5],
+		]);
 	});
 
 	test("ZINTERSTORE with WEIGHTS and AGGREGATE MAX", async () => {
@@ -1526,7 +1510,7 @@ describe("Sorted Set", () => {
 		).toBe(1);
 		expect(
 			await client.send("ZRANGE", ["zinter-dst", "0", "-1", "WITHSCORES"]),
-		).toEqual(["b", "9"]);
+		).toEqual([["b", 9]]);
 	});
 
 	test("ZDIFFSTORE keeps only the first set's exclusive members", async () => {
@@ -1537,7 +1521,7 @@ describe("Sorted Set", () => {
 		).toBe(1);
 		expect(
 			await client.send("ZRANGE", ["zdiff-dst", "0", "-1", "WITHSCORES"]),
-		).toEqual(["a", "1"]);
+		).toEqual([["a", 1]]);
 	});
 
 	test("TYPE reports zset", async () => {
@@ -1665,10 +1649,38 @@ describe("Transactions", () => {
 		watchClient.close();
 	});
 
+	// A queued SELECT moves the commands after it, and the connection once
+	// EXEC has run. Spanning both halves also puts a memory-half command in
+	// the same dispatcher batch as a SQL one, which routed it to `kv_0` — a
+	// table the memory half never reads — before routing was per command.
+	test("SELECT inside MULTI moves later commands, across both halves", async () => {
+		const c = new Bun.RedisClient(redisUrl);
+		try {
+			await c.send("SELECT", ["0"]);
+			await c.send("DEL", ["tx-select-key"]);
+			await c.send("MULTI", []);
+			await c.send("SET", ["tx-select-key", "cache"]);
+			await c.send("SELECT", ["9"]);
+			await c.send("SET", ["tx-select-key", "durable"]);
+			expect(await c.send("EXEC", [])).toEqual(["OK", "OK", "OK"]);
+			// EXEC left the connection on db 9.
+			expect(await c.get("tx-select-key")).toBe("durable");
+			await c.send("SELECT", ["0"]);
+			expect(await c.get("tx-select-key")).toBe("cache");
+			await c.send("DEL", ["tx-select-key"]);
+			await c.send("SELECT", ["9"]);
+			await c.send("DEL", ["tx-select-key"]);
+		} finally {
+			c.close();
+		}
+	});
+
 	test("WATCH inside MULTI returns error", async () => {
 		await client.send("MULTI", []);
+		// Redis 7.2's wording. Unlike a queueing error it does not flag the
+		// transaction: `watchCommand` replies and returns, so EXEC would run.
 		await expect(client.send("WATCH", ["some-key"])).rejects.toThrow(
-			/not allowed inside a transaction/,
+			/WATCH inside MULTI is not allowed/,
 		);
 		await client.send("DISCARD", []);
 	});
@@ -1912,7 +1924,6 @@ describe("Binary safety", () => {
 	// A member past the inline prefix owns a chain, and only a pool that runs
 	// dry reveals a removal path that fails to give it back.
 	test("churning long members does not exhaust the member pools", async () => {
-		if (!memoryMode) return; // db 0 is a table here; nothing is pooled
 
 		const long = (i: number) => {
 			const m = Buffer.alloc(MAX_MEMBER_LEN, 0x6d);
@@ -1993,6 +2004,50 @@ describe("Pub/Sub pattern matching", () => {
 	});
 });
 
+describe("Sharded Pub/Sub", () => {
+	// A stand-alone Redis keeps sharded channels in a namespace of their own:
+	// SPUBLISH reaches SSUBSCRIBE and nothing else, PUBLISH the reverse, and
+	// no pattern subscription sees a sharded message.
+	test("SPUBLISH and PUBLISH do not cross namespaces", async () => {
+		const sharded = new Bun.RedisClient(redisUrl);
+		const plain = new Bun.RedisClient(redisUrl);
+		const everything = new Bun.RedisClient(redisUrl);
+		try {
+			await sharded.send("SSUBSCRIBE", ["orders"]);
+			await plain.send("SUBSCRIBE", ["orders"]);
+			await everything.send("PSUBSCRIBE", ["*"]);
+			await Bun.sleep(100);
+
+			expect(await client.send("SPUBLISH", ["orders", "s"])).toBe(1);
+			// The plain subscriber and the `*` pattern, not the sharded one.
+			expect(await client.send("PUBLISH", ["orders", "p"])).toBe(2);
+
+			expect(await client.send("PUBSUB", ["SHARDCHANNELS"])).toEqual(["orders"]);
+			expect(await client.send("PUBSUB", ["SHARDNUMSUB", "orders", "none"])).toEqual([
+				"orders",
+				1,
+				"none",
+				0,
+			]);
+			const plainChannels = (await client.send("PUBSUB", ["CHANNELS"])) as string[];
+			expect(plainChannels).toContain("orders");
+			expect(plainChannels.some((c) => c.includes("shard"))).toBe(false);
+		} finally {
+			sharded.close();
+			plain.close();
+			everything.close();
+		}
+	});
+
+	test("SUNSUBSCRIBE outside subscribe mode answers per channel", async () => {
+		// A RESP3 push frame, which Bun's client hands back as { type, data }.
+		expect(await client.send("SUNSUBSCRIBE", ["a"])).toEqual({
+			type: "sunsubscribe",
+			data: ["a", 0],
+		});
+	});
+});
+
 describe("Pub/Sub size limits", () => {
 	// Names and payloads live in fixed-size shared-memory slots. Truncating them
 	// would leave a client subscribed to a channel it can never receive on, so
@@ -2046,19 +2101,14 @@ describe("Pub/Sub size limits", () => {
 	});
 });
 
-// The shared-memory backend stores the first INLINE_VAL_LEN (64) bytes of a
-// value inside the entry and spills the rest into a pool of fixed-size chunks,
-// one chunk per CHUNK_LEN bytes, chained by index. `redis-benchmark` writes
-// 3-byte values, so nothing in the benchmark suite has ever crossed either
-// boundary, and the spill/reclaim paths were where two silent-truncation bugs
-// lived.
+// Sizes where the old fixed-table engine had boundaries — a 64-byte inline
+// slot, 64-byte chunks, a 64 KiB value cap, 512-byte keys and members. The
+// memory engine no longer has any of them, and the values either side are
+// kept because `redis-benchmark` writes 3-byte values and nothing else in the
+// suite crosses them.
 const INLINE_VAL_LEN = 64;
 const CHUNK_LEN = 64;
-// An eighth of a pool of `redis.mem_max_entries` chunks, capped at 64 KiB —
-// which is where the default 8192 lands. See docs/IMPLEMENTATION.md.
 const MAX_TOTAL_VAL_LEN = 64 * 1024;
-// Members carry the same 512-byte bound as keys: a share of a chunk pool, not
-// the size of an array. See docs/IMPLEMENTATION.md.
 const MAX_MEMBER_LEN = 512;
 const MEM_MAX_KEY = 512;
 
@@ -2081,7 +2131,7 @@ const VALUE_SIZES = [
 	511, // the cap before the pool replaced the fixed overflow row...
 	512, // ...and one byte past it, now unremarkable
 	MAX_TOTAL_VAL_LEN - 1, // 65535
-	MAX_TOTAL_VAL_LEN, // 65536 largest the memory backend accepts
+	MAX_TOTAL_VAL_LEN, // 65536 the old cap
 ];
 
 // Both storage backends, the same assertions. Every case here was found by the
@@ -2796,6 +2846,79 @@ for (const half of ["cache", "durable"]) {
 			await raw.send("DEL", "p0:h");
 		});
 
+		// Found by Redis's own suite once its memory pass really ran on the
+		// memory half: each was right on SQL and wrong in shared memory.
+		test("ZRANGE BYSCORE REV takes the high end first, and scores only on request", async () => {
+			await raw.send("DEL", "p0:z", "p0:z2");
+			await raw.send("ZADD", "p0:z", "1", "a", "2", "b", "3", "c", "4", "d");
+			const words = async (...a: string[]) =>
+				(await raw.array(...a)).map((b) => b?.toString());
+			expect(await words("ZRANGE", "p0:z", "5", "0", "BYSCORE", "REV", "LIMIT", "0", "2", "WITHSCORES")).toEqual(["d", "4", "c", "3"]);
+			expect(await words("ZRANGE", "p0:z", "0", "5", "BYSCORE", "LIMIT", "0", "2")).toEqual(["a", "b"]);
+			expect(await words("ZRANGE", "p0:z", "[d", "[b", "BYLEX", "REV")).toEqual(["d", "c", "b"]);
+			expect(integerReply(await raw.send("ZRANGESTORE", "p0:z2", "p0:z", "1", "2", "BYSCORE"))).toBe(2);
+			await raw.send("DEL", "p0:z", "p0:z2");
+		});
+
+		test("ZADD XX leaves a missing key missing; INCR refused by GT/LT is nil", async () => {
+			await raw.send("DEL", "p0:z");
+			expect(integerReply(await raw.send("ZADD", "p0:z", "XX", "1", "a"))).toBe(0);
+			expect((await raw.send("TYPE", "p0:z")).toString()).toBe("+none\r\n");
+			await raw.send("ZADD", "p0:z", "5", "a");
+			expect((await raw.send("ZADD", "p0:z", "LT", "INCR", "1", "a")).toString()).toBe("$-1\r\n");
+			expect((await raw.send("ZADD", "p0:z", "GT", "INCR", "-1", "a")).toString()).toBe("$-1\r\n");
+			await raw.send("DEL", "p0:z");
+		});
+
+		// A key past its deadline is gone the moment it is looked up, the
+		// sweep notwithstanding: a write that reads the old value starts from
+		// nothing and leaves a key with no deadline.
+		test("writes that read the old value treat an expired key as absent", async () => {
+			const expired = async (key: string, value: string) => {
+				await raw.send("SET", key, value, "PX", "1");
+				await Bun.sleep(20);
+			};
+			const str = async (...a: string[]) => (await raw.bulk(...a))?.toString() ?? null;
+			await expired("p0:x1", "5");
+			expect(integerReply(await raw.send("INCR", "p0:x1"))).toBe(1);
+			expect(integerReply(await raw.send("TTL", "p0:x1"))).toBe(-1);
+			await expired("p0:x2", "x");
+			expect(integerReply(await raw.send("APPEND", "p0:x2", "y"))).toBe(1);
+			expect(await str("GET", "p0:x2")).toBe("y");
+			await expired("p0:x3", "hello");
+			await raw.send("SETRANGE", "p0:x3", "0", "J");
+			expect(await str("GET", "p0:x3")).toBe("J");
+			await expired("p0:x4", "old");
+			expect(await str("GETSET", "p0:x4", "new")).toBeNull();
+			await expired("p0:x5", "old");
+			expect(integerReply(await raw.send("SETNX", "p0:x5", "new"))).toBe(1);
+			await expired("p0:x6", "old");
+			expect(integerReply(await raw.send("MSETNX", "p0:x6", "new"))).toBe(1);
+			expect(await str("GET", "p0:x6")).toBe("new");
+			await expired("p0:x7", "old");
+			await raw.send("SET", "p0:x7", "new", "KEEPTTL");
+			expect(await str("GET", "p0:x7")).toBe("new");
+			expect(integerReply(await raw.send("TTL", "p0:x7"))).toBe(-1);
+			await raw.send("DEL", "p0:x1", "p0:x2", "p0:x3", "p0:x4", "p0:x5", "p0:x6", "p0:x7");
+		});
+
+		test("TTL rounds to the nearest second", async () => {
+			await raw.send("SET", "p0:t", "v", "PX", "9700");
+			expect(integerReply(await raw.send("TTL", "p0:t"))).toBe(10);
+			await raw.send("DEL", "p0:t");
+		});
+
+		// `smoveCommand`: onto itself it only answers whether the member is
+		// there, and changes nothing.
+		test("SMOVE onto the same set keeps the member", async () => {
+			await raw.send("DEL", "p0:s");
+			await raw.send("SADD", "p0:s", "m");
+			expect(integerReply(await raw.send("SMOVE", "p0:s", "p0:s", "m"))).toBe(1);
+			expect(integerReply(await raw.send("SMOVE", "p0:s", "p0:s", "x"))).toBe(0);
+			expect(integerReply(await raw.send("SISMEMBER", "p0:s", "m"))).toBe(1);
+			await raw.send("DEL", "p0:s");
+		});
+
 		test("HSET counts the fields it added, not the ones it wrote", async () => {
 			await raw.send("DEL", "p0:h");
 			expect(
@@ -2914,8 +3037,8 @@ for (const half of ["cache", "durable"]) {
 }
 
 describe("Value size limits", () => {
-	// These limits belong to the ephemeral half. On db 8 every value is a
-	// bytea column with no cap, so the whole describe would pass vacuously.
+	// The ephemeral half, where the memory engine is under test; on db 8 every
+	// value is a bytea column.
 	beforeAll(async () => {
 		await raw.send("SELECT", "cache");
 	});
@@ -3026,72 +3149,56 @@ describe("Value size limits", () => {
 		await raw.send("DEL", "vs:m0", "vs:m1", "vs:m2", "vs:mh", "vs:ml");
 	});
 
-	// The pool is finite, so filling it has to end in a refusal rather than a
-	// truncated value or a dead worker — and deleting what filled it has to
-	// hand every chunk back. Written as a loop rather than a fixed count so it
-	// keeps testing the property if `redis.mem_max_entries` ever changes.
-	test("a full chunk pool refuses cleanly and recovers on delete", async () => {
-		if (!memoryMode) return; // db 0 is a table here; nothing is pooled
-
-		const big = payload(MAX_TOTAL_VAL_LEN);
+	// Redis's maxmemory: past the limit a write that could grow memory is
+	// refused before it runs, nothing already stored is touched, and deleting
+	// brings the room back. The limit is lowered for the test with CONFIG SET,
+	// which is also what proves CONFIG SET maxmemory takes effect.
+	test("past maxmemory a write is refused cleanly and deleting makes room", async () => {
+		const big = payload(1 << 20);
+		await raw.send("CONFIG", "SET", "maxmemory", "16mb");
 		const stored: string[] = [];
 		let refusal = "";
-
-		for (let i = 0; i < 64 && !refusal; i++) {
-			const key = `vs:fill:${i}`;
-			const reply = (await raw.send("SET", key, big)).toString();
-			if (reply === "+OK\r\n") stored.push(key);
-			else refusal = reply;
+		try {
+			for (let i = 0; i < 64 && !refusal; i++) {
+				const key = `vs:fill:${i}`;
+				const reply = (await raw.send("SET", key, big)).toString();
+				if (reply === "+OK\r\n") stored.push(key);
+				else refusal = reply;
+			}
+			expect(refusal).toMatch(/^-OOM /);
+			expect(stored.length).toBeGreaterThan(4);
+			expect(await raw.bulk("GET", stored[0])).toEqual(big);
+			expect(await raw.bulk("GET", `vs:fill:${stored.length}`)).toBeNull();
+			// A removal is never refused, whatever the limit.
+			expect(integerReply(await raw.send("DEL", ...stored))).toBe(stored.length);
+			expect((await raw.send("SET", stored[0], big)).toString()).toBe("+OK\r\n");
+			await raw.send("DEL", stored[0]);
+		} finally {
+			await raw.send("CONFIG", "SET", "maxmemory", "0");
+			for (const key of stored) await raw.send("DEL", key);
 		}
-
-		expect(refusal).toMatch(/^-OOM /);
-		expect(stored.length).toBeGreaterThan(1);
-		// Nothing that was stored was damaged by the write that failed.
-		expect(await raw.bulk("GET", stored[0])).toEqual(big);
-		expect(await raw.bulk("GET", stored[stored.length - 1])).toEqual(big);
-		// ...and the key the refusal names was never created.
-		expect(await raw.bulk("GET", `vs:fill:${stored.length}`)).toBeNull();
-
-		for (const key of stored) await raw.send("DEL", key);
-
-		// Every chunk is back: the pool takes the same number of values again.
-		for (const key of stored) {
-			expect((await raw.send("SET", key, big)).toString()).toBe("+OK\r\n");
-		}
-		for (const key of stored) await raw.send("DEL", key);
 	});
 
-	// Storing the first key of an MSET and then reporting OOM is what the
-	// pre-check exists to prevent. Filling the pool is the cheap way there.
-	test("an MSET that does not fit stores none of it", async () => {
-		if (!memoryMode) return; // db 0 is a table here; nothing is pooled
-
-		const big = payload(MAX_TOTAL_VAL_LEN);
+	// The limit is checked once, before the command: past it an MSET stores
+	// none of its keys, never the ones that happened to fit.
+	test("past maxmemory an MSET stores none of it", async () => {
+		const big = payload(1 << 20);
+		await raw.send("CONFIG", "SET", "maxmemory", "16mb");
 		const stored: string[] = [];
-		for (let i = 0; i < 64; i++) {
-			const key = `vs:atomic:${i}`;
-			if ((await raw.send("SET", key, big)).toString() !== "+OK\r\n") break;
-			stored.push(key);
+		try {
+			for (let i = 0; i < 64; i++) {
+				const key = `vs:atomic:${i}`;
+				if ((await raw.send("SET", key, big)).toString() !== "+OK\r\n") break;
+				stored.push(key);
+			}
+			const reply = (await raw.send("MSET", "vs:atomic:a", big, "vs:atomic:b", big)).toString();
+			expect(reply).toMatch(/^-OOM /);
+			expect(await raw.bulk("GET", "vs:atomic:a")).toBeNull();
+			expect(await raw.bulk("GET", "vs:atomic:b")).toBeNull();
+		} finally {
+			await raw.send("CONFIG", "SET", "maxmemory", "0");
+			await raw.send("DEL", ...stored, "vs:atomic:a", "vs:atomic:b");
 		}
-		expect(stored.length).toBeGreaterThan(1);
-
-		// One value's worth of room was just freed, so an MSET of two is short.
-		await raw.send("DEL", stored.pop() as string);
-		const reply = (
-			await raw.send("MSET", "vs:atomic:a", big, "vs:atomic:b", big)
-		).toString();
-		expect(reply).toMatch(/^-OOM /);
-		expect(await raw.bulk("GET", "vs:atomic:a")).toBeNull();
-		expect(await raw.bulk("GET", "vs:atomic:b")).toBeNull();
-
-		// ...and a full table still takes an MSET that only overwrites, because
-		// the check counts the keys that are actually absent.
-		expect(
-			(
-				await raw.send("MSET", stored[0], "small", stored[1], "small")
-			).toString(),
-		).toBe("+OK\r\n");
-		for (const key of stored) await raw.send("DEL", key);
 	});
 
 	// The pool is finite and shared by every value in its table, so a path that
@@ -3149,7 +3256,6 @@ describe("Value size limits", () => {
 	// is dry, so the only way to see it is to churn enough keys to empty one —
 	// 512-byte keys are 6 chunks each, so 4,000 of them is three pools' worth.
 	test("churning long keys does not exhaust the chunk pool", async () => {
-		if (!memoryMode) return; // db 0 is a table here; nothing is pooled
 		const longKey = (i: number) => {
 			const k = Buffer.alloc(MEM_MAX_KEY, 0x6b);
 			k.write(`churnkey:${i}:`, 0);
@@ -3172,49 +3278,33 @@ describe("Value size limits", () => {
 		await raw.send("DEL", longKey(0));
 	});
 
-	test("a value one byte over the limit is refused in memory mode, stored otherwise", async () => {
-		const over = payload(MAX_TOTAL_VAL_LEN + 1);
-		await raw.send("DEL", "vs:over");
-		const reply = (await raw.send("SET", "vs:over", over)).toString();
-		if (memoryMode) {
-			expect(reply).toMatch(/limit/);
-			// A refusal must not leave a partial value behind.
-			expect(await raw.bulk("GET", "vs:over")).toBeNull();
-		} else {
-			expect(reply).toBe("+OK\r\n");
-			expect(await raw.bulk("GET", "vs:over")).toEqual(over);
+	// No value cap below Redis's own 512 MiB, on either half.
+	test("values far past 64 KiB are stored whole on both halves", async () => {
+		for (const n of [MAX_TOTAL_VAL_LEN + 1, 1 << 20, 4 << 20]) {
+			const v = payload(n);
+			expect((await raw.send("SET", "vs:over", v)).toString()).toBe("+OK\r\n");
+			expect(await raw.bulk("GET", "vs:over")).toEqual(v);
+			await raw.send("HSET", "vs:overh", "f", v);
+			expect(await raw.bulk("HGET", "vs:overh", "f")).toEqual(v);
 		}
-		await raw.send("DEL", "vs:over");
+		await raw.send("DEL", "vs:over", "vs:overh");
 	});
 
-	test("hash fields and keys are bounded the same way", async () => {
-		const okField = payload(MAX_MEMBER_LEN);
-		const bigField = payload(MAX_MEMBER_LEN + 1);
-		const okKey = payload(MEM_MAX_KEY);
-		const bigKey = payload(MEM_MAX_KEY + 1);
-
-		await raw.send("HSET", "vs:lim", okField, "v");
-		expect((await raw.bulk("HGET", "vs:lim", okField))?.toString()).toBe("v");
-		await raw.send("SET", okKey, "v");
-		expect((await raw.bulk("GET", okKey))?.toString()).toBe("v");
-
-		const fieldReply = (
-			await raw.send("HSET", "vs:lim", bigField, "v")
-		).toString();
-		const keyReply = (await raw.send("SET", bigKey, "v")).toString();
-		if (memoryMode) {
-			expect(fieldReply).toMatch(/limit/);
-			expect(keyReply).toMatch(/limit/);
-			// The over-long key must not have collided onto its own prefix.
-			expect((await raw.bulk("GET", okKey))?.toString()).toBe("v");
-		} else {
-			expect(fieldReply).toMatch(/^:/);
-			expect(keyReply).toBe("+OK\r\n");
-			await raw.send("DEL", bigKey);
+	// Redis puts no length limit on a key or a field short of 512 MiB.
+	test("long keys and hash fields are stored whole on both halves", async () => {
+		for (const n of [MAX_MEMBER_LEN + 1, 64 * 1024]) {
+			// Letters after the prefix, so the key cannot read as a glob.
+			const key = Buffer.alloc(n, 0x6b);
+			key.write("vslong:", 0);
+			const field = payload(n);
+			expect((await raw.send("SET", key, "v")).toString()).toBe("+OK\r\n");
+			expect((await raw.bulk("GET", key))?.toString()).toBe("v");
+			const listed = await raw.array("KEYS", Buffer.from("vslong:*"));
+			expect(listed.map((k) => k?.toString("hex"))).toEqual([key.toString("hex")]);
+			expect(integerReply(await raw.send("HSET", "vs:lim", field, "v"))).toBe(1);
+			expect((await raw.bulk("HGET", "vs:lim", field))?.toString()).toBe("v");
+			await raw.send("DEL", key, "vs:lim");
 		}
-
-		await raw.send("DEL", "vs:lim");
-		await raw.send("DEL", okKey);
 	});
 });
 
@@ -3504,6 +3594,27 @@ describe("Concurrent clients", () => {
 				String(WRITERS * PER_WRITER),
 			);
 			await raw.send("DEL", key);
+		});
+
+		// The guarantee a lock built on SET NX rests on. The memory half used to
+		// test existence and write under two lock acquisitions, so two workers
+		// could both be told OK.
+		test(`${half}: SET NX has exactly one winner`, async () => {
+			for (let round = 0; round < 20; round++) {
+				const key = `conc:${half}:lock:${round}`;
+				await raw.send("SELECT", half);
+				await raw.send("DEL", key);
+				const won: string[] = [];
+				await fanOut(WRITERS, async (c, i) => {
+					await c.send("SELECT", [half]);
+					if ((await c.send("SET", [key, `owner-${i}`, "NX", "PX", "30000"])) === "OK") {
+						won.push(`owner-${i}`);
+					}
+				});
+				expect(won.length).toBe(1);
+				expect((await raw.bulk("GET", key))?.toString()).toBe(won[0]);
+				await raw.send("DEL", key);
+			}
 		});
 
 		test(`${half}: every element pushed to a shared list survives`, async () => {
@@ -4246,5 +4357,204 @@ describe("DUMP and RESTORE across the halves", () => {
 			),
 		).toEqual(["a", "1", "b", "2"]);
 		await raw.send("DEL", "dr:x");
+	});
+});
+
+// ─────────────────── Storage policies (docs/STORAGE.md) ──────────────────────
+
+describe("Storage policies", () => {
+	const persistence = async (table: string) => {
+		const [{ p }] = await sql`
+			SELECT c.relpersistence::text AS p FROM pg_class c
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname = 'redis' AND c.relname = ${table}`;
+		return p;
+	};
+	const policyOf = async (db: number) => {
+		const [{ policy }] = await sql`SELECT policy FROM redis.policies() WHERE db = ${db}`;
+		return policy;
+	};
+
+	afterAll(async () => {
+		await sql`SELECT redis.set_policy(13, 'logged')`;
+		await sql`DELETE FROM redis.db_policy WHERE db = 13`;
+		await raw.send("SELECT", "durable");
+	});
+
+	test("the defaults are the old split", async () => {
+		expect(await policyOf(8)).toBe("logged");
+		expect(await policyOf(15)).toBe("logged");
+		expect(await policyOf(0)).toBe("memory");
+		expect(await policyOf(7)).toBe("memory");
+	});
+
+	test("every database's tables are WAL-logged", async () => {
+		expect(await persistence("kv_0")).toBe("p");
+		expect(await persistence("hash_7")).toBe("p");
+		expect(await persistence("kv_13")).toBe("p");
+	});
+
+	test("unlogged is not a policy", async () => {
+		// `.then`: a Bun query only runs once something awaits it, which
+		// `rejects` does not.
+		await expect(sql`SELECT redis.set_policy(13, 'unlogged')`.then(() => "ok")).rejects.toThrow(
+			/unknown policy 'unlogged'/,
+		);
+		expect(await policyOf(13)).toBe("logged");
+	});
+
+	test("an unknown policy or database is refused", async () => {
+		expect(sql`SELECT redis.set_policy(13, 'tape')`.then(() => "ok")).rejects.toThrow(/unknown policy/);
+		expect(sql`SELECT redis.set_policy(16, 'logged')`.then(() => "ok")).rejects.toThrow(/out of range/);
+	});
+});
+
+describe("Moving a database between memory and tables", () => {
+	const movingFrom = async (db: number) => {
+		const [{ moving_from }] = await sql`SELECT moving_from FROM redis.policies() WHERE db = ${db}`;
+		return moving_from as string | null;
+	};
+	const settled = async (db: number) => {
+		for (let i = 0; i < 200 && (await movingFrom(db)) !== null; i++) await Bun.sleep(50);
+		return movingFrom(db);
+	};
+	const str = async (...a: string[]) => (await raw.bulk(...a))?.toString() ?? null;
+	const fill = async (prefix: string) => {
+		await raw.send("SET", `${prefix}:s`, "v", "EX", "1000");
+		await raw.send("HSET", `${prefix}:h`, "f", "v");
+		await raw.send("RPUSH", `${prefix}:l`, "a", "b");
+		await raw.send("SADD", `${prefix}:set`, "m");
+		await raw.send("ZADD", `${prefix}:z`, "1.5", "m");
+		await raw.send("XADD", `${prefix}:x`, "1-1", "f", "v");
+	};
+	const check = async (prefix: string) => {
+		expect(await str("GET", `${prefix}:s`)).toBe("v");
+		const ttl = integerReply(await raw.send("TTL", `${prefix}:s`));
+		expect(ttl).toBeGreaterThan(900);
+		expect(await str("HGET", `${prefix}:h`, "f")).toBe("v");
+		expect((await raw.array("LRANGE", `${prefix}:l`, "0", "-1")).map(String)).toEqual(["a", "b"]);
+		expect(integerReply(await raw.send("SISMEMBER", `${prefix}:set`, "m"))).toBe(1);
+		expect(await str("ZSCORE", `${prefix}:z`, "m")).toBe("1.5");
+		expect(integerReply(await raw.send("XLEN", `${prefix}:x`))).toBe(1);
+	};
+
+	afterAll(async () => {
+		await settled(13);
+		await sql`SELECT redis.set_policy(13, 'logged')`;
+		await settled(13);
+		await settled(7);
+		await sql`SELECT redis.set_policy(7, 'memory')`;
+		await settled(7);
+		await sql`DELETE FROM redis.db_policy WHERE db IN (7, 13)`;
+		await raw.send("SELECT", "durable");
+	});
+
+	test("a memory database moves to logged tables, readable throughout", async () => {
+		await raw.send("SELECT", "7");
+		await raw.send("FLUSHDB");
+		await fill("mv");
+		const [{ set_policy }] = await sql`SELECT redis.set_policy(7, 'logged')`;
+		expect(set_policy).toBe("logged");
+		await check("mv");
+		expect(await settled(7)).toBeNull();
+		const [{ n }] = await sql`SELECT count(*)::int AS n FROM redis.kv_7`;
+		expect(n).toBe(1);
+		await check("mv");
+		expect((await str("INFO", "server")) ?? "").toContain("pg_redis_table_mode:logged");
+	});
+
+	test("a durable database takes the freed memory slot", async () => {
+		await raw.send("SELECT", "13");
+		await raw.send("FLUSHDB");
+		await fill("mv13");
+		await sql`SELECT redis.set_policy(13, 'memory')`;
+		await check("mv13");
+		expect(await settled(13)).toBeNull();
+		const [{ n }] = await sql`SELECT count(*)::int AS n FROM redis.kv_13`;
+		expect(n).toBe(0);
+		await check("mv13");
+	});
+
+	test("a move turned round keeps every key, and DBSIZE is exact throughout", async () => {
+		await raw.send("SELECT", "13");
+		await raw.send("FLUSHDB");
+		const keys = Array.from({ length: 3000 }, (_, i) => `many:${i}`);
+		for (let i = 0; i < keys.length; i += 500) {
+			await raw.send("MSET", ...keys.slice(i, i + 500).flatMap((k) => [k, k]));
+		}
+		// Straight back: it turns round if the sweep has not finished yet,
+		// and moves back if it has. Either way nothing may be lost.
+		await sql`SELECT redis.set_policy(13, 'logged')`;
+		const [{ set_policy }] = await sql`SELECT redis.set_policy(13, 'memory')`;
+		expect(set_policy).toBe("memory");
+		expect(await str("GET", "many:2999")).toBe("many:2999");
+		expect(integerReply(await raw.send("DBSIZE"))).toBe(3000);
+		expect(await settled(13)).toBeNull();
+		expect(integerReply(await raw.send("DBSIZE"))).toBe(3000);
+		expect(await str("GET", "many:0")).toBe("many:0");
+		await raw.send("FLUSHDB");
+	});
+
+	test("every database can be in memory at once", async () => {
+		// The arena has a slot for each of the sixteen: none is refused for
+		// want of one.
+		const before = await sql`SELECT db, policy FROM redis.policies() WHERE policy <> 'memory'`;
+		for (const { db } of before) {
+			await settled(db);
+			await sql`SELECT redis.set_policy(${db}, 'memory')`;
+		}
+		const [{ n }] = await sql`SELECT count(*)::int AS n FROM redis.policies() WHERE policy = 'memory'`;
+		expect(n).toBe(16);
+		for (const { db, policy } of before) {
+			await settled(db);
+			await sql`SELECT redis.set_policy(${db}, ${policy})`;
+			await settled(db);
+		}
+	});
+});
+
+describe("memory+snapshot", () => {
+	const rows = async (db: number) => {
+		const [{ n }] = await sql`SELECT count(*)::int AS n FROM redis.snapshot WHERE db = ${db}`;
+		return n as number;
+	};
+	const takenAt = async (db: number) => {
+		const r = await sql`SELECT taken_at FROM redis.snapshot_taken WHERE db = ${db}`;
+		return r.length ? new Date(r[0].taken_at).getTime() : 0;
+	};
+
+	afterAll(async () => {
+		await sql`SELECT redis.set_policy(6, 'memory')`;
+		await sql`DELETE FROM redis.db_policy WHERE db = 6`;
+		await raw.send("SELECT", "durable");
+	});
+
+	test("SAVE writes the snapshot, BGSAVE asks for one, and memory drops it", async () => {
+		await raw.send("SELECT", "6");
+		await raw.send("FLUSHDB");
+		await raw.send("SET", "snap:s", "v", "EX", "1000");
+		await raw.send("HSET", "snap:h", "f", "v");
+		await raw.send("ZADD", "snap:z", "2", "m");
+		const [{ set_policy }] = await sql`SELECT redis.set_policy(6, 'memory+snapshot')`;
+		expect(set_policy).toBe("memory+snapshot");
+		const before = integerReply(await raw.send("LASTSAVE"));
+		expect((await raw.send("SAVE")).toString()).toBe("+OK\r\n");
+		expect(await rows(6)).toBe(3);
+		expect(integerReply(await raw.send("LASTSAVE"))).toBeGreaterThanOrEqual(before);
+		const [{ deadline_us }] = await sql`SELECT deadline_us::text FROM redis.snapshot WHERE db = 6 AND key = 'snap:s'`;
+		expect(Number(deadline_us)).toBeGreaterThan(Date.now() * 1000);
+
+		await raw.send("SET", "snap:new", "v");
+		const first = await takenAt(6);
+		await Bun.sleep(1100);
+		expect((await raw.send("BGSAVE")).toString()).toBe("+Background saving started\r\n");
+		for (let i = 0; i < 100 && (await takenAt(6)) === first; i++) await Bun.sleep(50);
+		expect(await takenAt(6)).toBeGreaterThan(first);
+		expect(await rows(6)).toBe(4);
+
+		await sql`SELECT redis.set_policy(6, 'memory')`;
+		expect(await rows(6)).toBe(0);
+		expect((await raw.bulk("GET", "snap:new"))?.toString()).toBe("v");
+		await raw.send("FLUSHDB");
 	});
 });

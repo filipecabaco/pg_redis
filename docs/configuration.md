@@ -11,9 +11,9 @@
 | `redis.max_connections` | `128` | Max simultaneous Redis clients per worker |
 | `redis.batch_size` | `64` | Max commands coalesced into one transaction; `1` disables batching |
 | `redis.password` | _(none)_ | When set, clients must `AUTH <password>` before any command |
-| `redis.storage_mode` | `memory` | Storage backend for the ephemeral databases (0–7). `memory` = shared-memory hash tables (default); `auto` = UNLOGGED tables. Requires restart. See [Storage modes](./IMPLEMENTATION.md). |
-| `redis.mem_max_entries` | `8192` | Maximum keys per data type per ephemeral database in memory mode. Requires restart. |
-| `redis.maxmemory_policy` | `noeviction` | What memory mode does when a table fills: `noeviction` (refuse the write, as in Redis), `allkeys-random`, or `volatile-ttl`. See [Storage modes](./IMPLEMENTATION.md#when-a-table-fills). |
+| `redis.maxmemory` | `256MB` | Redis's `maxmemory` for the memory engine: past it, a write that could grow memory is refused with `OOM` unless `redis.maxmemory_policy` evicts enough first. Reserved at startup (plus a quarter, at least 32 MB, of headroom) but backed by RAM only as data fills it. `CONFIG SET maxmemory` lowers the limit at runtime, never past this. Requires restart. |
+| `redis.snapshot_interval` | `60` | Seconds between snapshots of a `memory+snapshot` database. See [Storage policies](./STORAGE.md#snapshots-phase-4). |
+| `redis.maxmemory_policy` | `noeviction` | What memory mode does past `redis.maxmemory`: `noeviction` (refuse the write, as in Redis), `allkeys-random`, or `volatile-ttl`. `CONFIG SET maxmemory-policy` changes it at runtime. See [Memory limit](./STORAGE.md#growable-shared-memory-phase-6). |
 
 Apply at runtime (no restart needed unless noted):
 
@@ -46,12 +46,13 @@ Binding a non-loopback address with no password logs a warning at startup.
 
 ## Selecting a database per connection
 
-There are 16 databases, split into two contiguous halves:
+There are 16 databases. By default they split into two contiguous halves, and
+any one can be given another policy at runtime ([Storage policies](./STORAGE.md)):
 
-| Databases | Storage | Durability |
-|-----------|---------|------------|
-| **0–7** | Shared memory, or UNLOGGED tables under `storage_mode = 'auto'` | Lost on restart |
-| **8–15** | WAL-logged PostgreSQL tables | Survives crashes, replicated |
+| Databases | Default policy | Durability |
+|-----------|----------------|------------|
+| **0–7** | `memory`: shared memory | Lost on restart |
+| **8–15** | `logged`: WAL-logged PostgreSQL tables | Survives crashes, replicated |
 
 `SELECT` also accepts the name of each half, so you do not have to remember
 where the boundary is — `cache` is database 0 and `durable` is database 8:

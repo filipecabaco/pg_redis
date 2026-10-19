@@ -1,19 +1,58 @@
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 const MAX_PUBSUB_SLOTS: usize = 256;
 const PUBSUB_RING_CAP: usize = 256;
-const MAX_SUBS_PER_SLOT: usize = 16;
-/// Maximum PUBLISH payload. Matches `mem::MAX_TOTAL_VAL_LEN` so a value that
-/// fits in memory mode also fits through pub/sub.
+pub const MAX_SUBS_PER_SLOT: usize = 16;
+/// Maximum PUBLISH payload: the size of one slot in the shared message ring.
 pub const PUBSUB_MSG_LEN: usize = 512;
 /// Maximum channel or pattern name. One byte is reserved for the NUL
 /// terminator, so `MAX_CHANNEL_LEN` is what callers may actually use.
 const CHAN_LEN: usize = 256;
 pub const MAX_CHANNEL_LEN: usize = CHAN_LEN - 1;
 
+/// Sharded pub/sub (`SSUBSCRIBE`, `SPUBLISH`) is its own namespace in Redis.
+/// Its channels share the registry here under this prefix. A leading 0x01
+/// marks a channel as internal — kept out of `PUBSUB CHANNELS` and out of
+/// every pattern subscription. Not a NUL: slot entries are NUL-terminated, so
+/// a name starting with one would read back empty.
+pub const SHARD_PREFIX: &[u8] = b"\x01shard:";
+
+/// The byte every internal channel starts with.
+pub const INTERNAL_MARK: u8 = 0x01;
+
+/// Whether `channel` is one of this extension's own: sharded, or MONITOR's.
+pub fn is_internal(channel: &[u8]) -> bool {
+    channel.first() == Some(&INTERNAL_MARK)
+}
+
+pub fn shard_name(channel: &[u8]) -> Vec<u8> {
+    [SHARD_PREFIX, channel].concat()
+}
+
+/// The name a client used, for a channel as the registry stores it.
+pub fn shown_name(channel: &[u8]) -> &[u8] {
+    channel.strip_prefix(SHARD_PREFIX).unwrap_or(channel)
+}
+
 const MAX_ROUTES: usize = 64;
 const ROUTE_SCHEMA_LEN: usize = 64;
 const ROUTE_TABLE_LEN: usize = 64;
+
+// ─────────────────────────────── the safety model ───────────────────────────
+//
+// Two shared-memory blocks hold every process's pub/sub state, and two rules
+// make sharing them sound. They are the only `unsafe` in this module.
+//
+// 1. Subscriptions, and the routes, are read and written only while holding
+//    their block's spinlock. `Locked` and `RoutesLocked` are what holding it
+//    looks like: the only way to reach the `UnsafeCell`s behind the lock.
+// 2. A slot's message ring has one consumer, the connection that owns the
+//    slot, and publishers who write only under the spinlock — so one producer
+//    at a time. A publisher fills the message at `tail` and then publishes
+//    `tail + 1`; the owner reads the message at `head` and then publishes
+//    `head + 1`. Each side touches a message only when the other's index says
+//    it may (`write_to_ring`, `poll_message`).
 
 #[repr(C, align(8))]
 pub struct RouteEntry {
@@ -29,12 +68,18 @@ pub struct RouteEntry {
 
 #[repr(C, align(8))]
 pub struct RouteCtl {
-    pub lock: AtomicU8,
+    lock: AtomicU8,
     pub initialised: AtomicU8,
-    pub route_count: AtomicU8,
-    pub _pad: [u8; 5],
-    pub entries: [RouteEntry; MAX_ROUTES],
+    route_count: AtomicU8,
+    _pad: [u8; 5],
+    entries: UnsafeCell<[RouteEntry; MAX_ROUTES]>,
 }
+
+// SAFETY: zero is an empty, unlocked table, and `entries` is reached only
+// through `RoutesLocked`, under `lock` (rule 1).
+unsafe impl crate::shared::Shareable for RouteCtl {}
+// SAFETY: as above; the cell is never touched without the lock.
+unsafe impl Sync for RouteCtl {}
 
 pub fn route_ctl_size() -> usize {
     std::mem::size_of::<RouteCtl>()
@@ -63,14 +108,36 @@ impl Drop for SpinGuard<'_> {
     }
 }
 
-/// Header block: global spinlock protecting subscription map changes and PUBLISH scans.
-/// AtomicU8 CAS works correctly across Postgres BGW processes sharing this physical memory
-/// page — no pg_sys calls required, safe from any thread.
+/// The routes, with their lock held.
+struct RoutesLocked<'a> {
+    _guard: SpinGuard<'a>,
+    entries: &'a mut [RouteEntry; MAX_ROUTES],
+}
+
+impl RouteCtl {
+    fn locked(&self) -> RoutesLocked<'_> {
+        let guard = SpinGuard::acquire(&self.lock);
+        // SAFETY: rule 1 — `lock` is held for as long as the guard, which the
+        // returned value owns, so this is the only reference to the entries.
+        let entries = unsafe { &mut *self.entries.get() };
+        RoutesLocked {
+            _guard: guard,
+            entries,
+        }
+    }
+}
+
+/// Header block: the global spinlock protecting every slot's subscriptions,
+/// and the PUBLISH scans over them. A CAS on an `AtomicU8` works across the
+/// worker processes sharing this page; no PostgreSQL call is needed.
 #[repr(C)]
 pub struct PubsubCtl {
-    pub lock: AtomicU8,
-    pub _pad: [u8; 7],
+    lock: AtomicU8,
+    _pad: [u8; 7],
 }
+
+// SAFETY: one atomic; zero is unlocked.
+unsafe impl crate::shared::Shareable for PubsubCtl {}
 
 #[repr(C)]
 pub struct PubsubMsg {
@@ -82,23 +149,42 @@ pub struct PubsubMsg {
     pub pattern: [u8; CHAN_LEN],
 }
 
+/// What a slot is subscribed to. Under `PubsubCtl::lock` (rule 1).
 #[repr(C)]
-pub struct PubsubSlot {
+pub struct Subs {
     pub channels: [[u8; CHAN_LEN]; MAX_SUBS_PER_SLOT],
     pub patterns: [[u8; CHAN_LEN]; MAX_SUBS_PER_SLOT],
     pub channel_count: u32,
     pub pattern_count: u32,
     pub in_use: u8,
-    pub _pad: [u8; 3],
-    pub head: AtomicU32,
-    pub tail: AtomicU32,
-    pub ring: [PubsubMsg; PUBSUB_RING_CAP],
+    _pad: [u8; 3],
 }
 
-unsafe impl Send for PubsubCtl {}
-unsafe impl Sync for PubsubCtl {}
-unsafe impl Send for PubsubSlot {}
+impl Subs {
+    fn reset(&mut self) {
+        self.in_use = 0;
+        self.channel_count = 0;
+        self.pattern_count = 0;
+    }
+}
+
+#[repr(C)]
+pub struct PubsubSlot {
+    subs: UnsafeCell<Subs>,
+    head: AtomicU32,
+    tail: AtomicU32,
+    ring: [UnsafeCell<PubsubMsg>; PUBSUB_RING_CAP],
+}
+
+// SAFETY: zero is a free slot with an empty ring; `subs` is reached only under
+// the global lock (rule 1) and `ring` only by the head/tail protocol (rule 2).
 unsafe impl Sync for PubsubSlot {}
+
+/// Every slot.
+pub type Slots = [PubsubSlot; MAX_PUBSUB_SLOTS];
+
+// SAFETY: an array of `PubsubSlot`s, each of which zero makes free and empty.
+unsafe impl crate::shared::Shareable for Slots {}
 
 pub fn pubsub_ctl_size() -> usize {
     std::mem::size_of::<PubsubCtl>()
@@ -108,92 +194,103 @@ pub fn pubsub_ctl_size() -> usize {
 /// requested whether or not pub/sub is used. Raising `CHAN_LEN`,
 /// `PUBSUB_MSG_LEN` or `PUBSUB_RING_CAP` is a real cost to every deployment.
 pub fn pubsub_slots_size() -> usize {
-    std::mem::size_of::<PubsubSlot>() * MAX_PUBSUB_SLOTS
+    std::mem::size_of::<Slots>()
 }
 
-pub unsafe fn route_add(ctl: *mut RouteCtl, channel: &[u8], schema: &[u8], table: &[u8]) -> bool {
-    unsafe {
-        let ch_len = channel.len().min(CHAN_LEN - 1);
-        let sc_len = schema.len().min(ROUTE_SCHEMA_LEN - 1);
-        let tb_len = table.len().min(ROUTE_TABLE_LEN - 1);
+/// Every slot's subscriptions, with the global lock held.
+struct Locked<'a> {
+    _guard: SpinGuard<'a>,
+    slots: &'a Slots,
+}
 
-        let _guard = SpinGuard::acquire(&(*ctl).lock);
-        let mut free_idx = None;
-        for i in 0..MAX_ROUTES {
-            let e = &mut (*ctl).entries[i];
-            if e.active == 0 {
-                if free_idx.is_none() {
-                    free_idx = Some(i);
-                }
-                continue;
-            }
-            if e.channel_len as usize == ch_len && e.channel[..ch_len] == channel[..ch_len] {
-                e.schema[..sc_len].copy_from_slice(&schema[..sc_len]);
-                e.schema_len = sc_len as u16;
-                e.table[..tb_len].copy_from_slice(&table[..tb_len]);
-                e.table_len = tb_len as u16;
-                return true;
-            }
+impl<'a> Locked<'a> {
+    fn new(ctl: &'a PubsubCtl, slots: &'a Slots) -> Self {
+        Locked {
+            _guard: SpinGuard::acquire(&ctl.lock),
+            slots,
         }
-        let Some(idx) = free_idx else { return false };
-        let e = &mut (*ctl).entries[idx];
-        e.channel[..ch_len].copy_from_slice(&channel[..ch_len]);
-        e.channel_len = ch_len as u16;
-        e.schema[..sc_len].copy_from_slice(&schema[..sc_len]);
-        e.schema_len = sc_len as u16;
-        e.table[..tb_len].copy_from_slice(&table[..tb_len]);
-        e.table_len = tb_len as u16;
-        e.active = 1;
-        (*ctl).route_count.fetch_add(1, Ordering::Relaxed);
-        true
+    }
+
+    /// Slot `idx`'s subscriptions. Borrowing `self` mutably keeps any two
+    /// from being alive at once.
+    fn subs(&mut self, idx: usize) -> &mut Subs {
+        // SAFETY: rule 1 — the global lock is held for as long as `self`,
+        // and the `&mut self` borrow makes this the only reference into any
+        // slot's subscriptions until it ends.
+        unsafe { &mut *self.slots[idx].subs.get() }
     }
 }
 
-pub unsafe fn route_remove(ctl: *mut RouteCtl, channel: &[u8]) -> bool {
-    unsafe {
-        let _guard = SpinGuard::acquire(&(*ctl).lock);
-        for i in 0..MAX_ROUTES {
-            let e = &mut (*ctl).entries[i];
-            let ch_len = e.channel_len as usize;
-            if e.active != 0 && ch_len == channel.len() && e.channel[..ch_len] == *channel {
-                e.active = 0;
-                (*ctl).route_count.fetch_sub(1, Ordering::Relaxed);
-                return true;
+pub fn route_add(ctl: &RouteCtl, channel: &[u8], schema: &[u8], table: &[u8]) -> bool {
+    let ch_len = channel.len().min(CHAN_LEN - 1);
+    let sc_len = schema.len().min(ROUTE_SCHEMA_LEN - 1);
+    let tb_len = table.len().min(ROUTE_TABLE_LEN - 1);
+
+    let routes = ctl.locked();
+    let mut free_idx = None;
+    for (i, e) in routes.entries.iter_mut().enumerate() {
+        if e.active == 0 {
+            if free_idx.is_none() {
+                free_idx = Some(i);
             }
+            continue;
         }
-        false
+        if e.channel_len as usize == ch_len && e.channel[..ch_len] == channel[..ch_len] {
+            e.schema[..sc_len].copy_from_slice(&schema[..sc_len]);
+            e.schema_len = sc_len as u16;
+            e.table[..tb_len].copy_from_slice(&table[..tb_len]);
+            e.table_len = tb_len as u16;
+            return true;
+        }
     }
+    let Some(idx) = free_idx else { return false };
+    let e = &mut routes.entries[idx];
+    e.channel[..ch_len].copy_from_slice(&channel[..ch_len]);
+    e.channel_len = ch_len as u16;
+    e.schema[..sc_len].copy_from_slice(&schema[..sc_len]);
+    e.schema_len = sc_len as u16;
+    e.table[..tb_len].copy_from_slice(&table[..tb_len]);
+    e.table_len = tb_len as u16;
+    e.active = 1;
+    ctl.route_count.fetch_add(1, Ordering::Relaxed);
+    true
 }
 
-pub unsafe fn route_lookup(ctl: *mut RouteCtl, channel: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
-    unsafe {
-        if (*ctl).route_count.load(Ordering::Relaxed) == 0 {
-            return None;
+pub fn route_remove(ctl: &RouteCtl, channel: &[u8]) -> bool {
+    let routes = ctl.locked();
+    for e in routes.entries.iter_mut() {
+        let ch_len = e.channel_len as usize;
+        if e.active != 0 && ch_len == channel.len() && e.channel[..ch_len] == *channel {
+            e.active = 0;
+            ctl.route_count.fetch_sub(1, Ordering::Relaxed);
+            return true;
         }
-        let _guard = SpinGuard::acquire(&(*ctl).lock);
-        (0..MAX_ROUTES).find_map(|i| {
-            let e = &(*ctl).entries[i];
-            let ch_len = e.channel_len as usize;
-            (e.active != 0 && ch_len == channel.len() && e.channel[..ch_len] == *channel).then(
-                || {
-                    (
-                        e.schema[..e.schema_len as usize].to_vec(),
-                        e.table[..e.table_len as usize].to_vec(),
-                    )
-                },
+    }
+    false
+}
+
+pub fn route_lookup(ctl: &RouteCtl, channel: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    if ctl.route_count.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let routes = ctl.locked();
+    routes.entries.iter().find_map(|e| {
+        let ch_len = e.channel_len as usize;
+        (e.active != 0 && ch_len == channel.len() && e.channel[..ch_len] == *channel).then(|| {
+            (
+                e.schema[..e.schema_len as usize].to_vec(),
+                e.table[..e.table_len as usize].to_vec(),
             )
         })
-    }
+    })
 }
 
-unsafe fn slot_reset(slot: *mut PubsubSlot) {
-    unsafe {
-        (*slot).in_use = 0;
-        (*slot).channel_count = 0;
-        (*slot).pattern_count = 0;
-        (*slot).head.store(0, Ordering::Relaxed);
-        (*slot).tail.store(0, Ordering::Relaxed);
-    }
+/// Free slot `idx`'s subscriptions and empty its ring. Under the lock: the
+/// ring indices move here, while no publisher can be writing to it.
+fn slot_reset(slots: &Slots, subs: &mut Subs, idx: usize) {
+    subs.reset();
+    slots[idx].head.store(0, Ordering::Relaxed);
+    slots[idx].tail.store(0, Ordering::Relaxed);
 }
 
 /// Length of a NUL-terminated fixed-size slot entry.
@@ -208,11 +305,7 @@ fn entry_eq(entry: &[u8; CHAN_LEN], value: &[u8]) -> bool {
     value.len() < CHAN_LEN && entry[..value.len()] == *value && entry[value.len()] == 0
 }
 
-unsafe fn slot_add(
-    arr: &mut [[u8; CHAN_LEN]; MAX_SUBS_PER_SLOT],
-    count: &mut u32,
-    value: &[u8],
-) -> bool {
+fn slot_add(arr: &mut [[u8; CHAN_LEN]; MAX_SUBS_PER_SLOT], count: &mut u32, value: &[u8]) -> bool {
     let n = *count as usize;
     if arr[..n].iter().any(|entry| entry_eq(entry, value)) {
         return false;
@@ -227,11 +320,7 @@ unsafe fn slot_add(
     true
 }
 
-unsafe fn slot_remove(
-    arr: &mut [[u8; CHAN_LEN]; MAX_SUBS_PER_SLOT],
-    count: &mut u32,
-    value: &[u8],
-) {
+fn slot_remove(arr: &mut [[u8; CHAN_LEN]; MAX_SUBS_PER_SLOT], count: &mut u32, value: &[u8]) {
     let n = *count as usize;
     if let Some(i) = arr[..n].iter().position(|entry| entry_eq(entry, value)) {
         arr[i] = arr[n - 1];
@@ -239,415 +328,333 @@ unsafe fn slot_remove(
     }
 }
 
-unsafe fn slot_names(arr: &[[u8; CHAN_LEN]; MAX_SUBS_PER_SLOT], count: u32) -> Vec<Vec<u8>> {
+fn slot_names(arr: &[[u8; CHAN_LEN]; MAX_SUBS_PER_SLOT], count: u32) -> Vec<Vec<u8>> {
     arr[..count as usize]
         .iter()
         .map(|entry| entry[..entry_len(entry)].to_vec())
         .collect()
 }
 
-/// Acquire lock, mutate a slot, return counts. Frees the slot if both counts reach zero.
-unsafe fn with_slot_locked<F>(
-    ctl: *mut PubsubCtl,
-    slots: *mut PubsubSlot,
-    idx: usize,
-    mutate: F,
-) -> (u32, u32)
-where
-    F: FnOnce(&mut PubsubSlot),
-{
-    unsafe {
-        let _guard = SpinGuard::acquire(&(*ctl).lock);
-        let slot = &mut *slots.add(idx);
-        mutate(slot);
-        let counts = (slot.channel_count, slot.pattern_count);
-        if counts == (0, 0) {
-            slot_reset(slot as *mut _);
-        }
-        counts
+/// Which of a slot's two lists a subscription command works on.
+#[derive(Clone, Copy)]
+enum List {
+    Channels,
+    Patterns,
+}
+
+fn list(subs: &mut Subs, which: List) -> (&mut [[u8; CHAN_LEN]; MAX_SUBS_PER_SLOT], &mut u32) {
+    match which {
+        List::Channels => (&mut subs.channels, &mut subs.channel_count),
+        List::Patterns => (&mut subs.patterns, &mut subs.pattern_count),
     }
 }
 
-/// Allocate a free slot and populate it in one lock acquisition.
-/// `field_fn` selects which array/counter pair to populate.
-/// Returns `None` if no slot is available.
-unsafe fn slot_alloc_and_sub_inner<F>(
-    ctl: *mut PubsubCtl,
-    slots: *mut PubsubSlot,
+/// Mutate a slot under the lock and return its counts, freeing it when both
+/// reach zero.
+fn with_slot_locked(
+    ctl: &PubsubCtl,
+    slots: &Slots,
+    idx: usize,
+    mutate: impl FnOnce(&mut Subs),
+) -> (u32, u32) {
+    let mut locked = Locked::new(ctl, slots);
+    let subs = locked.subs(idx);
+    mutate(subs);
+    let counts = (subs.channel_count, subs.pattern_count);
+    if counts == (0, 0) {
+        slot_reset(slots, subs, idx);
+    }
+    counts
+}
+
+/// Allocate a free slot and subscribe it in one lock acquisition. `None` if
+/// every slot is taken.
+fn slot_alloc_and_sub(
+    ctl: &PubsubCtl,
+    slots: &Slots,
     items: &[Vec<u8>],
-    field_fn: F,
-) -> Option<(usize, u32)>
-where
-    F: Fn(
-        *mut PubsubSlot,
-    ) -> (
-        &'static mut [[u8; CHAN_LEN]; MAX_SUBS_PER_SLOT],
-        &'static mut u32,
-    ),
-{
-    unsafe {
-        let _guard = SpinGuard::acquire(&(*ctl).lock);
-        (0..MAX_PUBSUB_SLOTS).find_map(|i| {
-            let slot = slots.add(i);
-            ((*slot).in_use == 0).then(|| {
-                slot_reset(slot);
-                (*slot).in_use = 1;
-                let (arr, count) = field_fn(slot);
-                for item in items {
-                    slot_add(arr, count, item);
-                }
-                (i, *count)
-            })
+    which: List,
+) -> Option<(usize, u32)> {
+    let mut locked = Locked::new(ctl, slots);
+    (0..MAX_PUBSUB_SLOTS).find_map(|i| {
+        let subs = locked.subs(i);
+        (subs.in_use == 0).then(|| {
+            slot_reset(slots, subs, i);
+            subs.in_use = 1;
+            let (arr, count) = list(subs, which);
+            for item in items {
+                slot_add(arr, count, item);
+            }
+            (i, *count)
         })
-    }
+    })
 }
 
-pub unsafe fn slot_alloc_and_subscribe(
-    ctl: *mut PubsubCtl,
-    slots: *mut PubsubSlot,
+pub fn slot_alloc_and_subscribe(
+    ctl: &PubsubCtl,
+    slots: &Slots,
     channels: &[Vec<u8>],
 ) -> Option<(usize, u32)> {
-    unsafe {
-        slot_alloc_and_sub_inner(ctl, slots, channels, |slot| {
-            (&mut (*slot).channels, &mut (*slot).channel_count)
-        })
-    }
+    slot_alloc_and_sub(ctl, slots, channels, List::Channels)
 }
 
-pub unsafe fn slot_alloc_and_psubscribe(
-    ctl: *mut PubsubCtl,
-    slots: *mut PubsubSlot,
+pub fn slot_alloc_and_psubscribe(
+    ctl: &PubsubCtl,
+    slots: &Slots,
     patterns: &[Vec<u8>],
 ) -> Option<(usize, u32)> {
-    unsafe {
-        slot_alloc_and_sub_inner(ctl, slots, patterns, |slot| {
-            (&mut (*slot).patterns, &mut (*slot).pattern_count)
-        })
+    slot_alloc_and_sub(ctl, slots, patterns, List::Patterns)
+}
+
+pub fn slot_free(ctl: &PubsubCtl, slots: &Slots, idx: usize) {
+    let mut locked = Locked::new(ctl, slots);
+    let subs = locked.subs(idx);
+    if subs.in_use != 0 {
+        slot_reset(slots, subs, idx);
     }
 }
 
-pub unsafe fn slot_free(ctl: *mut PubsubCtl, slots: *mut PubsubSlot, idx: usize) {
-    unsafe {
-        let _guard = SpinGuard::acquire(&(*ctl).lock);
-        let slot = slots.add(idx);
-        if (*slot).in_use != 0 {
-            slot_reset(slot);
+fn change(
+    ctl: &PubsubCtl,
+    slots: &Slots,
+    idx: usize,
+    items: &[Vec<u8>],
+    which: List,
+    add: bool,
+) -> (u32, u32) {
+    with_slot_locked(ctl, slots, idx, |subs| {
+        let (arr, count) = list(subs, which);
+        for item in items {
+            if add {
+                slot_add(arr, count, item);
+            } else {
+                slot_remove(arr, count, item);
+            }
         }
-    }
+    })
 }
 
-pub unsafe fn subscribe(
-    ctl: *mut PubsubCtl,
-    slots: *mut PubsubSlot,
-    idx: usize,
-    channels: &[Vec<u8>],
-) -> (u32, u32) {
-    unsafe {
-        with_slot_locked(ctl, slots, idx, |slot| {
-            for ch in channels {
-                slot_add(&mut slot.channels, &mut slot.channel_count, ch);
-            }
-        })
-    }
+pub fn subscribe(ctl: &PubsubCtl, slots: &Slots, idx: usize, channels: &[Vec<u8>]) -> (u32, u32) {
+    change(ctl, slots, idx, channels, List::Channels, true)
 }
 
-pub unsafe fn unsubscribe(
-    ctl: *mut PubsubCtl,
-    slots: *mut PubsubSlot,
-    idx: usize,
-    channels: &[Vec<u8>],
-) -> (u32, u32) {
-    unsafe {
-        with_slot_locked(ctl, slots, idx, |slot| {
-            for ch in channels {
-                slot_remove(&mut slot.channels, &mut slot.channel_count, ch);
-            }
-        })
-    }
+pub fn unsubscribe(ctl: &PubsubCtl, slots: &Slots, idx: usize, channels: &[Vec<u8>]) -> (u32, u32) {
+    change(ctl, slots, idx, channels, List::Channels, false)
 }
 
-pub unsafe fn psubscribe(
-    ctl: *mut PubsubCtl,
-    slots: *mut PubsubSlot,
+pub fn psubscribe(ctl: &PubsubCtl, slots: &Slots, idx: usize, patterns: &[Vec<u8>]) -> (u32, u32) {
+    change(ctl, slots, idx, patterns, List::Patterns, true)
+}
+
+pub fn punsubscribe(
+    ctl: &PubsubCtl,
+    slots: &Slots,
     idx: usize,
     patterns: &[Vec<u8>],
 ) -> (u32, u32) {
-    unsafe {
-        with_slot_locked(ctl, slots, idx, |slot| {
-            for pat in patterns {
-                slot_add(&mut slot.patterns, &mut slot.pattern_count, pat);
-            }
-        })
-    }
+    change(ctl, slots, idx, patterns, List::Patterns, false)
 }
 
-pub unsafe fn punsubscribe(
-    ctl: *mut PubsubCtl,
-    slots: *mut PubsubSlot,
-    idx: usize,
-    patterns: &[Vec<u8>],
-) -> (u32, u32) {
-    unsafe {
-        with_slot_locked(ctl, slots, idx, |slot| {
-            for pat in patterns {
-                slot_remove(&mut slot.patterns, &mut slot.pattern_count, pat);
-            }
-        })
-    }
+pub fn channel_names(ctl: &PubsubCtl, slots: &Slots, idx: usize) -> Vec<Vec<u8>> {
+    let mut locked = Locked::new(ctl, slots);
+    let subs = locked.subs(idx);
+    slot_names(&subs.channels, subs.channel_count)
 }
 
-pub unsafe fn channel_names(
-    ctl: *mut PubsubCtl,
-    slots: *mut PubsubSlot,
-    idx: usize,
-) -> Vec<Vec<u8>> {
-    unsafe {
-        let _guard = SpinGuard::acquire(&(*ctl).lock);
-        let slot = slots.add(idx);
-        slot_names(&(*slot).channels, (*slot).channel_count)
-    }
+pub fn pattern_names(ctl: &PubsubCtl, slots: &Slots, idx: usize) -> Vec<Vec<u8>> {
+    let mut locked = Locked::new(ctl, slots);
+    let subs = locked.subs(idx);
+    slot_names(&subs.patterns, subs.pattern_count)
 }
 
-pub unsafe fn pattern_names(
-    ctl: *mut PubsubCtl,
-    slots: *mut PubsubSlot,
-    idx: usize,
-) -> Vec<Vec<u8>> {
-    unsafe {
-        let _guard = SpinGuard::acquire(&(*ctl).lock);
-        let slot = slots.add(idx);
-        slot_names(&(*slot).patterns, (*slot).pattern_count)
-    }
-}
-
-pub unsafe fn publish(
-    ctl: *mut PubsubCtl,
-    slots: *mut PubsubSlot,
-    channel: &[u8],
-    message: &[u8],
-) -> i64 {
-    unsafe {
-        let _guard = SpinGuard::acquire(&(*ctl).lock);
-        let mut count: i64 = 0;
-        for i in 0..MAX_PUBSUB_SLOTS {
-            let slot = slots.add(i);
-            if (*slot).in_use == 0 {
-                continue;
-            }
-            let ch_count = (*slot).channel_count as usize;
-            if (&(*slot).channels)[..ch_count]
-                .iter()
-                .any(|entry| entry_eq(entry, channel))
-                && write_to_ring(slot, channel, b"", message)
-            {
+pub fn publish(ctl: &PubsubCtl, slots: &Slots, channel: &[u8], message: &[u8]) -> i64 {
+    let mut locked = Locked::new(ctl, slots);
+    let mut count: i64 = 0;
+    for (i, slot) in slots.iter().enumerate() {
+        let subs = locked.subs(i);
+        if subs.in_use == 0 {
+            continue;
+        }
+        let ch_count = subs.channel_count as usize;
+        if subs.channels[..ch_count]
+            .iter()
+            .any(|entry| entry_eq(entry, channel))
+            && write_to_ring(slot, channel, b"", message)
+        {
+            count += 1;
+        }
+        // Patterns never see an internal channel: `PSUBSCRIBE *` gets
+        // neither sharded messages nor MONITOR's traffic.
+        if is_internal(channel) {
+            continue;
+        }
+        let pat_count = subs.pattern_count as usize;
+        for entry in subs.patterns[..pat_count].iter() {
+            let pat = &entry[..entry_len(entry)];
+            if glob_match(pat, channel) && write_to_ring(slot, channel, pat, message) {
                 count += 1;
             }
-            let pat_count = (*slot).pattern_count as usize;
-            for entry in (&(*slot).patterns)[..pat_count].iter() {
-                let pat = &entry[..entry_len(entry)];
-                if glob_match(pat, channel) && write_to_ring(slot, channel, pat, message) {
-                    count += 1;
-                }
-            }
         }
-        count
     }
+    count
 }
 
-unsafe fn write_to_ring(
-    slot: *mut PubsubSlot,
-    channel: &[u8],
-    pattern: &[u8],
-    payload: &[u8],
-) -> bool {
-    unsafe {
-        let head = (*slot).head.load(Ordering::Acquire);
-        let tail = (*slot).tail.load(Ordering::Relaxed);
-        if tail.wrapping_sub(head) >= PUBSUB_RING_CAP as u32 {
-            return false;
-        }
-        let msg = &mut (*slot).ring[(tail as usize) % PUBSUB_RING_CAP];
-
-        let ch_len = channel.len().min(CHAN_LEN - 1);
-        msg.channel[..ch_len].copy_from_slice(&channel[..ch_len]);
-        msg.channel[ch_len] = 0;
-        msg.channel_len = ch_len as u16;
-
-        let pat_len = pattern.len().min(CHAN_LEN - 1);
-        msg.pattern[..pat_len].copy_from_slice(&pattern[..pat_len]);
-        msg.pattern[pat_len] = 0;
-        msg.pattern_len = pat_len as u16;
-
-        // Callers reject oversized payloads before reaching here; the clamp is a
-        // belt-and-braces bound on the memcpy, not the enforcement point.
-        let pay_len = payload.len().min(PUBSUB_MSG_LEN);
-        msg.payload[..pay_len].copy_from_slice(&payload[..pay_len]);
-        msg.payload_len = pay_len as u32;
-
-        (*slot).tail.store(tail + 1, Ordering::Release);
-        wake_subscriber(slot);
-        true
+/// Append a message to `slot`'s ring, if it has room. Callers hold the global
+/// lock, which is what makes them the ring's one producer (rule 2).
+fn write_to_ring(slot: &PubsubSlot, channel: &[u8], pattern: &[u8], payload: &[u8]) -> bool {
+    let head = slot.head.load(Ordering::Acquire);
+    let tail = slot.tail.load(Ordering::Relaxed);
+    if tail.wrapping_sub(head) >= PUBSUB_RING_CAP as u32 {
+        return false;
     }
+    // SAFETY: rule 2 — the message at `tail` is outside what the consumer may
+    // read (`head..tail`), and the room check above means the consumer has
+    // finished with it: its Release store of `head` past it happened-before
+    // our Acquire load. Only this producer, under the lock, writes it.
+    let msg = unsafe { &mut *slot.ring[(tail as usize) % PUBSUB_RING_CAP].get() };
+
+    let ch_len = channel.len().min(CHAN_LEN - 1);
+    msg.channel[..ch_len].copy_from_slice(&channel[..ch_len]);
+    msg.channel[ch_len] = 0;
+    msg.channel_len = ch_len as u16;
+
+    let pat_len = pattern.len().min(CHAN_LEN - 1);
+    msg.pattern[..pat_len].copy_from_slice(&pattern[..pat_len]);
+    msg.pattern[pat_len] = 0;
+    msg.pattern_len = pat_len as u16;
+
+    // Callers reject oversized payloads before reaching here; the clamp is a
+    // belt-and-braces bound on the copy, not the enforcement point.
+    let pay_len = payload.len().min(PUBSUB_MSG_LEN);
+    msg.payload[..pay_len].copy_from_slice(&payload[..pay_len]);
+    msg.payload_len = pay_len as u32;
+
+    slot.tail.store(tail.wrapping_add(1), Ordering::Release);
+    crate::sys::futex_wake(&slot.tail);
+    true
 }
 
 /// Current ring position, for a subscriber to pass to [`wait_for_message`].
-pub unsafe fn current_tail(slots: *mut PubsubSlot, idx: usize) -> u32 {
-    unsafe { (*slots.add(idx)).tail.load(Ordering::Acquire) }
+pub fn current_tail(slots: &Slots, idx: usize) -> u32 {
+    slots[idx].tail.load(Ordering::Acquire)
 }
 
 /// Block until this slot's ring advances past `seen_tail`, or `timeout`
 /// elapses. Waiting on the counter rather than polling the socket is what makes
 /// delivery immediate; the timeout only bounds how long a client command sits
-/// unread. Shared rather than `PRIVATE` futex operations, because the waiter
-/// and waker are different processes. A missed wakeup costs one timeout.
-///
-/// # Safety
-/// `slots` must point at the initialised slot array and `idx` be in range.
-#[cfg(target_os = "linux")]
-pub unsafe fn wait_for_message(
-    slots: *mut PubsubSlot,
-    idx: usize,
-    seen_tail: u32,
-    timeout: std::time::Duration,
-) {
-    const FUTEX_WAIT: libc::c_int = 0;
-    unsafe {
-        let addr = std::ptr::addr_of!((*slots.add(idx)).tail) as *const u32;
-        let deadline = libc::timespec {
-            tv_sec: timeout.as_secs() as libc::time_t,
-            tv_nsec: timeout.subsec_nanos() as libc::c_long,
-        };
-        // Returns EAGAIN immediately if tail already moved — exactly the race we
-        // need handled, since a publish between the drain and this call must not
-        // be slept through.
-        libc::syscall(libc::SYS_futex, addr, FUTEX_WAIT, seen_tail, &deadline);
+/// unread. A missed wakeup costs one timeout.
+pub fn wait_for_message(slots: &Slots, idx: usize, seen_tail: u32, timeout: std::time::Duration) {
+    wait_on(&slots[idx], seen_tail, timeout);
+}
+
+fn wait_on(slot: &PubsubSlot, seen_tail: u32, timeout: std::time::Duration) {
+    crate::sys::futex_wait(&slot.tail, seen_tail, timeout);
+}
+
+/// Take the oldest message from slot `idx`'s ring. Only the connection that
+/// owns the slot calls this: it is the ring's one consumer (rule 2).
+pub fn poll_message(slots: &Slots, idx: usize) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    poll_slot(&slots[idx])
+}
+
+fn poll_slot(slot: &PubsubSlot) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let head = slot.head.load(Ordering::Relaxed);
+    let tail = slot.tail.load(Ordering::Acquire);
+    if head == tail {
+        return None;
     }
+    // SAFETY: rule 2 — `head` is inside `head..tail`, published by the
+    // producer's Release store of `tail` that our Acquire load saw, so the
+    // message is fully written, and the producer will not touch it again until
+    // our store of `head` below moves past it.
+    let msg = unsafe { &*slot.ring[(head as usize) % PUBSUB_RING_CAP].get() };
+    let channel = msg.channel[..msg.channel_len as usize].to_vec();
+    let pattern = msg.pattern[..msg.pattern_len as usize].to_vec();
+    let payload = msg.payload[..msg.payload_len as usize].to_vec();
+    slot.head.store(head.wrapping_add(1), Ordering::Release);
+    Some((channel, pattern, payload))
 }
 
-#[cfg(target_os = "linux")]
-unsafe fn wake_subscriber(slot: *mut PubsubSlot) {
-    const FUTEX_WAKE: libc::c_int = 1;
-    unsafe {
-        let addr = std::ptr::addr_of!((*slot).tail) as *const u32;
-        libc::syscall(libc::SYS_futex, addr, FUTEX_WAKE, 1i32);
-    }
-}
-
-/// Fallback for platforms without futex: sleep briefly and let the caller
-/// re-check, i.e. the polling behaviour this replaces on Linux.
-#[cfg(not(target_os = "linux"))]
-pub unsafe fn wait_for_message(
-    _slots: *mut PubsubSlot,
-    _idx: usize,
-    _seen_tail: u32,
-    timeout: std::time::Duration,
-) {
-    std::thread::sleep(timeout.min(std::time::Duration::from_millis(5)));
-}
-
-#[cfg(not(target_os = "linux"))]
-unsafe fn wake_subscriber(_slot: *mut PubsubSlot) {}
-
-/// Lock-free ring poll — safe from any thread, no spinlock needed.
-pub unsafe fn poll_message(
-    slots: *mut PubsubSlot,
-    idx: usize,
-) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-    unsafe {
-        let slot = slots.add(idx);
-        let head = (*slot).head.load(Ordering::Relaxed);
-        let tail = (*slot).tail.load(Ordering::Acquire);
-        if head == tail {
-            return None;
+/// Every in-use slot's subscriptions, visited under the lock.
+fn each_subs(ctl: &PubsubCtl, slots: &Slots, mut visit: impl FnMut(&Subs)) {
+    let mut locked = Locked::new(ctl, slots);
+    for i in 0..MAX_PUBSUB_SLOTS {
+        let subs = locked.subs(i);
+        if subs.in_use != 0 {
+            visit(subs);
         }
-        let msg = &(*slot).ring[(head as usize) % PUBSUB_RING_CAP];
-        let channel = msg.channel[..msg.channel_len as usize].to_vec();
-        let pattern = msg.pattern[..msg.pattern_len as usize].to_vec();
-        let payload = msg.payload[..msg.payload_len as usize].to_vec();
-        (*slot).head.store(head + 1, Ordering::Release);
-        Some((channel, pattern, payload))
     }
 }
 
 /// PUBSUB CHANNELS [pattern]
-pub unsafe fn pubsub_channels(
-    ctl: *mut PubsubCtl,
-    slots: *mut PubsubSlot,
+pub fn pubsub_channels(
+    ctl: &PubsubCtl,
+    slots: &Slots,
     pattern: Option<&[u8]>,
+    shard: bool,
 ) -> Vec<Vec<u8>> {
-    unsafe {
-        let mut names: Vec<Vec<u8>> = Vec::new();
-        {
-            let _guard = SpinGuard::acquire(&(*ctl).lock);
-            for i in 0..MAX_PUBSUB_SLOTS {
-                let slot = slots.add(i);
-                if (*slot).in_use == 0 {
-                    continue;
-                }
-                let ch_count = (*slot).channel_count as usize;
-                for entry in (&(*slot).channels)[..ch_count].iter() {
-                    let name = &entry[..entry_len(entry)];
-                    if pattern.is_none_or(|p| glob_match(p, name)) {
-                        names.push(name.to_vec());
-                    }
-                }
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    each_subs(ctl, slots, |subs| {
+        for entry in subs.channels[..subs.channel_count as usize].iter() {
+            let name = &entry[..entry_len(entry)];
+            // `shard` lists the sharded namespace by the names clients used;
+            // otherwise internal channels are hidden.
+            let listed = match (shard, name.strip_prefix(SHARD_PREFIX)) {
+                (true, Some(shown)) => Some(shown),
+                (false, None) if !is_internal(name) => Some(name),
+                _ => None,
+            };
+            if let Some(name) = listed
+                && pattern.is_none_or(|p| glob_match(p, name))
+            {
+                names.push(name.to_vec());
             }
         }
-        // Dedup outside the lock so sort cost doesn't extend the critical section
-        names.sort_unstable();
-        names.dedup();
-        names
-    }
+    });
+    // Dedup outside the lock so sort cost doesn't extend the critical section
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 /// PUBSUB NUMSUB [channel ...]
-pub unsafe fn pubsub_numsub(
-    ctl: *mut PubsubCtl,
-    slots: *mut PubsubSlot,
-    channels: &[Vec<u8>],
-) -> Vec<i64> {
-    unsafe {
-        let _guard = SpinGuard::acquire(&(*ctl).lock);
-        let mut counts = vec![0i64; channels.len()];
-        for i in 0..MAX_PUBSUB_SLOTS {
-            let slot = slots.add(i);
-            if (*slot).in_use == 0 {
-                continue;
-            }
-            let ch_count = (*slot).channel_count as usize;
-            for entry in (&(*slot).channels)[..ch_count].iter() {
-                for (k, target) in channels.iter().enumerate() {
-                    if entry_eq(entry, target) {
-                        counts[k] += 1;
-                    }
+pub fn pubsub_numsub(ctl: &PubsubCtl, slots: &Slots, channels: &[Vec<u8>]) -> Vec<i64> {
+    let mut counts = vec![0i64; channels.len()];
+    each_subs(ctl, slots, |subs| {
+        for entry in subs.channels[..subs.channel_count as usize].iter() {
+            for (k, target) in channels.iter().enumerate() {
+                if entry_eq(entry, target) {
+                    counts[k] += 1;
                 }
             }
         }
-        counts
-    }
+    });
+    counts
 }
 
-/// PUBSUB NUMPAT
-pub unsafe fn pubsub_numpat(ctl: *mut PubsubCtl, slots: *mut PubsubSlot) -> i64 {
-    unsafe {
-        let _guard = SpinGuard::acquire(&(*ctl).lock);
-        (0..MAX_PUBSUB_SLOTS)
-            .map(|i| {
-                let slot = slots.add(i);
-                if (*slot).in_use != 0 {
-                    (*slot).pattern_count as i64
-                } else {
-                    0
-                }
-            })
-            .sum()
-    }
+/// `PUBSUB NUMPAT`: the number of distinct patterns subscribed to — two
+/// clients on `ch*` count once, as in Redis.
+pub fn pubsub_numpat(ctl: &PubsubCtl, slots: &Slots) -> i64 {
+    let mut patterns: Vec<Vec<u8>> = Vec::new();
+    each_subs(ctl, slots, |subs| {
+        for entry in subs.patterns[..subs.pattern_count as usize].iter() {
+            patterns.push(entry[..entry_len(entry)].to_vec());
+        }
+    });
+    patterns.sort_unstable();
+    patterns.dedup();
+    patterns.len() as i64
 }
 
 /// Redis-compatible glob match over `*`, `?` and `[...]`. Iterative and
 /// index-based, so no input can drive a slice out of bounds: `publish` calls
 /// this holding the pub/sub spinlock, where a panic would be fatal.
 pub fn glob_match(pattern: &[u8], string: &[u8]) -> bool {
+    // Redis's `stringmatchlen` never enters its loop for an empty name, so
+    // only the empty pattern matches one: `*` included, checked on Redis 7.2.
+    if string.is_empty() {
+        return pattern.is_empty();
+    }
     let (mut p, mut s) = (0usize, 0usize);
     // Position of the last `*` seen, and how much of `string` it currently absorbs.
     let (mut star_p, mut star_s) = (usize::MAX, 0usize);
@@ -664,6 +671,12 @@ pub fn glob_match(pattern: &[u8], string: &[u8]) -> bool {
                 p += 1;
                 s += 1;
                 continue;
+            }
+            // `\x` matches `x` literally, as in Redis's `stringmatchlen`; a
+            // backslash ending the pattern is an ordinary character.
+            Some(b'\\') if p + 1 < pattern.len() => {
+                p += 1;
+                pattern[p] == string[s]
             }
             Some(b'[') => match match_class(&pattern[p + 1..], string[s]) {
                 (true, len) => {
@@ -705,11 +718,23 @@ fn match_class(pat: &[u8], ch: u8) -> (bool, usize) {
     let mut i = usize::from(negate);
     let mut matched = false;
     while let Some(&c) = pat.get(i) {
+        if c == b'\\' && i + 1 < pat.len() {
+            // `\x` in a class is `x`, `]` included.
+            matched |= ch == pat[i + 1];
+            i += 2;
+            continue;
+        }
         if c == b']' {
             return (matched != negate, i + 1);
         }
         if pat.len() - i > 2 && pat[i + 1] == b'-' {
-            matched |= ch >= c && ch <= pat[i + 2];
+            // Redis swaps a range given backwards: `[z-a]` is `[a-z]`.
+            let (lo, hi) = if c <= pat[i + 2] {
+                (c, pat[i + 2])
+            } else {
+                (pat[i + 2], c)
+            };
+            matched |= ch >= lo && ch <= hi;
             i += 3;
         } else {
             matched |= ch == c;
@@ -734,7 +759,8 @@ mod tests {
         (b"", b"x", false),
         // `*`
         (b"*", b"anything", true),
-        (b"*", b"", true),
+        // Redis matches no wildcard against an empty name (checked on 7.2).
+        (b"*", b"", false),
         (b"h*o", b"hello", true),
         (b"news.*", b"news.sports", true),
         (b"news.*", b"sports", false),
@@ -803,58 +829,49 @@ mod tests {
         let mut count = 0u32;
         let name = vec![b'c'; MAX_CHANNEL_LEN];
 
-        assert!(unsafe { slot_add(&mut arr, &mut count, &name) });
+        assert!(slot_add(&mut arr, &mut count, &name));
         assert_eq!(count, 1);
         assert!(entry_eq(&arr[0], &name), "a stored name must match itself");
-        assert_eq!(unsafe { slot_names(&arr, count) }, vec![name.clone()]);
+        assert_eq!(slot_names(&arr, count), vec![name.clone()]);
 
         // Subscribing twice to the same channel is a no-op, not a second entry.
-        assert!(!unsafe { slot_add(&mut arr, &mut count, &name) });
+        assert!(!slot_add(&mut arr, &mut count, &name));
         assert_eq!(count, 1);
     }
 
-    /// Backing store for a slot, aligned for the atomics inside it.
-    struct SlotBuf(#[allow(dead_code)] Vec<u64>, *mut PubsubSlot);
-    // The pointer addresses a heap buffer owned by the test and is only ever
-    // touched while that buffer is alive.
-    unsafe impl Send for SlotBuf {}
-
-    fn slot_buf() -> SlotBuf {
-        let words = std::mem::size_of::<PubsubSlot>().div_ceil(8);
-        let mut buf = vec![0u64; words];
-        let ptr = buf.as_mut_ptr() as *mut PubsubSlot;
-        unsafe { (*ptr).in_use = 1 };
-        SlotBuf(buf, ptr)
+    /// One slot on the heap, as the postmaster would create it: zeroed.
+    fn slot() -> std::sync::Arc<PubsubSlot> {
+        // SAFETY: zero is a valid `PubsubSlot` — a free slot with an empty
+        // ring (see its `Shareable` impl).
+        std::sync::Arc::new(unsafe { std::mem::MaybeUninit::<PubsubSlot>::zeroed().assume_init() })
     }
 
     /// A publish must wake a waiting subscriber rather than leaving it to
     /// discover the message on the next timeout.
     #[test]
     fn a_publish_wakes_a_waiting_subscriber() {
-        let slot = slot_buf();
-        let ptr = slot.1;
-
-        let publisher = std::thread::spawn(move || {
-            let slot = slot;
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            unsafe { write_to_ring(slot.1, b"chan", b"", b"payload") };
-            slot
-        });
+        let slot = slot();
+        let publisher = {
+            let slot = std::sync::Arc::clone(&slot);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                write_to_ring(&slot, b"chan", b"", b"payload");
+            })
+        };
 
         let start = std::time::Instant::now();
         // A ten-second timeout expected to return in ~100 ms: if the
         // wakeup were lost this test would take the full timeout.
-        unsafe { wait_for_message(ptr, 0, 0, std::time::Duration::from_secs(10)) };
+        wait_on(&slot, 0, std::time::Duration::from_secs(10));
         let waited = start.elapsed();
-        let slot = publisher.join().unwrap();
+        publisher.join().unwrap();
 
         assert!(
             waited < std::time::Duration::from_secs(5),
             "waited {waited:?}; the publish should have woken the subscriber"
         );
-        let message = unsafe { poll_message(slot.1, 0) };
         assert_eq!(
-            message,
+            poll_slot(&slot),
             Some((b"chan".to_vec(), Vec::new(), b"payload".to_vec()))
         );
     }
@@ -862,12 +879,12 @@ mod tests {
     /// A publish that lands before the wait starts must not be slept through.
     #[test]
     fn a_publish_already_in_the_ring_does_not_block() {
-        let slot = slot_buf();
-        unsafe { write_to_ring(slot.1, b"chan", b"", b"payload") };
+        let slot = slot();
+        write_to_ring(&slot, b"chan", b"", b"payload");
 
         let start = std::time::Instant::now();
         // seen_tail = 0, but the publish already moved it to 1.
-        unsafe { wait_for_message(slot.1, 0, 0, std::time::Duration::from_secs(10)) };
+        wait_on(&slot, 0, std::time::Duration::from_secs(10));
         assert!(
             start.elapsed() < std::time::Duration::from_secs(5),
             "a stale snapshot must return at once, not sleep"
@@ -878,9 +895,9 @@ mod tests {
     /// wakeup can only ever cost latency — never a hung subscriber.
     #[test]
     fn a_missed_wakeup_degrades_to_the_timeout() {
-        let slot = slot_buf();
+        let slot = slot();
         let start = std::time::Instant::now();
-        unsafe { wait_for_message(slot.1, 0, 0, std::time::Duration::from_millis(150)) };
+        wait_on(&slot, 0, std::time::Duration::from_millis(150));
         let waited = start.elapsed();
         assert!(
             waited >= std::time::Duration::from_millis(100),
@@ -892,6 +909,24 @@ mod tests {
         );
     }
 
+    /// The ring holds `PUBSUB_RING_CAP` messages and refuses the next, and
+    /// hands them back in order.
+    #[test]
+    fn the_ring_is_bounded_and_ordered() {
+        let slot = slot();
+        for i in 0..PUBSUB_RING_CAP {
+            assert!(write_to_ring(&slot, b"c", b"", i.to_string().as_bytes()));
+        }
+        assert!(!write_to_ring(&slot, b"c", b"", b"one too many"));
+        for i in 0..PUBSUB_RING_CAP {
+            assert_eq!(
+                poll_slot(&slot).map(|(_, _, p)| p),
+                Some(i.to_string().into_bytes())
+            );
+        }
+        assert_eq!(poll_slot(&slot), None);
+    }
+
     #[test]
     fn entry_eq_matches_nul_terminated_entry() {
         let mut entry = [0u8; CHAN_LEN];
@@ -901,5 +936,93 @@ mod tests {
         assert!(!entry_eq(&entry, b"news.x"));
         // A name too long to have been stored can never match.
         assert!(!entry_eq(&entry, &[b'a'; CHAN_LEN]));
+    }
+}
+
+/// Safe entry points over the shared pub/sub state, for callers that run a
+/// pub/sub command off the connection thread — a script's `redis.call`.
+/// `None` when the extension was not preloaded and there is no state.
+pub mod shared {
+    /// What `publish` did: the receivers reached, and the `(schema, table)`
+    /// the channel is routed to, if any.
+    pub type Published = (i64, Option<(Vec<u8>, Vec<u8>)>);
+
+    /// `PUBLISH`: the receivers reached, and the table the channel is routed
+    /// to, if any, so the caller can insert the message there.
+    pub fn publish(channel: &[u8], message: &[u8]) -> Option<Published> {
+        let (ctl, slots) = crate::pubsub_state()?;
+        let n = super::publish(ctl, slots, channel, message);
+        let route =
+            crate::route_state().and_then(|route_ctl| super::route_lookup(route_ctl, channel));
+        Some((n, route))
+    }
+
+    pub fn channels(pattern: Option<&[u8]>, shard: bool) -> Option<Vec<Vec<u8>>> {
+        let (ctl, slots) = crate::pubsub_state()?;
+        Some(super::pubsub_channels(ctl, slots, pattern, shard))
+    }
+
+    pub fn numsub(channels: &[Vec<u8>]) -> Option<Vec<i64>> {
+        let (ctl, slots) = crate::pubsub_state()?;
+        Some(super::pubsub_numsub(ctl, slots, channels))
+    }
+
+    pub fn numpat() -> Option<i64> {
+        let (ctl, slots) = crate::pubsub_state()?;
+        Some(super::pubsub_numpat(ctl, slots))
+    }
+
+    /// A pub/sub command run off the connection's thread — queued in a
+    /// transaction, or called from a script. `None` for any other command.
+    /// The reply comes with the insert a routed channel needs, which the
+    /// caller runs: it is the one holding a database connection.
+    pub fn run(
+        cmd: crate::commands::Command,
+    ) -> Option<(crate::commands::Response, Option<crate::commands::Command>)> {
+        use crate::commands::{Command, Response, Value};
+        Some(match cmd {
+            Command::Publish { channel, message } => match publish(&channel, &message) {
+                None => (Response::Integer(0), None),
+                Some((n, route)) => (
+                    Response::Integer(n),
+                    route.map(|(schema, table)| Command::TablePublish {
+                        schema,
+                        table,
+                        channel,
+                        payload: message,
+                    }),
+                ),
+            },
+            Command::PubSubChannels { pattern, shard } => (
+                Response::Array(
+                    channels(pattern.as_deref(), shard)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(Some)
+                        .collect(),
+                ),
+                None,
+            ),
+            Command::PubSubNumSub { channels, shard } => {
+                let stored: Vec<Vec<u8>> = if shard {
+                    channels.iter().map(|c| super::shard_name(c)).collect()
+                } else {
+                    channels.clone()
+                };
+                let counts = numsub(&stored).unwrap_or_else(|| vec![0; channels.len()]);
+                (
+                    Response::Value(Value::Array(
+                        channels
+                            .into_iter()
+                            .zip(counts)
+                            .flat_map(|(c, n)| [Value::Bulk(c), Value::Int(n)])
+                            .collect(),
+                    )),
+                    None,
+                )
+            }
+            Command::PubSubNumPat => (Response::Integer(numpat().unwrap_or(0)), None),
+            _ => return None,
+        })
     }
 }

@@ -100,6 +100,22 @@ run = [
   "docker compose --profile parity down -v",
 ]
 
+[tasks.acceptance]
+description = "Run Redis's own Tcl test suite against pg_redis (both halves), gated on the baseline"
+env = { PG_REDIS_PASSWORD = "" }
+run = [
+  "docker compose -f docker-compose.yml -f docker-compose.noports.yml --profile acceptance up --build --abort-on-container-exit --exit-code-from acceptance",
+  "docker compose --profile acceptance down -v",
+]
+
+[tasks.acceptance-update]
+description = "Re-record the acceptance baseline after tests start passing (or a regression is accepted)"
+env = { PG_REDIS_PASSWORD = "" }
+run = [
+  "docker compose -f docker-compose.yml -f docker-compose.noports.yml --profile acceptance run --build --rm -v $PWD/docker/acceptance:/opt/redis/acceptance acceptance bun run acceptance/run.ts --update-baseline",
+  "docker compose --profile acceptance down -v",
+]
+
 [tasks.clients]
 description = "Run client-compatibility e2e tests in Docker (node-redis, ioredis)"
 run = [
@@ -136,7 +152,7 @@ run_suite 'pg_redis' postgres
 description = "Benchmark memory mode against Redis and print the markdown CI posts on a PR"
 run = """
 set -e
-PG_REDIS_STORAGE_MODE=memory PG_REDIS_DEFAULT_DB=0 \
+PG_REDIS_DEFAULT_DB=0 \
   docker compose -f docker-compose.yml -f docker-compose.noports.yml --profile bench up -d --build --wait
 trap 'docker compose --profile bench down' EXIT INT TERM
 bash docker/bench/report.sh
@@ -149,7 +165,7 @@ set -e
 # Memory mode on db 0: the inline slot and the chunk pool this sweeps only
 # exist there. The compose default is the durable half, where every size is a
 # bytea column and the boundaries do not exist.
-PG_REDIS_STORAGE_MODE=memory PG_REDIS_DEFAULT_DB=0 \
+PG_REDIS_DEFAULT_DB=0 \
   docker compose -f docker-compose.yml -f docker-compose.noports.yml --profile bench up -d --build --wait
 trap 'docker compose --profile bench down' EXIT INT TERM
 sleep 2
@@ -224,3 +240,30 @@ docker run --rm --network pg_redis_default \
   -v "$(pwd)/docker/e2e:/app" \
   oven/bun:latest bun run /app/bench_pubsub.ts
 """
+
+[tasks.og]
+description = "Re-render docs/assets/og.png (the social card) from scripts/og.html"
+run = """
+CHROME="${CHROME:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
+"$CHROME" --headless=new --disable-gpu --hide-scrollbars \\
+  --force-device-scale-factor=1 --window-size=1200,630 --virtual-time-budget=5000 \\
+  --screenshot=docs/assets/og.png "file://$PWD/scripts/og.html"
+"""
+
+[tasks.docs]
+description = "Serve the docs site locally with live reload"
+run = 'uvx --from "mkdocs>=1.6,<2" --with mkdocs-material mkdocs serve'
+
+[tasks.demo]
+description = "Build the in-browser demo (docker/demo, via snowglobe) into docs/demo/"
+run = """
+set -e
+SNOWGLOBE="${SNOWGLOBE:-snowglobe}"
+docker build --platform linux/arm64 -t pg_redis:alpine-arm64 .
+rm -rf docs/demo
+"$SNOWGLOBE" build docker/demo --out docs/demo
+"""
+
+[tasks.bench-suite]
+description = "Benchmark the four storage policies against Redis on pinned CPUs (docker/bench/suite.exs)"
+run = "elixir docker/bench/suite.exs"

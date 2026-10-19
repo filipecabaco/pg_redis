@@ -1,5 +1,5 @@
 site_name: pg_redis
-site_description: Redis protocol support for PostgreSQL — backed by real SQL tables
+site_description: A Redis server inside PostgreSQL. Any Redis client, port 6379, with a storage policy per database, from shared memory to WAL-logged tables you can query in SQL.
 site_url: https://filipecabaco.github.io/pg_redis
 repo_url: https://github.com/filipecabaco/pg_redis
 repo_name: filipecabaco/pg_redis
@@ -8,6 +8,10 @@ copyright: Copyright &copy; 2026 Filipe Cabaço — MIT License
 
 theme:
   name: material
+  custom_dir: overrides
+  font:
+    text: Inter
+    code: JetBrains Mono
   palette:
     - scheme: slate
       primary: custom
@@ -31,6 +35,7 @@ theme:
 
 extra_css:
   - stylesheets/supabase.css
+  - stylesheets/home.css
 
 extra:
   social:
@@ -53,6 +58,7 @@ nav:
   - Getting started:
       - Installation: installation.md
       - Configuration: configuration.md
+      - Storage policies: STORAGE.md
   - Reference:
       - Commands: commands.md
       - Command coverage: command-coverage.md

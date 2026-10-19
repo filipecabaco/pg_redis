@@ -1,20 +1,20 @@
 [
 	{
 		"half": "cache",
-		"case": "how a float counter is printed back",
-		"at": 3,
-		"cmd": "INCRBYFLOAT n2 1.000000000000000005",
+		"case": "GEO",
+		"at": 20,
+		"cmd": "ZRANGE dst 0 -1 WITHSCORES",
 		"kind": "value",
-		"pg_redis": "$1\\n4\\n",
-		"redis": "$19\\n4.00000000000000001\\n"
+		"pg_redis": "*4\\n$7\\nCatania\\n$16\\n56.4412578701582\\n$7\\nPalermo\\n$18\\n190.44242984775784\\n",
+		"redis": "*4\\n$7\\nCatania\\n$17\\n56.44125787015819\\n$7\\nPalermo\\n$18\\n190.44242984775792\\n"
 	},
 	{
 		"half": "durable",
-		"case": "how a float counter is printed back",
-		"at": 3,
-		"cmd": "INCRBYFLOAT n2 1.000000000000000005",
+		"case": "GEO",
+		"at": 20,
+		"cmd": "ZRANGE dst 0 -1 WITHSCORES",
 		"kind": "value",
-		"pg_redis": "$1\\n4\\n",
-		"redis": "$19\\n4.00000000000000001\\n"
+		"pg_redis": "*4\\n$7\\nCatania\\n$16\\n56.4412578701582\\n$7\\nPalermo\\n$18\\n190.44242984775784\\n",
+		"redis": "*4\\n$7\\nCatania\\n$17\\n56.44125787015819\\n$7\\nPalermo\\n$18\\n190.44242984775792\\n"
 	}
 ]

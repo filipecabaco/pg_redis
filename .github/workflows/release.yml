@@ -1,0 +1,265 @@
+name: Release
+
+# Every supported PostgreSQL major × CPU × libc, built natively, smoke-tested the way a user
+# meets it, and published three ways from the same build:
+#
+#   tarballs   pg_redis-pg<major>-linux-<arch>-<gnu|musl>.tar.gz + SHA256SUMS on the GitHub
+#              release, for docs/install.sh
+#   drop-in    ghcr.io/<owner>/pg_redis:<major>[-bookworm|-alpine], the official postgres image
+#              with the extension preloaded and created on first start
+#   ext        ghcr.io/<owner>/pg_redis-ext:<major>-<bookworm|alpine>, FROM scratch, the files at
+#              their install paths:  COPY --from=ghcr.io/<owner>/pg_redis-ext:17-bookworm / /
+#
+# A v* tag publishes. A pull request that touches the packaging builds and tests every cell
+# and publishes nothing, so a broken cell is found before the tag, not after it.
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  pull_request:
+    branches: [main]
+    paths:
+      - "docker/release/**"
+      - "docs/install.sh"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY: ghcr.io
+  PUBLISH: ${{ startsWith(github.ref, 'refs/tags/v') }}
+
+jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      owner: ${{ steps.v.outputs.owner }}
+    steps:
+      # A tag is the release version; anything else builds as a prerelease of 0.0.0 so the
+      # control file and SQL script names still parse as versions
+      - id: v
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version=${REF_NAME#v}
+          else
+            version="0.0.0-ci.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "owner=${OWNER,,}" >> "$GITHUB_OUTPUT"
+
+  package:
+    name: pg${{ matrix.pg }} ${{ matrix.arch }} ${{ matrix.libc }}
+    needs: [version]
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [15, 16, 17, 18]
+        arch: [amd64, arm64]
+        libc: [gnu, musl]
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      OWNER: ${{ needs.version.outputs.owner }}
+      DOCKERFILE: docker/release/${{ matrix.libc == 'gnu' && 'glibc' || 'alpine' }}.Dockerfile
+      FLAVOR: ${{ matrix.libc == 'gnu' && 'bookworm' || 'alpine' }}
+      BASE: postgres:${{ matrix.pg }}-${{ matrix.libc == 'gnu' && 'bookworm' || 'alpine' }}
+      ASSET: pg_redis-pg${{ matrix.pg }}-linux-${{ matrix.arch }}-${{ matrix.libc }}.tar.gz
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # One build; the three targets below share its layers through the GitHub Actions cache,
+      # scoped per cell so the sixteen cells don't evict one another
+      - name: Build the drop-in image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE }}
+          target: runtime
+          build-args: |
+            PG_MAJOR=${{ matrix.pg }}
+            VERSION=${{ env.VERSION }}
+          load: true
+          tags: pg_redis-release:runtime
+          cache-from: type=gha,scope=release-pg${{ matrix.pg }}-${{ matrix.arch }}-${{ matrix.libc }}
+          cache-to: type=gha,mode=max,scope=release-pg${{ matrix.pg }}-${{ matrix.arch }}-${{ matrix.libc }}
+
+      - name: Build the tarball
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE }}
+          target: dist
+          build-args: |
+            PG_MAJOR=${{ matrix.pg }}
+            VERSION=${{ env.VERSION }}
+          outputs: type=local,dest=dist
+          cache-from: type=gha,scope=release-pg${{ matrix.pg }}-${{ matrix.arch }}-${{ matrix.libc }}
+
+      - name: Name the tarball
+        run: |
+          mv dist/pg_redis.tar.gz "dist/$ASSET"
+          tar -tzvf "dist/$ASSET"
+
+      - name: Smoke-test the drop-in image
+        run: docker/release/smoke.sh image pg_redis-release:runtime
+
+      # The tarball goes into a stock image through install.sh, which is how it is used
+      - name: Smoke-test the tarball with install.sh
+        run: docker/release/smoke.sh tarball "dist/$ASSET" "$BASE"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.ASSET }}
+          path: dist/${{ env.ASSET }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Log in to GHCR
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Per-arch tags; the manifest job joins each pair into one multi-arch tag
+      - name: Push the drop-in image (${{ matrix.arch }})
+        if: env.PUBLISH == 'true'
+        run: |
+          tag="$REGISTRY/$OWNER/pg_redis:${VERSION}-pg${{ matrix.pg }}-${FLAVOR}-${{ matrix.arch }}"
+          docker tag pg_redis-release:runtime "$tag"
+          docker push "$tag"
+
+      - name: Push the extension image (${{ matrix.arch }})
+        if: env.PUBLISH == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE }}
+          target: ext
+          build-args: |
+            PG_MAJOR=${{ matrix.pg }}
+            VERSION=${{ env.VERSION }}
+          push: true
+          provenance: false
+          tags: ${{ env.REGISTRY }}/${{ env.OWNER }}/pg_redis-ext:${{ env.VERSION }}-pg${{ matrix.pg }}-${{ env.FLAVOR }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=release-pg${{ matrix.pg }}-${{ matrix.arch }}-${{ matrix.libc }}
+
+  manifest:
+    name: Multi-arch tags
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      OWNER: ${{ needs.version.outputs.owner }}
+    steps:
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # A prerelease tag (v1.2.0-rc.1) gets its versioned tags only; the moving ones
+      # (17, 17-alpine, latest) follow final releases
+      - name: Join the per-arch images
+        run: |
+          set -euo pipefail
+          final=true
+          [[ "$VERSION" == *-* ]] && final=false
+          latest_pg=18
+          for pg in 15 16 17 18; do
+            for flavor in bookworm alpine; do
+              for repo in pg_redis pg_redis-ext; do
+                src="$REGISTRY/$OWNER/$repo:${VERSION}-pg${pg}-${flavor}"
+                tags=(-t "$src")
+                if $final; then
+                  tags+=(-t "$REGISTRY/$OWNER/$repo:${pg}-${flavor}")
+                  if [[ $repo == pg_redis && $flavor == bookworm ]]; then
+                    tags+=(-t "$REGISTRY/$OWNER/$repo:${pg}")
+                    [[ $pg == "$latest_pg" ]] && tags+=(-t "$REGISTRY/$OWNER/$repo:latest")
+                  fi
+                fi
+                docker buildx imagetools create "${tags[@]}" "${src}-amd64" "${src}-arm64"
+                echo "${tags[*]}"
+              done
+            done
+          done
+
+  release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version, package, manifest]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: pg_redis-pg*.tar.gz
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          cp ../docs/install.sh install.sh
+          sha256sum pg_redis-pg*.tar.gz install.sh > SHA256SUMS
+          cat SHA256SUMS
+          test "$(find . -maxdepth 1 -name 'pg_redis-pg*.tar.gz' | wc -l)" -eq 16
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          prerelease=()
+          [[ "$VERSION" == *-* ]] && prerelease=(--prerelease)
+          cat > notes.md <<EOF
+          ## Install
+
+          Into an existing PostgreSQL 15–18 on Linux (amd64 or arm64; glibc from Ubuntu 22.04 / Debian 12 on, or musl):
+
+          \`\`\`sh
+          curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/install.sh | sh -s -- --version ${TAG} --configure
+          \`\`\`
+
+          As a container, the official postgres image with pg_redis preloaded:
+
+          \`\`\`sh
+          docker run -e POSTGRES_PASSWORD=postgres -e PG_REDIS_PASSWORD=change-me -p 6379:6379 ${REGISTRY}/${OWNER,,}/pg_redis:${VERSION}-pg17-bookworm
+          \`\`\`
+
+          Into your own image:
+
+          \`\`\`dockerfile
+          COPY --from=${REGISTRY}/${OWNER,,}/pg_redis-ext:${VERSION}-pg17-bookworm / /
+          \`\`\`
+          EOF
+          gh release create "$TAG" dist/* --title "$TAG" --notes-file notes.md --generate-notes "${prerelease[@]}"

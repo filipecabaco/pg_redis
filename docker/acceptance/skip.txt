@@ -1,0 +1,15 @@
+# Tests skipped by name (exact) or regexp (leading /), one per line.
+# Only for tests that hang or take the server down, never to hide a failure:
+# a failing test belongs in the baseline, where it stays visible.
+
+# Deadlocks: the client writes 200k commands before reading a reply, and
+# pg_redis writes each reply synchronously, so once the client's receive buffer
+# fills, pg_redis stops reading and both ends block. Redis buffers replies in
+# memory and keeps reading. Remove once replies are written asynchronously.
+PIPELINING stresser (also a regression for the old epoll bug)
+
+# A script of 1,000,000 SADDs. On the durable half each `redis.call` is a SQL
+# statement, so it outlives the unit's timeout; and a script that has written
+# cannot be killed, so it then holds the server BUSY for every unit after it.
+# Remove once scripts batch their writes.
+LATENCY of expire events are correctly collected

@@ -1,31 +1,64 @@
+#![forbid(unsafe_code)]
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
 const MAX_BULK_LEN: usize = 512 * 1024 * 1024; // 512 MiB — matches Redis default
 const MAX_ARRAY_LEN: usize = 65_536;
-const MAX_INLINE_LEN: usize = 8_192;
+/// Redis's `PROTO_INLINE_MAX_SIZE`: the longest line accepted, inline command
+/// or RESP header alike.
+const MAX_INLINE_LEN: usize = 64 * 1024;
 /// Bulk strings are read in chunks of this size rather than allocated up front,
 /// so a client cannot reserve memory it never intends to send.
 const BULK_CHUNK: usize = 64 * 1024;
 
-pub struct RespParser {
-    reader: BufReader<TcpStream>,
+/// Reads RESP commands from a client. Generic over the byte source so the
+/// parser can be driven from memory (the fuzz harness below); the server only
+/// ever builds it over a `TcpStream`.
+pub struct RespParser<R = TcpStream> {
+    reader: BufReader<R>,
     line_buf: Vec<u8>,
 }
 
-impl RespParser {
-    pub fn new(stream: TcpStream) -> Self {
+impl<R: Read> RespParser<R> {
+    pub fn from_reader(source: R) -> Self {
         Self {
-            reader: BufReader::new(stream),
+            reader: BufReader::new(source),
             line_buf: Vec::with_capacity(256),
         }
+    }
+
+    /// Whether a command is already waiting in the read buffer — a pipeline
+    /// that arrived together.
+    pub fn has_buffered(&self) -> bool {
+        !self.reader.buffer().is_empty()
+    }
+}
+
+impl RespParser<TcpStream> {
+    pub fn new(stream: TcpStream) -> Self {
+        Self::from_reader(stream)
     }
 
     pub fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
         self.reader.get_ref().set_read_timeout(dur)
     }
 
+    /// Whether the client has hung up, without consuming anything it sent:
+    /// a peek that reads end-of-stream. Buffered input means it has not.
+    pub fn peer_closed(&self) -> bool {
+        !self.has_buffered() && crate::sys::peer_closed(self.reader.get_ref())
+    }
+
+    /// Wait up to `timeout` for the client to send something. True once the
+    /// socket is readable, or has hung up or failed, which the next read
+    /// reports; false when the time ran out.
+    pub fn wait_readable(&self, timeout: Duration) -> bool {
+        crate::sys::wait_readable(self.reader.get_ref(), timeout)
+    }
+}
+
+impl<R: Read> RespParser<R> {
     fn read_line_bytes(&mut self) -> io::Result<&[u8]> {
         self.line_buf.clear();
         // `read_until` only returns at a newline or EOF, so it must be capped:
@@ -40,10 +73,13 @@ impl RespParser {
             ));
         }
         if self.line_buf.last() != Some(&b'\n') {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "inline command too long",
-            ));
+            // Redis's wording, which names what the line was meant to be.
+            let what = match self.line_buf.first() {
+                Some(b'*') => "too big mbulk count string",
+                Some(b'$') => "too big bulk count string",
+                _ => "too big inline request",
+            };
+            return Err(protocol_error(what));
         }
         let end = self.line_buf.len();
         let end = if end >= 2 && self.line_buf[end - 2] == b'\r' {
@@ -60,54 +96,46 @@ impl RespParser {
         let line = self.read_line_bytes()?;
 
         if line.first() == Some(&b'*') {
-            let count_str = std::str::from_utf8(&line[1..])
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad array count"))?;
-            let count: usize = count_str
-                .parse()
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad array count"))?;
-            if count > MAX_ARRAY_LEN {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "array too large",
-                ));
+            let count: i64 = std::str::from_utf8(&line[1..])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| protocol_error("invalid multibulk length"))?;
+            // A count of zero or less is no command at all, which Redis
+            // skips rather than refuses.
+            if count <= 0 {
+                return Ok(vec![]);
             }
+            if count as u64 > MAX_ARRAY_LEN as u64 {
+                return Err(protocol_error("invalid multibulk length"));
+            }
+            let count = count as usize;
             let mut parts = Vec::with_capacity(count);
             for _ in 0..count {
                 parts.push(self.read_bulk_string()?);
             }
             Ok(parts)
         } else {
-            Ok(line
-                .split(|b| b.is_ascii_whitespace())
-                .filter(|w| !w.is_empty())
-                .map(<[u8]>::to_vec)
-                .collect())
+            split_inline(line)
         }
     }
 
     fn read_bulk_string(&mut self) -> io::Result<Vec<u8>> {
         let line = self.read_line_bytes()?;
-        if line.first() != Some(&b'$') {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "expected bulk string",
-            ));
+        match line.first() {
+            Some(b'$') => {}
+            other => {
+                let got = other.map(|&b| b as char).unwrap_or(' ');
+                return Err(protocol_error(&format!("expected '$', got '{got}'")));
+            }
         }
-        let len_str = std::str::from_utf8(&line[1..])
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad bulk len"))?;
-        let len: i64 = len_str
-            .parse()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad bulk len"))?;
-        if len < 0 {
-            return Ok(vec![]);
+        let len: i64 = std::str::from_utf8(&line[1..])
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| protocol_error("invalid bulk length"))?;
+        if len < 0 || len as u64 > MAX_BULK_LEN as u64 {
+            return Err(protocol_error("invalid bulk length"));
         }
         let len = len as usize;
-        if len > MAX_BULK_LEN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "bulk string too large",
-            ));
-        }
         // Grow as the bytes actually arrive. Trusting the announced length would
         // let a client commit up to MAX_BULK_LEN per connection from a 12-byte
         // header and then simply stall, holding the memory for the read timeout.
@@ -124,14 +152,140 @@ impl RespParser {
     }
 }
 
+/// A malformed request. The worker answers it with `-ERR Protocol error: ...`
+/// and closes the connection, as Redis does — the stream cannot be trusted
+/// past the point it went wrong.
+fn protocol_error(reason: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, reason.to_string())
+}
+
+/// The text a protocol error is reported with, or `None` for an error that is
+/// not one (a timeout, a hung-up client).
+pub fn protocol_error_reason(e: &io::Error) -> Option<String> {
+    (e.kind() == io::ErrorKind::InvalidData).then(|| format!("Protocol error: {e}"))
+}
+
+/// An inline command split as Redis's `sdssplitargs` does: whitespace between
+/// arguments, double quotes with C escapes (`\n`, `\xHH`, ...), single quotes
+/// with only `\'`. A closing quote must end the argument.
+pub(crate) fn split_inline(line: &[u8]) -> io::Result<Vec<Vec<u8>>> {
+    let unbalanced = || protocol_error("unbalanced quotes in request");
+    let mut args = Vec::new();
+    let mut i = 0;
+    // Redis splits the line as a C string, so a NUL byte ends it.
+    let n = line.iter().position(|&b| b == 0).unwrap_or(line.len());
+    loop {
+        while i < n && matches!(line[i], b' ' | b'\n' | b'\r' | b'\t' | 0x0b | 0x0c) {
+            i += 1;
+        }
+        if i >= n {
+            return Ok(args);
+        }
+        let mut cur = Vec::new();
+        let (mut inq, mut insq) = (false, false);
+        loop {
+            if inq {
+                if i >= n {
+                    return Err(unbalanced());
+                }
+                let c = line[i];
+                if c == b'\\' && i + 3 < n && line[i + 1] == b'x' {
+                    let hex = |b: u8| (b as char).to_digit(16);
+                    if let (Some(h), Some(l)) = (hex(line[i + 2]), hex(line[i + 3])) {
+                        cur.push((h * 16 + l) as u8);
+                        i += 4;
+                        continue;
+                    }
+                }
+                if c == b'\\' && i + 1 < n {
+                    cur.push(match line[i + 1] {
+                        b'n' => b'\n',
+                        b'r' => b'\r',
+                        b't' => b'\t',
+                        b'b' => 0x08,
+                        b'a' => 0x07,
+                        other => other,
+                    });
+                    i += 2;
+                    continue;
+                }
+                if c == b'"' {
+                    if i + 1 < n && !line[i + 1].is_ascii_whitespace() {
+                        return Err(unbalanced());
+                    }
+                    i += 1;
+                    break;
+                }
+                cur.push(c);
+                i += 1;
+            } else if insq {
+                if i >= n {
+                    return Err(unbalanced());
+                }
+                let c = line[i];
+                if c == b'\\' && i + 1 < n && line[i + 1] == b'\'' {
+                    cur.push(b'\'');
+                    i += 2;
+                    continue;
+                }
+                if c == b'\'' {
+                    if i + 1 < n && !line[i + 1].is_ascii_whitespace() {
+                        return Err(unbalanced());
+                    }
+                    i += 1;
+                    break;
+                }
+                cur.push(c);
+                i += 1;
+            } else {
+                if i >= n {
+                    break;
+                }
+                match line[i] {
+                    b' ' | b'\n' | b'\r' | b'\t' => break,
+                    b'"' => inq = true,
+                    b'\'' => insq = true,
+                    c => cur.push(c),
+                }
+                i += 1;
+            }
+        }
+        args.push(cur);
+    }
+}
+
 pub fn write_simple_string(w: &mut impl Write, s: &str) -> io::Result<()> {
     write!(w, "+{}\r\n", s)
+}
+
+thread_local! {
+    /// Set by every error reply on this thread, so the connection loop can
+    /// tell a failed command from a successful one for `INFO commandstats`.
+    pub static REPLIED_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A RESP error, prefixed with `ERR` only when the message carries no code of
 /// its own. Clients match on the code, so prefixing unconditionally turned an
 /// OOM reply into `-ERR OOM …`, which no OOM handling recognises.
 pub fn write_error(w: &mut impl Write, msg: &str) -> io::Result<()> {
+    REPLIED_ERROR.with(|e| e.set(true));
+    let code = msg
+        .split(' ')
+        .next()
+        .filter(|c| ERROR_CODES.contains(c))
+        .unwrap_or("ERR");
+    crate::server::count_error(code);
+    // An error is one line. Messages that echo client input — "unknown
+    // command ... with args beginning with" — can carry a CR or LF, and a raw
+    // one ends the line early and desyncs every reply after it. Redis maps
+    // both to spaces for the same reason.
+    let clean;
+    let msg = if msg.contains(['\r', '\n']) {
+        clean = msg.replace(['\r', '\n'], " ");
+        clean.as_str()
+    } else {
+        msg
+    };
     if has_error_code(msg) {
         write!(w, "-{}\r\n", msg)
     } else {
@@ -153,13 +307,42 @@ const ERROR_CODES: &[&str] = &[
     "LOADING",
     "BUSY",
     "BUSYKEY",
+    "BUSYGROUP",
+    "NOGROUP",
     "NOPERM",
     "READONLY",
     "NOPROTO",
+    "INVALIDOBJ",
+    "NOTBUSY",
+    "UNBLOCKED",
+    "TRYAGAIN",
+    "MOVED",
+    "CROSSSLOT",
+    "NOREPLICAS",
+    "MASTERDOWN",
+    "MISCONF",
+    "NOGOODSLAVE",
+    "TESTFAILED",
 ];
 
 /// Whether `msg` opens with one of those codes followed by a space.
-fn has_error_code(msg: &str) -> bool {
+/// An error passed through as given, its first word counted as its code — a
+/// script's own `{err=...}` or `redis.error_reply`, whose codes Redis does not
+/// vet.
+pub fn write_error_verbatim(w: &mut impl Write, msg: &str) -> io::Result<()> {
+    REPLIED_ERROR.with(|e| e.set(true));
+    let msg = msg.replace(['\r', '\n'], " ");
+    let msg = msg.trim_end();
+    let code = msg
+        .split(' ')
+        .next()
+        .filter(|c| !c.is_empty())
+        .unwrap_or("ERR");
+    crate::server::count_error(code);
+    write!(w, "-{}\r\n", msg)
+}
+
+pub(crate) fn has_error_code(msg: &str) -> bool {
     matches!(msg.split_once(' '), Some((code, _)) if ERROR_CODES.contains(&code))
 }
 
@@ -275,6 +458,38 @@ mod tests {
         }
     }
 
+    /// A NUL byte ends an inline request, as it does in Redis. Found by the
+    /// fuzzer: the splitter used to stop on a NUL without consuming it and
+    /// pushed empty arguments until memory ran out.
+    #[test]
+    fn an_inline_request_ends_at_a_nul() {
+        let cases: [(&[u8], &[&[u8]]); 3] = [
+            (b"\0", &[]),
+            (b"GET a\0b c", &[b"GET", b"a"]),
+            (b"SET k v\0\0\0", &[b"SET", b"k", b"v"]),
+        ];
+        for (line, want) in cases {
+            assert_eq!(split_inline(line).unwrap(), want, "{line:?}");
+        }
+        assert!(split_inline(b"GET \"a\0b\"").is_err());
+    }
+
+    /// An error that echoes client bytes stays one line: a CR or LF in it
+    /// used to end the reply early and desync the connection.
+    #[test]
+    fn an_error_never_spans_lines() {
+        let mut out = Vec::new();
+        write_error(
+            &mut out,
+            "unknown command 'EVAL', with args beginning with: '\n x\r\n'",
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            b"-ERR unknown command 'EVAL', with args beginning with: '  x  '\r\n".to_vec()
+        );
+    }
+
     #[test]
     fn pubsub_header_follows_negotiated_protocol() {
         let mut resp2 = Vec::new();
@@ -306,8 +521,13 @@ mod tests {
                 b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$3\r\n\x00\xff\x01\r\n",
                 &[b"SET", b"k", b"\x00\xff\x01"],
             ),
-            // A negative bulk length is the RESP null, decoded as empty.
-            (b"*1\r\n$-1\r\n", &[b""]),
+            // Quoted inline arguments, split as Redis's sdssplitargs does.
+            (b"SET \"a b\" 'c d'\r\n", &[b"SET", b"a b", b"c d"]),
+            (b"SET k \"\\x41\\n\"\r\n", &[b"SET", b"k", b"A\n"]),
+            (b"SET k 'it\\'s'\r\n", &[b"SET", b"k", b"it's"]),
+            // A multibulk count of zero or less is skipped, not refused.
+            (b"*-10\r\n", &[]),
+            (b"*0\r\n", &[]),
         ];
         for (wire, expected) in cases {
             let parts = parse(wire).unwrap_or_else(|e| panic!("{:?} failed to parse: {e}", wire));
@@ -323,18 +543,25 @@ mod tests {
         let cases: &[(Vec<u8>, &str)] = &[
             (
                 format!("*1\r\n${}\r\n", MAX_BULK_LEN + 1).into_bytes(),
-                "bulk string too large",
+                "invalid bulk length",
             ),
             (
                 format!("*{}\r\n", MAX_ARRAY_LEN + 1).into_bytes(),
-                "array too large",
+                "invalid multibulk length",
             ),
             (
                 format!("{}\r\n", "A".repeat(MAX_INLINE_LEN + 1)).into_bytes(),
-                "inline command too long",
+                "too big inline request",
             ),
             // No newline at all: `read_until` would happily buffer forever.
-            (vec![b'A'; MAX_INLINE_LEN * 4], "inline command too long"),
+            (vec![b'A'; MAX_INLINE_LEN * 4], "too big inline request"),
+            // The rest are Redis's protocol errors, worded as Redis words them.
+            (b"*1\r\n$-1\r\n".to_vec(), "invalid bulk length"),
+            (b"*1\r\n$abc\r\n".to_vec(), "invalid bulk length"),
+            (b"*abc\r\n".to_vec(), "invalid multibulk length"),
+            (b"*1\r\nfoo\r\n".to_vec(), "expected '$', got 'f'"),
+            (b"set \"\"\"k\"\"\" v\r\n".to_vec(), "unbalanced quotes"),
+            (b"set \"k v\r\n".to_vec(), "unbalanced quotes"),
         ];
         for (wire, expected) in cases {
             let err = parse(wire).unwrap_err();

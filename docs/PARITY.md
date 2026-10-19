@@ -12,13 +12,23 @@ Written against `claude/pg-redis-member-array-b41dkl` at the point it went in.
 Re-measure before trusting any table here; the recipe is below and takes two
 minutes.
 
-**Re-measured against Redis 7.0.15 after the second correctness block.** The
-probe now reads: 240 top-level commands in the reference, **149 accepted, 91
-missing** — `TIME`, `TOUCH`, `HSTRLEN`, `ZINTERCARD`, `DUMP` and `RESTORE`
-moved columns. `COMMAND COUNT` answers 149 and is derived, not asserted, so
-the probe and the reply agree by construction. The tier 1 table gained a row
-(`RANDOMKEY` closed, the `ZUNION` family's set-input gap opened) and the
-throughput question tier 1 priced is decided and re-measured below.
+**Re-measured against Redis 7.2.5 after the parity block.** Redis 7.2 has 242
+top-level commands; pg_redis now accepts **235**. The seven missing are the
+replication and migration internals (`MIGRATE`, `PSYNC`, `REPLCONF`,
+`RESTORE-ASKING`, `SYNC`), `MODULE` and `SENTINEL`. `COMMAND COUNT` answers 235
+and is derived from the coverage page, not asserted. The block added
+streams, scripting and functions, the blocking commands, the server and
+introspection commands, HyperLogLog, GEO and RESP3, and closed the `ZUNION`
+family's set-input gap. Redis's own acceptance suite is the measure now — see
+"Redis's own acceptance suite" in `IMPLEMENTATION.md` for the current count.
+
+The tables below predate that block. Their tier 2 ("commands we do not
+implement") is now the list above; tier 1's rows are kept for their
+reasoning, and several have since been closed — re-check one against the
+code before relying on it.
+
+Previously, against Redis 7.0.15: 240 top-level commands, 150 accepted, 90
+missing.
 
 A pattern worth carrying forward: this page has now been wrong three times,
 each time in the same direction — the defect found was bigger than the entry
@@ -86,7 +96,8 @@ one place; a fifth, found later, follows the table.
 
 | Gap | Half | Status |
 |---|---|---|
-| `INCRBYFLOAT` precision — `f64` against Redis's `long double` | both | **Accepted.** The 2 baseline entries. See [phase 2](IMPLEMENTATION.md#phase-2-ranges-shapes-and-ties) |
+| `INCRBYFLOAT` precision — `f64` against Redis's `long double` | both | **Accepted.** See [phase 2](IMPLEMENTATION.md#phase-2-ranges-shapes-and-ties) |
+| GEO distance stored by `GEOSEARCHSTORE … STOREDIST` — last-digit `f64` rounding | both | **Accepted.** The 2 baseline entries, one per half |
 | An expired collection outlives its expiry: `TYPE` answers `none` while `LLEN` still reports the old count, until the sweep runs | both | **Fixed.** It was never memory-only, and it was never one command — see [below](#the-stale-collection-read-was-bigger-than-this-table-said) |
 | `SCAN`/`KEYS` return the whole keyspace in one reply, cursor always 0 | both | Open. See [Incremental cursors](#incremental-cursors) below |
 | `RANDOMKEY` returns the first live key the KV scan reaches, and consults the collection metas only when there is none | ~~memory~~ both | **Fixed**, and it was worse than this row said: the durable half read `kv_N` alone, so a database holding only collections answered *nil* while `DBSIZE` counted them — a wrong answer, not a skew. Both halves now draw uniformly over every live key: the durable half with a five-table `UNION` under `ORDER BY random()`, the memory half with a single-pass reservoir over the KV scan and the collection names. An expired-but-unswept collection is excluded on both. The e2e `RANDOMKEY` describes pin all three properties per half |
@@ -169,7 +180,7 @@ without waiting for the sweep, and costs only the miss path.
 
 ## Tier 2 — commands we do not implement
 
-**149 of 240 accepted, 91 missing.** Grouped by what a client loses, which is
+**150 of 240 accepted, 90 missing.** `MEMORY` (`USAGE` only) moved columns with the acceptance-suite work. Grouped by what a client loses, which is
 the same ordering [§12's phase plan](IMPLEMENTATION.md#the-plan) used and for
 the same reason: a command that answers wrongly costs more than one that is
 absent, and an absent command a client actually calls costs more than one it
@@ -196,7 +207,7 @@ version 11+ payloads and pre-7 compact encodings are refused loudly, as
 | **Sharded pub/sub** | 3 | `SPUBLISH` `SSUBSCRIBE` `SUNSUBSCRIBE` |
 | **Streams** | 15 | `XADD` and friends |
 | **Scripting and functions** | 8 | `EVAL` `EVAL_RO` `EVALSHA` `EVALSHA_RO` `FCALL` `FCALL_RO` `FUNCTION` `SCRIPT` |
-| **Cluster, replication, admin** | 27 | `ACL` `CLUSTER` `REPLICAOF` `DEBUG` `MONITOR` `SLOWLOG` `WAIT` `MIGRATE` … |
+| **Cluster, replication, admin** | 26 | `ACL` `CLUSTER` `REPLICAOF` `DEBUG` `MONITOR` `SLOWLOG` `WAIT` `MIGRATE` … |
 
 Notes on individual entries worth knowing before planning:
 
@@ -212,9 +223,10 @@ Notes on individual entries worth knowing before planning:
   with anything built, and the only group here that is more arithmetic than
   plumbing.
 
-**Keyspace notifications** (`__keyspace@N__` / `__keyevent@N__`) are absent and
-are not a command, so they appear nowhere in the table above. The pub/sub
-machinery to carry them already exists.
+**Keyspace notifications** (`__keyspace@N__` / `__keyevent@N__`) were absent
+when this was written, and are not a command, so they appear nowhere in the
+table above. They have since been built on the pub/sub machinery, along with
+client tracking.
 
 
 ## Tier 3 — introspection that answers, and answers wrongly
@@ -231,7 +243,7 @@ Measured side by side against the reference:
 | `OBJECT IDLETIME k` | *(nil)* | `0` |
 | `OBJECT FREQ k` | *(nil)* | error unless LFU is on |
 | `CONFIG GET maxmemory` | *(empty)* | `maxmemory 0` |
-| `COMMAND COUNT` | ~~`100`~~ **149** — fixed | `240` |
+| `COMMAND COUNT` | ~~`100`~~ **150** — fixed | `240` |
 | `COMMAND DOCS` / `INFO` / `LIST` | *(empty)* | populated |
 | `CLIENT ID` | `0`, always | unique per connection |
 

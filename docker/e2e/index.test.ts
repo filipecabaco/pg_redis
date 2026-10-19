@@ -1753,6 +1753,39 @@ describe("Transactions", () => {
 	});
 });
 
+// MIGRATE to this same server, a database over: the network path end to end.
+describe("MIGRATE", () => {
+	test("moves keys with their TTL, COPY keeps them, NOKEY when none exist", async () => {
+		const host = process.env.REDIS_HOST ?? "localhost";
+		const port = process.env.REDIS_PORT ?? "6379";
+		const pw = process.env.REDIS_PASSWORD ?? "testpass";
+		const auth = pw ? ["AUTH", pw] : [];
+		await raw.send("SELECT", "0");
+		await raw.send("DEL", "mig:a", "mig:b");
+		await raw.send("SET", "mig:a", "1", "EX", "100");
+		await raw.send("SET", "mig:b", "2");
+		expect((await raw.send("MIGRATE", host, port, "mig:a", "1", "5000", ...auth)).toString()).toBe("+OK\r\n");
+		expect(integerReply(await raw.send("EXISTS", "mig:a"))).toBe(0);
+		await raw.send("SELECT", "1");
+		expect((await raw.bulk("GET", "mig:a"))?.toString()).toBe("1");
+		expect(integerReply(await raw.send("TTL", "mig:a"))).toBeGreaterThan(90);
+		await raw.send("DEL", "mig:a");
+		await raw.send("SELECT", "0");
+		const copy = await raw.send("MIGRATE", host, port, "", "1", "5000", "COPY", ...auth, "KEYS", "mig:b", "mig:none");
+		expect(copy.toString()).toBe("+OK\r\n");
+		expect(integerReply(await raw.send("EXISTS", "mig:b"))).toBe(1);
+		expect((await raw.send("MIGRATE", host, port, "mig:none", "1", "5000", ...auth)).toString()).toBe("+NOKEY\r\n");
+		// Already there without REPLACE: the target's error, the key kept.
+		const busy = errorReply(await raw.send("MIGRATE", host, port, "mig:b", "1", "5000", ...auth));
+		expect(busy).toStartWith("ERR Target instance replied with error: BUSYKEY");
+		expect(integerReply(await raw.send("EXISTS", "mig:b"))).toBe(1);
+		await raw.send("DEL", "mig:b");
+		await raw.send("SELECT", "1");
+		await raw.send("DEL", "mig:b");
+		await raw.send("SELECT", "durable");
+	});
+});
+
 // INFO's rdb_changes_since_last_save counts as Redis's server.dirty does.
 describe("The dirty counter", () => {
 	const changes = async () => {

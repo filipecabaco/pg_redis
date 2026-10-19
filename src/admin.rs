@@ -47,6 +47,7 @@ const NAMES: &[&str] = &[
     "SHUTDOWN",
     "FAILOVER",
     "MEMORY",
+    "MIGRATE",
 ];
 
 impl Admin {
@@ -136,6 +137,7 @@ pub fn execute(a: &Admin, conn: &mut Conn, data: &mut Data) -> Response {
         ),
         "DEBUG" => debug(a, conn, data),
         "MEMORY" => memory(a),
+        "MIGRATE" => migrate(a, conn, data),
         "LASTSAVE" => Response::Integer(
             server::ctl().map_or(0, |c| c.lastsave.load(std::sync::atomic::Ordering::Relaxed)),
         ),
@@ -1834,6 +1836,144 @@ fn debug_populate(args: &[Vec<u8>], conn: &mut Conn, data: &mut Data) -> Respons
         }
     }
     Response::Ok
+}
+
+/// `MIGRATE host port key|"" destination-db timeout [COPY] [REPLACE]
+/// [AUTH password | AUTH2 username password] [KEYS key ...]`, as Redis's
+/// `migrateCommand`: each key is dumped with its time to live and restored
+/// on the target, then, without COPY, deleted here.
+fn migrate(a: &Admin, conn: &mut Conn, data: &mut Data) -> Response {
+    use std::io::{BufRead, BufReader, Write};
+    let args = &a.args;
+    let (Some(port), Some(dest_db), Some(timeout)) = (
+        args.get(1).and_then(|p| int(p)),
+        args.get(3).and_then(|d| int(d)),
+        args.get(4).and_then(|t| int(t)),
+    ) else {
+        return err("ERR value is not an integer or out of range");
+    };
+    let (mut copy, mut replace) = (false, false);
+    let mut auth: Option<Vec<Vec<u8>>> = None;
+    let mut keys: Vec<Vec<u8>> = vec![args[2].clone()];
+    let mut j = 5;
+    while j < args.len() {
+        let opt = String::from_utf8_lossy(&args[j]).to_ascii_uppercase();
+        let more = args.len() - j - 1;
+        match opt.as_str() {
+            "COPY" => copy = true,
+            "REPLACE" => replace = true,
+            "AUTH" if more >= 1 => {
+                auth = Some(vec![b"AUTH".to_vec(), args[j + 1].clone()]);
+                j += 1;
+            }
+            "AUTH2" if more >= 2 => {
+                auth = Some(vec![
+                    b"AUTH".to_vec(),
+                    args[j + 1].clone(),
+                    args[j + 2].clone(),
+                ]);
+                j += 2;
+            }
+            "KEYS" => {
+                if !args[2].is_empty() {
+                    return err(
+                        "ERR When using MIGRATE KEYS option, the key argument must be set to the empty string",
+                    );
+                }
+                keys = args[j + 1..].to_vec();
+                break;
+            }
+            _ => return syntax(),
+        }
+        j += 1;
+    }
+    // The keys there are, each dumped with its time to live.
+    let mut found = Vec::new();
+    for key in &keys {
+        if let Response::BulkString(payload) = data(Command::Dump { key: key.clone() }, conn.db) {
+            let ttl = match data(Command::PTtl { key: key.clone() }, conn.db) {
+                Response::Integer(t) if t > 0 => t,
+                _ => 0,
+            };
+            found.push((key.clone(), payload, ttl));
+        }
+    }
+    if found.is_empty() {
+        return Response::SimpleString("NOKEY".into());
+    }
+    let host = String::from_utf8_lossy(&args[0]).into_owned();
+    let limit = std::time::Duration::from_millis(timeout.max(1) as u64);
+    let ioerr = || err("IOERR error or timeout connecting to the client");
+    let Ok(addr) = std::net::ToSocketAddrs::to_socket_addrs(&(host.as_str(), port as u16))
+        .map(|mut a| a.next())
+    else {
+        return ioerr();
+    };
+    let Some(Ok(stream)) = addr.map(|a| std::net::TcpStream::connect_timeout(&a, limit)) else {
+        return ioerr();
+    };
+    if stream.set_read_timeout(Some(limit)).is_err()
+        || stream.set_write_timeout(Some(limit)).is_err()
+    {
+        return ioerr();
+    }
+    let Ok(read_half) = stream.try_clone() else {
+        return ioerr();
+    };
+    let mut writer = std::io::BufWriter::new(stream);
+    let mut reader = BufReader::new(read_half);
+    let mut commands: Vec<Vec<Vec<u8>>> = Vec::new();
+    commands.extend(auth);
+    commands.push(vec![b"SELECT".to_vec(), dest_db.to_string().into_bytes()]);
+    for (key, payload, ttl) in &found {
+        let mut c = vec![
+            b"RESTORE".to_vec(),
+            key.clone(),
+            ttl.to_string().into_bytes(),
+            payload.clone(),
+        ];
+        if replace {
+            c.push(b"REPLACE".to_vec());
+        }
+        commands.push(c);
+    }
+    for c in &commands {
+        let mut frame = format!("*{}\r\n", c.len()).into_bytes();
+        for part in c {
+            frame.extend_from_slice(format!("${}\r\n", part.len()).as_bytes());
+            frame.extend_from_slice(part);
+            frame.extend_from_slice(b"\r\n");
+        }
+        if writer.write_all(&frame).is_err() {
+            return ioerr();
+        }
+    }
+    if writer.flush().is_err() {
+        return ioerr();
+    }
+    // One status reply each: AUTH, SELECT, then each RESTORE.
+    let restores_from = commands.len() - found.len();
+    let mut moved = Vec::new();
+    let mut failure = None;
+    for (i, _) in commands.iter().enumerate() {
+        let mut line = String::new();
+        if reader.read_line(&mut line).is_err() || line.is_empty() {
+            return ioerr();
+        }
+        let line = line.trim_end();
+        if let Some(e) = line.strip_prefix('-') {
+            failure.get_or_insert_with(|| e.to_string());
+        } else if i >= restores_from {
+            moved.push(found[i - restores_from].0.clone());
+        }
+    }
+    if !copy && !moved.is_empty() {
+        data(Command::Del { keys: moved }, conn.db);
+    }
+    match failure {
+        Some(e) => err(format!("ERR Target instance replied with error: {e}")),
+        None => Response::Ok,
+    }
 }
 
 fn debug(a: &Admin, conn: &mut Conn, data: &mut Data) -> Response {

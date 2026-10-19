@@ -918,7 +918,9 @@ fn object_encoding(store: &mut dyn Store, key: &[u8]) -> Out<Response> {
                 .collect::<Vec<_>>(),
         ),
     };
-    Ok(Response::SimpleString(name.to_string()))
+    // A bulk string, as Redis's `addReplyBulkCString`: `$8 listpack`, not
+    // `+listpack`.
+    Ok(Response::BulkString(name.as_bytes().to_vec()))
 }
 
 fn integer_reply(n: Num<i64>) -> Response {

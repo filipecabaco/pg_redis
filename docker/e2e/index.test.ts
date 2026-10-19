@@ -2501,10 +2501,13 @@ for (const half of ["cache", "durable"]) {
 			await raw.send("SADD", "p5:i", "1", "2");
 			await raw.send("RPUSH", "p5:l", "a");
 			await raw.send("ZADD", "p5:z", "1", "m");
-			const enc = async (k: string) =>
-				(await raw.send("OBJECT", "ENCODING", k))
-					.toString()
-					.replace(/^\+|\r\n$/g, "");
+			// A bulk string, as Redis sends it. `+embstr` was a simple string,
+			// which a client that checks reply types refuses.
+			const enc = async (k: string) => {
+				const reply = (await raw.send("OBJECT", "ENCODING", k)).toString();
+				expect(reply.startsWith("$")).toBe(true);
+				return reply.split("\r\n")[1];
+			};
 			expect(await enc("p5:k")).toBe("embstr");
 			expect(await enc("p5:n")).toBe("int");
 			expect(await enc("p5:big")).toBe("raw");

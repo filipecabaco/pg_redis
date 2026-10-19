@@ -1,0 +1,64 @@
+name: Redis acceptance
+
+# Redis's own Tcl test suite (tests/unit at a pinned tag), run against pg_redis
+# as an external server on both storage halves. A ratchet, like the parity
+# gate: docker/acceptance/baseline.json records the tests that pass today, and
+# this fails when one of them stops passing — not because the rest still fail.
+#
+# Its own workflow rather than a job in ci.yml so it builds the image itself
+# and pins only node24 actions.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  acceptance:
+    name: Redis acceptance suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # dbs 0-7 on the shared-memory tables, 8-15 on SQL: the suite's default
+      # SELECT 9 reaches the durable half and --singledb the memory half.
+      # --singledb never SELECTs, so it runs on the server's default database:
+      # 0 here, or the "memory" pass would land on the SQL half's db 8.
+      PG_REDIS_DEFAULT_DB: "0"
+      # The Tcl client cannot AUTH against an external server.
+      PG_REDIS_PASSWORD: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build postgres image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          tags: pg_redis:latest
+          cache-from: type=gha,scope=pg_redis-acceptance
+          cache-to: type=gha,mode=max,scope=pg_redis-acceptance
+
+      - name: Build acceptance image
+        run: docker compose --profile acceptance build acceptance
+
+      - name: Run the Redis test suite
+        run: |
+          docker compose --profile acceptance up \
+            --no-build \
+            --exit-code-from acceptance \
+            --abort-on-container-exit
+
+      - name: Print logs on failure
+        if: failure()
+        run: docker compose --profile acceptance logs postgres

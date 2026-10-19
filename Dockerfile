@@ -25,7 +25,12 @@ RUN apk add --no-cache \
 
 WORKDIR /build
 
-COPY Cargo.toml Cargo.lock* ./
+# build.rs compiles Lua and Redis's Lua libraries from C. Alpine ships clang
+# but no `cc`, which is the compiler the cc crate looks for by default.
+ENV CC=clang
+
+COPY Cargo.toml Cargo.lock* build.rs ./
+COPY vendor/ vendor/
 COPY src/ src/
 COPY sql/ sql/
 # The crate embeds the coverage page: `COMMAND COUNT` answers with its row

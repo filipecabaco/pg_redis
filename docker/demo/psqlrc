@@ -1,0 +1,6 @@
+\set QUIET 1
+\pset pager off
+\pset null '∅'
+\set PROMPT1 'sql=# '
+\set PROMPT2 'sql-# '
+\unset QUIET

@@ -2,40 +2,46 @@
   <img src="logo.svg" alt="pg_redis" width="600"/>
 </div>
 
-A PostgreSQL extension that lets you connect to Postgres using the **Redis protocol (RESP2)**. Drop-in Redis wire compatibility with three storage modes to match your performance and durability needs.
+A PostgreSQL extension that lets you connect to Postgres using the **Redis protocol (RESP2 and RESP3)**. Drop-in Redis wire compatibility, with a storage policy per database to match your performance and durability needs.
 
 Built with [pgrx](https://github.com/pgcentralfoundation/pgrx) in Rust.
 
 ## How it works
 
-`pg_redis` starts a pool of TCP background workers inside PostgreSQL that listen for Redis clients on port 6379. Incoming RESP2 commands are parsed and dispatched to one of three storage backends:
+`pg_redis` starts a pool of TCP background workers inside PostgreSQL that listen for Redis clients on port 6379. Each of its 16 databases (0–15, Redis's own model) has a storage policy, changeable at runtime while clients keep using it ([Storage policies](./docs/STORAGE.md)):
 
-- **Memory** (default, databases 0–7) — shared-memory hash tables, no transaction overhead, near-Redis throughput
-- **SPI/unlogged** (databases 0–7 with `storage_mode=auto`) — PostgreSQL UNLOGGED tables via SPI, survives worker restarts
-- **SPI/logged** (databases 8–15) — WAL-logged PostgreSQL tables, full crash durability and SQL visibility
+- **`memory`** (default for 0–7) — an in-memory engine in PostgreSQL shared memory, no transaction overhead, near-Redis throughput
+- **`memory+snapshot`** — memory, copied to a logged table on an interval and reloaded at startup, like Redis's RDB
+- **`logged`** (default for 8–15) — WAL-logged PostgreSQL tables, full crash durability, replication and SQL visibility
 
-Data is stored across 16 databases (0–15), mirroring Redis's native database model, split into an ephemeral half (0–7) and a durable half (8–15). `SELECT` accepts `cache` and `durable` as names for the two.
+`SELECT` accepts `cache` (0) and `durable` (8) as names for the two default halves.
 
-Memory mode buys its speed with a fixed-size shared-memory region, reserved at
-server start, and that has consequences worth knowing before you rely on it:
-keys, hash fields and set members are capped at 512 bytes and values at 64 KiB;
-a full table either evicts or refuses the write depending on
-`redis.maxmemory_policy`. Nothing is ever silently truncated. The durable half
-has none of these limits. See [Implementation](./docs/IMPLEMENTATION.md#7-limits).
+Memory mode keeps its data in PostgreSQL shared memory, bounded by
+`redis.maxmemory` (256 MB by default) the way Redis is by `maxmemory`: the
+space is reserved at start but backed by RAM only as data fills it, and past
+the limit a write either evicts or is refused with `OOM`, depending on
+`redis.maxmemory_policy`. Keys and values are as long as Redis allows. See
+[Implementation](./docs/IMPLEMENTATION.md#3-the-shared-memory-backend).
 
 ## Performance
 
-Benchmarked with `redis-benchmark -n 50000 -c 200` on Docker, Apple M-series:
+Requests per second, higher is better. `redis-benchmark`, 50 clients, 64-byte values over
+100,000 random keys, median of 5 runs; each server pinned to the same 4 CPUs, Docker on an
+Apple M5 Pro (`mise run bench-suite`).
 
-| Command | Redis 7 | pg_redis (memory) | pg_redis (SPI/logged) |
-|---------|---------|-------------------|-----------------------|
-| SET     | 224,000 | **103,000**       | 12,000                |
-| GET     | 243,000 | **106,000**       | 92,000                |
-| INCR    | 253,000 | **116,000**       | 14,000                |
-| ZADD    | 185,000 | **118,000**       | 7,000                 |
-| SADD    | 194,000 | 82,000            | 66,000                |
+| Command | Redis 7.2 | pg_redis `memory` | pg_redis `logged` |
+|---------|----------:|------------------:|------------------:|
+| SET     | 225,734   | **182,315**       | 6,374             |
+| GET     | 229,885   | **187,970**       | 121,065           |
+| INCR    | 228,311   | **187,617**       | 4,609             |
+| LPUSH   | 217,865   | **186,916**       | 3,004             |
+| SADD    | 226,501   | **182,482**       | 8,486             |
+| HSET    | 225,989   | **179,211**       | 5,890             |
+| ZADD    | 226,757   | **175,593**       | 6,368             |
 
-Memory mode reaches ~50–70% of Redis throughput for writes and reads. See [Performance](./docs/IMPLEMENTATION.md#8-performance) for the full table and tuning options.
+`memory` runs at about 80% of Redis; `memory+snapshot` is within 2% of it. `logged` reads
+stay fast, and its writes wait for the WAL to reach disk. See
+[Performance](./docs/IMPLEMENTATION.md#8-performance) for the full table and tuning options.
 
 ## Quick start
 

@@ -20,10 +20,25 @@ pg_test = []
 pgrx = "=0.18.0"
 socket2 = { version = "0.5", features = ["all"] }
 libc = "0.2"
+# Safe wrappers for the system calls std does not have: poll, futexes (src/sys.rs).
+rustix = { version = "1.1", features = ["event", "thread", "time", "param"] }
 subtle = "2"
+# The memory engine's collections, in the shared-memory arena (src/memdb, src/shm.rs).
+allocator-api2 = { version = "0.2", default-features = false, features = ["alloc"] }
+hashbrown = { version = "0.17", default-features = false, features = ["allocator-api2", "inline-more"] }
+talc = { version = "5.1", default-features = false }
+mlua = { version = "0.12.2", features = ["lua51", "vendored"] }
+mlua-sys = { version = "0.13.0", features = ["lua51", "vendored"] }
 
 [dev-dependencies]
 pgrx-tests = "=0.18.0"
+# Fuzz harnesses (src/fuzz.rs): run as tests on stable, under libFuzzer with cargo-bolero.
+# Held below bolero-generator-derive 0.13.5, which pins `indexmap = "=2.11.2"`
+# and so blocks any dependency needing a newer indexmap (pgrx 0.19 does, via
+# toml 1). The two generator crates are listed only to hold that line.
+bolero = "=0.13.4"
+bolero-generator = "=0.13.5"
+bolero-generator-derive = "=0.13.4"
 
 [profile.dev]
 panic = "unwind"
@@ -33,3 +48,12 @@ panic = "unwind"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+
+[build-dependencies]
+cc = "1"
+
+[package.metadata.cargo-machete]
+# Not referenced from Rust: build.rs reads the Lua headers' path from
+# DEP_LUA_INCLUDE, which Cargo only hands to crates that depend on mlua-sys
+# directly.
+ignored = ["mlua-sys", "bolero-generator", "bolero-generator-derive"]

@@ -34,7 +34,7 @@
 | `RENAME key newkey` | Rename, replacing `newkey`; errors if `key` is missing |
 | `RENAMENX key newkey` | The same, but `0` rather than replacing an occupied `newkey` |
 | `COPY src dst [DB n] [REPLACE]` | Duplicate a key of any type — see below |
-| `DUMP key` / `RESTORE key ttl payload [REPLACE\|ABSTTL]` | Redis's serialisation format, interchangeable with a real 7.0 — see below |
+| `DUMP key` / `RESTORE key ttl payload [REPLACE\|ABSTTL]` | Redis's serialisation format, interchangeable with a real 7.2 — see below |
 | `OBJECT ENCODING key` | Redis's name for the representation — see below |
 | `FLUSHDB [ASYNC\|SYNC]` | Empty the current database |
 | `FLUSHALL [ASYNC\|SYNC]` | Empty **all sixteen**, the durable half included — see below |
@@ -70,13 +70,17 @@ limit of the half it is going to.
 ### `DUMP` and `RESTORE`
 
 `DUMP` emits Redis's own payload format — an RDB-serialised value, a two-byte
-version stamped 10, and a CRC-64 — so what it produces restores into a real
-Redis 7.0 and vice versa. The bytes are not identical to what Redis itself
-would emit for the same value, because valid encodings are not unique;
-`RESTORE` accepts everything a 7.0 produces, listpacks and compressed strings
-included. Two deliberate refusals, both loud: payloads stamped newer than
-version 10 (what a 7.2 would hand you — Redis 7.0 refuses them too), and the
-compact encodings no server since 6.x has written (ziplists, zipmaps).
+version stamped 11, and a CRC-64 — so what it produces restores into a real
+Redis 7.2 (the version this server reports) and vice versa. Streams included:
+they are written as Redis lays them out, node listpacks, consumer groups,
+pending entries and consumer times, and a Redis stream payload of any format
+since 5.0 restores here. The bytes are not always identical to what Redis
+itself would emit, because valid encodings are not unique (a set's member
+order, say); `RESTORE` accepts everything a 7.2 produces, listpacks and
+compressed strings included. Two deliberate refusals, both loud: payloads
+stamped newer than version 11 (what a 7.4 would hand you — Redis 7.2 refuses
+them too), and the compact encodings no server since 6.x has written
+(ziplists, zipmaps).
 `REPLACE` and `ABSTTL` behave as in Redis; `IDLETIME` and `FREQ` are accepted
 and unused, there being no LRU or LFU clock to hand them to.
 
@@ -85,7 +89,7 @@ and unused, there being no LRU or LFU clock to hand them to.
 Reports the encoding **Redis** would use — `int`, `embstr`, `raw`, `listpack`,
 `quicklist`, `intset`, `hashtable`, `skiplist` — derived from the value's shape
 against Redis's default thresholds. pg_redis stores none of those
-representations; it has an inline slot and a chunk pool, or a `bytea` column.
+representations; it has its own collections, or a `bytea` column.
 The name is reported for the benefit of clients that branch on it, and says
 nothing about how this server stores anything. A missing key answers nil, which
 is Redis's own reply here and not the error most commands give.
@@ -163,18 +167,12 @@ works unchanged:
 | Reply | Meaning |
 |---|---|
 | `-ERR ...` | The general case |
-| `-WRONGTYPE Operation against a key holding the wrong kind of value` | The key holds another type. A key holds exactly one — see [the key directory](IMPLEMENTATION.md#the-key-directory) |
-| `-OOM command not allowed when used memory > 'maxmemory'` | A shared-memory table is full and `redis.maxmemory_policy` is `noeviction`. See [When a table fills](IMPLEMENTATION.md#when-a-table-fills) |
-| `-ERR key exceeds redis.storage_mode='memory' limit of 512 bytes ...` | The key, hash field, set member or value is larger than memory mode accepts |
-| `-ERR key or member hash collides with a different one already stored ...` | Two keys, or two members of one collection, shared a 128-bit keyed hash. Refused rather than merged — see [how keys are stored](IMPLEMENTATION.md#lookups-verify-the-key) |
+| `-WRONGTYPE Operation against a key holding the wrong kind of value` | The key holds another type. A key holds exactly one — see [one database, one dictionary](IMPLEMENTATION.md#one-database-one-dictionary) |
+| `-OOM command not allowed when used memory > 'maxmemory'` | Memory mode is past `redis.maxmemory` and `redis.maxmemory_policy` could not evict enough. See [the limit and eviction](IMPLEMENTATION.md#the-limit-and-eviction) |
 
-`WRONGTYPE` applies to both halves. The rest are specific to
-`storage_mode = 'memory'`; the durable half is
-bounded only by disk. Size limits are checked before the command runs, so a
-refusal never leaves a partial write — no half-stored value and no entry under
-a truncated key. A multi-key write is priced the same way: `MSET`, `SADD`,
-`HSET`, `ZADD` and the pushes are refused whole rather than storing the keys
-that fit.
+`WRONGTYPE` applies to every policy; `OOM` is specific to databases in memory,
+and a `logged` database is bounded only by disk. The
+limit is checked before the command runs, so a refused write changes nothing.
 
 ## Transactions
 

@@ -1,33 +1,84 @@
 name: Deploy docs
 
+# The site is MkDocs plus the in-browser demo: a snowglobe build of docker/demo, which boots
+# the extension on an emulated arm64 machine in the visitor's tab. The demo is ~100 MB of
+# content-addressed blobs, so the site ships as a Pages artifact rather than as commits on a
+# gh-pages branch, where every rebuilt snapshot would stay in history forever.
+#
+# Needs Settings → Pages → Source set to "GitHub Actions".
+
 on:
   push:
     branches: [main]
     paths:
       - "docs/**"
+      - "overrides/**"
       - "mkdocs.yml"
+      - "docker/demo/**"
+      - "Dockerfile"
+      - "src/**"
+      - "sql/**"
+      - ".github/workflows/docs.yml"
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  SNOWGLOBE_VERSION: 0.1.2
 
 jobs:
-  deploy:
-    runs-on: ubuntu-latest
+  build:
+    # snowglobe guests are arm64; an arm64 runner builds the extension natively instead of
+    # under QEMU, which for a pgrx build is the difference between minutes and an hour
+    runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.x"
 
       - name: Install MkDocs
-        run: pip install mkdocs-material mkdocs-linkcheck
+        run: pip install "mkdocs>=1.6,<2" mkdocs-material
 
-      - name: Check links
+      - name: Install snowglobe
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "v${SNOWGLOBE_VERSION}" -R filipecabaco/snowglobe \
+            -p "snowglobe_${SNOWGLOBE_VERSION}_linux_arm64.tar.gz" -p SHA256SUMS -D /tmp/snowglobe
+          cd /tmp/snowglobe
+          grep "linux_arm64.tar.gz" SHA256SUMS | sha256sum -c -
+          tar -xzf "snowglobe_${SNOWGLOBE_VERSION}_linux_arm64.tar.gz"
+          sudo install snowglobe /usr/local/bin/snowglobe
+
+      - name: Build the extension image (arm64)
+        run: docker build -t pg_redis:alpine-arm64 .
+
+      - name: Build the in-browser demo
+        run: snowglobe build docker/demo --out docs/demo
+
+      - name: Build the site
         run: mkdocs build --strict
 
-      - name: Deploy
-        run: mkdocs gh-deploy --force
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

@@ -7,6 +7,7 @@
 //! Keys are hashed into a fixed table rather than stored, which keeps it
 //! allocation-free, lock-free and unable to grow. Two keys sharing a counter
 //! aborts an EXEC that did not have to abort; the reverse would not be safe.
+#![forbid(unsafe_code)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -18,9 +19,6 @@ const WATCH_SLOTS: usize = 65_536;
 pub struct WatchCtl {
     pub versions: [AtomicU64; WATCH_SLOTS],
 }
-
-unsafe impl Send for WatchCtl {}
-unsafe impl Sync for WatchCtl {}
 
 pub fn watch_ctl_size() -> usize {
     std::mem::size_of::<WatchCtl>()
@@ -38,20 +36,14 @@ fn slot_of(db: u8, key: &[u8]) -> usize {
 
 /// Current write version for `key`, as snapshotted by WATCH.
 ///
-/// # Safety
-/// `ctl` must point at the initialised shared-memory block.
-pub unsafe fn version(ctl: *mut WatchCtl, db: u8, key: &[u8]) -> u64 {
-    unsafe { (*ctl).versions[slot_of(db, key)].load(Ordering::Acquire) }
+pub fn version(ctl: &WatchCtl, db: u8, key: &[u8]) -> u64 {
+    ctl.versions[slot_of(db, key)].load(Ordering::Acquire)
 }
 
 /// Record a write to `key`, invalidating any WATCH taken before it.
 ///
-/// # Safety
-/// `ctl` must point at the initialised shared-memory block.
-pub unsafe fn bump(ctl: *mut WatchCtl, db: u8, key: &[u8]) {
-    unsafe {
-        (*ctl).versions[slot_of(db, key)].fetch_add(1, Ordering::AcqRel);
-    }
+pub fn bump(ctl: &WatchCtl, db: u8, key: &[u8]) {
+    ctl.versions[slot_of(db, key)].fetch_add(1, Ordering::AcqRel);
 }
 
 /// Record a write to every key there could be. `FLUSHDB` and `FLUSHALL` touch
@@ -59,11 +51,9 @@ pub unsafe fn bump(ctl: *mut WatchCtl, db: u8, key: &[u8]) {
 /// hashed into it — so every counter moves. It aborts watches on databases the
 /// flush did not touch, which is the direction this table is allowed to err in.
 ///
-/// # Safety
-/// `ctl` must point at the initialised shared-memory block.
-pub unsafe fn bump_all(ctl: *mut WatchCtl) {
-    for slot in 0..WATCH_SLOTS {
-        unsafe { (*ctl).versions[slot].fetch_add(1, Ordering::AcqRel) };
+pub fn bump_all(ctl: &WatchCtl) {
+    for v in &ctl.versions {
+        v.fetch_add(1, Ordering::AcqRel);
     }
 }
 

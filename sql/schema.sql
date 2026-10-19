@@ -1,23 +1,23 @@
 CREATE SCHEMA IF NOT EXISTS redis;
 
--- The 16 Redis databases are split into two contiguous halves:
+-- Every one of the 16 Redis databases has WAL-logged tables. They hold its
+-- data while its policy is `logged`, and stay empty while it is in memory
+-- (docs/STORAGE.md). The defaults split the databases into two halves:
 --
---   0-7   ephemeral — UNLOGGED tables, or shared memory under
---                     redis.storage_mode = 'memory' (the default), in which
---                     case these tables stay empty
---   8-15  durable   — WAL-logged, replicated, survives restart
+--   0-7   memory  — shared memory; these tables stay empty
+--   8-15  logged  — WAL-logged, replicated, survives restart
 --
 -- `SELECT cache` is an alias for 0 and `SELECT durable` an alias for 8, so a
 -- client never has to remember which half a number lands in.
 
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.kv_0  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.kv_1  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.kv_2  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.kv_3  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.kv_4  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.kv_5  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.kv_6  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.kv_7  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
+CREATE         TABLE IF NOT EXISTS redis.kv_0  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
+CREATE         TABLE IF NOT EXISTS redis.kv_1  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
+CREATE         TABLE IF NOT EXISTS redis.kv_2  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
+CREATE         TABLE IF NOT EXISTS redis.kv_3  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
+CREATE         TABLE IF NOT EXISTS redis.kv_4  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
+CREATE         TABLE IF NOT EXISTS redis.kv_5  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
+CREATE         TABLE IF NOT EXISTS redis.kv_6  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
+CREATE         TABLE IF NOT EXISTS redis.kv_7  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
 CREATE         TABLE IF NOT EXISTS redis.kv_8  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
 CREATE         TABLE IF NOT EXISTS redis.kv_9  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
 CREATE         TABLE IF NOT EXISTS redis.kv_10 (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
@@ -47,14 +47,14 @@ CREATE INDEX IF NOT EXISTS kv_13_expires_idx ON redis.kv_13 (expires_at) WHERE e
 CREATE INDEX IF NOT EXISTS kv_14_expires_idx ON redis.kv_14 (expires_at) WHERE expires_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS kv_15_expires_idx ON redis.kv_15 (expires_at) WHERE expires_at IS NOT NULL;
 
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.hash_0  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.hash_1  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.hash_2  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.hash_3  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.hash_4  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.hash_5  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.hash_6  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.hash_7  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_0  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_1  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_2  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_3  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_4  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_5  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_6  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_7  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
 CREATE         TABLE IF NOT EXISTS redis.hash_8  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
 CREATE         TABLE IF NOT EXISTS redis.hash_9  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
 CREATE         TABLE IF NOT EXISTS redis.hash_10 (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
@@ -67,14 +67,14 @@ CREATE         TABLE IF NOT EXISTS redis.hash_15 (key BYTEA NOT NULL, field BYTE
 -- Lists. `pos` is a signed BIGINT with gaps so LPUSH can decrement below
 -- the current minimum and RPUSH can increment above the current maximum
 -- without renumbering. LINSERT bisects gaps and renumbers when exhausted.
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.list_0  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.list_1  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.list_2  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.list_3  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.list_4  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.list_5  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.list_6  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.list_7  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
+CREATE         TABLE IF NOT EXISTS redis.list_0  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
+CREATE         TABLE IF NOT EXISTS redis.list_1  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
+CREATE         TABLE IF NOT EXISTS redis.list_2  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
+CREATE         TABLE IF NOT EXISTS redis.list_3  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
+CREATE         TABLE IF NOT EXISTS redis.list_4  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
+CREATE         TABLE IF NOT EXISTS redis.list_5  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
+CREATE         TABLE IF NOT EXISTS redis.list_6  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
+CREATE         TABLE IF NOT EXISTS redis.list_7  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
 CREATE         TABLE IF NOT EXISTS redis.list_8  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
 CREATE         TABLE IF NOT EXISTS redis.list_9  (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
 CREATE         TABLE IF NOT EXISTS redis.list_10 (key BYTEA NOT NULL, pos BIGINT NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, pos));
@@ -88,14 +88,14 @@ CREATE         TABLE IF NOT EXISTS redis.list_15 (key BYTEA NOT NULL, pos BIGINT
 -- Sets. PRIMARY KEY (key, member) covers both the (key=?) scan path used by
 -- SMEMBERS/SCARD and the (key=?, member=?) membership test used by SISMEMBER,
 -- so no standalone key index is needed.
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.set_0  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.set_1  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.set_2  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.set_3  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.set_4  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.set_5  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.set_6  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.set_7  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_0  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_1  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_2  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_3  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_4  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_5  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_6  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_7  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
 CREATE         TABLE IF NOT EXISTS redis.set_8  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
 CREATE         TABLE IF NOT EXISTS redis.set_9  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
 CREATE         TABLE IF NOT EXISTS redis.set_10 (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
@@ -143,14 +143,14 @@ CREATE INDEX IF NOT EXISTS set_15_key_pattern_idx  ON redis.set_15  (key);
 -- (native +Infinity/-Infinity handling). The composite index on
 -- (key, score, member) covers ZRANGE BYSCORE, ZRANGE BYLEX, ZRANK, ZCOUNT,
 -- and ZLEXCOUNT; the PK (key, member) covers ZSCORE/ZREM membership lookup.
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.zset_0  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.zset_1  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.zset_2  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.zset_3  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.zset_4  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.zset_5  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.zset_6  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.zset_7  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.zset_0  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.zset_1  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.zset_2  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.zset_3  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.zset_4  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.zset_5  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.zset_6  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.zset_7  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
 CREATE         TABLE IF NOT EXISTS redis.zset_8  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
 CREATE         TABLE IF NOT EXISTS redis.zset_9  (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
 CREATE         TABLE IF NOT EXISTS redis.zset_10 (key BYTEA NOT NULL, member BYTEA NOT NULL, score DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, member));
@@ -177,18 +177,38 @@ CREATE INDEX IF NOT EXISTS zset_13_key_score_member ON redis.zset_13 (key, score
 CREATE INDEX IF NOT EXISTS zset_14_key_score_member ON redis.zset_14 (key, score, member);
 CREATE INDEX IF NOT EXISTS zset_15_key_score_member ON redis.zset_15 (key, score, member);
 
+-- Streams. The whole stream — entries, consumer groups, pending lists — is one
+-- serialised value per key (see src/stream.rs), loaded and stored back by each
+-- X* command. Its expiry lives in expiry_N, as a collection's does.
+CREATE         TABLE IF NOT EXISTS redis.stream_0  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.stream_1  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.stream_2  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.stream_3  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.stream_4  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.stream_5  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.stream_6  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.stream_7  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.stream_8  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.stream_9  (key BYTEA PRIMARY KEY, value BYTEA NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.stream_10 (key BYTEA PRIMARY KEY, value BYTEA NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.stream_11 (key BYTEA PRIMARY KEY, value BYTEA NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.stream_12 (key BYTEA PRIMARY KEY, value BYTEA NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.stream_13 (key BYTEA PRIMARY KEY, value BYTEA NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.stream_14 (key BYTEA PRIMARY KEY, value BYTEA NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.stream_15 (key BYTEA PRIMARY KEY, value BYTEA NOT NULL);
+
 -- Where a collection's expiry lives. Only the KV table has a column for one,
 -- so without this a list, set, hash or sorted set could not carry a TTL at all
 -- and every cache-with-an-expiry pattern over a collection kept its data
 -- forever. A string keeps its own column: it is read on the GET path already.
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.expiry_0   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.expiry_1   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.expiry_2   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.expiry_3   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.expiry_4   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.expiry_5   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.expiry_6   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
-CREATE UNLOGGED TABLE IF NOT EXISTS redis.expiry_7   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.expiry_0   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.expiry_1   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.expiry_2   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.expiry_3   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.expiry_4   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.expiry_5   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.expiry_6   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.expiry_7   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
 CREATE         TABLE IF NOT EXISTS redis.expiry_8   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
 CREATE         TABLE IF NOT EXISTS redis.expiry_9   (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
 CREATE         TABLE IF NOT EXISTS redis.expiry_10  (key BYTEA PRIMARY KEY, expires_at TIMESTAMPTZ NOT NULL);
@@ -214,6 +234,47 @@ CREATE INDEX IF NOT EXISTS expiry_12_expires_idx  ON redis.expiry_12  (expires_a
 CREATE INDEX IF NOT EXISTS expiry_13_expires_idx  ON redis.expiry_13  (expires_at);
 CREATE INDEX IF NOT EXISTS expiry_14_expires_idx  ON redis.expiry_14  (expires_at);
 CREATE INDEX IF NOT EXISTS expiry_15_expires_idx  ON redis.expiry_15  (expires_at);
+
+-- Lua scripting. The script cache is shared by every worker so that EVALSHA
+-- finds a script whichever worker EVAL first saw it on; like Redis's cache it is
+-- not data, so it is unlogged. Function libraries are data — Redis keeps them in
+-- its RDB — so they are logged.
+CREATE UNLOGGED TABLE IF NOT EXISTS redis.scripts (
+    sha  TEXT PRIMARY KEY,
+    body BYTEA NOT NULL
+);
+CREATE TABLE IF NOT EXISTS redis.functions (
+    name TEXT PRIMARY KEY,
+    code BYTEA NOT NULL
+);
+
+-- Storage policies (docs/STORAGE.md): the databases whose policy was set with
+-- redis.set_policy. A database with no row keeps its default. from_policy is
+-- set while its data is still moving from the policy it had, so a restart
+-- carries the move on.
+CREATE TABLE IF NOT EXISTS redis.db_policy (
+    db          SMALLINT PRIMARY KEY CHECK (db BETWEEN 0 AND 15),
+    policy      TEXT NOT NULL CHECK (policy IN ('memory', 'memory+snapshot', 'logged')),
+    slot        SMALLINT CHECK (slot BETWEEN 0 AND 15),
+    from_policy TEXT CHECK (from_policy IN ('memory', 'memory+snapshot', 'logged')),
+    from_slot   SMALLINT CHECK (from_slot BETWEEN 0 AND 15)
+);
+
+-- memory+snapshot databases: each key's DUMP payload and its deadline in
+-- microseconds since the epoch (0 for none), replaced whole at every
+-- snapshot and reloaded into memory when the server starts.
+CREATE TABLE IF NOT EXISTS redis.snapshot (
+    db          SMALLINT NOT NULL,
+    key         BYTEA NOT NULL,
+    payload     BYTEA NOT NULL,
+    deadline_us BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (db, key)
+);
+CREATE TABLE IF NOT EXISTS redis.snapshot_taken (
+    db       SMALLINT PRIMARY KEY,
+    taken_at TIMESTAMPTZ NOT NULL,
+    keys     BIGINT NOT NULL
+);
 
 -- Pub/sub table routing: persists channel→table mappings across server restarts.
 -- Loaded into shared memory by the first BGW on startup via CAS flag.

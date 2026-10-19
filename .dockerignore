@@ -1,0 +1,3 @@
+# Build output and the demo site: never part of an image build context
+target/
+docs/demo/

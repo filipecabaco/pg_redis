@@ -1,0 +1,69 @@
+# The benchmark rig behind `mise run bench-suite` (docker/bench/suite.exs).
+#
+# Like for like: every server under test gets the same four pinned CPUs and the same memory
+# cap, and only one of them is loaded at a time. The load generator has CPUs of its own, so
+# redis-benchmark never competes with the server it is measuring.
+#
+#   pg_redis    one server; the suite gives databases 0-3 the four storage policies
+#   redis       Redis 7.2 with persistence off: the reference for memory
+#   redis-aof   Redis 7.2 with appendfsync everysec: the reference for the durable policies
+#   load        redis-benchmark and memtier_benchmark
+x-server: &server
+  cpuset: "0-3"
+  mem_limit: 4g
+
+services:
+  pg_redis:
+    <<: *server
+    image: pg_redis:latest
+    shm_size: 2g
+    environment:
+      POSTGRES_PASSWORD: postgres
+    command: >
+      postgres
+        -c shared_preload_libraries=pg_redis
+        -c redis.listen_address=0.0.0.0
+        -c redis.password=bench
+        -c redis.workers=4
+        -c redis.maxmemory=1024MB
+        -c redis.snapshot_interval=60
+        -c shared_buffers=1GB
+        -c max_wal_size=4GB
+        -c checkpoint_timeout=15min
+    volumes:
+      - ../postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres && nc -z 127.0.0.1 6379"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  redis:
+    <<: *server
+    image: redis:7.2-alpine
+    command: ["redis-server", "--requirepass", "bench", "--save", "", "--appendonly", "no", "--maxmemory", "1gb"]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a bench --no-auth-warning ping | grep -q PONG"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  redis-aof:
+    <<: *server
+    image: redis:7.2-alpine
+    command: ["redis-server", "--requirepass", "bench", "--save", "", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory", "1gb"]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a bench --no-auth-warning ping | grep -q PONG"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  load:
+    image: redis:7.2-alpine
+    cpuset: "8-13"
+    entrypoint: ["sleep", "infinity"]
+
+  memtier:
+    image: redislabs/memtier_benchmark:2.2.1
+    cpuset: "8-13"
+    entrypoint: ["sleep", "infinity"]

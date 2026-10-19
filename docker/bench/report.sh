@@ -24,8 +24,8 @@ PASSWORD=${PASSWORD:-testpass}
 # Requests per second for one redis-benchmark run, or "n/a" if it did not
 # complete — a refused connection must not silently read as a zero.
 rps() {
-  local host=$1 port=$2 test=$3 size=$4 requests=$5 out
-  out=$($BENCH_RUN redis-benchmark -h "$host" -p "$port" -a "$PASSWORD" \
+  local host=$1 port=$2 test=$3 size=$4 requests=$5 db=${6:-0} out
+  out=$($BENCH_RUN redis-benchmark -h "$host" -p "$port" -a "$PASSWORD" --dbnum "$db" \
           -n "$requests" -c 50 -d "$size" -q -t "$test" 2>/dev/null \
         | tr '\r' '\n' \
         | sed -n 's/.*: \([0-9.]*\) requests per second.*/\1/p' \
@@ -34,11 +34,9 @@ rps() {
 }
 
 # redis-benchmark builds `mylist` up as it goes and never clears it — including
-# for `-t lrange`, which pushes the list it is about to read. Twenty thousand
-# elements is past what `redis.mem_max_entries` allows a list table to hold, so
-# the run ends in the OOM the server is supposed to give, and reports nothing.
-# Clearing the key and keeping the list runs inside the table measures the
-# command instead of the limit.
+# for `-t lrange`, which pushes the list it is about to read. Clearing the key
+# and keeping the list runs short measures the command at a steady list size,
+# rather than a list that grows with every test before it.
 LIST_REQUESTS=4000
 
 clear_list() {
@@ -57,14 +55,13 @@ ratio() {
   fi
 }
 
-storage_mode=$($PSQL_RUN -tAc "SELECT current_setting('redis.storage_mode')" 2>/dev/null | tr -d '[:space:]')
 shmem=$($PSQL_RUN -tAc 'SHOW shared_memory_size' 2>/dev/null | tr -d '[:space:]')
-max_val=$($PSQL_RUN -tAc "SELECT current_setting('redis.mem_max_entries')" 2>/dev/null | tr -d '[:space:]')
+maxmemory=$($PSQL_RUN -tAc "SELECT current_setting('redis.maxmemory')" 2>/dev/null | tr -d '[:space:]')
 
 echo "<!-- pg_redis-bench -->"
 echo "## Benchmarks"
 echo
-echo "\`storage_mode=${storage_mode:-unknown}\` · \`mem_max_entries=${max_val:-unknown}\` · \`shared_memory_size=${shmem:-unknown}\` · 50 clients · Redis 7 on the same runner as the reference."
+echo "\`maxmemory=${maxmemory:-unknown}\` · \`shared_memory_size=${shmem:-unknown}\` · 50 clients · Redis 7 on the same runner as the reference."
 echo
 
 # The value-size sweep is the interesting one: redis-benchmark defaults to
@@ -108,4 +105,25 @@ for t in ping set get incr lpush rpush lpop rpop sadd hset spop zadd zpopmin lra
   echo "| $t | $(fmt "$p") | $(fmt "$r") | $(ratio "$p" "$r") |"
 done
 echo
+
+# One row per storage policy, on the same server: db 0 keeps its default
+# (memory), db 1 is given memory+snapshot, db 8 keeps its default (logged).
+$PSQL_RUN -tAc "SELECT redis.set_policy(1, 'memory+snapshot')" > /dev/null 2>&1
+echo "### Storage policies (64-byte values)"
+echo
+echo "| policy | SET | GET | INCR | LPUSH | HSET |"
+echo "|---|---:|---:|---:|---:|---:|"
+for row in "memory:0" "memory+snapshot:1" "logged:8"; do
+  name=${row%%:*} db=${row##*:}
+  line="| \`$name\` (db $db)"
+  for t in set get incr lpush hset; do
+    n=20000
+    case $db in 8) n=4000 ;; esac
+    [[ $t == lpush ]] && $BENCH_RUN redis-cli -h "$PG_HOST" -p "$PG_PORT" -a "$PASSWORD" -n "$db" DEL mylist > /dev/null 2>&1
+    line="$line | $(fmt "$(rps "$PG_HOST" "$PG_PORT" "$t" 64 "$n" "$db")")"
+  done
+  echo "$line |"
+done
+echo
+
 echo "<sub>Requests per second, higher is better. 20,000 requests each, 4,000 for the list commands — see the note in \`docker/bench/report.sh\`. GitHub-hosted runners are shared and noisy: read this as a smoke test for a collapse in throughput, not as a regression gate. Both servers run on the same runner, so the ratio travels better than the absolute numbers.</sub>"

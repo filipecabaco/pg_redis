@@ -1,9 +1,35 @@
+// Every `unsafe` block says why it is sound, and every module that needs none
+// says so with `#![forbid(unsafe_code)]`: the six that do are shm, shared,
+// pubsub, pg, scripting's Lua bridge, and the worker entry point here.
+#![deny(clippy::undocumented_unsafe_blocks)]
+
+pub(crate) mod admin;
+pub(crate) mod blocking;
 mod commands;
-pub(crate) mod htab;
-pub(crate) mod mem;
+pub(crate) mod composite;
+pub(crate) mod config;
+#[cfg(test)]
+mod fuzz;
+pub(crate) mod geo;
+pub(crate) mod hll;
+pub(crate) mod memdb;
+pub(crate) mod notify;
+pub(crate) mod pg;
+pub(crate) mod plans;
 pub(crate) mod pubsub;
 pub(crate) mod rdb;
+pub(crate) mod redis_tables;
 mod resp;
+pub(crate) mod resp3;
+pub(crate) mod scripting;
+pub(crate) mod server;
+pub(crate) mod shared;
+pub(crate) mod shm;
+pub(crate) mod storage;
+pub(crate) mod store;
+pub(crate) mod stream;
+pub(crate) mod sys;
+pub(crate) mod tracking;
 pub(crate) mod watch;
 pub(crate) mod worker;
 
@@ -31,182 +57,71 @@ pub(crate) static MAX_CONNECTIONS: GucSetting<i32> = GucSetting::<i32>::new(128)
 pub(crate) static PASSWORD: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
 pub(crate) static BATCH_SIZE: GucSetting<i32> = GucSetting::<i32>::new(64);
+/// Seconds between snapshots of a `memory+snapshot` database.
+pub(crate) static SNAPSHOT_INTERVAL: GucSetting<i32> = GucSetting::<i32>::new(60);
 pub(crate) static DATABASE: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(Some(c"postgres"));
-
-pub(crate) static STORAGE_MODE: GucSetting<Option<std::ffi::CString>> =
-    GucSetting::<Option<std::ffi::CString>>::new(Some(c"memory"));
 
 /// What memory mode does when a shared-memory table fills. Defaults to
 /// `noeviction`, as Redis's own `maxmemory-policy` does.
 pub(crate) static MAXMEMORY_POLICY: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(Some(c"noeviction"));
 
-/// Boot value of `redis.mem_max_entries`, and the sizing assumed when memory
-/// mode is asked about its limits with no shared memory attached. The one knob
-/// that scales the whole reservation — doubling it costs about 74 MB — and it
-/// sizes each chunk pool, with it the largest value accepted.
-pub(crate) const MEM_MAX_ENTRIES_DEFAULT: i32 = 8192;
-pub(crate) static MEM_MAX_ENTRIES: GucSetting<i32> =
-    GucSetting::<i32>::new(MEM_MAX_ENTRIES_DEFAULT);
+/// Megabytes the memory engine may hold — Redis's `maxmemory`. The arena is
+/// reserved at this size (plus headroom) but backed only as it fills.
+pub(crate) static MAXMEMORY: GucSetting<i32> = GucSetting::<i32>::new(256);
 
-#[derive(Copy, Clone, PartialEq)]
-pub enum StorageMode {
-    Postgres,
-    Memory,
+static PUBSUB_CTL: shared::Block<pubsub::PubsubCtl> = shared::Block::new();
+static PUBSUB_SLOTS: shared::Block<pubsub::Slots> = shared::Block::new();
+static ROUTE_CTL: shared::Block<pubsub::RouteCtl> = shared::Block::new();
+static WATCH_CTL: shared::Block<watch::WatchCtl> = shared::Block::new();
+static SERVER_CTL: shared::Block<server::ServerCtl> = shared::Block::new();
+
+/// Everything this extension keeps in shared memory, reserved in the
+/// postmaster's request hook.
+fn request_shmem() {
+    // Pub/sub, its routes, the WATCH counters and the server-wide state.
+    shared::request(pubsub::pubsub_ctl_size());
+    shared::request(pubsub::pubsub_slots_size());
+    shared::request(pubsub::route_ctl_size());
+    shared::request(watch::watch_ctl_size());
+    shared::request(server::server_ctl_size());
+    // The memory engine's arena: reserved at redis.maxmemory, backed by RAM
+    // only as it fills.
+    shm::request();
 }
 
-pub fn storage_mode() -> StorageMode {
-    match STORAGE_MODE.get().as_deref().and_then(|s| s.to_str().ok()) {
-        Some("memory") => StorageMode::Memory,
-        _ => StorageMode::Postgres,
+/// Attach the blocks `request_shmem` reserved, in the startup hook.
+fn attach_shmem() {
+    PUBSUB_CTL.attach(c"pg_redis_pubsub_ctl", pubsub::pubsub_ctl_size());
+    PUBSUB_SLOTS.attach(c"pg_redis_pubsub_slots", pubsub::pubsub_slots_size());
+    ROUTE_CTL.attach(c"pg_redis_route_ctl", pubsub::route_ctl_size());
+    WATCH_CTL.attach(c"pg_redis_watch_ctl", watch::watch_ctl_size());
+    if !SERVER_CTL.attach(c"pg_redis_server_ctl", server::server_ctl_size())
+        && let Some(ctl) = SERVER_CTL.get()
+    {
+        server::init(ctl);
     }
-}
-
-static mut SHMEM_CTL: *mut mem::MemControlBlock = std::ptr::null_mut();
-static mut PUBSUB_CTL: *mut pubsub::PubsubCtl = std::ptr::null_mut();
-static mut PUBSUB_SLOTS: *mut pubsub::PubsubSlot = std::ptr::null_mut();
-static mut ROUTE_CTL: *mut pubsub::RouteCtl = std::ptr::null_mut();
-static mut WATCH_CTL: *mut watch::WatchCtl = std::ptr::null_mut();
-static mut PREV_SHMEM_REQUEST_HOOK: pg_sys::shmem_request_hook_type = None;
-static mut PREV_SHMEM_STARTUP_HOOK: pg_sys::shmem_startup_hook_type = None;
-
-unsafe extern "C-unwind" fn pg_redis_shmem_request() {
-    unsafe {
-        if let Some(prev) = PREV_SHMEM_REQUEST_HOOK {
-            prev();
-        }
-        // Pub/sub shared memory — always allocated.
-        // Uses an AtomicU8 spinlock (no pg_sys LWLock needed), so no LWLock tranche required.
-        pg_sys::RequestAddinShmemSpace(pubsub::pubsub_ctl_size());
-        pg_sys::RequestAddinShmemSpace(pubsub::pubsub_slots_size());
-        pg_sys::RequestAddinShmemSpace(pubsub::route_ctl_size());
-        // WATCH version counters — needed in both storage modes.
-        pg_sys::RequestAddinShmemSpace(watch::watch_ctl_size());
-
-        // Memory-mode shared memory — only when storage_mode = 'memory'.
-        if storage_mode() == StorageMode::Memory {
-            pg_sys::RequestAddinShmemSpace(mem::mem_ctl_size());
-            pg_sys::RequestAddinShmemSpace(mem::mem_htab_total_size());
-            pg_sys::RequestAddinShmemSpace(mem::mem_hash_htab_total_size());
-            pg_sys::RequestAddinShmemSpace(mem::mem_set_htab_total_size());
-            pg_sys::RequestAddinShmemSpace(mem::mem_zset_htab_total_size());
-            pg_sys::RequestAddinShmemSpace(mem::mem_list_htab_total_size());
-            pg_sys::RequestAddinShmemSpace(mem::mem_list_meta_htab_total_size());
-            pg_sys::RequestAddinShmemSpace(mem::mem_zset_meta_htab_total_size());
-            pg_sys::RequestAddinShmemSpace(mem::mem_set_meta_htab_total_size());
-            pg_sys::RequestAddinShmemSpace(mem::mem_hash_meta_htab_total_size());
-            pg_sys::RequestAddinShmemSpace(mem::mem_dir_htab_total_size());
-            pg_sys::RequestAddinShmemSpace(mem::mem_val_pool_total_size());
-            pg_sys::RequestNamedLWLockTranche(
-                c"pg_redis_mem".as_ptr(),
-                (mem::NUM_MEM_DBS * 6) as i32,
-            );
-        }
-    }
-}
-
-unsafe extern "C-unwind" fn pg_redis_shmem_startup() {
-    unsafe {
-        if let Some(prev) = PREV_SHMEM_STARTUP_HOOK {
-            prev();
-        }
-
-        // Always init pub/sub ctl + slots.
-        let mut found = false;
-        PUBSUB_CTL = pg_sys::ShmemInitStruct(
-            c"pg_redis_pubsub_ctl".as_ptr(),
-            pubsub::pubsub_ctl_size(),
-            &mut found,
-        )
-        .cast();
-        PUBSUB_SLOTS = pg_sys::ShmemInitStruct(
-            c"pg_redis_pubsub_slots".as_ptr(),
-            pubsub::pubsub_slots_size(),
-            &mut found,
-        )
-        .cast();
-
-        ROUTE_CTL = pg_sys::ShmemInitStruct(
-            c"pg_redis_route_ctl".as_ptr(),
-            pubsub::route_ctl_size(),
-            &mut found,
-        )
-        .cast();
-        if !found {
-            std::ptr::write_bytes(ROUTE_CTL, 0, 1);
-        }
-
-        let mut watch_found = false;
-        WATCH_CTL = pg_sys::ShmemInitStruct(
-            c"pg_redis_watch_ctl".as_ptr(),
-            watch::watch_ctl_size(),
-            &mut watch_found,
-        )
-        .cast();
-        if !watch_found {
-            std::ptr::write_bytes(WATCH_CTL, 0, 1);
-        }
-
-        // Memory-mode init — conditional.
-        if storage_mode() == StorageMode::Memory {
-            let mut mem_found = false;
-            let ctl: *mut mem::MemControlBlock = pg_sys::ShmemInitStruct(
-                c"pg_redis_ctl".as_ptr(),
-                mem::mem_ctl_size(),
-                &mut mem_found,
-            )
-            .cast();
-
-            let locks = pg_sys::GetNamedLWLockTranche(c"pg_redis_mem".as_ptr());
-            for i in 0..mem::NUM_MEM_DBS {
-                (*ctl).lwlock[i] = std::ptr::addr_of_mut!((*locks.add(i)).lock);
-                (*ctl).hash_lwlock[i] =
-                    std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS + i)).lock);
-                (*ctl).set_lwlock[i] =
-                    std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS * 2 + i)).lock);
-                (*ctl).zset_lwlock[i] =
-                    std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS * 3 + i)).lock);
-                (*ctl).list_lwlock[i] =
-                    std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS * 4 + i)).lock);
-                (*ctl).dir_lwlock[i] =
-                    std::ptr::addr_of_mut!((*locks.add(mem::NUM_MEM_DBS * 5 + i)).lock);
-            }
-
-            if !mem_found {
-                mem::mem_init_tables(ctl);
-            }
-
-            SHMEM_CTL = ctl;
-        }
-    }
-}
-
-pub(crate) fn shmem_ctl() -> *mut mem::MemControlBlock {
-    unsafe { SHMEM_CTL }
+    shm::startup();
 }
 
 /// Returns `Some((ctl, slots))` when pub/sub shared memory is initialised, `None` otherwise.
-pub(crate) fn pubsub_state() -> Option<(*mut pubsub::PubsubCtl, *mut pubsub::PubsubSlot)> {
-    let ctl = unsafe { PUBSUB_CTL };
-    let slots = unsafe { PUBSUB_SLOTS };
-    if ctl.is_null() || slots.is_null() {
-        None
-    } else {
-        Some((ctl, slots))
-    }
+pub(crate) fn pubsub_state() -> Option<(&'static pubsub::PubsubCtl, &'static pubsub::Slots)> {
+    Some((PUBSUB_CTL.get()?, PUBSUB_SLOTS.get()?))
 }
 
-pub(crate) fn route_state() -> Option<*mut pubsub::RouteCtl> {
-    let ctl = unsafe { ROUTE_CTL };
-    if ctl.is_null() { None } else { Some(ctl) }
+pub(crate) fn route_state() -> Option<&'static pubsub::RouteCtl> {
+    ROUTE_CTL.get()
 }
 
-/// `Some(ctl)` once WATCH's shared-memory counters exist, `None` when the
-/// extension was not loaded via `shared_preload_libraries`.
-pub(crate) fn watch_state() -> Option<*mut watch::WatchCtl> {
-    let ctl = unsafe { WATCH_CTL };
-    if ctl.is_null() { None } else { Some(ctl) }
+/// The server-wide shared state, once it exists — see `server.rs`.
+pub(crate) fn server_state() -> Option<&'static server::ServerCtl> {
+    SERVER_CTL.get()
+}
+
+/// The WATCH counters, once they exist.
+pub(crate) fn watch_state() -> Option<&'static watch::WatchCtl> {
+    WATCH_CTL.get()
 }
 
 #[pg_guard]
@@ -223,11 +138,23 @@ pub extern "C-unwind" fn _PG_init() {
     );
 
     GucRegistry::define_int_guc(
+        c"redis.snapshot_interval",
+        c"Seconds between snapshots of a memory+snapshot database",
+        c"A memory+snapshot database is copied to redis.snapshot this often, and \
+          reloaded from it when the server starts; a crash loses at most this \
+          much. SAVE and BGSAVE take one on demand.",
+        &SNAPSHOT_INTERVAL,
+        1,
+        86400,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
         c"redis.default_db",
         c"Database new connections start on",
-        c"Databases 0-7 are ephemeral (shared memory, or UNLOGGED tables when \
-          redis.storage_mode = 'auto'); 8-15 are WAL-logged and survive restart. \
-          Default: 0, matching Redis. Clients override per-connection with SELECT, \
+        c"By default databases 0-7 are in shared memory and 8-15 are WAL-logged; \
+          redis.set_policy changes either. Default: 0, matching Redis. Clients override per-connection with SELECT, \
           which also accepts the names 'cache' (0) and 'durable' (8).",
         &DEFAULT_DB,
         0,
@@ -304,48 +231,32 @@ pub extern "C-unwind" fn _PG_init() {
     );
 
     GucRegistry::define_string_guc(
-        c"redis.storage_mode",
-        c"Storage backend for the ephemeral databases (0-7)",
-        c"'auto': use UNLOGGED PostgreSQL tables. 'memory' (default): use shared-memory \
-          hash tables, bypassing SPI and transactions entirely. Data is lost on server \
-          restart. Requires restart to take effect.",
-        &STORAGE_MODE,
-        GucContext::Postmaster,
-        GucFlags::default(),
-    );
-
-    GucRegistry::define_string_guc(
         c"redis.maxmemory_policy",
-        c"What memory mode does when a shared-memory table is full",
+        c"What memory mode does past redis.maxmemory",
         c"'noeviction' (default, as in Redis): refuse the write with an OOM error. \
-          'allkeys-random': evict entries to make room, collections whole. \
-          'volatile-ttl': evict only keys that carry an expiry, soonest first. \
-          Expired keys are always reclaimed first, whatever the policy.",
+          'allkeys-random': evict random keys, collections whole, to make room. \
+          'volatile-ttl': evict only keys that carry an expiry, soonest first.",
         &MAXMEMORY_POLICY,
         GucContext::Suset,
         GucFlags::default(),
     );
 
     GucRegistry::define_int_guc(
-        c"redis.mem_max_entries",
-        c"Maximum keys per data type per ephemeral database in memory mode",
-        c"Controls the size of each shared-memory hash table. Larger values use more RAM \
-          (proportional). Default 8192. Requires server restart.",
-        &MEM_MAX_ENTRIES,
-        256,
-        1048576,
+        c"redis.maxmemory",
+        c"Memory the shared-memory databases may use",
+        c"Redis's maxmemory, for memory mode. Past it, a write that could grow memory \
+          is refused with OOM unless redis.maxmemory_policy can evict enough first. \
+          Reserved at startup but backed by RAM only as data fills it. Requires restart.",
+        &MAXMEMORY,
+        8,
+        i32::MAX,
         GucContext::Postmaster,
-        GucFlags::default(),
+        GucFlags::UNIT_MB,
     );
 
-    unsafe {
-        PREV_SHMEM_REQUEST_HOOK = pg_sys::shmem_request_hook;
-        pg_sys::shmem_request_hook = Some(pg_redis_shmem_request);
-        PREV_SHMEM_STARTUP_HOOK = pg_sys::shmem_startup_hook;
-        pg_sys::shmem_startup_hook = Some(pg_redis_shmem_startup);
-    }
+    shared::install_hooks(request_shmem, attach_shmem);
 
-    let my_db: pg_sys::Oid = unsafe { pg_sys::MyDatabaseId };
+    let my_db: pg_sys::Oid = pg::database_oid();
     let db_oid_datum = pg_sys::Datum::from(my_db);
     let n = NUM_WORKERS.get() as usize;
     for idx in 0..n {
@@ -369,7 +280,7 @@ pub extern "C-unwind" fn pg_redis_worker_main(arg: pg_sys::Datum) {
 /// Dynamic workers will not restart after being terminated.
 #[pg_extern(schema = "redis")]
 fn add_workers(n: i32) -> i32 {
-    if !unsafe { pg_sys::superuser() } {
+    if !pg::is_superuser() {
         error!("permission denied: superuser required");
     }
     let schema_exists =
@@ -380,7 +291,7 @@ fn add_workers(n: i32) -> i32 {
     if !schema_exists {
         error!("pg_redis is not installed in the current database");
     }
-    let my_db: pg_sys::Oid = unsafe { pg_sys::MyDatabaseId };
+    let my_db: pg_sys::Oid = pg::database_oid();
     let db_oid_datum = pg_sys::Datum::from(my_db);
     let mut added = 0i32;
     for _ in 0..n.max(0) {
@@ -405,7 +316,7 @@ fn add_workers(n: i32) -> i32 {
 /// pool, lower redis.workers and restart the server.
 #[pg_extern(schema = "redis")]
 fn remove_workers(n: i32) -> i32 {
-    if !unsafe { pg_sys::superuser() } {
+    if !pg::is_superuser() {
         error!("permission denied: superuser required");
     }
     match Spi::get_one::<i32>(&format!(
@@ -422,6 +333,48 @@ fn remove_workers(n: i32) -> i32 {
 }
 
 /// Return the current number of running pg_redis workers.
+/// Give a database a storage policy — `memory`, `memory+snapshot` or `logged`
+/// (docs/STORAGE.md). Returns the policy it now has.
+#[pg_extern(schema = "redis")]
+fn set_policy(db: i32, policy: &str) -> String {
+    if !pg::is_superuser() {
+        error!("permission denied: superuser required");
+    }
+    if !(0..commands::NUM_DBS as i32).contains(&db) {
+        error!(
+            "database {db} is out of range: 0 to {}",
+            commands::NUM_DBS - 1
+        );
+    }
+    let Some(to) = storage::Policy::parse(policy) else {
+        error!("unknown policy '{policy}': memory, memory+snapshot or logged");
+    };
+    match Spi::connect_mut(|client| storage::set_policy(client, db as u8, to)) {
+        Ok(p) => p.name().to_string(),
+        Err(e) => error!("{e}"),
+    }
+}
+
+/// Every database with the policy that serves it now, and — while its data
+/// is still moving — the policy it is moving from.
+#[pg_extern(schema = "redis")]
+fn policies() -> TableIterator<
+    'static,
+    (
+        name!(db, i32),
+        name!(policy, String),
+        name!(moving_from, Option<String>),
+    ),
+> {
+    TableIterator::new(storage::status().into_iter().map(|(db, p, from)| {
+        (
+            db as i32,
+            p.name().to_string(),
+            from.map(|f| f.name().to_string()),
+        )
+    }))
+}
+
 #[pg_extern(schema = "redis")]
 fn worker_count() -> i64 {
     Spi::get_one::<i64>(
@@ -438,7 +391,7 @@ fn worker_count() -> i64 {
 /// Call `redis.create_pubsub_table(schema, tbl)` to create a compatible table.
 #[pg_extern(schema = "redis")]
 fn route_publish(channel: &str, schema: &str, tbl: &str) {
-    if !unsafe { pg_sys::superuser() } {
+    if !pg::is_superuser() {
         error!("permission denied: superuser required");
     }
     // Schema and table are PostgreSQL identifiers (NAMEDATALEN - 1); the channel
@@ -466,16 +419,14 @@ fn route_publish(channel: &str, schema: &str, tbl: &str) {
             .unwrap_or_else(|e| error!("failed to save route: {e}"));
     });
     if let Some(ctl) = crate::route_state() {
-        unsafe {
-            crate::pubsub::route_add(ctl, channel.as_bytes(), schema.as_bytes(), tbl.as_bytes());
-        }
+        crate::pubsub::route_add(ctl, channel.as_bytes(), schema.as_bytes(), tbl.as_bytes());
     }
 }
 
 /// Remove the PUBLISH→table route for `channel`.
 #[pg_extern(schema = "redis")]
 fn unroute_publish(channel: &str) {
-    if !unsafe { pg_sys::superuser() } {
+    if !pg::is_superuser() {
         error!("permission denied: superuser required");
     }
     Spi::connect_mut(|client| {
@@ -488,9 +439,7 @@ fn unroute_publish(channel: &str) {
             .unwrap_or_else(|e| error!("failed to remove route: {e}"));
     });
     if let Some(ctl) = crate::route_state() {
-        unsafe {
-            crate::pubsub::route_remove(ctl, channel.as_bytes());
-        }
+        crate::pubsub::route_remove(ctl, channel.as_bytes());
     }
 }
 
@@ -531,7 +480,7 @@ mod tests {
     // ─────────────────────────── Schema contract ────────────────────────────
 
     /// Every db must exist with the columns and constraints the generated SQL
-    /// assumes — including the UNLOGGED/logged split on even/odd databases.
+    /// assumes, every table WAL-logged.
     #[pg_test]
     fn every_database_has_the_expected_tables() {
         for db in 0..NUM_DBS {
@@ -552,12 +501,10 @@ mod tests {
                  WHERE n.nspname = 'redis' AND c.relname = 'kv_{db}'"
             ))
             .unwrap();
-            let ephemeral = crate::commands::is_ephemeral(db as u8);
             assert_eq!(
                 persistence.as_deref(),
-                Some(if ephemeral { "u" } else { "p" }),
-                "redis.kv_{db} should be {}",
-                if ephemeral { "UNLOGGED" } else { "logged" }
+                Some("p"),
+                "redis.kv_{db} should be logged"
             );
 
             truncate(db);
@@ -605,12 +552,12 @@ mod tests {
                 Some(1),
                 "STRLEN on db {db}"
             );
-            // No expiry set, so TTL/PTTL report -1 and a missing key reports -2.
-            assert_eq!(query_one::<i64>(&sql::TTL[db], &[b"k"]), Some(-1));
-            assert_eq!(query_one::<i64>(&sql::PTTL[db], &[b"k"]), Some(-1));
-            assert_eq!(query_one::<i64>(&sql::TTL[db], &[b"absent"]), Some(-2));
-            assert_eq!(query_one::<i64>(&sql::EXPIRETIME[db], &[b"k"]), Some(-1));
-            assert_eq!(query_one::<i64>(&sql::PEXPIRETIME[db], &[b"k"]), Some(-1));
+            // No expiry set, so the deadline reads -1 and a missing key -2.
+            assert_eq!(query_one::<i64>(&sql::EXPIRE_US[db], &[b"k"]), Some(-1));
+            assert_eq!(
+                query_one::<i64>(&sql::EXPIRE_US[db], &[b"absent"]),
+                Some(-2)
+            );
 
             assert_eq!(
                 query_one::<Vec<u8>>(&sql::HGET[db], &[b"h", b"f"]).as_deref(),
@@ -629,11 +576,6 @@ mod tests {
             assert_eq!(query_one::<i64>(&sql::SCARD[db], &[b"nosuchset"]), Some(0));
             assert_eq!(query_one::<i64>(&sql::ZCARD[db], &[b"nosuchzset"]), Some(0));
             assert_eq!(query_one::<i64>(&sql::LLEN[db], &[b"nosuchlist"]), Some(0));
-
-            // INCR upserts and returns the new value; a second call increments.
-            assert_eq!(query_one::<i64>(&sql::INCR[db], &[b"n"]), Some(1));
-            assert_eq!(query_one::<i64>(&sql::INCR[db], &[b"n"]), Some(2));
-            assert_eq!(query_one::<i64>(&sql::DECR[db], &[b"n"]), Some(1));
 
             // GETDEL returns the value and removes the row in one statement.
             assert_eq!(
@@ -662,8 +604,8 @@ mod tests {
             Some(&b"v"[..])
         );
         assert!(
-            query_one::<i64>(&sql::TTL[1], &[b"live"]).unwrap_or(0) >= 3599,
-            "TTL should report the remaining hour"
+            query_one::<i64>(&sql::EXPIRE_US[1], &[b"live"]).unwrap_or(0) > 0,
+            "the deadline should be there"
         );
 
         // The sweep the worker runs every second removes the expired row.
@@ -854,30 +796,24 @@ mod tests {
         Spi::run("CREATE TEMP TABLE batch_iso (n int)").unwrap();
 
         // Committed: the command reported success.
-        let ok = unsafe {
-            crate::worker::in_subtransaction(|| {
-                Spi::run("INSERT INTO batch_iso VALUES (1)").unwrap();
-                Response::Ok
-            })
-        };
+        let ok = crate::worker::in_subtransaction(|| {
+            Spi::run("INSERT INTO batch_iso VALUES (1)").unwrap();
+            Response::Ok
+        });
         assert!(matches!(ok, Response::Ok));
 
         // Rolled back: the command reported an error, so its write is discarded.
-        let failed = unsafe {
-            crate::worker::in_subtransaction(|| {
-                Spi::run("INSERT INTO batch_iso VALUES (2)").unwrap();
-                Response::Error("boom".to_string())
-            })
-        };
+        let failed = crate::worker::in_subtransaction(|| {
+            Spi::run("INSERT INTO batch_iso VALUES (2)").unwrap();
+            Response::Error("boom".to_string())
+        });
         assert!(matches!(failed, Response::Error(_)));
 
         // Committed again: the surrounding transaction survived the rollback.
-        unsafe {
-            crate::worker::in_subtransaction(|| {
-                Spi::run("INSERT INTO batch_iso VALUES (3)").unwrap();
-                Response::Ok
-            })
-        };
+        crate::worker::in_subtransaction(|| {
+            Spi::run("INSERT INTO batch_iso VALUES (3)").unwrap();
+            Response::Ok
+        });
 
         let rows: Vec<Option<i32>> = Spi::connect(|c| {
             c.select("SELECT n FROM batch_iso ORDER BY n", None, &[])
@@ -904,13 +840,11 @@ mod tests {
 
         Spi::run("CREATE TEMP TABLE raise_iso (n int)").unwrap();
 
-        let overflowed = unsafe {
-            crate::worker::in_subtransaction(|| {
-                Spi::run("INSERT INTO raise_iso VALUES (1)").unwrap();
-                Spi::run("SELECT 9223372036854775807::bigint + 1").unwrap();
-                Response::Ok
-            })
-        };
+        let overflowed = crate::worker::in_subtransaction(|| {
+            Spi::run("INSERT INTO raise_iso VALUES (1)").unwrap();
+            Spi::run("SELECT 9223372036854775807::bigint + 1").unwrap();
+            Response::Ok
+        });
         match overflowed {
             Response::Error(e) => assert!(
                 e.contains("overflow"),
@@ -920,12 +854,10 @@ mod tests {
         }
 
         // The subtransaction was rolled back, not merely abandoned...
-        let survived = unsafe {
-            crate::worker::in_subtransaction(|| {
-                Spi::run("INSERT INTO raise_iso VALUES (2)").unwrap();
-                Response::Ok
-            })
-        };
+        let survived = crate::worker::in_subtransaction(|| {
+            Spi::run("INSERT INTO raise_iso VALUES (2)").unwrap();
+            Response::Ok
+        });
         assert!(matches!(survived, Response::Ok));
 
         let rows: Vec<Option<i32>> = Spi::connect(|c| {
@@ -952,9 +884,9 @@ mod tests {
     fn watch_counters_are_visible_through_shared_memory() {
         let ctl = crate::watch_state().expect("watch shmem must be initialised");
 
-        let before = unsafe { crate::watch::version(ctl, 0, b"k") };
-        unsafe { crate::watch::bump(ctl, 0, b"k") };
-        let after = unsafe { crate::watch::version(ctl, 0, b"k") };
+        let before = crate::watch::version(ctl, 0, b"k");
+        crate::watch::bump(ctl, 0, b"k");
+        let after = crate::watch::version(ctl, 0, b"k");
         assert_ne!(before, after, "a write must invalidate a prior WATCH");
 
         // An unrelated key must not be disturbed by that write. Slot collisions
@@ -962,23 +894,23 @@ mod tests {
         let other = (0..64u32)
             .map(|i| format!("other-{i}"))
             .find(|k| {
-                let v = unsafe { crate::watch::version(ctl, 0, k.as_bytes()) };
-                unsafe { crate::watch::bump(ctl, 0, b"k") };
-                v == unsafe { crate::watch::version(ctl, 0, k.as_bytes()) }
+                let v = crate::watch::version(ctl, 0, k.as_bytes());
+                crate::watch::bump(ctl, 0, b"k");
+                v == crate::watch::version(ctl, 0, k.as_bytes())
             })
             .expect("some key must not share a slot with \"k\"");
-        let untouched = unsafe { crate::watch::version(ctl, 0, other.as_bytes()) };
-        unsafe { crate::watch::bump(ctl, 0, b"k") };
+        let untouched = crate::watch::version(ctl, 0, other.as_bytes());
+        crate::watch::bump(ctl, 0, b"k");
         assert_eq!(
             untouched,
-            unsafe { crate::watch::version(ctl, 0, other.as_bytes()) },
+            crate::watch::version(ctl, 0, other.as_bytes()),
             "writing one key must not invalidate a WATCH on an unrelated key"
         );
 
         // Same key name, different database: tracked independently.
-        let db1 = unsafe { crate::watch::version(ctl, 1, b"k") };
-        unsafe { crate::watch::bump(ctl, 0, b"k") };
-        assert_eq!(db1, unsafe { crate::watch::version(ctl, 1, b"k") });
+        let db1 = crate::watch::version(ctl, 1, b"k");
+        crate::watch::bump(ctl, 0, b"k");
+        assert_eq!(db1, crate::watch::version(ctl, 1, b"k"));
     }
 
     // ──────────────────────────── Pub/sub routing ────────────────────────────

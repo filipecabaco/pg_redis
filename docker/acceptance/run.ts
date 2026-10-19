@@ -240,6 +240,8 @@ async function resetConfig(): Promise<void> {
 			"64",
 			"list-max-listpack-size",
 			"-2",
+			"hll-sparse-max-bytes",
+			"3000",
 		],
 		["CONFIG", "SET", "requirepass", "", "acllog-max-len", "128", "acl-pubsub-default", "resetchannels"],
 		["ACL", "SETUSER", "default", "reset", "on", "nopass", "~*", "&*", "+@all"],

@@ -407,10 +407,6 @@ client get `BUSY`, on every worker, until it ends or `SCRIPT KILL` /
   A RESP3 client that invalidations are redirected to receives them as push
   messages with no subscription of its own; the connection that sets up the
   redirect hands it a pub/sub slot to receive them on.
-- **A client that stops reading is disconnected after 60 seconds.** A reply
-  or pub/sub message that cannot be written for that long closes the
-  connection. Redis instead buffers replies for a normal client without limit
-  and applies its output limits only to subscribers and replicas.
 - **Eviction is silent.** A key evicted under `redis.maxmemory_policy` sends
   no `evicted` notification and no client-tracking invalidation. Keyspace
   notifications otherwise follow `notify-keyspace-events` event for

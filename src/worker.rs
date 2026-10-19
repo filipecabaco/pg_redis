@@ -64,8 +64,8 @@ const SUBSCRIBE_POLL: Duration = Duration::from_millis(5);
 /// wakes the sleeper — only how long a command from a quiet subscriber waits.
 const SUBSCRIBE_WAIT_MIN: Duration = Duration::from_millis(5);
 const SUBSCRIBE_WAIT_MAX: Duration = Duration::from_millis(250);
-/// How long a write may wait for a client to read before the connection is
-/// closed. Redis's pub/sub output limit gives a slow subscriber 60 seconds.
+/// How long a write to a subscriber may wait for it to read before the
+/// connection is closed: the 60 seconds of Redis's pub/sub output limit.
 const WRITE_STALL: Duration = Duration::from_secs(60);
 
 pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
@@ -762,14 +762,6 @@ fn accept_loop(port: u16, cmd_tx: mpsc::SyncSender<DispatchMsg>, listen_addr: St
                 if let Err(e) = s.set_read_timeout(Some(Duration::from_secs(30))) {
                     eprintln!("pg_redis: set_read_timeout failed: {}", e);
                 }
-                // A client that takes no bytes at all for this long is closed,
-                // where Redis would close it at its output buffer limit. Without
-                // it a client that stops reading parks its connection thread in
-                // a write for good, and a subscriber that fell behind is never
-                // told.
-                if let Err(e) = s.set_write_timeout(Some(WRITE_STALL)) {
-                    eprintln!("pg_redis: set_write_timeout failed: {}", e);
-                }
                 if let Err(e) = s.set_nodelay(true) {
                     eprintln!("pg_redis: set_nodelay failed: {}", e);
                 }
@@ -1315,6 +1307,20 @@ fn conn_loop(
                         continue;
                     }
                 }
+                // Redis's reply to a HELLO that neither comes authenticated
+                // nor carries AUTH; the protocol stays as it was.
+                if !authenticated {
+                    reply(&mut writer, |w| {
+                        write_error(
+                            w,
+                            "NOAUTH HELLO must be called with the client already authenticated, \
+                             otherwise the HELLO <proto> AUTH <user> <pass> option can be used to \
+                             authenticate the client and select the RESP protocol version at the \
+                             same time",
+                        )
+                    });
+                    continue;
+                }
                 if let Some(v) = requested_proto {
                     proto = *v;
                     client.set_proto(proto);
@@ -1382,7 +1388,9 @@ fn conn_loop(
                 writer.quit_reply = true;
                 break;
             }
-            Command::Ping { msg } => {
+            // Behind the password like everything but AUTH, HELLO, QUIT and
+            // RESET, the commands Redis flags `no_auth`.
+            Command::Ping { msg } if authenticated => {
                 match msg {
                     Some(m) => write_bulk_string(&mut writer, m).ok(),
                     None => write_simple_string(&mut writer, "PONG").ok(),
@@ -2127,6 +2135,7 @@ fn deliver_messages(writer: &mut ConnWriter, idx: usize, proto: u8) {
     let Some((_, slots)) = crate::pubsub_state() else {
         return;
     };
+    writer.limit_stalls();
     let muted = std::mem::replace(&mut writer.muted, false);
     let mut any = false;
     while let Some((channel, pattern, payload)) = crate::pubsub::poll_message(slots, idx) {
@@ -2292,6 +2301,7 @@ fn subscribe_loop(
     let mut keep_conn = true;
     let mut slot_freed = false;
     let mut idle_wait = SUBSCRIBE_WAIT_MIN;
+    writer.limit_stalls();
 
     'outer: loop {
         // Snapshot before draining, so a publish that lands between the drain
@@ -2774,6 +2784,8 @@ struct ConnWriter {
     /// QUIT was asked for: its OK goes out after the connection is torn
     /// down.
     quit_reply: bool,
+    /// Writes time out after `WRITE_STALL`; set once the client subscribes.
+    stall_limited: bool,
 }
 
 struct PendingRead {
@@ -2791,6 +2803,19 @@ impl ConnWriter {
             muted: false,
             pending_read: None,
             quit_reply: false,
+            stall_limited: false,
+        }
+    }
+
+    /// From a client's first subscription, a write it does not read for
+    /// `WRITE_STALL` closes the connection, as Redis's pub/sub output limit
+    /// does. A normal client gets no such limit, in Redis or here.
+    fn limit_stalls(&mut self) {
+        if !self.stall_limited {
+            self.stall_limited = true;
+            if let Err(e) = self.inner.get_ref().set_write_timeout(Some(WRITE_STALL)) {
+                eprintln!("pg_redis: set_write_timeout failed: {e}");
+            }
         }
     }
 

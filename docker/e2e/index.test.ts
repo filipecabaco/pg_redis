@@ -26,14 +26,35 @@ afterAll(async () => {
 });
 
 describe("Authentication", () => {
-	test("PING before AUTH returns PONG (allowed)", async () => {
+	// As in Redis: only AUTH, HELLO, QUIT and RESET answer before AUTH.
+	test("PING before AUTH returns NOAUTH", async () => {
 		const noAuthClient = new Bun.RedisClient(
 			`redis://${REDIS_HOST}:${REDIS_PORT}`,
 		);
 		try {
-			expect(await noAuthClient.ping()).toBe("PONG");
+			await expect(noAuthClient.ping()).rejects.toThrow(/NOAUTH/);
 		} finally {
 			noAuthClient.close();
+		}
+	});
+
+	// Redis refuses a HELLO that neither comes authenticated nor carries AUTH,
+	// and leaves the protocol where it was. It used to switch the connection
+	// to RESP3 and describe the server to anyone.
+	test("HELLO before AUTH returns Redis's NOAUTH and keeps RESP2", async () => {
+		const conn = await new RawRedis().connect({ password: "" });
+		try {
+			for (const args of [["HELLO"], ["HELLO", "3"]]) {
+				const reply = (await conn.send(...args)).toString();
+				expect(reply).toStartWith("-NOAUTH HELLO must be called with the client already authenticated");
+			}
+			expect((await conn.send("HELLO", "3", "AUTH", "default", "nope")).toString()).toStartWith(
+				"-WRONGPASS",
+			);
+			// Still RESP2: a RESP3 null would be `_`.
+			expect((await conn.send("PING")).toString()).toStartWith("-NOAUTH");
+		} finally {
+			conn.close();
 		}
 	});
 

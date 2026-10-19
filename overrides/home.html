@@ -56,7 +56,7 @@
   <div class="pr-wrap">
     <dl class="pr-stats">
       <div><dt>235<small>/242</small></dt><dd>Redis 7.2 commands accepted</dd></div>
-      <div><dt>2<small>/2,010</small></dt><dd>replies that differ from Redis</dd></div>
+      <div><dt>2<small>/2,250</small></dt><dd>replies that differ from Redis</dd></div>
       <div><dt>3</dt><dd>storage policies, set per database</dd></div>
       <div><dt>RESP2 + 3</dt><dd>works with stock clients</dd></div>
     </dl>
@@ -302,7 +302,6 @@ redis-cli PING   <span class="o"># PONG</span></code></pre>
         <li><strong>Atomicity is per command.</strong> A single command such as <code>INCR</code> or <code>SET lock token NX PX 30000</code> is atomic, so locks and rate limiters built from one command work as in Redis. The commands inside a Lua script or <code>MULTI</code>, and the steps of commands built from others such as <code>ZUNIONSTORE</code>, can interleave with other workers' commands, so a read-then-write in a script is not isolated. Redis runs on one thread, so nothing interleaves there.</li>
         <li><strong><code>SCAN</code> cursors on tables are kept by the server.</strong> On a <code>logged</code> database a cursor names the last key returned, and the server keeps up to 4,096 iterations in progress. A cursor sent a second time, or one pushed out by newer iterations, starts the iteration over, so keys come back again. None is skipped.</li>
         <li><strong>Blocked clients are served just after the write.</strong> A write that unblocks <code>BLPOP</code> clients waits up to 500 ms for them to be served, where Redis serves them inside the write.</li>
-        <li><strong>Small hashes and sets keep insertion order only until a removal.</strong> Redis documents both as unordered, but a client can see the difference.</li>
         <li><strong>No access clock.</strong> <code>OBJECT IDLETIME</code> and <code>OBJECT FREQ</code> return nil, since tracking reads would turn every read on a table into a write.</li>
         <li><strong>Eviction is silent.</strong> A key evicted under <code>maxmemory-policy</code> raises no <code>evicted</code> keyspace event and no <code>CLIENT TRACKING</code> invalidation.</li>
         <li><strong>Pub/sub has fixed limits.</strong> Past 256 subscribed connections, <code>SUBSCRIBE</code> returns an error. A subscription past the per-connection limit is refused with an error, and the rest of the command still applies. A subscriber that falls 256 messages behind is disconnected, as Redis disconnects one past its pub/sub output limit, so it never carries on with a gap it cannot see.</li>

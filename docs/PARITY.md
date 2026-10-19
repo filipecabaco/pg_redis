@@ -6,7 +6,7 @@
     behaviour see [Command coverage](command-coverage.md) and the
     [differences list on the home page](index.md#differences). Current
     numbers: pg_redis accepts 235 of Redis 7.2's 242 commands, and 2 of the
-    2,010 replies the parity harness compares differ, both in float
+    2,250 replies the parity harness compares differ, both in float
     formatting.
 
 What is left between pg_redis and Redis, why the headline number does not say
@@ -80,7 +80,7 @@ Reference used here: Redis 7.0.15, 240 top-level commands.
 
 ## Where parity actually stands
 
-**2 differences over 2,010 replies** (87 cases, run on both storage halves).
+**2 differences over 2,250 replies** (93 cases, run on both storage halves).
 Both are float formatting, one per half, and which pair shows depends on the
 reference Redis's build. Against x86 Redis it is `INCRBYFLOAT`, which is `f64`
 here where Redis uses an 80-bit `long double`. Against arm64 Redis it is the
@@ -359,7 +359,8 @@ sorted index was needed. The dynahash tables the bullets below describe were
 replaced in phase 6 of [Storage policies](STORAGE.md#growable-shared-memory-phase-6):
 a keyspace, hash or set is now a `memdb::Dict`, whose entries sit in a dense
 `Vec` found through a hashbrown table, and a removal swaps the last entry into
-the hole (`src/memdb/dict.rs`). An entry therefore only moves to a lower
+the hole or, in a listpack-encoded hash or set, moves the entries after it
+down one (`src/memdb/dict.rs`). An entry therefore only moves to a lower
 position, so the memory half's cursor is a position, iterated from the top
 down, with no state and O(`COUNT`) per call. The durable half resumes after
 the last key returned, through the primary key index, and keeps that key in a

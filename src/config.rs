@@ -350,6 +350,10 @@ pub fn set(args: &[Vec<u8>]) -> Result<(), String> {
     if let Some((_, v)) = staged.iter().find(|(n, _)| *n == "maxmemory") {
         crate::shm::set_limit(v.parse().unwrap_or(0));
     }
+    use crate::memdb::encoding::LIMIT_NAMES;
+    if staged.iter().any(|(n, _)| LIMIT_NAMES.contains(n)) {
+        crate::server::set_enc_limits(LIMIT_NAMES.map(get_i64));
+    }
     Ok(())
 }
 

@@ -47,22 +47,28 @@ CREATE INDEX IF NOT EXISTS kv_13_expires_idx ON redis.kv_13 (expires_at) WHERE e
 CREATE INDEX IF NOT EXISTS kv_14_expires_idx ON redis.kv_14 (expires_at) WHERE expires_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS kv_15_expires_idx ON redis.kv_15 (expires_at) WHERE expires_at IS NOT NULL;
 
-CREATE         TABLE IF NOT EXISTS redis.hash_0  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
-CREATE         TABLE IF NOT EXISTS redis.hash_1  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
-CREATE         TABLE IF NOT EXISTS redis.hash_2  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
-CREATE         TABLE IF NOT EXISTS redis.hash_3  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
-CREATE         TABLE IF NOT EXISTS redis.hash_4  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
-CREATE         TABLE IF NOT EXISTS redis.hash_5  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
-CREATE         TABLE IF NOT EXISTS redis.hash_6  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
-CREATE         TABLE IF NOT EXISTS redis.hash_7  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
-CREATE         TABLE IF NOT EXISTS redis.hash_8  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
-CREATE         TABLE IF NOT EXISTS redis.hash_9  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
-CREATE         TABLE IF NOT EXISTS redis.hash_10 (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
-CREATE         TABLE IF NOT EXISTS redis.hash_11 (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
-CREATE         TABLE IF NOT EXISTS redis.hash_12 (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
-CREATE         TABLE IF NOT EXISTS redis.hash_13 (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
-CREATE         TABLE IF NOT EXISTS redis.hash_14 (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
-CREATE         TABLE IF NOT EXISTS redis.hash_15 (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
+-- Hashes and sets come back in the order Redis gives them, which for a small
+-- one is the order its fields or members were added (docs/STORAGE.md). `seq`
+-- records that order: it is set when a row is inserted, from one sequence
+-- for every table, and left alone when a field's value is updated.
+CREATE SEQUENCE IF NOT EXISTS redis.seq;
+
+CREATE         TABLE IF NOT EXISTS redis.hash_0  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_1  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_2  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_3  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_4  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_5  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_6  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_7  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_8  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_9  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_10 (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_11 (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_12 (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_13 (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_14 (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, field));
+CREATE         TABLE IF NOT EXISTS redis.hash_15 (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, field));
 
 -- Lists. `pos` is a signed BIGINT with gaps so LPUSH can decrement below
 -- the current minimum and RPUSH can increment above the current maximum
@@ -88,22 +94,22 @@ CREATE         TABLE IF NOT EXISTS redis.list_15 (key BYTEA NOT NULL, pos BIGINT
 -- Sets. PRIMARY KEY (key, member) covers both the (key=?) scan path used by
 -- SMEMBERS/SCARD and the (key=?, member=?) membership test used by SISMEMBER,
 -- so no standalone key index is needed.
-CREATE         TABLE IF NOT EXISTS redis.set_0  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.set_1  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.set_2  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.set_3  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.set_4  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.set_5  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.set_6  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.set_7  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.set_8  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.set_9  (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.set_10 (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.set_11 (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.set_12 (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.set_13 (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.set_14 (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
-CREATE         TABLE IF NOT EXISTS redis.set_15 (key BYTEA NOT NULL, member BYTEA NOT NULL, PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_0  (key BYTEA NOT NULL, member BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_1  (key BYTEA NOT NULL, member BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_2  (key BYTEA NOT NULL, member BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_3  (key BYTEA NOT NULL, member BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_4  (key BYTEA NOT NULL, member BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_5  (key BYTEA NOT NULL, member BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_6  (key BYTEA NOT NULL, member BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_7  (key BYTEA NOT NULL, member BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_8  (key BYTEA NOT NULL, member BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_9  (key BYTEA NOT NULL, member BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_10 (key BYTEA NOT NULL, member BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_11 (key BYTEA NOT NULL, member BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_12 (key BYTEA NOT NULL, member BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_13 (key BYTEA NOT NULL, member BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_14 (key BYTEA NOT NULL, member BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, member));
+CREATE         TABLE IF NOT EXISTS redis.set_15 (key BYTEA NOT NULL, member BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, member));
 
 CREATE INDEX IF NOT EXISTS hash_0_key_pattern_idx  ON redis.hash_0  (key);
 CREATE INDEX IF NOT EXISTS hash_1_key_pattern_idx  ON redis.hash_1  (key);
@@ -235,6 +241,32 @@ CREATE INDEX IF NOT EXISTS expiry_13_expires_idx  ON redis.expiry_13  (expires_a
 CREATE INDEX IF NOT EXISTS expiry_14_expires_idx  ON redis.expiry_14  (expires_at);
 CREATE INDEX IF NOT EXISTS expiry_15_expires_idx  ON redis.expiry_15  (expires_at);
 
+-- The encoding Redis would have given a hash, set or sorted set, for the keys
+-- whose encoding their contents no longer show (docs/STORAGE.md). Redis
+-- converts a collection that outgrows a listpack or intset and never converts
+-- it back, which `OBJECT ENCODING` and the order of the elements both reveal.
+-- A key with no row is in the encoding its contents imply: a listpack for a
+-- hash or sorted set, an intset for a set of integers and a listpack for any
+-- other set. A row records 1 listpack (a set that holds an integer), 3
+-- hashtable (a hash or set) or 4 skiplist (a sorted set), and is written only
+-- when a key changes encoding.
+CREATE         TABLE IF NOT EXISTS redis.encoding_0  (key BYTEA PRIMARY KEY, encoding SMALLINT NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.encoding_1  (key BYTEA PRIMARY KEY, encoding SMALLINT NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.encoding_2  (key BYTEA PRIMARY KEY, encoding SMALLINT NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.encoding_3  (key BYTEA PRIMARY KEY, encoding SMALLINT NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.encoding_4  (key BYTEA PRIMARY KEY, encoding SMALLINT NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.encoding_5  (key BYTEA PRIMARY KEY, encoding SMALLINT NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.encoding_6  (key BYTEA PRIMARY KEY, encoding SMALLINT NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.encoding_7  (key BYTEA PRIMARY KEY, encoding SMALLINT NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.encoding_8  (key BYTEA PRIMARY KEY, encoding SMALLINT NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.encoding_9  (key BYTEA PRIMARY KEY, encoding SMALLINT NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.encoding_10 (key BYTEA PRIMARY KEY, encoding SMALLINT NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.encoding_11 (key BYTEA PRIMARY KEY, encoding SMALLINT NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.encoding_12 (key BYTEA PRIMARY KEY, encoding SMALLINT NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.encoding_13 (key BYTEA PRIMARY KEY, encoding SMALLINT NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.encoding_14 (key BYTEA PRIMARY KEY, encoding SMALLINT NOT NULL);
+CREATE         TABLE IF NOT EXISTS redis.encoding_15 (key BYTEA PRIMARY KEY, encoding SMALLINT NOT NULL);
+
 -- Lua scripting. The script cache is shared by every worker so that EVALSHA
 -- finds a script whichever worker EVAL first saw it on; like Redis's cache it is
 -- not data, so it is unlogged. Function libraries are data — Redis keeps them in
@@ -306,8 +338,9 @@ $$;
 -- pg_dump skips the tables an extension creates unless its script marks them
 -- as holding user data, so without this a logical backup held none of the
 -- data in `logged` databases, snapshots, policies or functions. Every logged
--- table in the schema is marked; `redis.scripts` is an unlogged cache that
--- Redis does not persist either.
+-- table in the schema is marked, and so is `redis.seq`, whose position the
+-- order of hashes and sets depends on; `redis.scripts` is an unlogged cache
+-- that Redis does not persist either.
 DO $$
 DECLARE
     t regclass;
@@ -316,7 +349,7 @@ BEGIN
         SELECT c.oid::regclass
         FROM pg_catalog.pg_class c
         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'redis' AND c.relkind = 'r' AND c.relpersistence = 'p'
+        WHERE n.nspname = 'redis' AND c.relkind IN ('r', 'S') AND c.relpersistence = 'p'
     LOOP
         PERFORM pg_catalog.pg_extension_config_dump(t, '');
     END LOOP;

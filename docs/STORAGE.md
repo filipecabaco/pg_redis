@@ -79,8 +79,10 @@ survive the restart, so for it there is nothing left to move.
 #### Moving one key
 
 A key is moved with the same serialisation `DUMP` and `RESTORE` use, which
-round-trips every type including streams, and its deadline is carried
-alongside:
+round-trips every type including streams. Its deadline is carried alongside,
+and so are a hash's, set's or sorted set's encoding and order
+([Order and encodings](IMPLEMENTATION.md#order-and-encodings)), so the key is
+the same collection in B:
 
 - If the key is live in **B**, B is authoritative. Any copy left in A is
   deleted.
@@ -143,7 +145,9 @@ one interval of writes.
   shared memory), the first worker fills the slot back in from the snapshot
   while the others wait, so no worker serves the database half loaded. No
   snapshot is taken of a slot until that is done; otherwise the empty slot
-  would be saved over the snapshot it is about to be filled from.
+  would be saved over the snapshot it is about to be filled from. A payload
+  loads as Redis loads its RDB file: a listpack or intset comes back as one,
+  in its order, and a hash table that has shrunk comes back as a listpack.
 - **On demand.** `SAVE` snapshots every `memory+snapshot` database there and
   then; `BGSAVE` makes them due at the workers' next round. `LASTSAVE` and
   `INFO persistence`'s `rdb_last_save_time` report the last one taken. With no

@@ -112,8 +112,14 @@ CREATE SCHEMA redis;
 -- Key-value (pattern repeats for db 0–15)
 CREATE TABLE redis.kv_0 (key BYTEA PRIMARY KEY, value BYTEA NOT NULL, expires_at TIMESTAMPTZ);
 
--- Hash (same pattern)
-CREATE TABLE redis.hash_0 (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, PRIMARY KEY (key, field));
+-- Hash and set (same pattern); `seq` is the order of insertion
+CREATE TABLE redis.hash_0 (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL,
+                           seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, field));
+CREATE TABLE redis.set_0 (key BYTEA NOT NULL, member BYTEA NOT NULL,
+                          seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, member));
+
+-- The encoding of a hash, set or sorted set whose contents no longer show it
+CREATE TABLE redis.encoding_0 (key BYTEA PRIMARY KEY, encoding SMALLINT NOT NULL);
 ```
 
 Every column is `BYTEA`. Redis keys, values, fields and members are arbitrary
@@ -131,6 +137,77 @@ SELECT value FROM redis.kv_8 WHERE key = convert_to('mykey', 'UTF8');
 Ordering is bytewise, which is what Redis means by lexicographic, so
 `ZRANGEBYLEX` and `ORDER BY member` agree with Redis whatever the database
 collation.
+
+### Order and encodings
+
+Redis keeps a small hash, set or sorted set packed, as a listpack or, for a
+set of integers, an intset, and converts it to a hash table or skiplist once
+it passes a threshold. It never converts one back. A client sees the encoding
+in two places: `OBJECT ENCODING`, and the order the elements come back in. A
+listpack keeps insertion order and deletes in place, an intset is sorted, and
+a hash table has an order of its own. Both halves keep the same state for
+every hash, set and sorted set and follow Redis 7.2's rules for each
+transition (`src/memdb/encoding.rs`):
+
+- A hash is a listpack while it has at most `hash-max-listpack-entries` (512)
+  fields and every field and value is at most `hash-max-listpack-value` (64)
+  bytes.
+- A set is an intset while every member is an integer as Redis reads one (no
+  `+`, no leading zero, no `-0`, within 64 bits) and it has at most
+  `set-max-intset-entries` (512) members. Otherwise it is a listpack while it
+  has at most `set-max-listpack-entries` (128) members of at most
+  `set-max-listpack-value` (64) bytes. An intset that takes a string becomes a
+  listpack with its integers first, in sorted order. An intset that passes 512
+  members becomes a hash table.
+- A sorted set is a listpack while it has at most `zset-max-listpack-entries`
+  (128) members of at most `zset-max-listpack-value` (64) bytes.
+- A command that adds several elements converts first when the number it
+  names passes the threshold, repeats included, because Redis sizes the
+  collection before it writes.
+- `CONFIG SET` of any of these parameters applies from the next write.
+  Collections already written keep their encoding until then.
+
+The results of `SUNION`, `SDIFF`, `SINTER`, their `STORE` forms, and an
+`SPOP` that takes the whole set are built as Redis builds them, so they come
+back in the order Redis's result keeps: the `SUNION` of a listpack holding only
+integers comes back sorted, because Redis builds the result as an intset.
+`SRANDMEMBER`, `HRANDFIELD` and `ZRANDMEMBER` with a count covering the
+collection return all of it in its order (a sorted set from the highest score
+down), and a listpack's random choice comes in the listpack's order. `HSCAN`,
+`SSCAN` and `ZSCAN` of a packed collection return all of it in one call with
+cursor 0, whatever `COUNT` asks for, as Redis does.
+
+A list's encoding is worked out from its elements: a listpack while they fit
+one quicklist node, which at the default `list-max-listpack-size` of -2 is
+8 KB as a listpack would store them.
+
+**Memory.** Each collection carries its encoding beside its dictionary. A
+listpack deletes in place: the entries after the hole move down one, O(n) for
+the at most 512 entries a packed collection holds. An intset is sorted when it
+is read, and put in sorted order once when it becomes a listpack. A hash table
+keeps the dictionary's order, and a removal moves the last entry into the
+hole.
+
+**Tables.** `redis.hash_N` and `redis.set_N` have a `seq` column, set from the
+sequence `redis.seq` when a row is inserted and left alone when a field's value
+changes, and reads order by it. `redis.encoding_N` holds a row for a key only
+when its contents no longer show its encoding: a converted hash or set (3,
+hashtable), a converted sorted set (4, skiplist), or a listpack set that holds
+an integer (1, listpack), which would read as an intset once its strings were
+removed. A key with no row is in the encoding its contents imply. A write
+reads the row and the key's size, counted no further than the threshold, in
+the statement that writes, and writes the row only when the encoding changes,
+so most writes run no extra statement. A write that finds the key absent
+starts afresh, so a row a removed key left behind does not carry over. `DEL`,
+expiry, `FLUSHDB` and `FLUSHALL` remove the row with the key, and so do
+`HDEL`, `SREM`, `SMOVE` and `ZREM` when they remove the last element.
+
+**Moving keys.** `COPY`, `MOVE`, `RENAME` and the moves between storage
+policies carry a key's encoding and order with it. `DUMP` writes the payload
+type Redis writes for the encoding, an intset or a listpack for a packed
+collection, and `RESTORE` and snapshot loading give a payload the encoding
+Redis's `rdbLoadObject` would. A hash table that has shrunk is written as a
+plain hash and loads as a listpack, as it does after a Redis restart.
 
 Every `kv_*` table carries a partial index on `expires_at` for the SQL expiry
 sweep; a unit test asserts it exists on all sixteen.
@@ -151,20 +228,24 @@ each backend, and neither matches Redis's.
 `src/memdb/dict.rs`). A call visits the `COUNT` positions below the cursor,
 from the top down, and returns the lowest one it visited, or 0 once it reaches
 the bottom. Cursor 0 starts at the top, and a cursor past the end is clamped to
-it. An insert appends at the end and a removal moves the last entry into the
-hole, so an entry only ever moves to a lower position. An entry not yet visited
+it. An insert appends at the end, and a removal either moves the last entry
+into the hole or, in a listpack, moves the entries after it down one, so an
+entry only ever moves to a lower position. An entry not yet visited
 therefore stays below the cursor however the dictionary changes between calls;
 one that moves down from a visited position is returned again. Nothing is kept
 between calls and a call costs O(`COUNT`). The keyspace, a hash's fields, a
-set's members and a sorted set's member dictionary are all iterated this way. A
-key past its deadline is passed over.
+set's members and a sorted set's member dictionary are all iterated this way,
+except a packed hash, set or sorted set, which comes back whole in one call
+([Order and encodings](#order-and-encodings)). A key past its deadline is
+passed over.
 
 **Tables.** A call resumes after the last key or element the previous call
 returned, in bytea order, through the primary key index. For `SCAN` each of
 the six tables a key can be in gives its next `COUNT` keys
 (`key > $last ORDER BY key LIMIT n`), and the first `COUNT` of their union are
 the page: a key not among them sorts after all of them, so the page has no gap.
-A collection is read with `key = $1 AND field > $last ORDER BY field LIMIT n`.
+A collection is read with `key = $1 AND field > $last ORDER BY field LIMIT n`,
+unless it is packed, when the first call returns all of it.
 
 A key does not fit in 64 bits, so the cursor is a token naming an entry in a
 table in shared memory (`src/cursor.rs`), where every worker can find it.
@@ -210,7 +291,7 @@ list) is an ordinary insert.
 
 | Type | Structure |
 |---|---|
-| Keyspace, hash, set | `dict::Dict`: entries in a dense `Vec`, found through a hashbrown `HashTable` of positions. Dense storage gives a random entry in O(1) (for `RANDOMKEY`, `SRANDMEMBER`, `SPOP` and eviction sampling), and removal swaps the last entry into the hole. Keys hash with SipHash under a per-postmaster random key, so a client cannot aim keys at one bucket. |
+| Keyspace, hash, set | `dict::Dict`: entries in a dense `Vec`, found through a hashbrown `HashTable` of positions. Dense storage gives a random entry in O(1) (for `RANDOMKEY`, `SRANDMEMBER`, `SPOP` and eviction sampling), and removal swaps the last entry into the hole, except in a listpack-encoded hash or set, which keeps its order ([Order and encodings](#order-and-encodings)). Keys hash with SipHash under a per-postmaster random key, so a client cannot aim keys at one bucket. |
 | List | `deque::Deque`: two stacks back to back, the head reversed. Pushes and pops at either end are O(1) amortised, indexing is O(1). |
 | Sorted set | `zset::ZSet`: a `Dict` from member to score beside the members in `(score, member)` order, kept as sorted blocks of up to 256. An insert moves at most one block; a rank or a score bound costs a walk over the blocks plus a binary search in one. |
 
@@ -479,12 +560,13 @@ client get `BUSY`, on every worker, until it ends or `SCRIPT KILL` /
   one pushed out by newer iterations, starts the iteration over, so elements
   come back again; none is skipped. A Redis cursor carries its whole state and
   can be sent again.
-- **Small hashes and sets keep insertion order only until a removal.** Redis
-  returns a listpack-encoded hash's fields, and a small set's members, in
-  the order they were added, and keeps that order across deletions. The
-  memory half keeps insertion order too, but a removal moves the last entry
-  into the hole; the durable half returns the table's order. Redis documents
-  both as unordered, but a client can observe the difference.
+- **A list that shrinks reports `listpack` sooner.** Redis converts a list
+  from quicklist back to listpack only once it is down to one node of half the
+  size limit. pg_redis does not keep quicklist nodes, and reports `listpack`
+  as soon as the elements fit one node.
+- **`SORT` leaves a sorted set's encoding alone.** Redis converts a listpack
+  sorted set to a skiplist when `SORT` or `SORT_RO` reads it; here it stays a
+  listpack.
 
 ---
 
@@ -666,7 +748,7 @@ mise run parity           # gate: fails on a difference not already recorded
 mise run parity-update    # re-record after fixing or accepting one
 ```
 
-87 cases, 2,010 replies a run, covering every command the parser accepts, the
+93 cases, 2,250 replies a run, covering every command the parser accepts, the
 corner cases the community trips on (empty collections vanishing, duplicate
 arguments, source equal to destination, score and float formatting, what counts
 as an integer, which operations keep a TTL), and the patterns people deploy (rate limiter, session, `SET NX PX` lock, leaderboard, work queue, dedup,
@@ -674,9 +756,13 @@ cache-aside, tag intersection, hash-as-object, time index).
 
 It normalises four things and nothing else:
 
-- **Unordered replies.** `SMEMBERS`, `HGETALL`, `KEYS` and the set-algebra
-  commands have no defined order in Redis, so comparing them verbatim measures
-  two hash-table iteration orders. Sorted before comparison.
+- **Unordered replies.** `KEYS` and the random draws have no order to
+  compare, so they are sorted before comparison. A hash's or set's elements
+  (`SMEMBERS`, `HGETALL`, `HKEYS`, `HVALS`, the set algebra) are compared in
+  order, since both servers keep the same encodings
+  ([Order and encodings](#order-and-encodings)); only a reply from a
+  collection Redis keeps as a hash table, marked `anyOrder` in the case, is
+  sorted first, because two hash tables iterate in their own orders.
 - **Draws and clocks.** `SPOP` without a count, `RANDOMKEY`, `TTL`, `INFO`.
   Only the reply *shape* is compared: the type byte, and an array's length.
 - **Scan cursors.** A `SCAN`-family cursor is a position in each server's own
@@ -922,7 +1008,7 @@ widening a parity or security gap is not worth making.
 closed, and a sharper harness added 10 along the way. Both survivors are the
 same accepted one, once per half: `INCRBYFLOAT` is `f64` where Redis uses
 `long double` (see [phase 2](#phase-2-ranges-shapes-and-ties)). The harness has
-grown since, to 2,010 replies, and still finds 2 differences, both float
+grown since, to 2,250 replies, and still finds 2 differences, both float
 formatting: `INCRBYFLOAT` against x86 Redis, and the last digits of a
 `GEOSEARCHSTORE … STOREDIST` distance against arm64 Redis.
 
@@ -1139,8 +1225,10 @@ is why the pair exists and why `COPY` is routed to the SPI path whatever the
 databases' policies.
 
 **`OBJECT ENCODING` reports Redis's representation names.** `int`,
-`embstr`, `raw`, `listpack`, `quicklist`, `intset`, `hashtable`, `skiplist`,
-derived from the value's shape against Redis's default thresholds. The memory
+`embstr`, `raw`, `listpack`, `quicklist`, `intset`, `hashtable`, `skiplist`.
+A string's and a list's are worked out from the value; a hash's, set's and
+sorted set's are the encoding each one carries, kept as Redis keeps it
+([Order and encodings](#order-and-encodings)). The memory
 half used an inline slot and a chunk pool then, and has used ordinary
 collections in an arena since phase 6; the durable half uses a `bytea` column.
 None of those names describes either. Reporting our own would be truthful but would break every client

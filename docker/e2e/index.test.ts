@@ -4267,20 +4267,22 @@ for (const half of HALVES) {
 			await raw.send("ZADD", "c:z", ...z);
 		}
 
+		// 600: a hash of 512 fields or fewer is a listpack, which HSCAN
+		// returns whole in one call, as Redis does; past that it pages.
 		test("HSCAN, SSCAN and ZSCAN page through a few hundred elements", async () => {
-			await collections(300);
+			await collections(600);
 			const hscan = await iterate(["HSCAN", "c:h", "COUNT", "10"], 2);
 			expect(hscan.calls).toBeGreaterThan(1);
 			const fields = new Map<string, string>();
 			for (let i = 0; i < hscan.items.length; i += 2) {
 				fields.set(hscan.items[i].toString(), hscan.items[i + 1].toString());
 			}
-			expect(fields.size).toBe(300);
-			for (let i = 0; i < 300; i++) expect(fields.get(member(i))).toBe(`v${i}`);
+			expect(fields.size).toBe(600);
+			for (let i = 0; i < 600; i++) expect(fields.get(member(i))).toBe(`v${i}`);
 
 			const sscan = await iterate(["SSCAN", "c:s", "COUNT", "10"], 2);
 			expect(sscan.calls).toBeGreaterThan(1);
-			expect(strings(sscan.items).size).toBe(300);
+			expect(strings(sscan.items).size).toBe(600);
 
 			const zscan = await iterate(["ZSCAN", "c:z", "COUNT", "10"], 2);
 			expect(zscan.calls).toBeGreaterThan(1);
@@ -4288,8 +4290,8 @@ for (const half of HALVES) {
 			for (let i = 0; i < zscan.items.length; i += 2) {
 				scores.set(zscan.items[i].toString(), zscan.items[i + 1].toString());
 			}
-			expect(scores.size).toBe(300);
-			for (let i = 0; i < 300; i++) expect(scores.get(member(i))).toBe(`${i}.5`);
+			expect(scores.size).toBe(600);
+			for (let i = 0; i < 600; i++) expect(scores.get(member(i))).toBe(`${i}.5`);
 
 			// MATCH applies to fields and members; a missing key is empty.
 			const matched = await iterate(["ZSCAN", "c:z", "MATCH", "m00*"], 2);
@@ -4301,7 +4303,7 @@ for (const half of HALVES) {
 		});
 
 		test("removing elements mid-HSCAN, SSCAN and ZSCAN hides none that stayed", async () => {
-			await collections(300);
+			await collections(600);
 			for (const [cmd, key, del] of [
 				["HSCAN", "c:h", "HDEL"],
 				["SSCAN", "c:s", "SREM"],
@@ -4310,17 +4312,255 @@ for (const half of HALVES) {
 				const removed = new Set<string>();
 				const { items } = await iterate([cmd, key, "COUNT", "10"], 2, async (call) => {
 					for (const j of [0, 1]) {
-						const m = member((call * 41 + j * 149) % 300);
+						const m = member((call * 41 + j * 149) % 600);
 						await raw.send(del, key, m);
 						removed.add(m);
 					}
 				});
 				const step = cmd === "SSCAN" ? 1 : 2;
 				const seen = new Set(items.filter((_, i) => i % step === 0).map((b) => b.toString()));
-				for (let i = 0; i < 300; i++) {
+				for (let i = 0; i < 600; i++) {
 					const m = member(i);
 					if (!removed.has(m)) expect(seen.has(m)).toBe(true);
 				}
+			}
+		});
+	});
+}
+
+// ───────────────────── Collection order and encodings ───────────────────────
+//
+// Redis keeps a small hash or set packed — a listpack, or an intset for a
+// set of integers — and converts it to a hash table once it outgrows a
+// threshold, for good. The encoding shows twice: in OBJECT ENCODING, and in
+// the order elements come back, since a listpack keeps insertion order and
+// deletes in place and an intset is sorted. Every expected value here is
+// what redis:7.2-alpine answered for the same commands.
+
+for (const half of HALVES) {
+	describe(`Collection order and encodings (${half})`, () => {
+		beforeAll(async () => {
+			await raw.send("SELECT", half);
+			await raw.send("FLUSHDB");
+		});
+		afterAll(async () => {
+			await raw.send("FLUSHDB");
+			await raw.send("SELECT", "durable");
+		});
+
+		const list = async (...args: string[]) =>
+			(await raw.array(...args)).map((b) => b?.toString());
+		const enc = async (key: string) =>
+			(await raw.bulk("OBJECT", "ENCODING", key))?.toString();
+		const many = (n: number, f: (i: number) => string[]) =>
+			Array.from({ length: n }, (_, i) => f(i)).flat();
+
+		test("a hash keeps insertion order across HDEL and updates", async () => {
+			await raw.send("HSET", "o:h", "c", "1", "a", "2", "b", "3");
+			await raw.send("HDEL", "o:h", "a");
+			await raw.send("HSET", "o:h", "d", "4");
+			await raw.send("HSET", "o:h", "c", "9");
+			expect(await list("HGETALL", "o:h")).toEqual(["c", "9", "b", "3", "d", "4"]);
+			expect(await list("HKEYS", "o:h")).toEqual(["c", "b", "d"]);
+			expect(await list("HVALS", "o:h")).toEqual(["9", "3", "4"]);
+			expect(await enc("o:h")).toBe("listpack");
+			// A listpack is scanned whole in one call, whatever COUNT says.
+			const page = scanReply(await raw.send("HSCAN", "o:h", "0", "COUNT", "1"));
+			expect(page.cursor).toBe("0");
+			expect(page.items.map((b) => b.toString())).toEqual(["c", "9", "b", "3", "d", "4"]);
+			// HRANDFIELD with a count covering the hash returns it in order.
+			expect(await list("HRANDFIELD", "o:h", "10", "WITHVALUES")).toEqual([
+				"c", "9", "b", "3", "d", "4",
+			]);
+		});
+
+		test("a hash grown past the listpack limit and shrunk stays a hashtable", async () => {
+			// 512 fields is Redis 7.2's compiled-in hash-max-listpack-entries.
+			await raw.send("HSET", "o:h129", ...many(129, (i) => [`f${i}`, "v"]));
+			expect(await enc("o:h129")).toBe("listpack");
+			await raw.send("HSET", "o:big", ...many(513, (i) => [`f${i}`, "v"]));
+			expect(await enc("o:big")).toBe("hashtable");
+			await raw.send("HDEL", "o:big", ...many(510, (i) => [`f${i}`]));
+			expect(integerReply(await raw.send("HLEN", "o:big"))).toBe(3);
+			expect(await enc("o:big")).toBe("hashtable");
+			// A value past 64 bytes converts it too, and its removal does not
+			// convert it back.
+			await raw.send("HSET", "o:long", "a", "1", "b", "x".repeat(65));
+			await raw.send("HDEL", "o:long", "b");
+			expect(await enc("o:long")).toBe("hashtable");
+		});
+
+		test("a set of integers is an intset and comes back sorted", async () => {
+			await raw.send("SADD", "o:i", "5", "-3", "100", "2");
+			expect(await list("SMEMBERS", "o:i")).toEqual(["-3", "2", "5", "100"]);
+			expect(await enc("o:i")).toBe("intset");
+			// A string converts it: the integers keep their sorted order and
+			// later members are appended.
+			await raw.send("SADD", "o:i", "x");
+			await raw.send("SADD", "o:i", "1");
+			expect(await list("SMEMBERS", "o:i")).toEqual(["-3", "2", "5", "100", "x", "1"]);
+			expect(await enc("o:i")).toBe("listpack");
+			// Losing the string does not make it an intset again.
+			await raw.send("SREM", "o:i", "x");
+			expect(await enc("o:i")).toBe("listpack");
+			expect(await list("SMEMBERS", "o:i")).toEqual(["-3", "2", "5", "100", "1"]);
+			// Not what Redis reads as integers: a listpack from the start.
+			for (const m of ["007", "-0", "+1", "1.0", "9223372036854775808"]) {
+				await raw.send("DEL", "o:n");
+				await raw.send("SADD", "o:n", m);
+				expect(await enc("o:n")).toBe("listpack");
+			}
+			await raw.send("SADD", "o:edge", "9223372036854775807", "-9223372036854775808");
+			expect(await list("SMEMBERS", "o:edge")).toEqual([
+				"-9223372036854775808",
+				"9223372036854775807",
+			]);
+			expect(await enc("o:edge")).toBe("intset");
+		});
+
+		test("a listpack set removes in place and SSCAN returns it whole", async () => {
+			await raw.send("SADD", "o:l", "c", "a", "b", "d");
+			await raw.send("SREM", "o:l", "a");
+			await raw.send("SADD", "o:l", "e");
+			expect(await list("SMEMBERS", "o:l")).toEqual(["c", "b", "d", "e"]);
+			expect(await enc("o:l")).toBe("listpack");
+			const page = scanReply(await raw.send("SSCAN", "o:l", "0", "COUNT", "1"));
+			expect(page.cursor).toBe("0");
+			expect(page.items.map((b) => b.toString())).toEqual(["c", "b", "d", "e"]);
+			expect(await list("SRANDMEMBER", "o:l", "10")).toEqual(["c", "b", "d", "e"]);
+		});
+
+		test("a set that gained and lost a non-integer reports listpack", async () => {
+			await raw.send("SADD", "o:g", "1", "2");
+			expect(await enc("o:g")).toBe("intset");
+			await raw.send("SADD", "o:g", "x");
+			await raw.send("SREM", "o:g", "x");
+			expect(await enc("o:g")).toBe("listpack");
+			expect(await list("SMEMBERS", "o:g")).toEqual(["1", "2"]);
+		});
+
+		test("sets convert to hashtable for good", async () => {
+			await raw.send("SADD", "o:s200", ...many(200, (i) => [`m${i}`]));
+			expect(await enc("o:s200")).toBe("hashtable");
+			await raw.send("SREM", "o:s200", ...many(197, (i) => [`m${i}`]));
+			expect(await enc("o:s200")).toBe("hashtable");
+			await raw.send("SADD", "o:i512", ...many(512, (i) => [String(i + 1)]));
+			expect(await enc("o:i512")).toBe("intset");
+			await raw.send("SADD", "o:i512", "513");
+			expect(await enc("o:i512")).toBe("hashtable");
+			await raw.send("SADD", "o:long", "a", "x".repeat(65));
+			await raw.send("SREM", "o:long", "x".repeat(65));
+			expect(await enc("o:long")).toBe("hashtable");
+			// SADD sizes a set by the members named, repeats included.
+			await raw.send("SADD", "o:dup", ...many(200, () => ["a"]));
+			expect(await enc("o:dup")).toBe("hashtable");
+		});
+
+		test("set operations come back in the order their result set keeps", async () => {
+			await raw.send("SADD", "o:A", "c", "a", "b", "3", "1");
+			await raw.send("SADD", "o:B", "b", "c", "z");
+			await raw.send("SADD", "o:I", "9", "3", "1");
+			await raw.send("SADD", "o:J", "1", "3", "7");
+			expect(await list("SINTER", "o:A", "o:B")).toEqual(["b", "c"]);
+			expect(await list("SUNION", "o:A", "o:B")).toEqual(["c", "a", "b", "3", "1", "z"]);
+			expect(await list("SDIFF", "o:A", "o:B")).toEqual(["a", "3", "1"]);
+			expect(await list("SINTER", "o:I", "o:J")).toEqual(["1", "3"]);
+			expect(await list("SUNION", "o:I", "o:J")).toEqual(["1", "3", "7", "9"]);
+			expect(await list("SUNION", "o:I", "o:A")).toEqual(["1", "3", "9", "c", "a", "b"]);
+			expect(await list("SDIFF", "o:A", "o:I")).toEqual(["c", "a", "b"]);
+			expect(integerReply(await raw.send("SINTERSTORE", "o:D1", "o:A", "o:B"))).toBe(2);
+			expect(await enc("o:D1")).toBe("listpack");
+			expect(await list("SMEMBERS", "o:D1")).toEqual(["b", "c"]);
+			expect(integerReply(await raw.send("SUNIONSTORE", "o:D2", "o:I", "o:J"))).toBe(4);
+			expect(await enc("o:D2")).toBe("intset");
+			expect(integerReply(await raw.send("SUNIONSTORE", "o:D3", "o:A", "o:B"))).toBe(6);
+			expect(await list("SMEMBERS", "o:D3")).toEqual(["c", "a", "b", "3", "1", "z"]);
+			// A listpack holding only integers, stored by SINTERSTORE or
+			// rebuilt by SUNION, becomes an intset and sorts.
+			await raw.send("SADD", "o:li", "a", "30", "10", "20");
+			await raw.send("SREM", "o:li", "a");
+			expect(await list("SMEMBERS", "o:li")).toEqual(["30", "10", "20"]);
+			expect(await list("SUNION", "o:li")).toEqual(["10", "20", "30"]);
+			expect(integerReply(await raw.send("SINTERSTORE", "o:lo", "o:li", "o:li"))).toBe(3);
+			expect(await enc("o:lo")).toBe("intset");
+			// SPOP of the whole set answers as SUNION would.
+			await raw.send("SADD", "o:q", "a", "3", "1");
+			await raw.send("SREM", "o:q", "a");
+			expect(await list("SPOP", "o:q", "5")).toEqual(["1", "3"]);
+			// SMOVE into an intset converts it the same way SADD does.
+			await raw.send("SADD", "o:sm1", "a", "5");
+			await raw.send("SADD", "o:sm2", "9", "1");
+			await raw.send("SMOVE", "o:sm1", "o:sm2", "a");
+			expect(await list("SMEMBERS", "o:sm2")).toEqual(["1", "9", "a"]);
+			expect(await enc("o:sm2")).toBe("listpack");
+		});
+
+		test("a sorted set converted to skiplist stays one", async () => {
+			await raw.send("ZADD", "o:z", ...many(129, (i) => [String(i), `m${i}`]));
+			expect(await enc("o:z")).toBe("skiplist");
+			await raw.send("ZREMRANGEBYRANK", "o:z", "0", "100");
+			expect(integerReply(await raw.send("ZCARD", "o:z"))).toBe(28);
+			expect(await enc("o:z")).toBe("skiplist");
+			await raw.send("ZADD", "o:zl", "1", "a", "2", "x".repeat(65));
+			await raw.send("ZREM", "o:zl", "x".repeat(65));
+			expect(await enc("o:zl")).toBe("skiplist");
+			await raw.send("ZADD", "o:small", "2", "b", "1", "a", "3", "c");
+			expect(await enc("o:small")).toBe("listpack");
+			const page = scanReply(await raw.send("ZSCAN", "o:small", "0", "COUNT", "1"));
+			expect(page.cursor).toBe("0");
+			expect(page.items.map((b) => b.toString())).toEqual(["a", "1", "b", "2", "c", "3"]);
+			// The whole sorted set from ZRANDMEMBER comes highest first.
+			expect(await list("ZRANDMEMBER", "o:small", "5", "WITHSCORES")).toEqual([
+				"c", "3", "b", "2", "a", "1",
+			]);
+		});
+
+		test("a list is a listpack until it outgrows 8 KB", async () => {
+			await raw.send("RPUSH", "o:list", ...many(200, (i) => [`a${i}`]));
+			expect(await enc("o:list")).toBe("listpack");
+			await raw.send("RPUSH", "o:list2", ...many(90, () => ["x".repeat(100)]));
+			expect(await enc("o:list2")).toBe("quicklist");
+		});
+
+		test("COPY and RENAME keep the encoding, DUMP and RESTORE load it as Redis does", async () => {
+			await raw.send("HSET", "o:hb", ...many(600, (i) => [`f${i}`, "v"]));
+			await raw.send("HDEL", "o:hb", ...many(597, (i) => [`f${i + 3}`]));
+			expect(await enc("o:hb")).toBe("hashtable");
+			await raw.send("COPY", "o:hb", "o:hc");
+			expect(await enc("o:hc")).toBe("hashtable");
+			await raw.send("RENAME", "o:hc", "o:hd");
+			expect(await enc("o:hd")).toBe("hashtable");
+			// A payload loads as Redis's rdbLoadObject would: three fields
+			// fit a listpack.
+			const payload = await raw.bulk("DUMP", "o:hb");
+			expect((await raw.send("RESTORE", "o:he", "0", payload as Buffer)).toString()).toBe(
+				"+OK\r\n",
+			);
+			expect(await enc("o:he")).toBe("listpack");
+			// A listpack's payload keeps its order and its encoding.
+			await raw.send("SADD", "o:sp", "a", "30", "10");
+			await raw.send("SREM", "o:sp", "a");
+			const sp = await raw.bulk("DUMP", "o:sp");
+			await raw.send("RESTORE", "o:sq", "0", sp as Buffer);
+			expect(await list("SMEMBERS", "o:sq")).toEqual(["30", "10"]);
+			expect(await enc("o:sq")).toBe("listpack");
+		});
+
+		test("CONFIG SET moves the thresholds", async () => {
+			try {
+				await raw.send("CONFIG", "SET", "hash-max-listpack-entries", "2");
+				await raw.send("HSET", "o:cs", "a", "1", "b", "2");
+				expect(await enc("o:cs")).toBe("listpack");
+				await raw.send("HSET", "o:cs", "c", "3");
+				expect(await enc("o:cs")).toBe("hashtable");
+				await raw.send("CONFIG", "SET", "set-max-intset-entries", "3");
+				await raw.send("SADD", "o:ci", "1", "2", "3");
+				expect(await enc("o:ci")).toBe("intset");
+				await raw.send("SADD", "o:ci", "4");
+				expect(await enc("o:ci")).toBe("hashtable");
+			} finally {
+				await raw.send("CONFIG", "SET", "hash-max-listpack-entries", "512");
+				await raw.send("CONFIG", "SET", "set-max-intset-entries", "512");
 			}
 		});
 	});

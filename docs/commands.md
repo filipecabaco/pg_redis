@@ -76,7 +76,9 @@ includes streams, which are written in Redis's layout of node listpacks,
 consumer groups, pending entries and consumer times. A Redis stream payload of
 any format since 5.0 restores here. The bytes are not always identical to what
 Redis itself would emit, because valid encodings are not unique (a set's
-member order, for example). `RESTORE` accepts everything a 7.2 produces,
+member order, for example). A hash, set or sorted set is written in the payload
+type its encoding calls for, as Redis writes it, so a listpack or intset
+restores as one with its order. `RESTORE` accepts everything a 7.2 produces,
 listpacks and compressed strings included. It deliberately refuses two kinds of
 payload, with an error: payloads stamped newer than version 11, which is what a
 7.4 produces and Redis 7.2 also refuses, and the compact encodings (ziplists,
@@ -87,12 +89,16 @@ and unused, because there is no LRU or LFU clock to apply them to.
 ### `OBJECT ENCODING`
 
 Reports the encoding **Redis** would use (`int`, `embstr`, `raw`, `listpack`,
-`quicklist`, `intset`, `hashtable` or `skiplist`), derived from the value's
-shape and Redis's default thresholds. pg_redis stores none of those
-representations; it uses its own collections, or a `bytea` column.
-The name is there for clients that branch on it, and says nothing about how
-this server stores the value. A missing key answers nil. That is Redis's own
-reply for this command, though most commands give an error instead.
+`quicklist`, `intset`, `hashtable` or `skiplist`). A hash, set or sorted set
+carries the encoding Redis would have given it, kept as Redis keeps it: it
+converts once it passes Redis's thresholds and never converts back, and the
+thresholds follow `CONFIG SET` of the `*-max-listpack-*` and
+`set-max-intset-entries` parameters. The same state decides the order the
+elements come back in: insertion order for a listpack, sorted for an intset.
+A string's and a list's encoding are worked out from the value. pg_redis
+stores none of those representations; it uses its own collections, or a
+`bytea` column. A missing key answers nil. That is Redis's own reply for this
+command, though most commands give an error instead.
 
 `OBJECT IDLETIME`, `OBJECT FREQ` and `OBJECT REFCOUNT` answer nil for every
 key, present or not. There is no LRU or LFU clock for the first two to read.

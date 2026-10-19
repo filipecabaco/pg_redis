@@ -24,21 +24,22 @@ type Case = { name: string; cmds: Cmd[] };
 
 /**
  * Replies Redis leaves unordered: comparing them verbatim measures two
- * hash-table iteration orders, not two behaviours.
+ * hash-table iteration orders, or two draws, not two behaviours.
+ *
+ * A hash's or set's elements are compared in order: pg_redis keeps the
+ * encoding Redis would have given each one, and with it Redis's order — a
+ * listpack's insertion order, an intset's sorted one. Only a collection
+ * Redis keeps as a hash table has an order of its own, and the cases that
+ * read one mark the command with `anyOrder`.
  */
-const UNORDERED = new Set([
-	"SMEMBERS",
-	"SUNION",
-	"SINTER",
-	"SDIFF",
-	"HGETALL",
-	"HKEYS",
-	"HVALS",
-	"KEYS",
-	"ZRANDMEMBER",
-	"SRANDMEMBER",
-	"SPOP",
-]);
+const UNORDERED = new Set(["KEYS", "ZRANDMEMBER", "SRANDMEMBER", "SPOP"]);
+
+/** Commands whose array reply compares in any order: see `UNORDERED`. */
+const anyOrdered = new WeakSet<Cmd>();
+const anyOrder = (cmd: Cmd): Cmd => {
+	anyOrdered.add(cmd);
+	return cmd;
+};
 
 /** Draws, clocks and builds: only the reply shape is comparable. `TIME` is
  * two clocks, and `DUMP` two valid spellings of one value — a hashtable's
@@ -191,7 +192,7 @@ function normalize(cmd: Cmd, reply: Buffer): string {
 	if ((name === "SPOP" || name === "SRANDMEMBER") && cmd.length > 2) {
 		return shape(reply);
 	}
-	if (UNORDERED.has(name) && reply[0] === 0x2a) {
+	if ((UNORDERED.has(name) || anyOrdered.has(cmd)) && reply[0] === 0x2a) {
 		return `*[${elements(reply).sort().join("|")}]`;
 	}
 	if (name === "FUNCTION" && cmd[1]?.toUpperCase() === "LIST" && reply[0] === 0x2a) {
@@ -533,6 +534,154 @@ c(
 	["SMEMBERS", "s2"],
 	["SMOVE", "s2", "s2", "c"],
 	["SMEMBERS", "s2"],
+);
+
+// ─────────────────────────── Order and encodings ────────────────────────────
+//
+// A small hash or set is a listpack (or an intset, for integers) until it
+// outgrows Redis's thresholds, and a hash table after, for good. Both the
+// order of the elements and OBJECT ENCODING show which.
+
+const many = (n: number, f: (i: number) => string[]) =>
+	Array.from({ length: n }, (_, i) => f(i)).flat();
+
+c(
+	"hash order across deletes and updates",
+	["HSET", "h", "c", "1", "a", "2", "b", "3"],
+	["HDEL", "h", "a"],
+	["HSET", "h", "d", "4"],
+	["HSET", "h", "c", "9"],
+	["HGETALL", "h"],
+	["HKEYS", "h"],
+	["HVALS", "h"],
+	["OBJECT", "ENCODING", "h"],
+	["HSCAN", "h", "0", "COUNT", "1"],
+	["HRANDFIELD", "h", "10", "WITHVALUES"],
+	["HSET", "n", "x", "1", "y", "2", "x", "3"],
+	["HGETALL", "n"],
+);
+c(
+	"a hash converted to a hashtable stays one",
+	["HSET", "h129", ...many(129, (i) => [`f${i}`, "v"])],
+	["OBJECT", "ENCODING", "h129"],
+	["HSET", "big", ...many(513, (i) => [`f${i}`, "v"])],
+	["OBJECT", "ENCODING", "big"],
+	["HDEL", "big", ...many(510, (i) => [`f${i}`])],
+	["OBJECT", "ENCODING", "big"],
+	anyOrder(["HGETALL", "big"]),
+	["HSET", "long", "a", "1", "b", "x".repeat(65)],
+	["HDEL", "long", "b"],
+	["OBJECT", "ENCODING", "long"],
+	["HINCRBY", "inc", "f".repeat(65), "1"],
+	["OBJECT", "ENCODING", "inc"],
+	["COPY", "big", "big2"],
+	["OBJECT", "ENCODING", "big2"],
+	["RENAME", "big2", "big3"],
+	["OBJECT", "ENCODING", "big3"],
+);
+c(
+	"set order through intset and listpack",
+	["SADD", "s", "5", "-3", "100", "2"],
+	["SMEMBERS", "s"],
+	["OBJECT", "ENCODING", "s"],
+	["SADD", "s", "x"],
+	["SADD", "s", "1"],
+	["SMEMBERS", "s"],
+	["OBJECT", "ENCODING", "s"],
+	["SREM", "s", "x"],
+	["SMEMBERS", "s"],
+	["OBJECT", "ENCODING", "s"],
+	["SSCAN", "s", "0", "COUNT", "1"],
+	["SADD", "l", "c", "a", "b", "d"],
+	["SREM", "l", "a"],
+	["SADD", "l", "e"],
+	["SMEMBERS", "l"],
+	["OBJECT", "ENCODING", "l"],
+	["SADD", "q", "a", "3", "1"],
+	["SREM", "q", "a"],
+	["SMEMBERS", "q"],
+	["SUNION", "q"],
+	["SDIFF", "q", "missing"],
+	["SADD", "odd", "007", "-0", "+1"],
+	["OBJECT", "ENCODING", "odd"],
+	["SADD", "edge", "9223372036854775807", "-9223372036854775808"],
+	["SMEMBERS", "edge"],
+	["SADD", "sm1", "a", "5"],
+	["SADD", "sm2", "9", "1"],
+	["SMOVE", "sm1", "sm2", "a"],
+	["SMEMBERS", "sm2"],
+	["OBJECT", "ENCODING", "sm2"],
+	["SORT", "sm2", "BY", "nosort"],
+);
+c(
+	"set operations build their results as Redis does",
+	["SADD", "A", "c", "a", "b", "3", "1"],
+	["SADD", "B", "b", "c", "z"],
+	["SADD", "I", "9", "3", "1"],
+	["SADD", "J", "1", "3", "7"],
+	["SINTER", "A", "B"],
+	["SINTER", "B", "A"],
+	["SUNION", "A", "B"],
+	["SUNION", "B", "A"],
+	["SDIFF", "A", "B"],
+	["SINTER", "I", "J"],
+	["SUNION", "I", "J"],
+	["SUNION", "I", "A"],
+	["SDIFF", "A", "I"],
+	["SINTERSTORE", "D1", "A", "B"],
+	["OBJECT", "ENCODING", "D1"],
+	["SMEMBERS", "D1"],
+	["SUNIONSTORE", "D2", "I", "J"],
+	["OBJECT", "ENCODING", "D2"],
+	["SMEMBERS", "D2"],
+	["SUNIONSTORE", "D3", "A", "B"],
+	["OBJECT", "ENCODING", "D3"],
+	["SMEMBERS", "D3"],
+	["SDIFFSTORE", "D4", "A", "B"],
+	["OBJECT", "ENCODING", "D4"],
+	["SMEMBERS", "D4"],
+	["SADD", "li", "a", "30", "10", "20"],
+	["SREM", "li", "a"],
+	["SINTERSTORE", "lo", "li", "li"],
+	["OBJECT", "ENCODING", "lo"],
+	["SMEMBERS", "lo"],
+);
+c(
+	"a set converted to a hashtable stays one",
+	["SADD", "big", ...many(200, (i) => [`m${i}`])],
+	["OBJECT", "ENCODING", "big"],
+	["SREM", "big", ...many(197, (i) => [`m${i}`])],
+	["OBJECT", "ENCODING", "big"],
+	anyOrder(["SMEMBERS", "big"]),
+	["SADD", "ints", ...many(512, (i) => [String(i + 1)])],
+	["OBJECT", "ENCODING", "ints"],
+	["SADD", "ints", "513"],
+	["OBJECT", "ENCODING", "ints"],
+	["SADD", "dup", ...many(200, () => ["a"])],
+	["OBJECT", "ENCODING", "dup"],
+	["SADD", "long", "a", "x".repeat(65)],
+	["SREM", "long", "x".repeat(65)],
+	["OBJECT", "ENCODING", "long"],
+);
+c(
+	"sorted set and list encodings",
+	["ZADD", "z", ...many(129, (i) => [String(i), `m${i}`])],
+	["OBJECT", "ENCODING", "z"],
+	["ZREMRANGEBYRANK", "z", "0", "100"],
+	["OBJECT", "ENCODING", "z"],
+	["ZADD", "zl", "1", "a", "2", "x".repeat(65)],
+	["ZREM", "zl", "x".repeat(65)],
+	["OBJECT", "ENCODING", "zl"],
+	["ZADD", "up", ...many(100, (i) => [String(i), `m${i}`])],
+	["ZADD", "up", ...many(50, (i) => [String(i + 1000), `m${i}`])],
+	["OBJECT", "ENCODING", "up"],
+	["ZADD", "small", "2", "b", "1", "a", "3", "c"],
+	["ZSCAN", "small", "0", "COUNT", "1"],
+	["ZRANDMEMBER", "small", "5", "WITHSCORES"],
+	["RPUSH", "list", ...many(200, (i) => [`a${i}`])],
+	["OBJECT", "ENCODING", "list"],
+	["RPUSH", "list2", ...many(90, () => ["x".repeat(100)])],
+	["OBJECT", "ENCODING", "list2"],
 );
 
 // ─────────────────────────────── Sorted set ─────────────────────────────────

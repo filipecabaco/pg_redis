@@ -119,7 +119,32 @@ const ANSI = /\x1b\[[0-9;]*m/g;
  * after it. Put back what pg_redis acts on, as a fresh server would have it.
  */
 async function resetConfig(): Promise<void> {
-	const cmd = ["CONFIG", "SET", "maxmemory", "0", "maxmemory-policy", "noeviction"];
+	const cmd = [
+		"CONFIG",
+		"SET",
+		"maxmemory",
+		"0",
+		"maxmemory-policy",
+		"noeviction",
+		// The encoding thresholds, which the hash, set and zset files change
+		// for a test and leave for the next file's fresh server to forget.
+		"hash-max-listpack-entries",
+		"512",
+		"hash-max-listpack-value",
+		"64",
+		"set-max-intset-entries",
+		"512",
+		"set-max-listpack-entries",
+		"128",
+		"set-max-listpack-value",
+		"64",
+		"zset-max-listpack-entries",
+		"128",
+		"zset-max-listpack-value",
+		"64",
+		"list-max-listpack-size",
+		"-2",
+	];
 	const wire = `*${cmd.length}\r\n${cmd.map((a) => `$${a.length}\r\n${a}\r\n`).join("")}`;
 	await new Promise<void>((resolve) => {
 		Bun.connect({

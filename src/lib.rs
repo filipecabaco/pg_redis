@@ -1019,7 +1019,9 @@ mod tests {
     const SCAN_DB: u8 = 13;
 
     fn clear_scan_db() {
-        for tbl in ["kv", "hash", "list", "set", "zset", "stream", "expiry"] {
+        for tbl in [
+            "kv", "hash", "list", "set", "zset", "stream", "expiry", "encoding",
+        ] {
             Spi::run(&format!("DELETE FROM redis.{tbl}_{SCAN_DB}")).unwrap();
         }
     }
@@ -1223,11 +1225,14 @@ mod tests {
              INSERT INTO redis.zset_{db} (key, member, score) \
                SELECT 'z', convert_to('m' || lpad(i::text, 3, '0'), 'UTF8'), i + 0.5 \
                  FROM generate_series(1, 300) i; \
-             INSERT INTO redis.kv_{db} (key, value) VALUES ('str', 'v')"
+             INSERT INTO redis.kv_{db} (key, value) VALUES ('str', 'v'); \
+             INSERT INTO redis.encoding_{db} (key, encoding) VALUES ('h', 3)"
         ))
         .unwrap();
 
-        // HSCAN: field, value pairs; delete fields as it goes.
+        // HSCAN: field, value pairs; delete fields as it goes. 300 fields fit
+        // a listpack, which HSCAN would return whole; the row makes it a hash
+        // table, as one grown past 512 and shrunk is.
         let mut deleted = std::collections::BTreeSet::new();
         let (flat, calls) = iterate(&[b"HSCAN", b"h", b"COUNT", b"10"], 2, |call| {
             let field = format!("f{:03}", (call * 53) % 300 + 1);
@@ -1294,6 +1299,290 @@ mod tests {
             other => panic!("ZSCAN on a string answered {other:?}"),
         }
         clear_scan_db();
+    }
+
+    // ───────────────────── Order and encodings on the tables ─────────────────────
+    //
+    // The order a hash's fields and a set's members come back in on the
+    // tables, and the encoding `OBJECT ENCODING` reports, against what Redis
+    // 7.2 answers.
+
+    /// The database these tests use: logged by default, and touched by no
+    /// other test.
+    const ORDER_DB: u8 = 12;
+
+    fn clear_order_db() {
+        for db in [ORDER_DB, ORDER_DB - 1] {
+            for tbl in [
+                "kv", "hash", "list", "set", "zset", "stream", "expiry", "encoding",
+            ] {
+                Spi::run(&format!("DELETE FROM redis.{tbl}_{db}")).unwrap();
+            }
+        }
+    }
+
+    fn run_line(line: &str) -> crate::commands::Response {
+        run_order_argv(line.split(' ').map(|p| p.as_bytes().to_vec()).collect())
+    }
+
+    fn run_order_argv(argv: Vec<Vec<u8>>) -> crate::commands::Response {
+        let cmd = crate::commands::Command::parse(argv).unwrap();
+        Spi::connect_mut(|c| cmd.execute(c, ORDER_DB))
+    }
+
+    fn order_words(prefix: &str, items: impl Iterator<Item = String>) -> String {
+        std::iter::once(prefix.to_string())
+            .chain(items)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn order_bulks(r: crate::commands::Response) -> Vec<String> {
+        match r {
+            crate::commands::Response::Array(v) => v
+                .into_iter()
+                .map(|b| String::from_utf8(b.unwrap_or_default()).unwrap())
+                .collect(),
+            other => panic!("not an array: {other:?}"),
+        }
+    }
+
+    fn order_encoding(key: &str) -> String {
+        match run_line(&format!("OBJECT ENCODING {key}")) {
+            crate::commands::Response::BulkString(v) => String::from_utf8(v).unwrap(),
+            other => panic!("not a bulk string: {other:?}"),
+        }
+    }
+
+    fn order_row(db: u8, key: &str) -> Option<i16> {
+        Spi::get_one_with_args::<i16>(
+            &format!("SELECT (SELECT encoding FROM redis.encoding_{db} WHERE key = $1)"),
+            &[key.as_bytes().into()],
+        )
+        .unwrap()
+    }
+
+    #[pg_test]
+    fn hash_fields_keep_insertion_order_through_deletes_and_updates() {
+        clear_order_db();
+        run_line("HSET h c 1 a 2 b 3");
+        run_line("HDEL h a");
+        run_line("HSET h d 4");
+        run_line("HSET h c 9");
+        assert_eq!(order_bulks(run_line("HKEYS h")), ["c", "b", "d"]);
+        assert_eq!(order_bulks(run_line("HVALS h")), ["9", "3", "4"]);
+        assert_eq!(
+            order_bulks(run_line("HGETALL h")),
+            ["c", "9", "b", "3", "d", "4"]
+        );
+        assert_eq!(order_encoding("h"), "listpack");
+        assert_eq!(
+            order_row(ORDER_DB, "h"),
+            None,
+            "a listpack hash needs no row"
+        );
+        // HSCAN returns a listpack whole, in order, whatever COUNT asks.
+        match run_line("HSCAN h 0 COUNT 1") {
+            crate::commands::Response::ScanResult { cursor, keys } => {
+                assert_eq!(cursor, 0);
+                assert_eq!(keys.len(), 6);
+            }
+            other => panic!("{other:?}"),
+        }
+        // A field named twice stays where it was first named.
+        run_line("HSET n x 1 y 2 x 3");
+        assert_eq!(order_bulks(run_line("HGETALL n")), ["x", "3", "y", "2"]);
+        clear_order_db();
+    }
+
+    #[pg_test]
+    fn a_hash_grown_past_the_limit_stays_a_hashtable() {
+        clear_order_db();
+        run_line(&order_words(
+            "HSET big",
+            (0..513).map(|i| format!("f{i} v")),
+        ));
+        assert_eq!(order_encoding("big"), "hashtable");
+        run_line(&order_words("HDEL big", (3..513).map(|i| format!("f{i}"))));
+        assert_eq!(order_encoding("big"), "hashtable");
+        assert_eq!(order_row(ORDER_DB, "big"), Some(3));
+        run_line(&format!("HSET long a 1 b {}", "x".repeat(65)));
+        run_line("HDEL long b");
+        assert_eq!(order_encoding("long"), "hashtable");
+        // The row goes with the last field, so the next hash of that name
+        // starts as a listpack.
+        run_line("HDEL long a");
+        assert_eq!(order_row(ORDER_DB, "long"), None);
+        run_line("HSET long a 1");
+        assert_eq!(order_encoding("long"), "listpack");
+        // DEL takes the row too.
+        run_line("DEL big");
+        assert_eq!(order_row(ORDER_DB, "big"), None);
+        clear_order_db();
+    }
+
+    #[pg_test]
+    fn sets_come_back_as_intsets_and_listpacks_would_have_them() {
+        clear_order_db();
+        run_line("SADD s 5 -3 100 2");
+        assert_eq!(order_bulks(run_line("SMEMBERS s")), ["-3", "2", "5", "100"]);
+        assert_eq!(order_encoding("s"), "intset");
+        assert_eq!(order_row(ORDER_DB, "s"), None, "an intset needs no row");
+        // A string makes it a listpack, the integers first in sorted order.
+        run_line("SADD s x 1");
+        assert_eq!(order_encoding("s"), "listpack");
+        assert_eq!(
+            order_bulks(run_line("SMEMBERS s")),
+            ["-3", "2", "5", "100", "x", "1"]
+        );
+        // Without the string it stays a listpack, in its order.
+        run_line("SREM s x 100");
+        assert_eq!(order_bulks(run_line("SMEMBERS s")), ["-3", "2", "5", "1"]);
+        assert_eq!(order_encoding("s"), "listpack");
+        match run_line("SSCAN s 0 COUNT 1") {
+            crate::commands::Response::ScanResult { cursor, keys } => {
+                assert_eq!((cursor, keys.len()), (0, 4))
+            }
+            other => panic!("{other:?}"),
+        }
+        // SUNION builds an intset of the integers, so sorts them.
+        assert_eq!(order_bulks(run_line("SUNION s")), ["-3", "1", "2", "5"]);
+        run_line("SADD l c a b d");
+        run_line("SREM l a");
+        run_line("SADD l e");
+        assert_eq!(order_bulks(run_line("SMEMBERS l")), ["c", "b", "d", "e"]);
+        assert_eq!(
+            order_bulks(run_line("SRANDMEMBER l 10")),
+            ["c", "b", "d", "e"]
+        );
+        run_line("SADD A c a b 3 1");
+        run_line("SADD B b c z");
+        assert_eq!(order_bulks(run_line("SINTER A B")), ["b", "c"]);
+        assert_eq!(
+            order_bulks(run_line("SUNION A B")),
+            ["c", "a", "b", "3", "1", "z"]
+        );
+        assert_eq!(order_bulks(run_line("SDIFF A B")), ["a", "3", "1"]);
+        run_line("SADD I 9 3 1");
+        assert_eq!(
+            order_bulks(run_line("SUNION I A")),
+            ["1", "3", "9", "c", "a", "b"]
+        );
+        run_line("SDIFFSTORE D A B");
+        assert_eq!(order_bulks(run_line("SMEMBERS D")), ["a", "3", "1"]);
+        assert_eq!(order_encoding("D"), "listpack");
+        run_line("SADD li a 30 10 20");
+        run_line("SREM li a");
+        run_line("SINTERSTORE lo li li");
+        assert_eq!(order_encoding("lo"), "intset");
+        assert_eq!(order_bulks(run_line("SMEMBERS lo")), ["10", "20", "30"]);
+        clear_order_db();
+    }
+
+    #[pg_test]
+    fn sets_convert_once_and_stay_converted() {
+        clear_order_db();
+        run_line(&order_words("SADD big", (0..200).map(|i| format!("m{i}"))));
+        assert_eq!(order_encoding("big"), "hashtable");
+        run_line(&order_words("SREM big", (3..200).map(|i| format!("m{i}"))));
+        assert_eq!(order_encoding("big"), "hashtable");
+        run_line(&order_words("SADD ints", (1..=513).map(|i| i.to_string())));
+        assert_eq!(order_encoding("ints"), "hashtable");
+        run_line(&order_words("SADD dup", (0..200).map(|_| "a".to_string())));
+        assert_eq!(order_encoding("dup"), "hashtable");
+        run_line("SADD mix a 1");
+        run_line("SREM mix a");
+        assert_eq!(order_encoding("mix"), "listpack");
+        run_line("SMOVE mix dst 1");
+        assert_eq!(order_encoding("dst"), "intset");
+        // Once a listpack, always one: moving the string out again leaves
+        // the integer in a listpack.
+        run_line("SADD dst x");
+        run_line("SMOVE dst mix x");
+        assert_eq!(order_encoding("dst"), "listpack");
+        assert_eq!(order_bulks(run_line("SMEMBERS mix")), ["x"]);
+        clear_order_db();
+    }
+
+    #[pg_test]
+    fn sorted_sets_stay_skiplists() {
+        clear_order_db();
+        run_line(&order_words(
+            "ZADD z",
+            (0..129).map(|i| format!("{i} m{i}")),
+        ));
+        assert_eq!(order_encoding("z"), "skiplist");
+        run_line("ZREMRANGEBYRANK z 0 100");
+        assert_eq!(order_encoding("z"), "skiplist");
+        run_line("ZADD small 2 b 1 a");
+        assert_eq!(order_encoding("small"), "listpack");
+        match run_line("ZSCAN small 0 COUNT 1") {
+            crate::commands::Response::ScanResult { cursor, keys } => {
+                assert_eq!((cursor, keys.len()), (0, 4))
+            }
+            other => panic!("{other:?}"),
+        }
+        run_line(&format!("ZINCRBY small 1 {}", "x".repeat(65)));
+        assert_eq!(order_encoding("small"), "skiplist");
+        clear_order_db();
+    }
+
+    /// RENAME, COPY and MOVE keep a converted key converted; a DUMP payload
+    /// restores as Redis loads one, a small hash table as a listpack.
+    #[pg_test]
+    fn whole_key_moves_keep_the_encoding_and_the_order() {
+        clear_order_db();
+        run_line(&order_words("HSET h", (0..600).map(|i| format!("f{i} v"))));
+        run_line(&order_words("HDEL h", (3..600).map(|i| format!("f{i}"))));
+        run_line("RENAME h h2");
+        assert_eq!(order_encoding("h2"), "hashtable");
+        assert_eq!(order_row(ORDER_DB, "h"), None);
+        run_line("COPY h2 h3");
+        assert_eq!(order_encoding("h3"), "hashtable");
+        let payload = match run_line("DUMP h2") {
+            crate::commands::Response::BulkString(p) => p,
+            other => panic!("{other:?}"),
+        };
+        run_order_argv(vec![
+            b"RESTORE".to_vec(),
+            b"h4".to_vec(),
+            b"0".to_vec(),
+            payload,
+        ]);
+        assert_eq!(order_encoding("h4"), "listpack");
+
+        run_line("SADD s z 3 1");
+        run_line("SREM s z");
+        run_line("COPY s s2");
+        assert_eq!(order_bulks(run_line("SMEMBERS s2")), ["3", "1"]);
+        assert_eq!(order_encoding("s2"), "listpack");
+        let payload = match run_line("DUMP s") {
+            crate::commands::Response::BulkString(p) => p,
+            other => panic!("{other:?}"),
+        };
+        run_order_argv(vec![
+            b"RESTORE".to_vec(),
+            b"s3".to_vec(),
+            b"0".to_vec(),
+            payload,
+        ]);
+        assert_eq!(order_bulks(run_line("SMEMBERS s3")), ["3", "1"]);
+        assert_eq!(order_encoding("s3"), "listpack");
+        run_line(&format!("MOVE h2 {}", ORDER_DB - 1));
+        assert_eq!(order_row(ORDER_DB - 1, "h2"), Some(3));
+        clear_order_db();
+    }
+
+    #[pg_test]
+    fn config_set_moves_the_thresholds() {
+        clear_order_db();
+        run_line("CONFIG SET hash-max-listpack-entries 2");
+        run_line("HSET cs a 1 b 2");
+        assert_eq!(order_encoding("cs"), "listpack");
+        run_line("HSET cs c 3");
+        assert_eq!(order_encoding("cs"), "hashtable");
+        run_line("CONFIG SET hash-max-listpack-entries 512");
+        clear_order_db();
     }
 }
 

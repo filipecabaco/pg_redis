@@ -267,6 +267,12 @@ pub struct ServerCtl {
     flush_epochs: [AtomicU64; 16],
     /// `notify-keyspace-events`, parsed: read before every command.
     notify_flags: AtomicU32,
+    /// The `*-max-listpack-*` and `set-max-intset-entries` thresholds, read
+    /// on every collection write (`memdb::encoding::Limits`). Written
+    /// together under the config lock, and `enc_limits_set` is 0 until
+    /// a `CONFIG SET` names one, which means Redis's defaults.
+    enc_limits: [AtomicI64; crate::memdb::encoding::LIMIT_COUNT],
+    enc_limits_set: AtomicU32,
     /// Clients with tracking on: when 0, no write looks at the table.
     pub tracking_clients: AtomicU32,
     pub track_lock: AtomicU32,
@@ -1269,6 +1275,29 @@ pub fn flush_epoch(db: u8) -> u64 {
     ctl()
         .and_then(|c| c.flush_epochs.get(db as usize))
         .map_or(0, |e| e.load(Ordering::Acquire))
+}
+
+/// Publish the encoding thresholds a `CONFIG SET` changed.
+pub fn set_enc_limits(values: [i64; crate::memdb::encoding::LIMIT_COUNT]) {
+    if let Some(ctl) = ctl() {
+        spin_lock(&ctl.config_lock);
+        for (slot, v) in ctl.enc_limits.iter().zip(values) {
+            slot.store(v, Ordering::Relaxed);
+        }
+        ctl.enc_limits_set.store(1, Ordering::Release);
+        spin_unlock(&ctl.config_lock);
+    }
+}
+
+/// The encoding thresholds, or `None` while they are Redis's defaults.
+pub fn enc_limits() -> Option<[i64; crate::memdb::encoding::LIMIT_COUNT]> {
+    let ctl = ctl()?;
+    if ctl.enc_limits_set.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    Some(std::array::from_fn(|i| {
+        ctl.enc_limits[i].load(Ordering::Relaxed)
+    }))
 }
 
 pub fn set_notify_flags(flags: u32) {

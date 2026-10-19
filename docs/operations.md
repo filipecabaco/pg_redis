@@ -106,12 +106,13 @@ data only while that database's policy is `logged`. Keys, fields, members and va
 | Table | Columns | Holds |
 |-------|---------|-------|
 | `redis.kv_N` | `key`, `value`, `expires_at` | Strings, with their expiry |
-| `redis.hash_N` | `key`, `field`, `value` | Hashes, one row per field |
+| `redis.hash_N` | `key`, `field`, `value`, `seq` | Hashes, one row per field |
 | `redis.list_N` | `key`, `pos`, `value` | Lists, one row per element, ordered by `pos` |
-| `redis.set_N` | `key`, `member` | Sets, one row per member |
+| `redis.set_N` | `key`, `member`, `seq` | Sets, one row per member |
 | `redis.zset_N` | `key`, `member`, `score` | Sorted sets, one row per member |
 | `redis.stream_N` | `key`, `value` | Streams, one serialised value per stream |
 | `redis.expiry_N` | `key`, `expires_at` | The expiry of every hash, list, set, sorted set and stream key that has one |
+| `redis.encoding_N` | `key`, `encoding` | The encoding of a hash, set or sorted set whose contents no longer show it |
 
 A string's expiry is the `expires_at` column of `redis.kv_N`, `NULL` when it has none. The
 other types keep theirs in `redis.expiry_N`, and a key with no expiry has no row there. A key
@@ -131,6 +132,26 @@ SELECT convert_from(h.key, 'UTF8') AS key,
 FROM redis.hash_8 h
 LEFT JOIN redis.expiry_8 e ON e.key = h.key
 WHERE e.expires_at IS NULL OR e.expires_at > now();
+```
+
+A hash's fields and a set's members come back in the order Redis would give
+them, and `seq` records it: it is set when a field or member is added and kept
+when a field's value changes, so `ORDER BY seq` is insertion order. A set of
+integers that Redis would keep as an intset comes back sorted by value
+instead. `redis.encoding_N` holds a row only for a key whose encoding its
+contents no longer show: `3` for a hash or set that grew past Redis's listpack
+limits and stays a hash table, `4` for such a sorted set, and `1` for a
+listpack set that holds an integer. `OBJECT ENCODING` reads it
+([Order and encodings](IMPLEMENTATION.md#order-and-encodings)). Neither needs
+setting by hand: a row written from SQL takes the next `seq`, and a key with
+no encoding row is in the encoding its contents imply.
+
+```sql
+-- A hash's fields in database 8, in the order HGETALL returns them
+SELECT convert_from(field, 'UTF8') AS field, convert_from(value, 'UTF8') AS value
+FROM redis.hash_8
+WHERE key = convert_to('user:1', 'UTF8')
+ORDER BY seq;
 ```
 
 `memory` and `memory+snapshot` databases have no rows in these tables. A `memory+snapshot`

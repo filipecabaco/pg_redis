@@ -15,6 +15,7 @@
 mod db;
 pub mod deque;
 pub mod dict;
+pub mod encoding;
 pub mod zset;
 
 pub use db::{Db, take_reaped};

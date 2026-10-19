@@ -1,16 +1,18 @@
 //! Redis's `DUMP`/`RESTORE` payload format: an RDB-serialised value, a
 //! two-byte format version, and a CRC-64 of everything before it.
 //!
-//! The two directions are deliberately asymmetric. What we *emit* is the
-//! narrowest set of encodings a real Redis 7.2 accepts — raw strings, plain
-//! sets and hashes, binary-double sorted sets, lists as quicklists of plain
-//! nodes, and streams as Redis lays them out — because a payload only has to
-//! be valid, not identical to the one Redis itself would build. Byte identity
-//! is not even possible: a hashtable-backed set serialises in iteration
-//! order, which is seeded per process. What we *accept* is wider: everything
-//! 7.2 emits, which for small collections means listpacks, plus intsets,
-//! LZF-compressed and integer-packed strings, the ASCII-double sorted sets of
-//! older servers, and the stream formats of 5.0 and 7.0.
+//! The two directions are deliberately asymmetric. What we *emit* follows
+//! the collection's encoding (`memdb::encoding`) as Redis's `rdbSaveObject`
+//! does: an intset or a listpack for a set, hash or sorted set that is one,
+//! so a restore gets the same encoding back and the same order, and plain
+//! sets, hashes and binary-double sorted sets otherwise. Strings are raw and
+//! lists are quicklists of plain nodes, because a payload only has to be
+//! valid, not identical to the one Redis itself would build. Byte identity is
+//! not even possible: a hashtable-backed set serialises in iteration order,
+//! which is seeded per process. What we *accept* is wider: everything 7.2
+//! emits, plus LZF-compressed and integer-packed strings, the ASCII-double
+//! sorted sets of older servers, and the stream formats of 5.0 and 7.0. A
+//! payload restores in the encoding Redis's `rdbLoadObject` would give it.
 //!
 //! The version footer is 11 — what Redis 7.2.5, the version this server
 //! reports, writes — and anything newer is refused, exactly as 7.2.5 refuses
@@ -23,6 +25,7 @@
 #![forbid(unsafe_code)]
 
 use crate::commands::KeyDump;
+use crate::memdb::encoding::{self, Enc, Limits};
 
 /// What Redis 7.2.5 stamps on every payload it emits, and the newest this
 /// module admits.
@@ -201,6 +204,26 @@ fn backlen_size(l: usize) -> usize {
     }
 }
 
+/// The bytes one element takes in a listpack, its trailing length included:
+/// what `listpack_build` writes for it.
+pub fn listpack_entry_len(e: &[u8]) -> usize {
+    let l = match lp_int_value(e) {
+        Some(v) if (0..=127).contains(&v) => 1,
+        Some(v) if (-4096..=4095).contains(&v) => 2,
+        Some(v) if i16::try_from(v).is_ok() => 3,
+        Some(v) if (-(1 << 23)..(1 << 23)).contains(&v) => 4,
+        Some(v) if i32::try_from(v).is_ok() => 5,
+        Some(_) => 9,
+        None if e.len() < 64 => 1 + e.len(),
+        None if e.len() < 4096 => 2 + e.len(),
+        None => 5 + e.len(),
+    };
+    l + backlen_size(l)
+}
+
+/// A listpack's header and terminator: total bytes, element count, `0xFF`.
+pub const LISTPACK_OVERHEAD: usize = 7;
+
 /// A listpack of `elements`, each in the encoding `lpAppend` picks for it:
 /// integers in the narrowest width that holds them, strings behind the
 /// shortest length prefix, every entry followed by its own length.
@@ -261,6 +284,30 @@ fn listpack_build(elements: &[Vec<u8>]) -> Vec<u8> {
     out
 }
 
+/// An intset of `items`, which must all be integers: the narrowest width
+/// that holds every one, then the values in ascending order.
+fn intset_build(items: &[Vec<u8>]) -> Option<Vec<u8>> {
+    let mut vals: Vec<i64> = items
+        .iter()
+        .map(|m| crate::memdb::parse_stored_int(m))
+        .collect::<Option<_>>()?;
+    vals.sort_unstable();
+    let width: usize = if vals.iter().all(|v| i16::try_from(*v).is_ok()) {
+        2
+    } else if vals.iter().all(|v| i32::try_from(*v).is_ok()) {
+        4
+    } else {
+        8
+    };
+    let mut out = Vec::with_capacity(8 + width * vals.len());
+    out.extend_from_slice(&(width as u32).to_le_bytes());
+    out.extend_from_slice(&(vals.len() as u32).to_le_bytes());
+    for v in vals {
+        out.extend_from_slice(&v.to_le_bytes()[..width]);
+    }
+    Some(out)
+}
+
 /// One key's value as a `RESTORE`-ready payload: object, version, CRC.
 pub fn serialize(dump: &KeyDump) -> Vec<u8> {
     let mut out = Vec::new();
@@ -279,14 +326,32 @@ pub fn serialize(dump: &KeyDump) -> Vec<u8> {
                 write_string(&mut out, item);
             }
         }
-        KeyDump::Set(items) => {
-            out.push(TYPE_SET);
-            write_len(&mut out, items.len() as u64);
-            for item in items {
-                write_string(&mut out, item);
+        KeyDump::Set(items, enc) => match (enc, intset_build(items)) {
+            (Enc::Intset, Some(blob)) => {
+                out.push(TYPE_SET_INTSET);
+                write_string(&mut out, &blob);
             }
+            (Enc::Listpack, _) => {
+                out.push(TYPE_SET_LISTPACK);
+                write_string(&mut out, &listpack_build(items));
+            }
+            _ => {
+                out.push(TYPE_SET);
+                write_len(&mut out, items.len() as u64);
+                for item in items {
+                    write_string(&mut out, item);
+                }
+            }
+        },
+        KeyDump::Hash(pairs, Enc::Listpack) => {
+            out.push(TYPE_HASH_LISTPACK);
+            let flat: Vec<Vec<u8>> = pairs
+                .iter()
+                .flat_map(|(f, v)| [f.clone(), v.clone()])
+                .collect();
+            write_string(&mut out, &listpack_build(&flat));
         }
-        KeyDump::Hash(pairs) => {
+        KeyDump::Hash(pairs, _) => {
             out.push(TYPE_HASH);
             write_len(&mut out, pairs.len() as u64);
             for (f, v) in pairs {
@@ -299,7 +364,16 @@ pub fn serialize(dump: &KeyDump) -> Vec<u8> {
             let s = crate::stream::Stream::decode(v).expect("a stored stream decodes");
             write_stream(&mut out, &s.to_rdb());
         }
-        KeyDump::Zset(pairs) => {
+        // In score order, each score spelled as `zzlInsertAt` spells it.
+        KeyDump::Zset(pairs, Enc::Listpack) => {
+            out.push(TYPE_ZSET_LISTPACK);
+            let flat: Vec<Vec<u8>> = pairs
+                .iter()
+                .flat_map(|(m, s)| [m.clone(), crate::commands::format_score(*s).into_bytes()])
+                .collect();
+            write_string(&mut out, &listpack_build(&flat));
+        }
+        KeyDump::Zset(pairs, _) => {
             out.push(TYPE_ZSET_2);
             write_len(&mut out, pairs.len() as u64);
             for (m, score) in pairs {
@@ -658,7 +732,23 @@ fn scored_of(items: Vec<Vec<u8>>) -> Option<Vec<(Vec<u8>, f64)>> {
         .collect()
 }
 
+/// A set as `rdbLoadObject` builds one from its members: plain sets convert
+/// as they load, the packed encodings stay packed unless too long.
+fn loaded_set(items: Vec<Vec<u8>>, from: u8, l: Limits) -> KeyDump {
+    let n = items.len();
+    match from {
+        TYPE_SET_INTSET if n <= l.set_intset => KeyDump::Set(items, Enc::Intset),
+        TYPE_SET_LISTPACK if n <= l.set_entries => KeyDump::Set(items, Enc::Listpack),
+        TYPE_SET_INTSET | TYPE_SET_LISTPACK => KeyDump::Set(items, Enc::Hashtable),
+        _ => {
+            let (items, enc) = encoding::set_loaded(items.iter().map(Vec::as_slice), n, l).finish();
+            KeyDump::Set(items, enc)
+        }
+    }
+}
+
 fn object(r: &mut Reader<'_>) -> Option<KeyDump> {
+    let l = Limits::current();
     let dump = match r.u8()? {
         TYPE_STRING => KeyDump::String(r.string()?),
         TYPE_PG_REDIS_STREAM => {
@@ -672,7 +762,7 @@ fn object(r: &mut Reader<'_>) -> Option<KeyDump> {
             for _ in 0..n {
                 items.push(r.string()?);
             }
-            KeyDump::Set(items)
+            loaded_set(items, TYPE_SET, l)
         }
         TYPE_HASH => {
             let n = r.plain_len()?;
@@ -682,7 +772,9 @@ fn object(r: &mut Reader<'_>) -> Option<KeyDump> {
                 let v = r.string()?;
                 pairs.push((f, v));
             }
-            KeyDump::Hash(pairs)
+            let widest = pairs.iter().map(|(f, v)| f.len().max(v.len())).max();
+            let enc = encoding::hash_shape(pairs.len(), widest.unwrap_or(0), &l);
+            KeyDump::Hash(pairs, enc)
         }
         t @ (TYPE_ZSET | TYPE_ZSET_2) => {
             let n = r.plain_len()?;
@@ -695,16 +787,30 @@ fn object(r: &mut Reader<'_>) -> Option<KeyDump> {
                 };
                 pairs.push((m, score));
             }
-            KeyDump::Zset(pairs)
+            let widest = pairs.iter().map(|(m, _)| m.len()).max().unwrap_or(0);
+            let enc = encoding::zset_shape(pairs.len(), widest, &l);
+            KeyDump::Zset(pairs, enc)
         }
-        TYPE_SET_INTSET => KeyDump::Set(intset_entries(&r.string()?)?),
-        TYPE_SET_LISTPACK => KeyDump::Set(listpack_entries(&r.string()?)?),
+        t @ TYPE_SET_INTSET => loaded_set(intset_entries(&r.string()?)?, t, l),
+        t @ TYPE_SET_LISTPACK => loaded_set(listpack_entries(&r.string()?)?, t, l),
         t @ (TYPE_STREAM_LISTPACKS | TYPE_STREAM_LISTPACKS_2 | TYPE_STREAM_LISTPACKS_3) => {
             let s = crate::stream::Stream::from_rdb(r.stream(t)?)?;
             KeyDump::Stream(s.encode())
         }
-        TYPE_HASH_LISTPACK => KeyDump::Hash(pairs_of(listpack_entries(&r.string()?)?)?),
-        TYPE_ZSET_LISTPACK => KeyDump::Zset(scored_of(listpack_entries(&r.string()?)?)?),
+        TYPE_HASH_LISTPACK => {
+            let pairs = pairs_of(listpack_entries(&r.string()?)?)?;
+            let enc = encoding::hash_grown(Enc::Listpack, pairs.len(), &l);
+            KeyDump::Hash(pairs, enc)
+        }
+        TYPE_ZSET_LISTPACK => {
+            let pairs = scored_of(listpack_entries(&r.string()?)?)?;
+            let enc = if pairs.len() > l.zset_entries {
+                Enc::Skiplist
+            } else {
+                Enc::Listpack
+            };
+            KeyDump::Zset(pairs, enc)
+        }
         TYPE_LIST_QUICKLIST_2 => {
             let nodes = r.plain_len()?;
             let mut items = Vec::new();
@@ -728,9 +834,9 @@ fn object(r: &mut Reader<'_>) -> Option<KeyDump> {
     let empty = match &dump {
         KeyDump::String(_) => false,
         KeyDump::List(v) => v.is_empty(),
-        KeyDump::Set(v) => v.is_empty(),
-        KeyDump::Hash(v) => v.is_empty(),
-        KeyDump::Zset(v) => v.is_empty(),
+        KeyDump::Set(v, _) => v.is_empty(),
+        KeyDump::Hash(v, _) => v.is_empty(),
+        KeyDump::Zset(v, _) => v.is_empty(),
         KeyDump::Stream(_) => false,
     };
     (!empty).then_some(dump)
@@ -849,22 +955,89 @@ mod tests {
             KeyDump::List(v) => assert_eq!(v, items),
             _ => panic!("came back as another type"),
         }
-        match round_trips(KeyDump::Set(items.clone())) {
-            KeyDump::Set(v) => assert_eq!(v, items),
-            _ => panic!("came back as another type"),
+        for enc in [Enc::Listpack, Enc::Hashtable] {
+            match round_trips(KeyDump::Set(items.clone(), enc)) {
+                // A small set written plain loads as a listpack, as in Redis.
+                KeyDump::Set(v, got) => assert_eq!((v, got), (items.clone(), Enc::Listpack)),
+                _ => panic!("came back as another type"),
+            }
         }
         let pairs = vec![(b"f".to_vec(), b"v".to_vec()), (b"g".to_vec(), vec![])];
-        match round_trips(KeyDump::Hash(pairs.clone())) {
-            KeyDump::Hash(v) => assert_eq!(v, pairs),
-            _ => panic!("came back as another type"),
+        for enc in [Enc::Listpack, Enc::Hashtable] {
+            match round_trips(KeyDump::Hash(pairs.clone(), enc)) {
+                KeyDump::Hash(v, got) => assert_eq!((v, got), (pairs.clone(), Enc::Listpack)),
+                _ => panic!("came back as another type"),
+            }
         }
         let scored = vec![
-            (b"m".to_vec(), 1.5),
-            (b"n".to_vec(), f64::INFINITY),
             (b"o".to_vec(), -0.0),
+            (b"m".to_vec(), 1.5),
+            (b"p".to_vec(), 3.0),
+            (b"n".to_vec(), f64::INFINITY),
         ];
-        match round_trips(KeyDump::Zset(scored.clone())) {
-            KeyDump::Zset(v) => assert_eq!(v, scored),
+        for enc in [Enc::Listpack, Enc::Skiplist] {
+            match round_trips(KeyDump::Zset(scored.clone(), enc)) {
+                KeyDump::Zset(v, got) => assert_eq!((v, got), (scored.clone(), Enc::Listpack)),
+                _ => panic!("came back as another type"),
+            }
+        }
+    }
+
+    /// The payload follows the encoding, so a restore gets the encoding and
+    /// the order back: an intset sorted, a listpack in insertion order, a
+    /// listpack of integers still a listpack.
+    #[test]
+    fn packed_encodings_round_trip_with_their_order() {
+        let ints: Vec<Vec<u8>> = ["-70000", "-3", "5", "100", "4000000000"]
+            .iter()
+            .map(|s| s.as_bytes().to_vec())
+            .collect();
+        let payload = serialize(&KeyDump::Set(ints.clone(), Enc::Intset));
+        assert_eq!(payload[0], TYPE_SET_INTSET);
+        match round_trips(KeyDump::Set(ints.clone(), Enc::Intset)) {
+            KeyDump::Set(v, enc) => assert_eq!((v, enc), (ints.clone(), Enc::Intset)),
+            _ => panic!("came back as another type"),
+        }
+        let mut backwards = ints.clone();
+        backwards.reverse();
+        match round_trips(KeyDump::Set(backwards.clone(), Enc::Listpack)) {
+            KeyDump::Set(v, enc) => assert_eq!((v, enc), (backwards.clone(), Enc::Listpack)),
+            _ => panic!("came back as another type"),
+        }
+        // Written plain, integers load into an intset, sorted, and the first
+        // string turns it into a listpack that keeps them first.
+        match round_trips(KeyDump::Set(
+            vec![b"3".to_vec(), b"x".to_vec(), b"1".to_vec()],
+            Enc::Hashtable,
+        )) {
+            KeyDump::Set(v, enc) => assert_eq!(
+                (v, enc),
+                (
+                    vec![b"3".to_vec(), b"x".to_vec(), b"1".to_vec()],
+                    Enc::Listpack
+                )
+            ),
+            _ => panic!("came back as another type"),
+        }
+        match round_trips(KeyDump::Set(
+            vec![b"3".to_vec(), b"1".to_vec(), b"x".to_vec()],
+            Enc::Hashtable,
+        )) {
+            KeyDump::Set(v, enc) => assert_eq!(
+                (v, enc),
+                (
+                    vec![b"1".to_vec(), b"3".to_vec(), b"x".to_vec()],
+                    Enc::Listpack
+                )
+            ),
+            _ => panic!("came back as another type"),
+        }
+        // Too many for a listpack: a hash table, as Redis loads it.
+        let many: Vec<(Vec<u8>, Vec<u8>)> = (0..600)
+            .map(|i| (format!("f{i}").into_bytes(), b"v".to_vec()))
+            .collect();
+        match round_trips(KeyDump::Hash(many, Enc::Hashtable)) {
+            KeyDump::Hash(v, enc) => assert_eq!((v.len(), enc), (600, Enc::Hashtable)),
             _ => panic!("came back as another type"),
         }
     }

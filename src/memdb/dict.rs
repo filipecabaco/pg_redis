@@ -137,6 +137,44 @@ impl<V, A: Allocator + Clone> Dict<V, A> {
         (s.key, s.value)
     }
 
+    /// Remove `key` keeping the order of the rest, as a listpack deletes:
+    /// every later entry moves down one. O(n), for the small collections
+    /// that are listpacks. An entry only moves to a lower position, which is
+    /// what [`Dict::scan`] relies on.
+    pub fn remove_ordered(&mut self, key: &[u8]) -> Option<V> {
+        let i = self.position(key)?;
+        Some(self.remove_at_ordered(i).1)
+    }
+
+    /// [`Dict::remove_ordered`] by position.
+    pub fn remove_at_ordered(&mut self, i: usize) -> (Bytes<A>, V) {
+        let hash = self.slots[i].hash;
+        if let Ok(e) = self.index.find_entry(hash, |&j| j as usize == i) {
+            e.remove();
+        }
+        for p in self.index.iter_mut() {
+            if *p as usize > i {
+                *p -= 1;
+            }
+        }
+        let s = self.slots.remove(i);
+        (s.key, s.value)
+    }
+
+    /// Put the entries in the order `key` sorts them, as an intset is when
+    /// it becomes a listpack. Entries can move up, so a `SCAN` cursor taken
+    /// before can miss some; the collections this reorders are scanned in
+    /// one call, which takes no cursor.
+    pub fn sort_by_cached_key<K: Ord>(&mut self, mut key: impl FnMut(&[u8], &V) -> K) {
+        self.slots.sort_by_cached_key(|s| key(&s.key, &s.value));
+        self.index.clear();
+        let slots = &self.slots;
+        for (i, s) in slots.iter().enumerate() {
+            self.index
+                .insert_unique(s.hash, i as u32, |&j| slots[j as usize].hash);
+        }
+    }
+
     pub fn at(&self, i: usize) -> Option<(&[u8], &V)> {
         self.slots.get(i).map(|s| (s.key.as_slice(), &s.value))
     }
@@ -245,6 +283,41 @@ mod tests {
         *v += 1;
         assert_eq!(d.get(&3u32.to_be_bytes()), Some(&4));
         assert!(!d.get_or_insert_with(&4u32.to_be_bytes(), || 0).1);
+    }
+
+    #[test]
+    fn an_ordered_removal_keeps_the_rest_in_order_and_findable() {
+        let mut d = dict();
+        for i in 0..10u32 {
+            d.insert(&key(i), i);
+        }
+        assert_eq!(d.remove_ordered(&key(3)), Some(3));
+        assert_eq!(d.remove_ordered(&key(0)), Some(0));
+        assert_eq!(d.remove_ordered(&key(42)), None);
+        let order: std::vec::Vec<u32> = d.values().copied().collect();
+        assert_eq!(order, [1, 2, 4, 5, 6, 7, 8, 9]);
+        for i in [1, 2, 4, 9] {
+            assert_eq!(d.get(&key(i)), Some(&i), "k{i}");
+        }
+        // Appending after an ordered removal lands at the end.
+        d.insert(&key(3), 3);
+        assert_eq!(d.at(d.len() - 1).map(|(_, v)| *v), Some(3));
+    }
+
+    #[test]
+    fn sorting_reorders_entries_and_keeps_them_findable() {
+        let mut d = dict();
+        for i in [5u32, 1, 4, 2, 3] {
+            d.insert(&key(i), i);
+        }
+        d.sort_by_cached_key(|_, v| *v);
+        let order: std::vec::Vec<u32> = d.values().copied().collect();
+        assert_eq!(order, [1, 2, 3, 4, 5]);
+        for i in 1..=5 {
+            assert_eq!(d.get(&key(i)), Some(&i));
+        }
+        assert_eq!(d.remove(&key(1)), Some(1));
+        assert_eq!(d.get(&key(5)), Some(&5));
     }
 
     fn key(i: u32) -> std::vec::Vec<u8> {

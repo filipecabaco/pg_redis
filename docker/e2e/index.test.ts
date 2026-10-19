@@ -2125,7 +2125,9 @@ describe("Pub/Sub and client tracking without fixed limits", () => {
 		const sub = await new RawRedis().connect();
 		try {
 			await sub.send("SUBSCRIBE", channel);
-			expect(await client.send("PUBLISH", [channel, payload])).toBe(1);
+			expect(await client.send("PUBSUB", ["NUMSUB", channel])).toEqual([channel, 1]);
+			// At least this subscriber; a pattern another test left may match too.
+			expect(await client.send("PUBLISH", [channel, payload])).toBeGreaterThanOrEqual(1);
 			const message = (await sub.next()).toString();
 			expect(message).toContain(`$${channel.length}\r\n${channel}\r\n`);
 			expect(message).toContain(`$${payload.length}\r\n${payload}\r\n`);
@@ -2221,9 +2223,11 @@ describe("Pub/Sub and client tracking without fixed limits", () => {
 	test("tracking remembers more than 16,384 keys, long ones included", async () => {
 
 		const tracker = await new RawRedis().connect();
+		const inval = await new RawRedis().connect();
 		try {
-			await tracker.send("HELLO", "3");
-			await tracker.send("CLIENT", "TRACKING", "ON");
+			const invalId = integerReply(await inval.send("CLIENT", "ID"));
+			await inval.send("SUBSCRIBE", "__redis__:invalidate");
+			await tracker.send("CLIENT", "TRACKING", "ON", "REDIRECT", String(invalId));
 			const long = `track-long-${"k".repeat(5000)}`;
 			await tracker.send("GET", long);
 			const keys = Array.from({ length: 20_000 }, (_, i) => `track-many-${i}`);
@@ -2234,12 +2238,14 @@ describe("Pub/Sub and client tracking without fixed limits", () => {
 			const total = Number(/tracking_total_keys:(\d+)/.exec(info)?.[1]);
 			expect(total).toBeGreaterThanOrEqual(20_001);
 			// A write to the long key names it in the invalidation.
+			const message = inval.next();
 			await client.send("SET", [long, "v"]);
-			const push = (await tracker.next()).toString();
-			expect(push).toContain("invalidate");
-			expect(push).toContain(long);
+			const got = (await message).toString();
+			expect(got).toContain("__redis__:invalidate");
+			expect(got).toContain(long);
 		} finally {
 			tracker.close();
+			inval.close();
 		}
 	});
 });
@@ -5603,7 +5609,10 @@ describe("Eviction and access tracking", () => {
 			const empty = await usedMemory();
 			for (let i = 0; i < 1000; i++) await raw.send("SET", `k:${i}`, value);
 			const full = await usedMemory();
-			for (let round = 0; round < 20; round++) {
+			// The counter climbs by chance: past 6 it takes one in eleven reads
+			// at the default lfu-log-factor, so 20 rounds left it at 6 one run
+			// in six. A hundred leave it there one run in ten thousand.
+			for (let round = 0; round < 100; round++) {
 				await Promise.all(Array.from({ length: 200 }, (_, i) => raw.send("GET", `k:${i}`)));
 			}
 			expect(integerReply(await raw.send("OBJECT", "FREQ", "k:0"))).toBeGreaterThan(6);

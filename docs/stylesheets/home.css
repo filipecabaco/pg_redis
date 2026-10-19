@@ -7,9 +7,14 @@
   --pr-green-lo: #249361;
   --pr-ink: #1f1f1f;
   --pr-ink-2: #141414;
+  --pr-mono: var(--md-code-font-family, "JetBrains Mono", ui-monospace, monospace);
+}
+
+/* These follow the colour scheme, which Material sets on <body>. Declared on
+   :root they would resolve against :root's tokens, the light ones, in both. */
+[data-md-color-scheme] {
   --pr-line: color-mix(in srgb, var(--md-default-fg-color) 12%, transparent);
   --pr-muted: var(--md-default-fg-color--light);
-  --pr-mono: var(--md-code-font-family, "JetBrains Mono", ui-monospace, monospace);
 }
 
 .pr-wrap {
@@ -44,6 +49,10 @@
   margin: 0 0 1rem;
 }
 
+.pr-nowrap {
+  white-space: nowrap;
+}
+
 .pr-hero__title {
   font-size: clamp(1.9rem, 4.2vw, 2.9rem);
   line-height: 1.05;
@@ -65,6 +74,29 @@
   display: flex;
   flex-wrap: wrap;
   gap: 0.6rem;
+}
+
+.pr-hero__note {
+  font-size: 0.66rem;
+  line-height: 1.6;
+  color: #b0b0b0;
+  max-width: 34em;
+  margin: 1rem 0 0;
+}
+
+.pr-hero__note code {
+  font: 0.95em var(--pr-mono);
+  color: #b8b8b8;
+}
+
+.pr-hero__note a {
+  color: var(--pr-green);
+  text-decoration: none;
+}
+
+.pr-hero__note a:hover {
+  color: var(--pr-green-hi);
+  text-decoration: underline;
 }
 
 .pr-btn {
@@ -838,6 +870,24 @@
     flex: none;
     height: clamp(20rem, 60vh, 28rem);
     min-height: 0;
+  }
+
+  /* Too narrow to centre the button on the line between the two panes without
+     covering the psql label: sit it and the note in the lower pane, below its
+     prompt, with the note clear of the pane's border. */
+  .pr-demo:not(.is-running) .pr-demo__screen {
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    align-items: center;
+    padding-bottom: 1.1rem;
+  }
+
+  .pr-demo__note {
+    position: relative;
+    bottom: auto;
+    margin-top: 0.9rem;
+    padding-inline: 1rem;
   }
 
 }

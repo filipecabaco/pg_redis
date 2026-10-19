@@ -11,7 +11,7 @@ hide:
 
 # pg_redis
 
-A PostgreSQL extension that lets you connect to Postgres using the **Redis protocol (RESP2 and RESP3)**. Drop-in Redis wire compatibility backed by real SQL tables — with two durability modes to match your performance needs.
+A PostgreSQL extension that lets you connect to Postgres using the **Redis protocol (RESP2 and RESP3)**. Existing Redis clients work unchanged. Data lives in shared memory or in PostgreSQL tables, chosen per database to match your performance and durability needs.
 
 Built with [pgrx](https://github.com/pgcentralfoundation/pgrx) in Rust.
 
@@ -45,7 +45,7 @@ SELECT key, value, expires_at FROM redis.kv_8;
 
 ## How it works
 
-`pg_redis` starts a pool of TCP background workers inside PostgreSQL that listen for Redis clients on port 6379. Incoming RESP2 commands are parsed and translated to SPI queries against regular PostgreSQL tables inside the `redis` schema, **or** handled entirely in shared memory with no transaction overhead.
+`pg_redis` starts a pool of TCP background workers inside PostgreSQL that listen for Redis clients on port 6379. Incoming RESP2 commands are parsed and translated to SPI queries against regular PostgreSQL tables inside the `redis` schema, or handled entirely in shared memory with no transaction overhead.
 
 Data is stored across 16 databases (0–15), mirroring Redis's native database model. Each has
 its own storage policy, which can be changed at runtime while clients keep using it:
@@ -65,9 +65,9 @@ See [Storage policies](STORAGE.md) for migration and snapshots.
 
 ## Next steps
 
-- [Installation](installation.md) — Docker, an existing server, or from source
-- [Configuration](configuration.md) — GUC reference and worker tuning
-- [Storage policies](STORAGE.md) — per-database storage, online migration, snapshots
-- [Commands](commands.md) — supported Redis commands with behaviour notes
-- [Command coverage](command-coverage.md) — full compatibility matrix
-- [Implementation](IMPLEMENTATION.md) — architecture, the shared-memory backend, limits, testing, open work
+- [Installation](installation.md): Docker, an existing server, or from source
+- [Configuration](configuration.md): GUC reference and worker tuning
+- [Storage policies](STORAGE.md): per-database storage, online migration, snapshots
+- [Commands](commands.md): supported Redis commands with behaviour notes
+- [Command coverage](command-coverage.md): full compatibility matrix
+- [Implementation](IMPLEMENTATION.md): architecture, the shared-memory backend, limits, testing, open work

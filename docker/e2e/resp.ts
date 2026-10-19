@@ -153,6 +153,32 @@ export function integerReply(reply: Buffer): number {
 	return Number(text.slice(1, text.indexOf("\r\n")));
 }
 
+/**
+ * A `SCAN`-family reply: the cursor as the server spelled it, and the
+ * elements. Throws on anything else, an error reply included.
+ */
+export function scanReply(reply: Buffer): { cursor: string; items: Buffer[] } {
+	if (!reply.toString("latin1", 0, 4).startsWith("*2\r\n")) {
+		throw new Error(`expected a scan reply, got ${reply.subarray(0, 64)}`);
+	}
+	const bulk = (at: number): [Buffer, number] => {
+		const head = reply.indexOf("\r\n", at);
+		const len = Number(reply.subarray(at + 1, head).toString());
+		return [reply.subarray(head + 2, head + 2 + len), head + 2 + len + 2];
+	};
+	const [cursor, rest] = bulk(4);
+	const head = reply.indexOf("\r\n", rest);
+	const count = Number(reply.subarray(rest + 1, head).toString());
+	const items: Buffer[] = [];
+	let cur = head + 2;
+	for (let i = 0; i < count; i++) {
+		const [item, next] = bulk(cur);
+		items.push(item);
+		cur = next;
+	}
+	return { cursor: cursor.toString(), items };
+}
+
 /** The message of an error reply, or null when the reply is not an error. */
 export function errorReply(reply: Buffer): string | null {
 	const text = reply.toString();

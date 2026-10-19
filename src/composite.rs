@@ -58,11 +58,6 @@ pub enum Op {
         db: u8,
     },
     Sort(Box<SortSpec>),
-    CollectionScan {
-        kind: ScanKind,
-        key: Vec<u8>,
-        pattern: Option<Vec<u8>>,
-    },
     BitField {
         key: Vec<u8>,
         ops: Vec<BitFieldOp>,
@@ -170,13 +165,6 @@ pub enum BitOpKind {
     Not,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ScanKind {
-    Hash,
-    Set,
-    Zset,
-}
-
 #[derive(Debug, Clone)]
 pub struct SortSpec {
     key: Vec<u8>,
@@ -249,7 +237,6 @@ impl Op {
             | "ZINTERCARD" => parse_zaggregate(name, args),
             "MOVE" => parse_move(args),
             "SORT" | "SORT_RO" => parse_sort(name == "SORT_RO", args),
-            "HSCAN" | "SSCAN" | "ZSCAN" => parse_collection_scan(name, args),
             "BITFIELD" | "BITFIELD_RO" => parse_bitfield(name == "BITFIELD_RO", args),
             "SWAPDB" => parse_swapdb(args),
             "PFADD" if !args.is_empty() => Ok(Op::PfAdd {
@@ -394,9 +381,6 @@ impl Op {
             } => run_mpop(exec, db, *zset, keys, *front, *count),
             Op::Move { key, db: to } => run_move(exec, db, key, *to),
             Op::Sort(spec) => run_sort(exec, db, spec),
-            Op::CollectionScan { kind, key, pattern } => {
-                run_collection_scan(exec, db, *kind, key, pattern.as_deref())
-            }
             Op::BitField { key, ops } => run_bitfield(exec, db, key, ops),
             Op::SwapDb { a, b } => run_swapdb(exec, *a, *b),
             Op::PfAdd { key, elements } => run_pfadd(exec, db, key, elements),
@@ -1420,77 +1404,6 @@ fn run_sort(exec: &mut Runner, db: u8, spec: &SortSpec) -> Result<Response, Resp
             Ok(Response::Integer(out.len() as i64))
         }
     }
-}
-
-// ───────────────────────────── HSCAN/SSCAN/ZSCAN ─────────────────────────────
-
-fn parse_collection_scan(name: &str, args: &[Vec<u8>]) -> Result<Op, String> {
-    if args.len() < 2 {
-        return Err(arity(name));
-    }
-    std::str::from_utf8(&args[1])
-        .ok()
-        .and_then(|c| c.parse::<u64>().ok())
-        .ok_or_else(|| "ERR invalid cursor".to_string())?;
-    let mut pattern = None;
-    let mut i = 2;
-    while i < args.len() {
-        if i + 1 >= args.len() {
-            return Err(SYNTAX.to_string());
-        }
-        if is(&args[i], "MATCH") {
-            pattern = Some(args[i + 1].clone());
-        } else if is(&args[i], "COUNT") {
-            if int(&args[i + 1])? < 1 {
-                return Err(SYNTAX.to_string());
-            }
-        } else {
-            return Err(SYNTAX.to_string());
-        }
-        i += 2;
-    }
-    Ok(Op::CollectionScan {
-        kind: match name {
-            "HSCAN" => ScanKind::Hash,
-            "SSCAN" => ScanKind::Set,
-            _ => ScanKind::Zset,
-        },
-        key: args[0].clone(),
-        pattern,
-    })
-}
-
-/// One pass over the whole collection, cursor 0 — the same guarantee `SCAN`
-/// gives here: every element present for the whole scan is returned.
-fn run_collection_scan(
-    exec: &mut Runner,
-    db: u8,
-    kind: ScanKind,
-    key: &[u8],
-    pattern: Option<&[u8]>,
-) -> Result<Response, Response> {
-    let (flat, stride) = match kind {
-        ScanKind::Hash => (items(ok(call(exec, db, &[b"HGETALL", key]))?), 2),
-        ScanKind::Set => (items(ok(call(exec, db, &[b"SMEMBERS", key]))?), 1),
-        ScanKind::Zset => (
-            items(ok(call(
-                exec,
-                db,
-                &[b"ZRANGE", key, b"0", b"-1", b"WITHSCORES"],
-            ))?),
-            2,
-        ),
-    };
-    let mut out = Vec::new();
-    for chunk in flat.chunks(stride) {
-        if pattern.is_none_or(|p| crate::pubsub::glob_match(p, &chunk[0])) {
-            out.extend(chunk.iter().cloned().map(Value::Bulk));
-        }
-    }
-    Ok(Response::Value(Value::Array(vec![
-        Value::str("0"),
-        Value::Array(out),
-    ])))
 }
 
 // ──────────────────────────────── BITFIELD ───────────────────────────────────

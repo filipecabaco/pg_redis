@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { errorReply, integerReply, RawRedis } from "./resp";
+import { errorReply, integerReply, RawRedis, scanReply } from "./resp";
 
 const REDIS_HOST = process.env.REDIS_HOST ?? "localhost";
 const REDIS_PORT = process.env.REDIS_PORT ?? "6379";
@@ -1810,9 +1810,15 @@ describe("Binary safety", () => {
 
 		const pattern = Buffer.concat([prefix, star]);
 		expect(hexes(await raw.array("KEYS", pattern))).toEqual(hexes(keys));
-		// SCAN's second element is the key array; cursor is always 0 here.
-		const scanned = await raw.array("SCAN", "0", "MATCH", pattern);
-		expect(scanned[1]).not.toBeNull();
+		// SCAN returns a page per call; the whole iteration names every key.
+		const scanned: Buffer[] = [];
+		let cursor = "0";
+		do {
+			const page = scanReply(await raw.send("SCAN", cursor, "MATCH", pattern));
+			scanned.push(...page.items);
+			cursor = page.cursor;
+		} while (cursor !== "0");
+		expect([...new Set(hexes(scanned))]).toEqual(hexes(keys));
 
 		// RANDOMKEY reads a key out of an entry through the same call. Whatever
 		// it names has to be a whole key: a truncating read would hand back a
@@ -4095,6 +4101,227 @@ for (const half of HALVES) {
 			// still be in the tables, and the draw must not see them.
 			await Bun.sleep(80);
 			expect(await raw.bulk("RANDOMKEY")).toBeNull();
+		});
+	});
+}
+
+// ───────────────────────────── SCAN cursors ─────────────────────────────────
+//
+// SCAN, HSCAN, SSCAN and ZSCAN return a page per call and a cursor to resume
+// from. Redis's guarantee is what these pin: a full iteration returns every
+// element present from its start to its end at least once, however the keys
+// change in between, and it ends. The memory half's cursor is a position in
+// the dictionary; the durable half's names the last key returned, kept in
+// shared memory so another connection, on another worker, can resume it.
+
+for (const half of HALVES) {
+	describe(`Incremental cursors (${half})`, () => {
+		let other: RawRedis;
+		beforeAll(async () => {
+			await raw.send("SELECT", half);
+			await raw.send("FLUSHDB");
+			other = await new RawRedis().connect();
+			await other.send("SELECT", half);
+		});
+		afterAll(async () => {
+			other.close();
+			await raw.send("FLUSHDB");
+			await raw.send("SELECT", "durable");
+		});
+
+		/**
+		 * A whole iteration of `cmd`, the cursor going in at `at`: every
+		 * element (repeats included) and the number of calls. `between` runs
+		 * after each call that is not the last; `conn` picks the connection
+		 * for each call.
+		 */
+		async function iterate(
+			cmd: string[],
+			at: number,
+			between: (call: number) => Promise<void> = async () => {},
+			conn: (call: number) => RawRedis = () => raw,
+		): Promise<{ items: Buffer[]; calls: number }> {
+			const items: Buffer[] = [];
+			let cursor = "0";
+			for (let call = 1; call < 20_000; call++) {
+				const line = [...cmd];
+				line.splice(at, 0, cursor);
+				const page = scanReply(await conn(call).send(...line));
+				// An unsigned 64-bit integer in decimal, as clients parse it.
+				expect(page.cursor).toMatch(/^\d+$/);
+				expect(BigInt(page.cursor) < 2n ** 64n).toBe(true);
+				items.push(...page.items);
+				if (page.cursor === "0") return { items, calls: call };
+				cursor = page.cursor;
+				await between(call);
+			}
+			throw new Error(`${cmd.join(" ")} did not end`);
+		}
+
+		const strings = (items: Buffer[]) => new Set(items.map((b) => b.toString()));
+		const name = (i: number) => `cur:${String(i).padStart(4, "0")}`;
+
+		async function thousandKeys() {
+			await raw.send("FLUSHDB");
+			const args: string[] = [];
+			for (let i = 0; i < 1000; i++) args.push(name(i), "v");
+			expect((await raw.send("MSET", ...args)).toString()).toBe("+OK\r\n");
+		}
+
+		test("SCAN pages through 1,000 keys and returns every one", async () => {
+			await thousandKeys();
+			const { items, calls } = await iterate(["SCAN", "COUNT", "10"], 1);
+			expect(calls).toBeGreaterThan(1);
+			const seen = strings(items);
+			expect(seen.size).toBe(1000);
+			for (let i = 0; i < 1000; i++) expect(seen.has(name(i))).toBe(true);
+			// The default COUNT is 10 too, so the default takes more than one call.
+			expect((await iterate(["SCAN"], 1)).calls).toBeGreaterThan(1);
+		});
+
+		test("a cursor resumes on another connection", async () => {
+			await thousandKeys();
+			const { items, calls } = await iterate(
+				["SCAN", "COUNT", "10"],
+				1,
+				undefined,
+				(call) => (call % 2 === 0 ? other : raw),
+			);
+			expect(calls).toBeGreaterThan(1);
+			expect(strings(items).size).toBe(1000);
+		});
+
+		test("deleting and adding keys mid-iteration hides no untouched key", async () => {
+			await thousandKeys();
+			const deleted = new Set<string>();
+			const { items } = await iterate(["SCAN", "COUNT", "10"], 1, async (call) => {
+				// Behind the cursor and ahead of it, wherever it is.
+				for (const j of [0, 1, 2]) {
+					const k = name((call * 37 + j * 331) % 1000);
+					await raw.send("DEL", k);
+					deleted.add(k);
+				}
+				await raw.send("SET", `cur:new:${call}`, "v");
+			});
+			const seen = strings(items);
+			for (let i = 0; i < 1000; i++) {
+				const k = name(i);
+				if (!deleted.has(k)) expect(seen.has(k)).toBe(true);
+			}
+		});
+
+		test("MATCH and TYPE filter each page and the iteration still ends", async () => {
+			await thousandKeys();
+			for (let i = 0; i < 20; i++) {
+				await raw.send("RPUSH", `other:list:${i}`, "a");
+				await raw.send("HSET", `other:hash:${i}`, "f", "v");
+			}
+			const listed = await iterate(["SCAN", "COUNT", "10", "MATCH", "other:*"], 1);
+			// Most pages of strings match nothing, and still are not the end.
+			expect(listed.calls).toBeGreaterThan(10);
+			expect(strings(listed.items).size).toBe(40);
+			const hashes = strings((await iterate(["SCAN", "TYPE", "hash", "COUNT", "25"], 1)).items);
+			expect([...hashes].sort()).toEqual(
+				Array.from({ length: 20 }, (_, i) => `other:hash:${i}`).sort(),
+			);
+			const lists = await iterate(["SCAN", "MATCH", "other:list:1*", "TYPE", "list"], 1);
+			expect([...strings(lists.items)].sort()).toEqual(
+				["1", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19"].map(
+					(n) => `other:list:${n}`,
+				).sort(),
+			);
+		});
+
+		test("a cursor the server never issued restarts or resumes, and ends", async () => {
+			await thousandKeys();
+			for (const made_up of ["12345", "9223372036854775807", "18446744073709551615"]) {
+				const page = scanReply(await raw.send("SCAN", made_up, "COUNT", "10"));
+				expect(page.cursor).toMatch(/^\d+$/);
+				let cursor = page.cursor;
+				for (let n = 0; cursor !== "0"; n++) {
+					expect(n).toBeLessThan(5000);
+					cursor = scanReply(await raw.send("SCAN", cursor, "COUNT", "50")).cursor;
+				}
+			}
+			// Not an integer at all is the error it always was.
+			expect((await raw.send("SCAN", "notanumber")).toString()).toMatch(/^-ERR/);
+			expect((await raw.send("SSCAN", "s", "-1")).toString()).toBe(
+				"-ERR invalid cursor\r\n",
+			);
+		});
+
+		const member = (i: number) => `m${String(i).padStart(3, "0")}`;
+
+		async function collections(n: number) {
+			await raw.send("FLUSHDB");
+			const h: string[] = [];
+			const s: string[] = [];
+			const z: string[] = [];
+			for (let i = 0; i < n; i++) {
+				h.push(member(i), `v${i}`);
+				s.push(member(i));
+				z.push(String(i + 0.5), member(i));
+			}
+			await raw.send("HSET", "c:h", ...h);
+			await raw.send("SADD", "c:s", ...s);
+			await raw.send("ZADD", "c:z", ...z);
+		}
+
+		test("HSCAN, SSCAN and ZSCAN page through a few hundred elements", async () => {
+			await collections(300);
+			const hscan = await iterate(["HSCAN", "c:h", "COUNT", "10"], 2);
+			expect(hscan.calls).toBeGreaterThan(1);
+			const fields = new Map<string, string>();
+			for (let i = 0; i < hscan.items.length; i += 2) {
+				fields.set(hscan.items[i].toString(), hscan.items[i + 1].toString());
+			}
+			expect(fields.size).toBe(300);
+			for (let i = 0; i < 300; i++) expect(fields.get(member(i))).toBe(`v${i}`);
+
+			const sscan = await iterate(["SSCAN", "c:s", "COUNT", "10"], 2);
+			expect(sscan.calls).toBeGreaterThan(1);
+			expect(strings(sscan.items).size).toBe(300);
+
+			const zscan = await iterate(["ZSCAN", "c:z", "COUNT", "10"], 2);
+			expect(zscan.calls).toBeGreaterThan(1);
+			const scores = new Map<string, string>();
+			for (let i = 0; i < zscan.items.length; i += 2) {
+				scores.set(zscan.items[i].toString(), zscan.items[i + 1].toString());
+			}
+			expect(scores.size).toBe(300);
+			for (let i = 0; i < 300; i++) expect(scores.get(member(i))).toBe(`${i}.5`);
+
+			// MATCH applies to fields and members; a missing key is empty.
+			const matched = await iterate(["ZSCAN", "c:z", "MATCH", "m00*"], 2);
+			expect(matched.items.map((b) => b.toString()).filter((_, i) => i % 2 === 0).sort()).toEqual(
+				Array.from({ length: 10 }, (_, i) => member(i)),
+			);
+			expect(await iterate(["SSCAN", "c:none"], 2)).toEqual({ items: [], calls: 1 });
+			expect((await raw.send("HSCAN", "c:s", "0")).toString()).toMatch(/^-WRONGTYPE/);
+		});
+
+		test("removing elements mid-HSCAN, SSCAN and ZSCAN hides none that stayed", async () => {
+			await collections(300);
+			for (const [cmd, key, del] of [
+				["HSCAN", "c:h", "HDEL"],
+				["SSCAN", "c:s", "SREM"],
+				["ZSCAN", "c:z", "ZREM"],
+			]) {
+				const removed = new Set<string>();
+				const { items } = await iterate([cmd, key, "COUNT", "10"], 2, async (call) => {
+					for (const j of [0, 1]) {
+						const m = member((call * 41 + j * 149) % 300);
+						await raw.send(del, key, m);
+						removed.add(m);
+					}
+				});
+				const step = cmd === "SSCAN" ? 1 : 2;
+				const seen = new Set(items.filter((_, i) => i % step === 0).map((b) => b.toString()));
+				for (let i = 0; i < 300; i++) {
+					const m = member(i);
+					if (!removed.has(m)) expect(seen.has(m)).toBe(true);
+				}
+			}
 		});
 	});
 }

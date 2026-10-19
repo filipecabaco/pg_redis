@@ -158,6 +158,34 @@ impl<V, A: Allocator + Clone> Dict<V, A> {
         self.slots.clear();
     }
 
+    /// One step of a `SCAN`-style cursor: visit up to `count` entries and
+    /// return the cursor to continue from, 0 when the iteration is done.
+    ///
+    /// The cursor is a position, and positions are visited from the top
+    /// down. An insert appends at the end and a removal moves the last entry
+    /// into the hole, so an entry only ever moves to a lower position. Every
+    /// entry not yet visited therefore stays below the cursor however the
+    /// dictionary changes between calls, which is Redis's guarantee: an entry
+    /// present from the first call to the last is visited at least once. One
+    /// that moves down from a position already visited is visited again.
+    ///
+    /// Cursor 0 starts at the top. A cursor past the end, from before
+    /// removals or from another dictionary, is clamped to it. Each call costs
+    /// O(`count`), and the cursor shrinks on every call, so the iteration
+    /// ends.
+    pub fn scan(&self, cursor: u64, count: usize, mut visit: impl FnMut(&[u8], &V)) -> u64 {
+        let len = self.slots.len();
+        let hi = match cursor {
+            0 => len,
+            c => usize::try_from(c).unwrap_or(usize::MAX).min(len),
+        };
+        let lo = hi.saturating_sub(count.max(1));
+        for s in self.slots[lo..hi].iter().rev() {
+            visit(&s.key, &s.value);
+        }
+        lo as u64
+    }
+
     /// Keep only the entries `keep` accepts.
     pub fn retain(&mut self, mut keep: impl FnMut(&[u8], &mut V) -> bool) {
         let mut i = 0;
@@ -217,5 +245,104 @@ mod tests {
         *v += 1;
         assert_eq!(d.get(&3u32.to_be_bytes()), Some(&4));
         assert!(!d.get_or_insert_with(&4u32.to_be_bytes(), || 0).1);
+    }
+
+    fn key(i: u32) -> std::vec::Vec<u8> {
+        format!("k{i}").into_bytes()
+    }
+
+    /// Run a whole iteration, calling `between` after each step with the
+    /// step number; every key returned, repeats included, and the number of
+    /// calls.
+    fn iterate(
+        d: &mut Dict<u32, Global>,
+        count: usize,
+        mut between: impl FnMut(&mut Dict<u32, Global>, usize),
+    ) -> (std::vec::Vec<std::vec::Vec<u8>>, usize) {
+        let mut seen = std::vec::Vec::new();
+        let mut cursor = 0;
+        let mut calls = 0;
+        loop {
+            cursor = d.scan(cursor, count, |k, _| seen.push(k.to_vec()));
+            calls += 1;
+            assert!(calls < 100_000, "the iteration did not end");
+            if cursor == 0 {
+                return (seen, calls);
+            }
+            between(d, calls);
+        }
+    }
+
+    #[test]
+    fn a_full_scan_returns_every_entry_once_when_nothing_changes() {
+        let mut d = dict();
+        for i in 0..1000 {
+            d.insert(&key(i), i);
+        }
+        let (mut seen, calls) = iterate(&mut d, 10, |_, _| {});
+        assert_eq!(calls, 100, "1000 entries, 10 a call");
+        seen.sort();
+        let mut want: std::vec::Vec<_> = (0..1000).map(key).collect();
+        want.sort();
+        assert_eq!(seen, want);
+    }
+
+    #[test]
+    fn entries_present_throughout_survive_removals_and_inserts_mid_scan() {
+        // Many runs with different churn, so the swap-into-the-hole moves
+        // land on both sides of the cursor.
+        for seed in 1..40u32 {
+            let mut d = dict();
+            for i in 0..500 {
+                d.insert(&key(i), i);
+            }
+            let mut removed = std::collections::HashSet::new();
+            let mut x = seed.wrapping_mul(2654435761) | 1;
+            let mut next_new = 10_000;
+            let (seen, _) = iterate(&mut d, 7, |d, _| {
+                for _ in 0..5 {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    let i = x % 500;
+                    if d.remove(&key(i)).is_some() {
+                        removed.insert(i);
+                    }
+                    d.insert(&key(next_new), next_new);
+                    next_new += 1;
+                }
+            });
+            let seen: std::collections::HashSet<_> = seen.into_iter().collect();
+            for i in (0..500).filter(|i| !removed.contains(i)) {
+                assert!(seen.contains(&key(i)), "seed {seed}: k{i} was skipped");
+            }
+        }
+    }
+
+    #[test]
+    fn a_cursor_past_the_end_is_clamped_and_every_scan_ends() {
+        let mut d = dict();
+        for i in 0..20 {
+            d.insert(&key(i), i);
+        }
+        // Past the end, and far past anything a usize holds on 32 bits.
+        let mut seen = std::vec::Vec::new();
+        let next = d.scan(u64::MAX, 5, |k, _| seen.push(k.to_vec()));
+        assert_eq!(next, 15);
+        assert_eq!(seen.len(), 5);
+        // Shrinking under a cursor still ends the iteration.
+        let mut cursor = d.scan(0, 3, |_, _| {});
+        assert_eq!(cursor, 17);
+        for i in 0..18 {
+            d.remove(&key(i));
+        }
+        let mut seen = std::vec::Vec::new();
+        cursor = d.scan(cursor, 3, |k, _| seen.push(k.to_vec()));
+        assert_eq!(cursor, 0);
+        seen.sort();
+        assert_eq!(seen, [key(18), key(19)]);
+        // An empty dictionary ends at once, and a COUNT of 0 still moves.
+        assert_eq!(dict().scan(0, 10, |_, _| {}), 0);
+        assert_eq!(d.scan(2, 0, |_, _| {}), 1);
     }
 }

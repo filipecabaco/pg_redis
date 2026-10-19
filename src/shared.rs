@@ -35,6 +35,9 @@ unsafe impl Shareable for crate::watch::WatchCtl {}
 // SAFETY: atomics and arrays of structs of atomics; `server::init` sets the
 // few fields zero is not the right start for, before any worker starts.
 unsafe impl Shareable for crate::server::ServerCtl {}
+// SAFETY: atomics only, read and written under its spinlock; zeroed, every
+// slot is free and the lock open.
+unsafe impl Shareable for crate::cursor::CursorTable {}
 
 impl<T> Block<T> {
     pub const fn new() -> Self {

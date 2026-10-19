@@ -115,7 +115,7 @@ fifth, found later, follows the table.
 | `INCRBYFLOAT` precision — `f64` against Redis's `long double` | both | **Accepted.** Two of the baseline's four entries, one per half; differs against x86 Redis only. See [phase 2](IMPLEMENTATION.md#phase-2-ranges-shapes-and-ties) |
 | GEO distance stored by `GEOSEARCHSTORE … STOREDIST` — last-digit `f64` rounding | both | **Accepted.** The other two baseline entries, one per half; differs against arm64 Redis only, and x86 Redis matches |
 | An expired collection outlives its expiry: `TYPE` answers `none` while `LLEN` still reports the old count, until the sweep runs | both | **Fixed.** It affected both halves and more than one command; see [below](#the-stale-collection-read-was-bigger-than-this-table-said) |
-| `SCAN`/`KEYS` return the whole keyspace in one reply, cursor always 0 | both | Open. See [Incremental cursors](#incremental-cursors) below |
+| `SCAN`/`KEYS` return the whole keyspace in one reply, cursor always 0 | both | **Fixed** for `SCAN`, `HSCAN`, `SSCAN` and `ZSCAN`: real cursors on both halves. See [Incremental cursors](#incremental-cursors) below. `KEYS` returns everything in one reply, as in Redis |
 | `RANDOMKEY` returns the first live key the KV scan reaches, and consults the collection metas only when there is none | ~~memory~~ both | **Fixed**, and it was worse than this row said. The durable half read `kv_N` alone, so a database holding only collections answered *nil* while `DBSIZE` counted them, which is a wrong answer. Both halves now draw uniformly over every live key: the durable half with a five-table `UNION` under `ORDER BY random()`, the memory half with a single-pass reservoir over the KV scan and the collection names. An expired-but-unswept collection is excluded on both. The e2e `RANDOMKEY` describes pin all three properties per half |
 
 A fifth was found while `ZINTERCARD` was being added, by probing the live pair:
@@ -352,13 +352,19 @@ nil when nothing is there.
 (underscore-prefixed because they are unused) and returns every matching key
 with cursor 0. `HSCAN`/`SSCAN`/`ZSCAN` do not exist at all.
 
-**Status now: still cursor 0, and the memory half below is history.**
-`HSCAN`, `SSCAN` and `ZSCAN` exist and, like `SCAN`, answer every match in one
-reply with cursor 0. The dynahash tables the bullets below describe were
+**Status now: built, on both halves, and everything below is history.** All
+four commands return a page per call and a cursor, with Redis's guarantee that
+a full iteration returns every element present from its start to its end. No
+sorted index was needed. The dynahash tables the bullets below describe were
 replaced in phase 6 of [Storage policies](STORAGE.md#growable-shared-memory-phase-6):
 a keyspace, hash or set is now a `memdb::Dict`, whose entries sit in a dense
 `Vec` found through a hashbrown table, and a removal swaps the last entry into
-the hole (`src/memdb/dict.rs`). Real cursors have not been built over it.
+the hole (`src/memdb/dict.rs`). An entry therefore only moves to a lower
+position, so the memory half's cursor is a position, iterated from the top
+down, with no state and O(`COUNT`) per call. The durable half resumes after
+the last key returned, through the primary key index, and keeps that key in a
+cursor table in shared memory that every worker reads.
+[SCAN cursors](IMPLEMENTATION.md#scan-cursors) has the details.
 
 Adding the three commands with the same "cursor always 0" convention is
 mechanical and would unblock client libraries. Giving any of the four real
@@ -416,8 +422,9 @@ Nothing below can be settled from the code. Two of the four are now taken.
 **Status now.** The parity block overtook questions 1, 2 and 4. Streams,
 scripting, `ACL` and `CLUSTER` are implemented, so they count toward parity;
 the blocking commands are built with oldest-first order across workers; and
-`CLIENT` has real connection state. Question 3's sorted index has not been
-built, and all four scan commands still answer with cursor 0.
+`CLIENT` has real connection state. Question 3 is settled without the sorted
+index: all four scan commands have real cursors on both halves (see
+[Incremental cursors](#incremental-cursors)).
 
 
 ## Tier 0 — correctness the harness never looks at
@@ -537,10 +544,13 @@ even though tier 2 is where the visible feature gap is.
    shared-memory layout, so size it with
    `pg_sys::hash_estimate_size` against [§3](IMPLEMENTATION.md#3-the-shared-memory-backend)
    and bring the number for sign-off before writing code. That instruction has
-   paid for itself twice already. **Status now: open.** The scan commands
-   exist with cursor 0. Phase 6 replaced the fixed tables, so the
-   `hash_estimate_size` sizing no longer applies, and the memory half's
-   `ZPOPMIN` already reads from a sorted set kept in score order.
+   paid for itself twice already. **Status now: done, without a sorted
+   index.** Phase 6 replaced the fixed tables, so the `hash_estimate_size`
+   sizing no longer applies, and the memory half's `ZPOPMIN` already reads
+   from a sorted set kept in score order. The scan commands have real cursors
+   on both halves; the only new shared memory is the durable half's cursor
+   table, 4,096 entries of about 300 bytes
+   ([SCAN cursors](IMPLEMENTATION.md#scan-cursors)).
 8. ~~**Blocking.**~~ Deferred by question 2. The eight commands stay absent
    until the correctness work above is done. When it is taken up it changes how
    a connection is serviced, so it wants its own PR. **Done** since, with

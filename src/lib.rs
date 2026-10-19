@@ -8,6 +8,7 @@ pub(crate) mod blocking;
 mod commands;
 pub(crate) mod composite;
 pub(crate) mod config;
+pub(crate) mod cursor;
 #[cfg(test)]
 mod fuzz;
 pub(crate) mod geo;
@@ -76,6 +77,7 @@ static PUBSUB_SLOTS: shared::Block<pubsub::Slots> = shared::Block::new();
 static ROUTE_CTL: shared::Block<pubsub::RouteCtl> = shared::Block::new();
 static WATCH_CTL: shared::Block<watch::WatchCtl> = shared::Block::new();
 static SERVER_CTL: shared::Block<server::ServerCtl> = shared::Block::new();
+static CURSOR_TABLE: shared::Block<cursor::CursorTable> = shared::Block::new();
 
 /// Everything this extension keeps in shared memory, reserved in the
 /// postmaster's request hook.
@@ -86,6 +88,8 @@ fn request_shmem() {
     shared::request(pubsub::route_ctl_size());
     shared::request(watch::watch_ctl_size());
     shared::request(server::server_ctl_size());
+    // The SCAN cursors of databases kept in tables.
+    shared::request(cursor::cursor_table_size());
     // The memory engine's arena: reserved at redis.maxmemory, backed by RAM
     // only as it fills.
     shm::request();
@@ -102,6 +106,7 @@ fn attach_shmem() {
     {
         server::init(ctl);
     }
+    CURSOR_TABLE.attach(c"pg_redis_cursor_table", cursor::cursor_table_size());
     shm::startup();
 }
 
@@ -117,6 +122,11 @@ pub(crate) fn route_state() -> Option<&'static pubsub::RouteCtl> {
 /// The server-wide shared state, once it exists — see `server.rs`.
 pub(crate) fn server_state() -> Option<&'static server::ServerCtl> {
     SERVER_CTL.get()
+}
+
+/// The SCAN cursor table, once it exists (`cursor.rs`).
+pub(crate) fn cursor_state() -> Option<&'static cursor::CursorTable> {
+    CURSOR_TABLE.get()
 }
 
 /// The WATCH counters, once they exist.
@@ -999,6 +1009,290 @@ mod tests {
             odd.replace('"', "\"\"")
         ))
         .unwrap();
+    }
+
+    // ──────────────────────────── SCAN cursors ───────────────────────────────
+
+    /// The database these tests fill: logged by default, and touched by no
+    /// other test.
+    const SCAN_DB: u8 = 13;
+
+    fn clear_scan_db() {
+        for tbl in ["kv", "hash", "list", "set", "zset", "stream", "expiry"] {
+            Spi::run(&format!("DELETE FROM redis.{tbl}_{SCAN_DB}")).unwrap();
+        }
+    }
+
+    /// One command through the SQL path, as a worker runs it.
+    fn run(argv: &[&[u8]]) -> crate::commands::Response {
+        let cmd =
+            crate::commands::Command::parse(argv.iter().map(|a| a.to_vec()).collect::<Vec<_>>())
+                .unwrap();
+        Spi::connect_mut(|c| cmd.execute(c, SCAN_DB))
+    }
+
+    /// A whole iteration of `argv` (the cursor goes after `cursor_at`
+    /// arguments), with `between` run after each call: every element, and
+    /// the number of calls.
+    fn iterate(
+        argv: &[&[u8]],
+        cursor_at: usize,
+        mut between: impl FnMut(usize),
+    ) -> (Vec<Vec<u8>>, usize) {
+        use crate::commands::Response;
+        let mut seen = Vec::new();
+        let mut cursor = 0u64;
+        for calls in 1..10_000 {
+            let text = cursor.to_string();
+            let mut line: Vec<&[u8]> = argv.to_vec();
+            line.insert(cursor_at, text.as_bytes());
+            match run(&line) {
+                Response::ScanResult { cursor: next, keys } => {
+                    seen.extend(keys.into_iter().flatten());
+                    if next == 0 {
+                        return (seen, calls);
+                    }
+                    assert!(next <= i64::MAX as u64, "the cursor must fit an i64");
+                    cursor = next;
+                }
+                other => panic!("{argv:?}: expected a scan reply, got {other:?}"),
+            }
+            between(calls);
+        }
+        panic!("{argv:?}: the iteration did not end");
+    }
+
+    fn sorted(mut v: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    /// Keys in every table, a live key with a deadline and two that are past
+    /// theirs, iterated ten at a time: every live key comes back, once each
+    /// since nothing changes, and the dead ones never.
+    #[pg_test]
+    fn scan_on_tables_returns_every_live_key_across_every_table() {
+        clear_scan_db();
+        let db = SCAN_DB;
+        Spi::run(&format!(
+            "INSERT INTO redis.kv_{db} (key, value) \
+               SELECT convert_to('k:' || lpad(i::text, 4, '0'), 'UTF8'), 'v' \
+                 FROM generate_series(1, 300) i; \
+             INSERT INTO redis.kv_{db} (key, value, expires_at) VALUES \
+               ('kv:live', 'v', now() + interval '1 hour'), \
+               ('kv:dead', 'v', now() - interval '1 second'); \
+             INSERT INTO redis.hash_{db} (key, field, value) \
+               SELECT convert_to('h:' || i, 'UTF8'), convert_to('f' || j, 'UTF8'), 'v' \
+                 FROM generate_series(1, 40) i, generate_series(1, 5) j; \
+             INSERT INTO redis.list_{db} (key, pos, value) \
+               SELECT convert_to('l:' || i, 'UTF8'), j, 'v' \
+                 FROM generate_series(1, 30) i, generate_series(1, 4) j; \
+             INSERT INTO redis.set_{db} (key, member) \
+               SELECT convert_to('s:' || i, 'UTF8'), convert_to('m' || j, 'UTF8') \
+                 FROM generate_series(1, 30) i, generate_series(1, 3) j; \
+             INSERT INTO redis.zset_{db} (key, member, score) \
+               SELECT convert_to('z:' || i, 'UTF8'), convert_to('m' || j, 'UTF8'), j \
+                 FROM generate_series(1, 30) i, generate_series(1, 3) j; \
+             INSERT INTO redis.stream_{db} (key, value) VALUES ('x:1', 'v'), ('x:2', 'v'); \
+             INSERT INTO redis.expiry_{db} (key, expires_at) VALUES \
+               ('s:1', now() - interval '1 second'), ('h:1', now() + interval '1 hour')"
+        ))
+        .unwrap();
+        let want: Vec<Vec<u8>> = Spi::connect(|c| {
+            c.select(
+                &format!(
+                    "SELECT key FROM (SELECT key FROM redis.kv_{db} \
+                       UNION SELECT key FROM redis.hash_{db} UNION SELECT key FROM redis.list_{db} \
+                       UNION SELECT key FROM redis.set_{db} UNION SELECT key FROM redis.zset_{db} \
+                       UNION SELECT key FROM redis.stream_{db}) u \
+                     WHERE key NOT IN ('kv:dead'::bytea, 's:1'::bytea)"
+                ),
+                None,
+                &[],
+            )
+            .unwrap()
+            .filter_map(|r| r.get::<Vec<u8>>(1).unwrap())
+            .collect()
+        });
+        assert_eq!(want.len(), 300 + 1 + 40 + 30 + 29 + 30 + 2);
+
+        let (seen, calls) = iterate(&[b"SCAN", b"COUNT", b"10"], 1, |_| {});
+        assert!(
+            calls > 40,
+            "ten a call over {} keys took {calls}",
+            want.len()
+        );
+        assert_eq!(
+            seen.len(),
+            want.len(),
+            "nothing changed, so nothing repeats"
+        );
+        assert_eq!(sorted(seen), sorted(want.clone()));
+
+        // MATCH and TYPE filter each page; the iteration still covers it all.
+        let (hashes, _) = iterate(&[b"SCAN", b"COUNT", b"10", b"TYPE", b"hash"], 1, |_| {});
+        assert_eq!(hashes.len(), 40);
+        let (matched, _) = iterate(&[b"SCAN", b"MATCH", b"z:*"], 1, |_| {});
+        assert_eq!(matched.len(), 30);
+        // One call with a large COUNT is the whole keyspace and ends at once.
+        let (all, calls) = iterate(&[b"SCAN", b"COUNT", b"100000"], 1, |_| {});
+        assert_eq!((all.len(), calls), (want.len(), 1));
+        clear_scan_db();
+    }
+
+    /// Keys deleted between calls, including ones the cursor has passed and
+    /// ones it has not reached: every key that stayed is still returned.
+    #[pg_test]
+    fn scan_on_tables_skips_nothing_when_keys_are_deleted_mid_iteration() {
+        clear_scan_db();
+        let db = SCAN_DB;
+        Spi::run(&format!(
+            "INSERT INTO redis.kv_{db} (key, value) \
+               SELECT convert_to('k:' || lpad(i::text, 4, '0'), 'UTF8'), 'v' \
+                 FROM generate_series(1, 500) i; \
+             INSERT INTO redis.set_{db} (key, member) \
+               SELECT convert_to('k:' || lpad(i::text, 4, '0') || 's', 'UTF8'), 'm' \
+                 FROM generate_series(1, 100) i"
+        ))
+        .unwrap();
+        let mut deleted = std::collections::BTreeSet::new();
+        let (seen, _) = iterate(&[b"SCAN", b"COUNT", b"10"], 1, |call| {
+            // Spread over the whole keyspace, behind and ahead of the cursor.
+            for j in 0..3 {
+                let i = (call * 37 + j * 211) % 500 + 1;
+                let key = format!("k:{i:04}");
+                Spi::connect_mut(|c| {
+                    c.update(
+                        &format!("DELETE FROM redis.kv_{db} WHERE key = $1"),
+                        None,
+                        &[key.as_bytes().into()],
+                    )
+                    .unwrap();
+                });
+                deleted.insert(key.into_bytes());
+            }
+        });
+        let seen: std::collections::BTreeSet<Vec<u8>> = seen.into_iter().collect();
+        for i in 1..=500 {
+            let key = format!("k:{i:04}").into_bytes();
+            assert!(
+                deleted.contains(&key) || seen.contains(&key),
+                "k:{i:04} was never deleted and never returned"
+            );
+        }
+        for i in 1..=100 {
+            assert!(seen.contains(format!("k:{i:04}s").as_bytes()));
+        }
+        clear_scan_db();
+    }
+
+    /// Fifty keys share a prefix longer than a cursor keeps, more than a page
+    /// of them: the iteration still ends and returns each.
+    #[pg_test]
+    fn scan_on_tables_ends_when_long_keys_share_a_prefix() {
+        clear_scan_db();
+        let prefix = "p".repeat(crate::cursor::BOUND_LEN + 20);
+        Spi::run(&format!(
+            "INSERT INTO redis.kv_{SCAN_DB} (key, value) \
+               SELECT convert_to('{prefix}' || lpad(i::text, 3, '0'), 'UTF8'), 'v' \
+                 FROM generate_series(1, 50) i; \
+             INSERT INTO redis.kv_{SCAN_DB} (key, value) \
+               SELECT convert_to('q' || i, 'UTF8'), 'v' FROM generate_series(1, 20) i"
+        ))
+        .unwrap();
+        let (seen, _) = iterate(&[b"SCAN", b"COUNT", b"10"], 1, |_| {});
+        assert_eq!(sorted(seen).len(), 70);
+        clear_scan_db();
+    }
+
+    /// HSCAN, SSCAN and ZSCAN page through one collection by its primary
+    /// key, with deletes mid-way, MATCH, and the scores ZSCAN pairs.
+    #[pg_test]
+    fn collection_scans_on_tables_page_through_and_skip_nothing() {
+        clear_scan_db();
+        let db = SCAN_DB;
+        Spi::run(&format!(
+            "INSERT INTO redis.hash_{db} (key, field, value) \
+               SELECT 'h', convert_to('f' || lpad(i::text, 3, '0'), 'UTF8'), \
+                      convert_to('v' || i, 'UTF8') FROM generate_series(1, 300) i; \
+             INSERT INTO redis.set_{db} (key, member) \
+               SELECT 's', convert_to('m' || lpad(i::text, 3, '0'), 'UTF8') \
+                 FROM generate_series(1, 300) i; \
+             INSERT INTO redis.zset_{db} (key, member, score) \
+               SELECT 'z', convert_to('m' || lpad(i::text, 3, '0'), 'UTF8'), i + 0.5 \
+                 FROM generate_series(1, 300) i; \
+             INSERT INTO redis.kv_{db} (key, value) VALUES ('str', 'v')"
+        ))
+        .unwrap();
+
+        // HSCAN: field, value pairs; delete fields as it goes.
+        let mut deleted = std::collections::BTreeSet::new();
+        let (flat, calls) = iterate(&[b"HSCAN", b"h", b"COUNT", b"10"], 2, |call| {
+            let field = format!("f{:03}", (call * 53) % 300 + 1);
+            Spi::connect_mut(|c| {
+                c.update(
+                    &format!("DELETE FROM redis.hash_{db} WHERE key = 'h' AND field = $1"),
+                    None,
+                    &[field.as_bytes().into()],
+                )
+                .unwrap();
+            });
+            deleted.insert(field.into_bytes());
+        });
+        assert!(calls > 20);
+        assert_eq!(flat.len() % 2, 0);
+        let pairs: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = flat
+            .chunks(2)
+            .map(|p| (p[0].clone(), p[1].clone()))
+            .collect();
+        for i in 1..=300 {
+            let f = format!("f{i:03}").into_bytes();
+            if !deleted.contains(&f) {
+                assert_eq!(
+                    pairs.get(&f),
+                    Some(&format!("v{i}").into_bytes()),
+                    "f{i:03}"
+                );
+            }
+        }
+
+        // SSCAN: members only.
+        let (members, calls) = iterate(&[b"SSCAN", b"s", b"COUNT", b"10"], 2, |_| {});
+        assert_eq!((sorted(members).len(), calls > 20), (300, true));
+
+        // ZSCAN: member, score pairs, with MATCH.
+        let (flat, _) = iterate(
+            &[b"ZSCAN", b"z", b"MATCH", b"m00*", b"COUNT", b"7"],
+            2,
+            |_| {},
+        );
+        let got: Vec<(String, String)> = flat
+            .chunks(2)
+            .map(|p| {
+                (
+                    String::from_utf8(p[0].clone()).unwrap(),
+                    String::from_utf8(p[1].clone()).unwrap(),
+                )
+            })
+            .collect();
+        let want: Vec<(String, String)> = (1..=9)
+            .map(|i| (format!("m{i:03}"), format!("{i}.5")))
+            .collect();
+        assert_eq!(got, want);
+
+        // A missing key is an empty collection; another type is WRONGTYPE.
+        let (none, calls) = iterate(&[b"SSCAN", b"nosuchkey"], 2, |_| {});
+        assert_eq!((none.len(), calls), (0, 1));
+        match run(&[b"HSCAN", b"s", b"0"]) {
+            crate::commands::Response::Error(e) => assert!(e.starts_with("WRONGTYPE"), "{e}"),
+            other => panic!("HSCAN on a set answered {other:?}"),
+        }
+        match run(&[b"ZSCAN", b"str", b"0"]) {
+            crate::commands::Response::Error(e) => assert!(e.starts_with("WRONGTYPE"), "{e}"),
+            other => panic!("ZSCAN on a string answered {other:?}"),
+        }
+        clear_scan_db();
     }
 }
 

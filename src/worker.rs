@@ -2753,9 +2753,9 @@ fn write_response(w: &mut impl std::io::Write, response: Response) -> std::io::R
         Response::Value(v) => write_value(w, &v),
         // Consumed by the connection loop; never meant for a client.
         Response::StreamWait(_) => write_null_array(w),
-        Response::ScanResult { keys } => {
+        Response::ScanResult { cursor, keys } => {
             write_array_header(w, 2)?;
-            write_bulk_string(w, b"0")?;
+            write_bulk_string(w, cursor.to_string().as_bytes())?;
             write_array_header(w, keys.len())?;
             for item in keys {
                 match item {

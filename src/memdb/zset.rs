@@ -102,6 +102,12 @@ impl<A: Allocator + Clone> ZSet<A> {
         self.dict.at(i).map(|(m, s)| (m, *s))
     }
 
+    /// One step of `ZSCAN`, over the member dictionary rather than the order:
+    /// see [`Dict::scan`] for the cursor and its guarantee.
+    pub fn scan(&self, cursor: u64, count: usize, mut visit: impl FnMut(&[u8], f64)) -> u64 {
+        self.dict.scan(cursor, count, |m, s| visit(m, *s))
+    }
+
     /// The number of entries for which `pred` holds, given that it holds for
     /// a prefix of the order and for nothing after: the rank where it stops.
     fn partition_point(&self, pred: impl Fn(f64, &[u8]) -> bool) -> usize {

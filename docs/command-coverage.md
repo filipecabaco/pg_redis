@@ -99,7 +99,7 @@ The limits that apply only to databases in memory are described once, in
 | `TOUCH` | Counts as `EXISTS` does; there is no LRU clock to refresh |
 | `TYPE` |  |
 | `KEYS` | Full scan, as in Redis, over keys of every type. Glob matching is done in-process, outside SQL |
-| `SCAN` | Cursor is always 0, so one call is a full pass with no incremental guarantee. `MATCH`, `COUNT` and `TYPE` honoured |
+| `SCAN` | Incremental, with Redis's guarantee: a full iteration returns every key present from its start to its end at least once. `COUNT` (default 10) is the work per call; `MATCH` and `TYPE` filter each page afterwards, so a page can be empty before the end. Cursor values differ from Redis's. See [Cursors](IMPLEMENTATION.md#scan-cursors) |
 | `RANDOMKEY` | Uniform over every live key, whatever table holds it |
 | `DUMP` | Redis's serialisation format, version 11, streams included; restores into a real 7.2 |
 | `RESTORE` | REPLACE and ABSTTL honoured, IDLETIME and FREQ accepted; Redis stream payloads of every format since 5.0; refuses payloads newer than version 11 and pre-7 compact encodings |
@@ -149,7 +149,7 @@ The limits that apply only to databases in memory are described once, in
 | `HINCRBY` |  |
 | `HINCRBYFLOAT` |  |
 | `HRANDFIELD` | A negative count repeats; WITHVALUES interleaves |
-| `HSCAN` | Cursor is always 0, so one call is a full pass; `MATCH` honoured |
+| `HSCAN` | Incremental, as `SCAN` is; `COUNT` and `MATCH` honoured |
 
 ## Lists
 
@@ -198,7 +198,7 @@ The limits that apply only to databases in memory are described once, in
 | `SINTERSTORE` |  |
 | `SDIFFSTORE` |  |
 | `SINTERCARD` | `LIMIT 0` means no limit |
-| `SSCAN` | Cursor is always 0, so one call is a full pass; `MATCH` honoured |
+| `SSCAN` | Incremental, as `SCAN` is; `COUNT` and `MATCH` honoured |
 
 ## Sorted sets
 
@@ -233,7 +233,7 @@ The limits that apply only to databases in memory are described once, in
 | `ZUNIONSTORE` |  |
 | `ZINTERSTORE` |  |
 | `ZDIFFSTORE` |  |
-| `ZSCAN` | Cursor is always 0, so one call is a full pass; `MATCH` honoured |
+| `ZSCAN` | Incremental, as `SCAN` is; `COUNT` and `MATCH` honoured |
 | `ZRANGESTORE` | Every `ZRANGE` form: by rank, `BYSCORE`, `BYLEX`, `REV`, `LIMIT` |
 | `ZMPOP` | `MIN`/`MAX` and `COUNT` |
 | `BZPOPMIN` | As `BLPOP`, for sorted sets |

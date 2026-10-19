@@ -599,6 +599,7 @@
 			"SCAN TYPE",
 			"SCAN basic",
 			"SCAN guarantees check under write load",
+			"SCAN regression test for issue #4906",
 			"SSCAN with PATTERN",
 			"SSCAN with encoding hashtable",
 			"SSCAN with encoding intset",

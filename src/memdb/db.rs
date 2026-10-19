@@ -523,6 +523,19 @@ impl<A: Allocator + Clone> Store for Db<A> {
             .collect())
     }
 
+    /// A key past its deadline is passed over, not removed: removing it would
+    /// move another key, and the sweep or the next access removes it anyway.
+    fn scan_keys(&mut self, cursor: u64, count: usize) -> Out<(u64, Vec<Vec<u8>>)> {
+        let now = now();
+        let mut out = Vec::new();
+        let next = self.keys.scan(cursor, count, |k, e| {
+            if !e.expired(now) {
+                out.push(k.to_vec());
+            }
+        });
+        Ok((next, out))
+    }
+
     fn dbsize(&mut self) -> Out<i64> {
         let now = now();
         Ok(self.keys.values().filter(|e| !e.expired(now)).count() as i64)
@@ -770,6 +783,19 @@ impl<A: Allocator + Clone> Store for Db<A> {
         }))
     }
 
+    fn hscan(
+        &mut self,
+        key: &[u8],
+        cursor: u64,
+        count: usize,
+    ) -> Out<crate::cursor::Page<Vec<u8>>> {
+        let mut out = Vec::new();
+        let next = self.hash(key).map_or(0, |h| {
+            h.scan(cursor, count, |f, v| out.push((f.to_vec(), v.to_vec())))
+        });
+        Ok((next, out))
+    }
+
     fn hkeys(&mut self, key: &[u8]) -> Out<Vec<Vec<u8>>> {
         Ok(self.hash(key).map_or_else(Vec::new, |h| vecs(h.keys())))
     }
@@ -879,6 +905,14 @@ impl<A: Allocator + Clone> Store for Db<A> {
 
     fn smembers(&mut self, key: &[u8]) -> Out<Vec<Vec<u8>>> {
         Ok(self.set(key).map_or_else(Vec::new, |s| vecs(s.keys())))
+    }
+
+    fn sscan(&mut self, key: &[u8], cursor: u64, count: usize) -> Out<(u64, Vec<Vec<u8>>)> {
+        let mut out = Vec::new();
+        let next = self
+            .set(key)
+            .map_or(0, |s| s.scan(cursor, count, |m, _| out.push(m.to_vec())));
+        Ok((next, out))
     }
 
     fn scard(&mut self, key: &[u8]) -> Out<i64> {
@@ -1030,6 +1064,14 @@ impl<A: Allocator + Clone> Store for Db<A> {
 
     fn zcard(&mut self, key: &[u8]) -> Out<i64> {
         Ok(self.zset(key).map_or(0, |z| z.len() as i64))
+    }
+
+    fn zscan(&mut self, key: &[u8], cursor: u64, count: usize) -> Out<crate::cursor::Page<f64>> {
+        let mut out = Vec::new();
+        let next = self.zset(key).map_or(0, |z| {
+            z.scan(cursor, count, |m, s| out.push((m.to_vec(), s)))
+        });
+        Ok((next, out))
     }
 
     fn zcount(&mut self, key: &[u8], min: ScoreBound, max: ScoreBound) -> Out<i64> {

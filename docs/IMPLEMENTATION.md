@@ -135,6 +135,63 @@ collation.
 Every `kv_*` table carries a partial index on `expires_at` for the SQL expiry
 sweep; a unit test asserts it exists on all sixteen.
 
+### SCAN cursors
+
+`SCAN`, `HSCAN`, `SSCAN` and `ZSCAN` return one page per call and a cursor to
+resume from, with Redis's guarantee: a full iteration, from cursor 0 until the
+server returns 0, returns every element present from its start to its end at
+least once. An element can come back more than once, and one added or removed
+during the iteration may or may not appear. `COUNT` (10 by default) sets the
+work per call. `MATCH` and `TYPE` filter the page afterwards, as in Redis, so
+a call can return nothing and still not be the last. The cursor is an
+unsigned 64-bit integer in decimal. Its value means something different on
+each backend, and neither matches Redis's.
+
+**Memory.** The cursor is a position in the dictionary (`Dict::scan` in
+`src/memdb/dict.rs`). A call visits the `COUNT` positions below the cursor,
+from the top down, and returns the lowest one it visited, or 0 once it reaches
+the bottom. Cursor 0 starts at the top, and a cursor past the end is clamped to
+it. An insert appends at the end and a removal moves the last entry into the
+hole, so an entry only ever moves to a lower position. An entry not yet visited
+therefore stays below the cursor however the dictionary changes between calls;
+one that moves down from a visited position is returned again. Nothing is kept
+between calls and a call costs O(`COUNT`). The keyspace, a hash's fields, a
+set's members and a sorted set's member dictionary are all iterated this way. A
+key past its deadline is passed over.
+
+**Tables.** A call resumes after the last key or element the previous call
+returned, in bytea order, through the primary key index. For `SCAN` each of
+the six tables a key can be in gives its next `COUNT` keys
+(`key > $last ORDER BY key LIMIT n`), and the first `COUNT` of their union are
+the page: a key not among them sorts after all of them, so the page has no gap.
+A collection is read with `key = $1 AND field > $last ORDER BY field LIMIT n`.
+
+A key does not fit in 64 bits, so the cursor is a token naming an entry in a
+table in shared memory (`src/cursor.rs`), where every worker can find it.
+Clients use connection pools, so the calls of one iteration can arrive on
+different connections and workers.
+
+- The table has 4,096 entries. Each holds a token, what it iterates (the
+  database, and for a collection a hash of its key), the first 256 bytes of the
+  key to resume after, and a last-use counter. One spinlock guards the table.
+- A new iteration takes a free entry, or else the one used least recently.
+  Each call moves its iteration's entry forward under a new token, and the
+  call that returns 0 frees it.
+- A key longer than 256 bytes is kept as its prefix. Resuming after a prefix
+  of the last key can only return elements again. When more than `COUNT` keys
+  share one 256-byte prefix, the call also returns the rest of them, so the
+  iteration cannot stall on that prefix.
+- A token the table does not know starts the iteration over: one evicted by
+  4,096 newer iterations, one issued before a restart, one made up, one issued
+  for another database or key, or a token sent a second time. That repeats
+  elements and skips none.
+
+**After a policy change.** A cursor issued by one backend and sent to the
+other is not an error. The tables do not know a position, and the memory
+engine clamps a token to its last position, so the iteration starts over.
+`SCAN` finishes a database's migration before it runs
+([Storage policies](STORAGE.md#when-keys-move)).
+
 ---
 
 ## 3. The shared-memory backend
@@ -416,6 +473,12 @@ client get `BUSY`, on every worker, until it ends or `SCRIPT KILL` /
   on the durable half into a write; `rdb_changes_since_last_save` stays 0.
   `SAVE`, `BGSAVE` and `LASTSAVE` act on `memory+snapshot` databases' snapshots
   ([Storage policies](STORAGE.md#snapshots-phase-4)).
+- **`SCAN` cursors on a table are kept by the server.** On the durable half
+  a cursor names an entry in a shared-memory table of 4,096 iterations in
+  progress ([SCAN cursors](#scan-cursors)). A cursor sent a second time, or
+  one pushed out by newer iterations, starts the iteration over, so elements
+  come back again; none is skipped. A Redis cursor carries its whole state and
+  can be sent again.
 - **Small hashes and sets keep insertion order only until a removal.** Redis
   returns a listpack-encoded hash's fields, and a small set's members, in
   the order they were added, and keeps that order across deletions. The
@@ -609,14 +672,18 @@ arguments, source equal to destination, score and float formatting, what counts
 as an integer, which operations keep a TTL), and the patterns people deploy (rate limiter, session, `SET NX PX` lock, leaderboard, work queue, dedup,
 cache-aside, tag intersection, hash-as-object, time index).
 
-It normalises three things and nothing else:
+It normalises four things and nothing else:
 
 - **Unordered replies.** `SMEMBERS`, `HGETALL`, `KEYS` and the set-algebra
   commands have no defined order in Redis, so comparing them verbatim measures
   two hash-table iteration orders. Sorted before comparison.
-- **Draws and clocks.** `SPOP` without a count, `RANDOMKEY`, `TTL`, `INFO`,
-  `SCAN` cursors. Only the reply *shape* is compared: the type byte, and an
-  array's length.
+- **Draws and clocks.** `SPOP` without a count, `RANDOMKEY`, `TTL`, `INFO`.
+  Only the reply *shape* is compared: the type byte, and an array's length.
+- **Scan cursors.** A `SCAN`-family cursor is a position in each server's own
+  structure, so cursor values and page boundaries cannot match. A reply that
+  ends the iteration (cursor 0) is compared by its elements in any order, with
+  field-value and member-score pairs kept together; any other page by its
+  shape.
 - **A dropped connection.** A command that kills the server it was sent to never
   replies; the harness records `NO REPLY` and reconnects, so it does not wait
   forever. That is how the `INCR` overflow below was found.

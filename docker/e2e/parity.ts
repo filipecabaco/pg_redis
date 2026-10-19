@@ -50,15 +50,40 @@ const SHAPE_ONLY = new Set([
 	"COMMAND",
 	"CONFIG",
 	"CLIENT",
-	"SCAN",
-	"HSCAN",
-	"SSCAN",
-	"ZSCAN",
 	"DEBUG",
 	"MEMORY",
 	"TIME",
 	"DUMP",
 ]);
+
+/**
+ * The SCAN family's cursors name a position in each server's own structure,
+ * so neither the cursor nor the split into pages can match. A reply that ends
+ * the iteration in one call (cursor 0, as both servers give for a small
+ * collection) is compared by the elements it returns, in any order and with
+ * field-value or member-score pairs kept together; a page that does not end
+ * it, by its shape alone.
+ */
+const SCAN_FAMILY = new Map([
+	["SCAN", 1],
+	["SSCAN", 1],
+	["HSCAN", 2],
+	["ZSCAN", 2],
+]);
+
+function scanForm(reply: Buffer, stride: number): string {
+	const [node] = readNode(reply, 0);
+	if (!Array.isArray(node) || node.length !== 2 || !Array.isArray(node[1])) {
+		return shape(reply);
+	}
+	if (node[0] !== "$0") return "*2 page";
+	const items = node[1].map(showNode);
+	const groups: string[] = [];
+	for (let i = 0; i < items.length; i += stride) {
+		groups.push(items.slice(i, i + stride).join(" "));
+	}
+	return `*2 end [${groups.sort().join("|")}]`;
+}
 
 /** RESP type name for a reply, used when only the shape is comparable. */
 function shape(reply: Buffer): string {
@@ -156,6 +181,8 @@ const CLOCK = new Set(["TTL", "PTTL", "EXPIRETIME", "PEXPIRETIME"]);
 function normalize(cmd: Cmd, reply: Buffer): string {
 	const name = cmd[0].toUpperCase();
 	if (SHAPE_ONLY.has(name)) return shape(reply);
+	const stride = SCAN_FAMILY.get(name);
+	if (stride !== undefined && reply[0] === 0x2a) return scanForm(reply, stride);
 	if (CLOCK.has(name) && reply[0] === 0x3a) {
 		const n = Number(reply.subarray(1, reply.indexOf("\r\n")).toString());
 		return n < 0 ? `:${n}` : ":positive";

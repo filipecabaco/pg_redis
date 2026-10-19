@@ -101,6 +101,10 @@ pub trait Store {
     fn rename(&mut self, key: &[u8], newkey: &[u8]) -> Out<bool>;
     /// Every live key matching the glob, or every one without it.
     fn keys(&mut self, pattern: Option<&[u8]>) -> Out<Vec<Vec<u8>>>;
+    /// One step of `SCAN`: about `count` keys from `cursor` (0 starts), live
+    /// ones only, and the cursor to continue from, 0 when the iteration is
+    /// done. A key present for the whole iteration is returned at least once.
+    fn scan_keys(&mut self, cursor: u64, count: usize) -> Out<(u64, Vec<Vec<u8>>)>;
     fn dbsize(&mut self) -> Out<i64>;
     /// INFO keyspace's keys and keys with an expiry.
     fn keyspace(&mut self) -> Out<(i64, i64)>;
@@ -135,6 +139,9 @@ pub trait Store {
     fn hget(&mut self, key: &[u8], field: &[u8]) -> Out<Option<Vec<u8>>>;
     fn hmget(&mut self, key: &[u8], fields: &[Vec<u8>]) -> Out<Vec<Option<Vec<u8>>>>;
     fn hgetall(&mut self, key: &[u8]) -> Out<Vec<(Vec<u8>, Vec<u8>)>>;
+    /// One step of `HSCAN`, as `scan_keys` is of `SCAN`: fields and values.
+    fn hscan(&mut self, key: &[u8], cursor: u64, count: usize)
+    -> Out<crate::cursor::Page<Vec<u8>>>;
     fn hkeys(&mut self, key: &[u8]) -> Out<Vec<Vec<u8>>>;
     fn hvals(&mut self, key: &[u8]) -> Out<Vec<Vec<u8>>>;
     fn hlen(&mut self, key: &[u8]) -> Out<i64>;
@@ -156,6 +163,8 @@ pub trait Store {
     fn sismember(&mut self, key: &[u8], member: &[u8]) -> Out<bool>;
     fn smismember(&mut self, key: &[u8], members: &[Vec<u8>]) -> Out<Vec<bool>>;
     fn smembers(&mut self, key: &[u8]) -> Out<Vec<Vec<u8>>>;
+    /// One step of `SSCAN`.
+    fn sscan(&mut self, key: &[u8], cursor: u64, count: usize) -> Out<(u64, Vec<Vec<u8>>)>;
     fn scard(&mut self, key: &[u8]) -> Out<i64>;
     /// Remove and return up to `n` members picked at random.
     fn spop(&mut self, key: &[u8], n: i64) -> Out<Vec<Vec<u8>>>;
@@ -184,6 +193,8 @@ pub trait Store {
     fn zscore(&mut self, key: &[u8], member: &[u8]) -> Out<Option<f64>>;
     fn zmscore(&mut self, key: &[u8], members: &[Vec<u8>]) -> Out<Vec<Option<f64>>>;
     fn zcard(&mut self, key: &[u8]) -> Out<i64>;
+    /// One step of `ZSCAN`: members and their scores.
+    fn zscan(&mut self, key: &[u8], cursor: u64, count: usize) -> Out<crate::cursor::Page<f64>>;
     fn zcount(&mut self, key: &[u8], min: ScoreBound, max: ScoreBound) -> Out<i64>;
     fn zlexcount(&mut self, key: &[u8], min: &LexBound, max: &LexBound) -> Out<i64>;
     /// The member's rank, counted from the low end (or the high end, `rev`),
@@ -292,7 +303,19 @@ pub fn run(cmd: &Command, store: &mut dyn Store) -> Option<Response> {
         }),
         Command::RenameNx { key, newkey } => renamenx(store, key, newkey),
         Command::Keys { pattern } => store.keys(Some(pattern)).map(array),
-        Command::Scan { pattern, kind, .. } => scan(store, pattern.as_deref(), *kind),
+        Command::Scan {
+            cursor,
+            pattern,
+            count,
+            kind,
+        } => scan(store, *cursor, *count, pattern.as_deref(), *kind),
+        Command::CollectionScan {
+            kind,
+            key,
+            cursor,
+            count,
+            pattern,
+        } => collection_scan(store, *kind, key, *cursor, *count, pattern.as_deref()),
         Command::DbSize => store.dbsize().map(Response::Integer),
         Command::Keyspace => store
             .keyspace()
@@ -865,15 +888,33 @@ fn renamenx(store: &mut dyn Store, key: &[u8], newkey: &[u8]) -> Out<Response> {
     })
 }
 
-/// `SCAN`: one pass, cursor 0. A TYPE pg_redis has no table for matches
-/// nothing, as in Redis 7.2.
+/// `COUNT`'s default, as in Redis.
+const SCAN_COUNT: i64 = 10;
+
+fn scan_count(count: Option<i64>) -> usize {
+    usize::try_from(count.unwrap_or(SCAN_COUNT)).unwrap_or(usize::MAX)
+}
+
+fn matches(pattern: Option<&[u8]>, item: &[u8]) -> bool {
+    pattern.is_none_or(|p| crate::pubsub::glob_match(p, item))
+}
+
+/// `SCAN`: one step of the backend's cursor. MATCH and TYPE filter what the
+/// step found, as in Redis, so a step can return nothing and still not be
+/// the last. A TYPE pg_redis has no table for matches nothing, as in Redis
+/// 7.2.
 fn scan(
     store: &mut dyn Store,
+    cursor: u64,
+    count: Option<i64>,
     pattern: Option<&[u8]>,
     kind: Option<Option<KeyKind>>,
 ) -> Out<Response> {
-    let mut keys = store.keys(pattern)?;
-    if let Some(want) = kind {
+    let (next, mut keys) = store.scan_keys(cursor, scan_count(count))?;
+    keys.retain(|k| matches(pattern, k));
+    if let Some(want) = kind
+        && !keys.is_empty()
+    {
         let kinds = store.kinds(&keys)?;
         keys = keys
             .into_iter()
@@ -883,7 +924,50 @@ fn scan(
             .collect();
     }
     Ok(Response::ScanResult {
+        cursor: next,
         keys: keys.into_iter().map(Some).collect(),
+    })
+}
+
+/// `HSCAN`, `SSCAN` and `ZSCAN`: one step over a collection, MATCH applied
+/// to fields and members afterwards. A missing key is an empty collection.
+fn collection_scan(
+    store: &mut dyn Store,
+    kind: KeyKind,
+    key: &[u8],
+    cursor: u64,
+    count: Option<i64>,
+    pattern: Option<&[u8]>,
+) -> Out<Response> {
+    let count = scan_count(count);
+    let (next, items): (u64, Vec<Vec<u8>>) = match kind {
+        KeyKind::Hash => {
+            let (next, pairs) = store.hscan(key, cursor, count)?;
+            let items = pairs
+                .into_iter()
+                .filter(|(f, _)| matches(pattern, f))
+                .flat_map(|(f, v)| [f, v])
+                .collect();
+            (next, items)
+        }
+        KeyKind::Zset => {
+            let (next, pairs) = store.zscan(key, cursor, count)?;
+            let items = pairs
+                .into_iter()
+                .filter(|(m, _)| matches(pattern, m))
+                .flat_map(|(m, s)| [m, format_score(s).into_bytes()])
+                .collect();
+            (next, items)
+        }
+        _ => {
+            let (next, mut members) = store.sscan(key, cursor, count)?;
+            members.retain(|m| matches(pattern, m));
+            (next, members)
+        }
+    };
+    Ok(Response::ScanResult {
+        cursor: next,
+        keys: items.into_iter().map(Some).collect(),
     })
 }
 
@@ -1125,6 +1209,49 @@ impl Store for SqlStore<'_, '_> {
                 .flatten()
                 .collect(),
         )
+    }
+
+    /// Keyset pagination over the six tables a key can be in: each yields
+    /// its first `count` keys after the bound through its primary key, and
+    /// the first `count` of their union are the page. A key in a table that
+    /// is not among them would sort after all of them, so the page has no
+    /// gap. The cursor follows the page's last key, live or not; a key past
+    /// its deadline is dropped from the reply afterwards.
+    fn scan_keys(&mut self, cursor: u64, count: usize) -> Out<(u64, Vec<Vec<u8>>)> {
+        let db = self.db;
+        let scope = crate::cursor::scope(db, 0, b"");
+        let (next, rows) = crate::cursor::step(
+            crate::cursor_state(),
+            cursor,
+            scope,
+            count,
+            token_random(),
+            |range, limit| {
+                let (from, upto) = range_args(range);
+                let tbl = self
+                    .client
+                    .select_kept(
+                        &scan_page_sql(db, range),
+                        &[from.into(), limit.into(), upto.into()],
+                    )
+                    .map_err(|e| failed("SCAN", e))?;
+                Ok(tbl
+                    .filter_map(|r| {
+                        Some((
+                            r.get::<Vec<u8>>(1).ok()??,
+                            r.get::<bool>(2).ok().flatten().unwrap_or(true),
+                        ))
+                    })
+                    .collect())
+            },
+        )?;
+        Ok((
+            next,
+            rows.into_iter()
+                .filter(|(_, live)| *live)
+                .map(|(k, _)| k)
+                .collect(),
+        ))
     }
 
     fn dbsize(&mut self) -> Out<i64> {
@@ -1580,6 +1707,33 @@ impl Store for SqlStore<'_, '_> {
             .collect())
     }
 
+    fn hscan(
+        &mut self,
+        key: &[u8],
+        cursor: u64,
+        count: usize,
+    ) -> Out<crate::cursor::Page<Vec<u8>>> {
+        let db = self.db;
+        let scope = crate::cursor::scope(db, KeyKind::Hash as u8, key);
+        crate::cursor::step(
+            crate::cursor_state(),
+            cursor,
+            scope,
+            count,
+            token_random(),
+            |range, limit| {
+                let (from, upto) = range_args(range);
+                let sql = collection_page_sql(db, "hash", "field, value", "field", range);
+                let args = [key.into(), from.into(), limit.into(), upto.into()];
+                Ok(self
+                    .rows("HSCAN", &sql, &args)?
+                    .into_iter()
+                    .filter_map(|(f, v)| Some((f, v?)))
+                    .collect())
+            },
+        )
+    }
+
     fn hkeys(&mut self, key: &[u8]) -> Out<Vec<Vec<u8>>> {
         let sql = &crate::commands::sql::HKEYS[self.db as usize];
         self.column("HKEYS", sql, &[key.into()])
@@ -1785,6 +1939,29 @@ impl Store for SqlStore<'_, '_> {
     fn smembers(&mut self, key: &[u8]) -> Out<Vec<Vec<u8>>> {
         let sql = &crate::commands::sql::SMEMBERS[self.db as usize];
         self.column("SMEMBERS", sql, &[key.into()])
+    }
+
+    fn sscan(&mut self, key: &[u8], cursor: u64, count: usize) -> Out<(u64, Vec<Vec<u8>>)> {
+        let db = self.db;
+        let scope = crate::cursor::scope(db, KeyKind::Set as u8, key);
+        let (next, rows) = crate::cursor::step(
+            crate::cursor_state(),
+            cursor,
+            scope,
+            count,
+            token_random(),
+            |range, limit| {
+                let (from, upto) = range_args(range);
+                let sql = collection_page_sql(db, "set", "member", "member", range);
+                let args = [key.into(), from.into(), limit.into(), upto.into()];
+                Ok(self
+                    .column("SSCAN", &sql, &args)?
+                    .into_iter()
+                    .map(|m| (m, ()))
+                    .collect())
+            },
+        )?;
+        Ok((next, rows.into_iter().map(|(m, ())| m).collect()))
     }
 
     fn scard(&mut self, key: &[u8]) -> Out<i64> {
@@ -2052,6 +2229,34 @@ impl Store for SqlStore<'_, '_> {
     fn zcard(&mut self, key: &[u8]) -> Out<i64> {
         let sql = &crate::commands::sql::ZCARD[self.db as usize];
         self.int("ZCARD", sql, &[key.into()])
+    }
+
+    fn zscan(&mut self, key: &[u8], cursor: u64, count: usize) -> Out<crate::cursor::Page<f64>> {
+        let db = self.db;
+        let scope = crate::cursor::scope(db, KeyKind::Zset as u8, key);
+        crate::cursor::step(
+            crate::cursor_state(),
+            cursor,
+            scope,
+            count,
+            token_random(),
+            |range, limit| {
+                let (from, upto) = range_args(range);
+                let sql = collection_page_sql(db, "zset", "member, score", "member", range);
+                let tbl = self
+                    .client
+                    .select_kept(&sql, &[key.into(), from.into(), limit.into(), upto.into()])
+                    .map_err(|e| failed("ZSCAN", e))?;
+                Ok(tbl
+                    .filter_map(|r| {
+                        Some((
+                            r.get::<Vec<u8>>(1).ok()??,
+                            r.get::<f64>(2).ok().flatten().unwrap_or(0.0),
+                        ))
+                    })
+                    .collect())
+            },
+        )
     }
 
     fn zcount(&mut self, key: &[u8], min: ScoreBound, max: ScoreBound) -> Out<i64> {
@@ -2652,6 +2857,89 @@ impl SqlStore<'_, '_> {
 /// Byte strings as a `bytea[]` parameter.
 fn arr(items: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
     items.iter().cloned().map(Some).collect()
+}
+
+// ───────────────────────────── keyset cursors ───────────────────────────────
+
+/// Random bits for a cursor token. Each worker's generator is seeded from
+/// the clock and may have been seeded before the fork, so the pid is mixed
+/// in for workers drawing at once.
+fn token_random() -> u64 {
+    crate::memdb::fast_random() ^ u64::from(std::process::id()).rotate_left(32)
+}
+
+/// The predicate a page's range puts on `col`, the bound being parameter
+/// `$from` and the upper bound `$upto`. Each range is its own statement text,
+/// so each keeps a plan that can use the index.
+fn range_sql(range: &crate::cursor::Range, col: &str, from: usize, upto: usize) -> String {
+    use crate::cursor::Range;
+    match range {
+        Range::All => "TRUE".to_string(),
+        Range::After(_) => format!("{col} > ${from}"),
+        Range::From(_) => format!("{col} >= ${from}"),
+        Range::Between(..) => format!("{col} > ${from} AND {col} < ${upto}"),
+    }
+}
+
+/// The two bounds as parameters, empty where the range has none: a
+/// statement may leave a parameter unused, so every range takes the same
+/// list.
+fn range_args(range: &crate::cursor::Range) -> (Vec<u8>, Vec<u8>) {
+    use crate::cursor::Range;
+    match range {
+        Range::All => (Vec::new(), Vec::new()),
+        Range::After(b) | Range::From(b) => (b.clone(), Vec::new()),
+        Range::Between(a, b) => (a.clone(), b.clone()),
+    }
+}
+
+/// One `SCAN` page of database `db`: the next `$2` keys in `range` (all of
+/// them for a NULL `$2`) across every table a key can be in, each with
+/// whether it is live. Parameters: `$1` the bound, `$3` the upper bound.
+fn scan_page_sql(db: u8, range: &crate::cursor::Range) -> String {
+    let pred = range_sql(range, "key", 1, 3);
+    let from = |tbl: &str, distinct: &str| {
+        format!("(SELECT {distinct}key FROM redis.{tbl}_{db} WHERE {pred} ORDER BY key LIMIT $2)")
+    };
+    // A collection keeps a row per element, so its keys are DISTINCT; the
+    // index on (key, ...) still delivers them in order.
+    let tables = [
+        from("kv", ""),
+        from("hash", "DISTINCT "),
+        from("list", "DISTINCT "),
+        from("set", "DISTINCT "),
+        from("zset", "DISTINCT "),
+        from("stream", ""),
+    ]
+    .join(" UNION ");
+    format!(
+        "WITH page AS (SELECT key FROM ({tables}) u ORDER BY key LIMIT $2) \
+         SELECT p.key, \
+                NOT EXISTS (SELECT 1 FROM redis.kv_{db} t \
+                             WHERE t.key = p.key AND t.expires_at <= now()) \
+            AND NOT EXISTS (SELECT 1 FROM redis.expiry_{db} e \
+                             WHERE e.key = p.key AND e.expires_at <= now()) \
+           FROM page p ORDER BY p.key"
+    )
+}
+
+/// One `HSCAN`/`SSCAN`/`ZSCAN` page: `cols` of the collection `$1` in table
+/// `tbl`, ordered by `col`, the next `$3` of them in `range` (all for a NULL
+/// `$3`), nothing once the key has expired. `$2` is the bound and `$4` the
+/// upper bound.
+fn collection_page_sql(
+    db: u8,
+    tbl: &str,
+    cols: &str,
+    col: &str,
+    range: &crate::cursor::Range,
+) -> String {
+    format!(
+        "SELECT {cols} FROM redis.{tbl}_{db} WHERE key = $1 AND {pred} AND {live} \
+         ORDER BY {col} LIMIT $3",
+        pred = range_sql(range, col, 2, 4),
+        live = crate::commands::sql::live(db as usize),
+    )
 }
 
 #[cfg(test)]

@@ -812,11 +812,20 @@ pub enum Command {
     },
     RandomKey,
     Scan {
-        _cursor: u64,
+        cursor: u64,
         pattern: Option<Vec<u8>>,
-        _count: Option<i64>,
+        count: Option<i64>,
         /// `TYPE`: `Some(None)` names no type pg_redis has, so nothing matches.
         kind: Option<Option<crate::memdb::KeyKind>>,
+    },
+    /// `HSCAN`, `SSCAN` or `ZSCAN`, by the type it iterates: `Hash`, `Set`
+    /// or `Zset`.
+    CollectionScan {
+        kind: crate::memdb::KeyKind,
+        key: Vec<u8>,
+        cursor: u64,
+        count: Option<i64>,
+        pattern: Option<Vec<u8>>,
     },
     // Hash commands
     HGet {
@@ -1175,7 +1184,10 @@ pub enum Response {
     /// Any reply shape, nesting included — what the variants above cannot
     /// spell: `LMPOP`'s key-and-list, `LCS IDX`, `XRANGE`, `SLOWLOG GET`.
     Value(Value),
+    /// A `SCAN`-family reply: the cursor to continue from, in decimal, and
+    /// the elements found.
     ScanResult {
+        cursor: u64,
         keys: Vec<Option<Vec<u8>>>,
     },
     Error(String),
@@ -1230,8 +1242,8 @@ impl Response {
                 Value::Array(vec![Value::Int(rank), Value::Bulk(score)])
             }
             Response::Value(v) => v,
-            Response::ScanResult { keys } => Value::Array(vec![
-                Value::str("0"),
+            Response::ScanResult { cursor, keys } => Value::Array(vec![
+                Value::Bulk(cursor.to_string().into_bytes()),
                 Value::Array(
                     keys.into_iter()
                         .map(|k| k.map_or(Value::Nil, Value::Bulk))
@@ -1978,6 +1990,7 @@ impl Command {
                 Ok(Command::BitCount { key, range })
             }
             "RANDOMKEY" => Ok(Command::RandomKey),
+            "HSCAN" | "SSCAN" | "ZSCAN" => parse_collection_scan(&cmd, args),
             "SCAN" => {
                 let cursor: u64 = str_arg(args, 0, "SCAN")?
                     .parse()
@@ -2023,9 +2036,9 @@ impl Command {
                     i += 2;
                 }
                 Ok(Command::Scan {
-                    _cursor: cursor,
+                    cursor,
                     pattern,
-                    _count: count,
+                    count,
                     kind,
                 })
             }
@@ -2750,11 +2763,15 @@ impl Command {
     /// the miss-path type check above would never fire. A multi-key read gets
     /// its reply from the keys that are fine — `SUNION str set` answered the
     /// set — and the per-element replies (`SMISMEMBER`, `HMGET`, `ZMSCORE`)
-    /// are as long as the request whatever the key holds.
+    /// are as long as the request whatever the key holds. A scan's reply is
+    /// never empty either: it always carries a cursor.
     fn reply_hides_wrong_type(&self) -> bool {
         matches!(
             self,
-            Command::SMisMember { .. } | Command::HMGet { .. } | Command::ZMScore { .. }
+            Command::SMisMember { .. }
+                | Command::HMGet { .. }
+                | Command::ZMScore { .. }
+                | Command::CollectionScan { .. }
         ) || self.typed_keys().len() > 1
     }
 
@@ -3437,6 +3454,7 @@ impl Command {
             | Command::RenameNx { .. }
             | Command::Keys { .. }
             | Command::Scan { .. }
+            | Command::CollectionScan { .. }
             | Command::DbSize
             | Command::Keyspace
             | Command::RandomKey
@@ -3839,6 +3857,14 @@ impl Command {
             | Command::HIncrByFloat { key, .. }
             | Command::HRandField { key, .. }
             | Command::HSetNx { key, .. } => one(key, HASH),
+            Command::CollectionScan { key, kind, .. } => one(
+                key,
+                match kind {
+                    crate::memdb::KeyKind::Hash => HASH,
+                    crate::memdb::KeyKind::Set => SET,
+                    _ => ZSET,
+                },
+            ),
 
             Command::LPush { key, .. }
             | Command::RPush { key, .. }
@@ -4797,6 +4823,52 @@ fn arity_error(cmd: &str, parts: &[Vec<u8>]) -> Option<String> {
         };
     }
     None
+}
+
+/// `HSCAN`, `SSCAN` or `ZSCAN key cursor [MATCH pattern] [COUNT count]`.
+fn parse_collection_scan(name: &str, args: &[Vec<u8>]) -> Result<Command, String> {
+    use crate::memdb::KeyKind;
+    if args.len() < 2 {
+        return Err(wrong_arity(name));
+    }
+    let cursor = std::str::from_utf8(&args[1])
+        .ok()
+        .and_then(|c| c.parse::<u64>().ok())
+        .ok_or_else(|| "ERR invalid cursor".to_string())?;
+    let mut pattern = None;
+    let mut count = None;
+    let mut i = 2;
+    while i < args.len() {
+        if i + 1 >= args.len() {
+            return Err("ERR syntax error".to_string());
+        }
+        if args[i].eq_ignore_ascii_case(b"MATCH") {
+            pattern = Some(args[i + 1].clone());
+        } else if args[i].eq_ignore_ascii_case(b"COUNT") {
+            let n: i64 = std::str::from_utf8(&args[i + 1])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| NOT_AN_INTEGER.to_string())?;
+            if n < 1 {
+                return Err("ERR syntax error".to_string());
+            }
+            count = Some(n);
+        } else {
+            return Err("ERR syntax error".to_string());
+        }
+        i += 2;
+    }
+    Ok(Command::CollectionScan {
+        kind: match name {
+            "HSCAN" => KeyKind::Hash,
+            "SSCAN" => KeyKind::Set,
+            _ => KeyKind::Zset,
+        },
+        key: args[0].clone(),
+        cursor,
+        count,
+        pattern,
+    })
 }
 
 fn wrong_arity(cmd: &str) -> String {
@@ -6371,9 +6443,9 @@ mod tests {
         assert!(matches!(
             cmd,
             Command::Scan {
-                _cursor: 0,
+                cursor: 0,
                 pattern: None,
-                _count: None,
+                count: None,
                 kind: None
             }
         ));
@@ -6383,7 +6455,7 @@ mod tests {
     fn parse_scan_with_match() {
         let cmd = is_ok(Command::parse(parts(&["SCAN", "0", "MATCH", "user:*"])));
         assert!(
-            matches!(cmd, Command::Scan { _cursor: 0, pattern: Some(p), _count: None, kind: None } if p == b"user:*")
+            matches!(cmd, Command::Scan { cursor: 0, pattern: Some(p), count: None, kind: None } if p == b"user:*")
         );
     }
 
@@ -6393,9 +6465,9 @@ mod tests {
         assert!(matches!(
             cmd,
             Command::Scan {
-                _cursor: 0,
+                cursor: 0,
                 pattern: None,
-                _count: Some(100),
+                count: Some(100),
                 kind: None
             }
         ));
@@ -6409,9 +6481,9 @@ mod tests {
         assert!(matches!(
             cmd,
             Command::Scan {
-                _cursor: 0,
+                cursor: 0,
                 pattern: Some(_),
-                _count: Some(10),
+                count: Some(10),
                 kind: None
             }
         ));

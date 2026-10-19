@@ -31,6 +31,9 @@ talc = { version = "5.1", default-features = false }
 # them (src/longdouble.rs).
 rustc_apfloat = "=0.2.3"
 mlua = { version = "0.12.2", features = ["lua51", "vendored"] }
+# Keyed SipHash, the same in every process (memdb's dictionaries, the SCAN
+# cursor and access tables); std's keyed SipHasher is deprecated.
+siphasher = "1"
 mlua-sys = { version = "0.13.0", features = ["lua51", "vendored"] }
 
 [dev-dependencies]

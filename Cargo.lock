@@ -1121,6 +1121,7 @@ dependencies = [
  "pgrx-tests",
  "rustc_apfloat",
  "rustix",
+ "siphasher",
  "socket2 0.5.10",
  "subtle",
  "talc",

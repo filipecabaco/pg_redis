@@ -198,8 +198,8 @@ pub fn access_table_size() -> usize {
 /// flush changes the database's epoch, which moves every key elsewhere.
 fn locate(db: u8, key: &[u8]) -> (usize, u64) {
     use std::hash::Hasher;
-    #[allow(deprecated)] // fixed keys, the same in every process
-    let mut h = std::hash::SipHasher::new_with_keys(0x7067_5f72_6564_6973, 0x6163_6365_7373);
+    // Fixed keys: the same in every process.
+    let mut h = siphasher::sip::SipHasher::new_with_keys(0x7067_5f72_6564_6973, 0x6163_6365_7373);
     h.write_u8(db);
     h.write_u64(crate::server::flush_epoch(db));
     h.write(key);

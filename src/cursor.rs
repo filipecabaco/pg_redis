@@ -92,12 +92,11 @@ pub struct Bound {
 
 /// What a cursor iterates: SCAN over a database, or one collection's
 /// elements. A token resumes only the iteration it was issued for.
-#[allow(deprecated)] // SipHasher is deprecated only in favour of unkeyed hashers.
 pub fn scope(db: u8, kind: u8, key: &[u8]) -> u64 {
     // SipHash with fixed keys: the same in every worker, which is all a
     // scope needs. A collision only lets one iteration resume at another's
     // bound under a token that also had to match.
-    let mut h = std::hash::SipHasher::new_with_keys(0x7063_7572, 0x736f_7273);
+    let mut h = siphasher::sip::SipHasher::new_with_keys(0x7063_7572, 0x736f_7273);
     (db, kind, key).hash(&mut h);
     h.finish()
 }

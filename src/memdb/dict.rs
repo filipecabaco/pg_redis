@@ -18,10 +18,9 @@ use super::{Bytes, bytes_in};
 pub struct Seed(pub u64, pub u64);
 
 impl Seed {
-    #[allow(deprecated)] // SipHasher is deprecated only in favour of unkeyed hashers.
     pub fn hash(self, bytes: &[u8]) -> u64 {
         use std::hash::Hasher;
-        let mut h = std::hash::SipHasher::new_with_keys(self.0, self.1);
+        let mut h = siphasher::sip::SipHasher::new_with_keys(self.0, self.1);
         h.write(bytes);
         h.finish()
     }

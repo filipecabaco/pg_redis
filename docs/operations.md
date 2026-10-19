@@ -160,10 +160,18 @@ database's snapshot is in `redis.snapshot`, as one serialised `DUMP` payload per
 ## Security
 
 The Redis port does not go through `pg_hba.conf` or PostgreSQL roles. It binds to
-`redis.listen_address`, which defaults to `127.0.0.1`, and requires `AUTH` only when
-`redis.password` is set. The workers connect as the superuser created by `initdb`, so a client
-that can authenticate can read and write every `redis.*` table. The listener speaks plain TCP.
-pg_redis has no TLS support, so keep the port on a trusted network.
+`redis.listen_address`, which defaults to `127.0.0.1`, and requires `AUTH` only when the
+`default` user has a password (`redis.password`) or is off. The workers connect as the
+superuser created by `initdb`, so a client that logs in as a user with every permission can read
+and write every `redis.*` table. The listener speaks plain TCP. pg_redis has no TLS support, so
+keep the port on a trusted network.
+
+To give applications less than that, create ACL users with the commands, keys and channels
+they need ([Users](./configuration.md#users)) and save them with `ACL SAVE`. Refused commands
+and failed logins are listed by `ACL LOG` and counted in `INFO stats`
+(`acl_access_denied_*`). Saved users are in `redis.acl_users`, with passwords stored only as
+SHA-256 hashes; restrict who can read it as you would any table holding credentials. `ACL
+SETUSER`'s arguments are hidden from `SLOWLOG`, as in Redis.
 
 `redis.password` set with `ALTER SYSTEM` is stored in plain text in `postgresql.auto.conf`, and
 a reload that changes it writes the new value to the server log

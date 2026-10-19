@@ -356,6 +356,10 @@ pub fn set(args: &[Vec<u8>]) -> Result<(), String> {
     if let Some((_, v)) = staged.iter().find(|(n, _)| *n == "notify-keyspace-events") {
         crate::server::set_notify_flags(crate::notify::parse_flags(v));
     }
+    // `updateRequirePass`: the default user's password, or none.
+    if let Some((_, v)) = staged.iter().find(|(n, _)| *n == "requirepass") {
+        crate::acl::set_default_password(Some(v.as_bytes()));
+    }
     if let Some((_, v)) = staged.iter().find(|(n, _)| *n == "maxmemory") {
         crate::shm::set_limit(v.parse().unwrap_or(0));
     }

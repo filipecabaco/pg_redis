@@ -579,15 +579,22 @@ pub enum Command {
     Select {
         db: u8,
     },
+    /// `AUTH [username] password`; no username means `default`.
     Auth {
-        password: String,
+        user: Option<Vec<u8>>,
+        password: Vec<u8>,
     },
     Time,
+    /// `HELLO [protover [AUTH username password] [SETNAME name]]`: the
+    /// last AUTH and SETNAME given win.
     Hello {
         proto: Option<u8>,
-        auth: Option<String>,
-        _setname: Option<String>,
+        auth: Option<(Vec<u8>, Vec<u8>)>,
+        setname: Option<Vec<u8>>,
     },
+    /// `ACL SAVE` / `ACL LOAD`: `redis.acl_users`, read or written on the
+    /// dispatcher (`acl.rs`).
+    AclTable(crate::acl::TableOp),
     Reset,
     Quit,
     /// A server-administration command — see `admin.rs`.
@@ -1393,47 +1400,57 @@ impl Command {
                 }
                 Ok(Command::Select { db })
             }
-            "AUTH" => Ok(Command::Auth {
-                // AUTH <password> or AUTH <username> <password> — password is always last.
-                password: str_arg(args, args.len().saturating_sub(1), "AUTH").unwrap_or_default(),
-            }),
+            "AUTH" => {
+                if args.len() > 2 {
+                    return Err("ERR syntax error".to_string());
+                }
+                Ok(Command::Auth {
+                    user: (args.len() == 2).then(|| args[0].clone()),
+                    password: args[args.len() - 1].clone(),
+                })
+            }
             "HELLO" => {
                 let proto = if args.is_empty() {
                     None
                 } else {
-                    let v: u8 = str_arg(args, 0, "HELLO")?.parse().map_err(|_| {
-                        "Protocol version is not an integer or out of range".to_string()
-                    })?;
+                    let v: i64 = std::str::from_utf8(&args[0])
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| {
+                            "ERR Protocol version is not an integer or out of range".to_string()
+                        })?;
                     if v != 2 && v != 3 {
                         return Err("NOPROTO unsupported protocol version".to_string());
                     }
-                    Some(v)
+                    Some(v as u8)
                 };
-                let mut auth: Option<String> = None;
-                let mut setname: Option<String> = None;
+                let mut auth = None;
+                let mut setname = None;
                 let mut i = 1;
                 while i < args.len() {
-                    let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
-                    match opt.as_str() {
-                        "AUTH" => {
-                            let password = str_arg(args, i + 2, "HELLO AUTH")
-                                .or_else(|_| str_arg(args, i + 1, "HELLO AUTH"))?;
-                            auth = Some(password);
-                            i += if i + 2 < args.len() { 3 } else { 2 };
+                    let more = args.len() - 1 - i;
+                    if args[i].eq_ignore_ascii_case(b"AUTH") && more >= 2 {
+                        auth = Some((args[i + 1].clone(), args[i + 2].clone()));
+                        i += 3;
+                    } else if args[i].eq_ignore_ascii_case(b"SETNAME") && more >= 1 {
+                        let name = &args[i + 1];
+                        if name.iter().any(|&c| c <= b' ' || c > b'~') {
+                            return Err("ERR Client names cannot contain spaces, newlines or special characters."
+                                .to_string());
                         }
-                        "SETNAME" => {
-                            setname = Some(str_arg(args, i + 1, "HELLO SETNAME")?);
-                            i += 2;
-                        }
-                        _ => {
-                            i += 1;
-                        }
+                        setname = Some(name.clone());
+                        i += 2;
+                    } else {
+                        return Err(format!(
+                            "ERR Syntax error in HELLO option '{}'",
+                            String::from_utf8_lossy(&args[i])
+                        ));
                     }
                 }
                 Ok(Command::Hello {
                     proto,
                     auth,
-                    _setname: setname,
+                    setname,
                 })
             }
             "RESET" => Ok(Command::Reset),
@@ -3420,6 +3437,7 @@ impl Command {
         matches!(
             self,
             Command::TablePublish { .. }
+                | Command::AclTable(_)
                 | Command::FlushAll
                 | Command::Copy { .. }
                 | Command::Dump { .. }
@@ -3592,6 +3610,7 @@ impl Command {
             }
             Command::Time => time_reply(),
             Command::Hello { .. } => Response::Ok,
+            Command::AclTable(op) => acl_table(client, op),
             Command::Reset => Response::Ok,
             Command::Quit => Response::Ok,
             // Answered on the connection's thread, never dispatched.
@@ -3603,11 +3622,14 @@ impl Command {
                 Command::Admin(a).execute_inner(client, db)
             }
             Command::Admin(a) => {
-                let handle = crate::server::ClientHandle::detached(0);
+                let origin = crate::tracking::origin();
+                let handle = crate::server::ClientHandle::detached(origin);
                 let mut conn = crate::admin::Conn {
                     client: &handle,
                     db,
                     reply: crate::admin::ReplyMode::On,
+                    session: crate::acl::session_of(origin),
+                    may_wait: false,
                 };
                 crate::admin::execute(a, &mut conn, &mut |cmd, d| Self::route(client, d, cmd))
             }
@@ -4690,6 +4712,60 @@ pub(crate) fn count_bits(value: &[u8], range: Option<(i64, i64, bool)>) -> i64 {
 
 /// The reply for an SPI call that failed. Logged through PostgreSQL rather than
 /// stderr, where an operator will find it.
+/// `ACL SAVE` and `ACL LOAD` against `redis.acl_users`.
+fn acl_table(client: &mut SpiClient<'_>, op: &crate::acl::TableOp) -> Response {
+    let present = client
+        .select(
+            "SELECT to_regclass('redis.acl_users') IS NOT NULL",
+            None,
+            &[],
+        )
+        .ok()
+        .and_then(|t| t.first().get::<bool>(1).ok().flatten())
+        .unwrap_or(false);
+    if !present {
+        pgrx::warning!("pg_redis: ACL SAVE/LOAD: redis.acl_users does not exist in this database");
+        return Response::Error(
+            "ERR redis.acl_users does not exist: run CREATE EXTENSION pg_redis in redis.database"
+                .into(),
+        );
+    }
+    match op {
+        crate::acl::TableOp::Save(rows) => {
+            if let Err(e) = client.update("DELETE FROM redis.acl_users", None, &[]) {
+                return spi_failed("ACL SAVE", e);
+            }
+            for (name, rules) in rows {
+                if let Err(e) = client.update(
+                    "INSERT INTO redis.acl_users (name, rules) VALUES ($1, $2)",
+                    None,
+                    &[name.as_slice().into(), rules.as_slice().into()],
+                ) {
+                    return spi_failed("ACL SAVE", e);
+                }
+            }
+            Response::Ok
+        }
+        crate::acl::TableOp::Load => {
+            match client.select(
+                "SELECT name, rules FROM redis.acl_users ORDER BY name",
+                None,
+                &[],
+            ) {
+                Ok(t) => Response::Value(Value::Array(
+                    t.filter_map(|r| {
+                        let n = r.get::<Vec<u8>>(1).ok().flatten()?;
+                        let rl = r.get::<Vec<u8>>(2).ok().flatten()?;
+                        Some(Value::Array(vec![Value::Bulk(n), Value::Bulk(rl)]))
+                    })
+                    .collect(),
+                )),
+                Err(e) => spi_failed("ACL LOAD", e),
+            }
+        }
+    }
+}
+
 pub(crate) fn spi_failed(cmd: &str, e: impl std::fmt::Display) -> Response {
     pgrx::warning!("pg_redis: {cmd} failed: {e}");
     Response::Error("ERR internal error executing the command".to_string())
@@ -6064,8 +6140,8 @@ mod tests {
         // Half aliases, case-insensitive like every other keyword.
         &["SELECT", "cache"] => Command::Select { db: CACHE_DB },
         &["SELECT", "DURABLE"] => Command::Select { db: DURABLE_DB },
-        &["AUTH", "secret"] => Command::Auth { password } if password == "secret",
-        &["AUTH", "user", "mypass"] => Command::Auth { password } if password == "mypass",
+        &["AUTH", "secret"] => Command::Auth { user: None, ref password } if password == b"secret",
+        &["AUTH", "user", "mypass"] => Command::Auth { user: Some(_), ref password } if password == b"mypass",
         // Server administration goes to admin.rs whole, subcommand and all;
         // the container's own arity is checked here, the rest on execution.
         &["INFO"] => Command::Admin(ref a) if a.name == "INFO",

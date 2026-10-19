@@ -1335,18 +1335,14 @@ fn lua_to_value(v: Lv, depth: usize) -> Value {
                 return Value::Double(d as f64);
             }
             if let Ok(Lv::String(b)) = t.raw_get::<Lv>("big_number") {
-                return Value::Bulk(
-                    b.as_bytes()
-                        .iter()
-                        .map(|&c| if c == b'\r' || c == b'\n' { b' ' } else { c })
-                        .collect(),
-                );
+                // `addReplyBigNum`: a line break would end the frame.
+                return Value::BigNum(b.to_string_lossy().replace(['\r', '\n'], " "));
             }
             if let Ok(Lv::Table(v)) = t.raw_get::<Lv>("verbatim_string")
                 && let (Ok(Lv::String(_)), Ok(Lv::String(s))) =
                     (v.raw_get::<Lv>("format"), v.raw_get::<Lv>("string"))
             {
-                return Value::Bulk(s.as_bytes().to_vec());
+                return Value::Verbatim(s.to_string_lossy());
             }
             if let Ok(Lv::Table(map)) = t.raw_get::<Lv>("map") {
                 return Value::Map(
@@ -1434,7 +1430,21 @@ fn dispatch_from_script(lua: &Lua, args: MultiValue, ctx: &mut &mut CallCtx<'_>)
         Ok(a) => a,
         Err(e) => return (true, err_table(lua, &format!("ERR {e}"))),
     };
-    match run_from_script(&argv, ctx) {
+    let started = std::time::Instant::now();
+    let ran = run_from_script(&argv, ctx);
+    // Counted as Redis's `call()` counts a script's commands: in
+    // `commandstats`, and an error reply in `errorstats` though `pcall`
+    // catches it.
+    if let Ok(r) = &ran
+        && let Some(i) = crate::worker::stat_index(&crate::worker::stat_name(&argv))
+    {
+        let failed = matches!(r, Response::Error(_));
+        crate::server::count_command(i, started.elapsed().as_micros() as u64, failed, false);
+        if let Response::Error(e) = r {
+            crate::server::count_error(crate::resp::error_code(e));
+        }
+    }
+    match ran {
         Ok(Response::Error(e)) => (true, err_table(lua, &command_error_text(&e))),
         Ok(r) => match value_to_lua(lua, {
             // After `redis.setresp(3)` a script sees replies as a RESP3
@@ -1500,7 +1510,8 @@ fn run_from_script(argv: &[Vec<u8>], ctx: &mut CallCtx<'_>) -> Result<Response, 
         return Err("Wrong number of args calling Redis command from script".into());
     }
     let has = |f: &str| spec.flags.contains(&f);
-    if has("noscript") {
+    // `DEBUG SET-DISABLE-DENY-SCRIPTS 1` lets a script run them.
+    if has("noscript") && !crate::server::deny_scripts_disabled() {
         return Err("This Redis command is not allowed from script".into());
     }
     let caller = CALLER.get();

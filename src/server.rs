@@ -254,6 +254,8 @@ pub struct ServerCtl {
     pub pause_writes_only: AtomicU32,
     pub monitors: AtomicU32,
     pub active_expire: AtomicU32,
+    /// `DEBUG SET-DISABLE-DENY-SCRIPTS`: scripts may run `noscript` commands.
+    pub deny_scripts_disabled: AtomicU32,
     pub lastsave: AtomicI64,
     next_ticket: AtomicU64,
     waiters: [Waiter; MAX_CLIENTS],
@@ -293,6 +295,8 @@ pub struct ServerCtl {
     dirty_at_save: AtomicU64,
     /// Each database's storage policy and memory slot (`storage.rs`).
     pub storage: crate::storage::PolicyTable,
+    /// The latency monitor's samples (`latency.rs`).
+    pub latency: crate::latency::LatencyCtl,
 }
 
 /// Keys one blocked client is recorded under; past this its later keys still
@@ -1587,6 +1591,10 @@ pub fn mark_saved() {
     if let Some(c) = ctl() {
         c.dirty_at_save.store(dirty_total(c), Ordering::Relaxed);
     }
+}
+
+pub fn deny_scripts_disabled() -> bool {
+    ctl().is_some_and(|c| c.deny_scripts_disabled.load(Ordering::Relaxed) != 0)
 }
 
 /// Whether keys are expired in the background, which `DEBUG

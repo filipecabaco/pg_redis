@@ -262,6 +262,34 @@ thread_local! {
     /// Set by every error reply on this thread, so the connection loop can
     /// tell a failed command from a successful one for `INFO commandstats`.
     pub static REPLIED_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set by an error that refuses a command before it runs, which Redis
+    /// counts as `rejected_calls`, not a call.
+    pub static REPLIED_REJECTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The refusals Redis's `processCommand` answers before calling a command:
+/// an unknown command or subcommand, the wrong arity, ACL, `OOM`, a busy
+/// script.
+fn is_rejection(msg: &str) -> bool {
+    [
+        "ERR unknown command",
+        "ERR unknown subcommand",
+        "ERR wrong number of arguments",
+        "NOPERM",
+        "OOM command not allowed",
+        "BUSY ",
+    ]
+    .iter()
+    .any(|p| msg.starts_with(p))
+}
+
+/// The code an error reply is counted under in `INFO errorstats`: its first
+/// word when Redis has that code, `ERR` otherwise.
+pub fn error_code(msg: &str) -> &str {
+    msg.split(' ')
+        .next()
+        .filter(|c| ERROR_CODES.contains(c))
+        .unwrap_or("ERR")
 }
 
 /// A RESP error, prefixed with `ERR` only when the message carries no code of
@@ -269,12 +297,10 @@ thread_local! {
 /// OOM reply into `-ERR OOM …`, which no OOM handling recognises.
 pub fn write_error(w: &mut impl Write, msg: &str) -> io::Result<()> {
     REPLIED_ERROR.with(|e| e.set(true));
-    let code = msg
-        .split(' ')
-        .next()
-        .filter(|c| ERROR_CODES.contains(c))
-        .unwrap_or("ERR");
-    crate::server::count_error(code);
+    if is_rejection(msg) {
+        REPLIED_REJECTION.with(|e| e.set(true));
+    }
+    crate::server::count_error(error_code(msg));
     // An error is one line. Messages that echo client input — "unknown
     // command ... with args beginning with" — can carry a CR or LF, and a raw
     // one ends the line early and desyncs every reply after it. Redis maps

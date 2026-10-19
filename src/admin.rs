@@ -1683,16 +1683,10 @@ fn slowlog(a: &Admin) -> Response {
 /// per-command latency `INFO latencystats` keeps.
 fn latency(a: &Admin) -> Response {
     match a.sub().as_str() {
-        "LATEST" => Response::Value(Value::Array(vec![])),
-        "HISTORY" => Response::Value(Value::Array(vec![])),
-        "RESET" => Response::Integer(0),
-        "GRAPH" => err(format!(
-            "ERR No samples available for event '{}'",
-            a.args
-                .get(1)
-                .map(|v| String::from_utf8_lossy(v).into_owned())
-                .unwrap_or_default()
-        )),
+        "LATEST" => crate::latency::latest(),
+        "HISTORY" if a.args.len() == 2 => crate::latency::history(&a.args[1]),
+        "RESET" => crate::latency::reset(&a.args[1..]),
+        "GRAPH" if a.args.len() == 2 => crate::latency::graph(&a.args[1]),
         "DOCTOR" => bulk(
             "Dave, no latency spike was observed during the lifetime of this Redis instance, not in the slightest bit. I honestly think you ought to sleep tonight.\n",
         ),
@@ -1709,7 +1703,9 @@ fn latency(a: &Admin) -> Response {
             for (i, spec) in crate::redis_tables::COMMANDS.iter().enumerate() {
                 let Some(s) = ctl.cmdstats.get(i) else { break };
                 let calls = s.calls.load(Relaxed);
-                if calls == 0 || (!wanted.is_empty() && !wanted.iter().any(|w| w == spec.name)) {
+                // A container names its subcommands too.
+                let named = |w: &String| *w == spec.name || *w == spec.container;
+                if calls == 0 || (!wanted.is_empty() && !wanted.iter().any(named)) {
                     continue;
                 }
                 let buckets: Vec<(Value, Value)> = s
@@ -1856,6 +1852,14 @@ fn debug(a: &Admin, conn: &mut Conn, data: &mut Data) -> Response {
             std::thread::sleep(std::time::Duration::from_secs_f64(secs.max(0.0)));
             Response::Ok
         }
+        "SET-DISABLE-DENY-SCRIPTS" => {
+            let on = a.args.get(1).and_then(|v| int(v)).unwrap_or(0) != 0;
+            if let Some(c) = server::ctl() {
+                c.deny_scripts_disabled
+                    .store(on as u32, std::sync::atomic::Ordering::Relaxed);
+            }
+            Response::Ok
+        }
         "SET-ACTIVE-EXPIRE" => {
             let on = a.args.get(1).and_then(|v| int(v)).unwrap_or(1) != 0;
             if let Some(c) = server::ctl() {
@@ -1868,7 +1872,6 @@ fn debug(a: &Admin, conn: &mut Conn, data: &mut Data) -> Response {
         // append-only file to load again.
         "RELOAD"
         | "LOADAOF"
-        | "SET-DISABLE-DENY-SCRIPTS"
         | "JMAP"
         | "CHANGE-REPL-ID"
         | "LOG"

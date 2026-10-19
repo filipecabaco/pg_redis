@@ -18,6 +18,7 @@ pub(crate) mod evict;
 mod fuzz;
 pub(crate) mod geo;
 pub(crate) mod hll;
+pub(crate) mod latency;
 pub(crate) mod longdouble;
 pub(crate) mod memdb;
 pub(crate) mod notify;

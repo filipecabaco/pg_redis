@@ -246,6 +246,8 @@ async function resetConfig(): Promise<void> {
 		["ACL", "LOG", "RESET"],
 		// A test that turns background expiry off and then fails leaves it off.
 		["DEBUG", "SET-ACTIVE-EXPIRE", "1"],
+		["DEBUG", "SET-DISABLE-DENY-SCRIPTS", "0"],
+		["CONFIG", "SET", "latency-tracking", "yes", "latency-tracking-info-percentiles", "50 99 99.9"],
 	];
 	if (users.length > 0) cmds.push(["ACL", "DELUSER", ...users]);
 	await roundTrip(cmds);

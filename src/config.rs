@@ -306,6 +306,26 @@ fn special(name: &str, arg: &str, v: &str) -> Result<String, String> {
                 .collect::<Vec<_>>()
                 .join(" "))
         }
+        // Each between 0 and 100, printed back as Redis prints a double.
+        "latency-tracking-info-percentiles" => {
+            let mut out = Vec::new();
+            for p in v.split_whitespace() {
+                let Ok(n) = p.parse::<f64>() else {
+                    return Err(failed(
+                        arg,
+                        "Invalid latency-tracking-info-percentiles parameters",
+                    ));
+                };
+                if !(0.0..=100.0).contains(&n) {
+                    return Err(failed(
+                        arg,
+                        "latency-tracking-info-percentiles parameters should be between 0.0 and 100.0",
+                    ));
+                }
+                out.push(crate::commands::format_score(n));
+            }
+            Ok(out.join(" "))
+        }
         "oom-score-adj-values" => {
             let parts: Vec<&str> = v.split_whitespace().collect();
             if parts.len() != 3

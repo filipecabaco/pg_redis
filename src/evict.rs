@@ -85,7 +85,13 @@ pub fn perform() -> Evict {
     let result = if s.policy == Policy::NoEviction {
         Evict::Fail
     } else {
-        evict_until_under(s)
+        let cycle = std::time::Instant::now();
+        let r = evict_until_under(s);
+        crate::latency::record(
+            crate::latency::EVICTION_CYCLE,
+            cycle.elapsed().as_millis() as u64,
+        );
+        r
     };
     crate::server::eviction_exceeded(result != Evict::Ok);
     result

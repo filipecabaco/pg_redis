@@ -381,6 +381,7 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
             && crate::server::active_expire()
         {
             last_expiry_scan = Instant::now();
+            let cycle = Instant::now();
             // redis.kv_* only exist where CREATE EXTENSION has run, and the
             // worker connects to redis.database, which commonly has not. A
             // missing relation raises, which killed the worker on a loop.
@@ -429,6 +430,10 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                     crate::notify::emit(notify, crate::notify::EXPIRED, "expired", &key, db);
                 }
             }
+            crate::latency::record(
+                crate::latency::EXPIRE_CYCLE,
+                cycle.elapsed().as_millis() as u64,
+            );
         }
     }
     // Left on SIGTERM: shutdown or `redis.remove_workers`.
@@ -1119,6 +1124,7 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<DispatchMsg>, default_d
         }
         client.touch(&counted, db);
         crate::resp::REPLIED_ERROR.with(|e| e.set(false));
+        crate::resp::REPLIED_REJECTION.with(|e| e.set(false));
         // CLIENT REPLY: SKIP drops this one reply, OFF every reply until ON —
         // and ON itself answers, which the admin arm unmutes for.
         writer.muted = !matches!(reply_mode, crate::admin::ReplyMode::On);
@@ -1373,6 +1379,7 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<DispatchMsg>, default_d
                                     return false;
                                 };
                                 for (resp, line) in responses.into_iter().zip(lines.drain(..)) {
+                                    count_exec_step(&line, matches!(resp, Response::Error(_)));
                                     write_reply(writer, resp, &line, proto).ok();
                                 }
                                 true
@@ -1381,7 +1388,7 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<DispatchMsg>, default_d
                         for ((line, _), no) in lines.iter().zip(&refused) {
                             if let Some(e) = no {
                                 ok &= run_segment(&mut segment, &mut segment_lines, &mut writer);
-                                write_error(&mut writer, e).ok();
+                                exec_refusal(&mut writer, line, e);
                                 continue;
                             }
                             let Some((cmd, d)) = queued.next() else { break };
@@ -1437,6 +1444,8 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<DispatchMsg>, default_d
                         }
                         settle(unblocks, true);
                         db = exec_db;
+                        crate::resp::REPLIED_ERROR.with(|e| e.set(false));
+                        crate::resp::REPLIED_REJECTION.with(|e| e.set(false));
                         flush(&mut writer);
                         continue;
                     }
@@ -1470,16 +1479,21 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<DispatchMsg>, default_d
                             let mut responses = responses.into_iter();
                             for ((line, _), no) in lines.iter().zip(&refused) {
                                 match no {
-                                    Some(e) => {
-                                        write_error(&mut writer, e).ok();
-                                    }
+                                    Some(e) => exec_refusal(&mut writer, line, e),
                                     None => {
                                         if let Some(resp) = responses.next() {
+                                            count_exec_step(
+                                                line,
+                                                matches!(resp, Response::Error(_)),
+                                            );
                                             write_reply(&mut writer, resp, line, proto).ok();
                                         }
                                     }
                                 }
                             }
+                            // The errors inside are the steps', not EXEC's.
+                            crate::resp::REPLIED_ERROR.with(|e| e.set(false));
+                            crate::resp::REPLIED_REJECTION.with(|e| e.set(false));
                             flush(&mut writer);
                         }
                         Err(_) => break,
@@ -3618,9 +3632,29 @@ struct InFlight {
     exec: Vec<(Vec<Vec<u8>>, u8)>,
 }
 
+/// One command an `EXEC` ran, counted as Redis's `call()` counts it: a call,
+/// failed when its own reply is an error.
+fn count_exec_step(line: &[Vec<u8>], failed: bool) {
+    if let Some(i) = stat_index(&stat_name(line)) {
+        crate::server::count_command(i, 0, failed, false);
+    }
+}
+
+/// Write an `EXEC` step's error: a queued `AUTH` that failed is a call that
+/// failed; a command the ACL refused at `EXEC` never ran.
+fn exec_refusal(writer: &mut ConnWriter, line: &[Vec<u8>], e: &str) {
+    if line
+        .first()
+        .is_some_and(|c| c.eq_ignore_ascii_case(b"AUTH"))
+    {
+        count_exec_step(line, true);
+    }
+    write_error(writer, e).ok();
+}
+
 /// Index of a command in the generated table, which is also its
 /// `INFO commandstats` slot.
-fn stat_index(name: &str) -> Option<usize> {
+pub(crate) fn stat_index(name: &str) -> Option<usize> {
     static INDEX: std::sync::LazyLock<HashMap<&'static str, usize>> =
         std::sync::LazyLock::new(|| {
             crate::redis_tables::COMMANDS
@@ -3634,7 +3668,7 @@ fn stat_index(name: &str) -> Option<usize> {
 
 /// The name a command line is counted under: `config|get` for a container's
 /// subcommand, the command itself otherwise.
-fn stat_name(parts: &[Vec<u8>]) -> String {
+pub(crate) fn stat_name(parts: &[Vec<u8>]) -> String {
     let top = String::from_utf8_lossy(&parts[0]).to_ascii_lowercase();
     if let Some(sub) = parts.get(1) {
         let full = format!(
@@ -3654,9 +3688,8 @@ fn stat_name(parts: &[Vec<u8>]) -> String {
 /// limit under `noeviction`. Under an evicting policy the worker evicts
 /// before running it, which a connection thread cannot do, so it is let
 /// through and meets the limit there.
-fn refused_for_memory(cmd: &Command, db: u8) -> bool {
-    crate::storage::slot(db).is_some()
-        && cmd.may_grow()
+fn refused_for_memory(cmd: &Command, _db: u8) -> bool {
+    cmd.may_grow()
         && crate::shm::over_limit()
         && crate::access::settings().policy == crate::access::Policy::NoEviction
 }
@@ -3696,8 +3729,23 @@ fn finish(job: InFlight, client: &crate::server::ClientHandle) {
         }
     }
     let failed = crate::resp::REPLIED_ERROR.with(|e| e.replace(false));
-    if let Some(i) = job.stat {
-        crate::server::count_command(i, usec, failed && !job.rejected, job.rejected);
+    let rejected = job.rejected || crate::resp::REPLIED_REJECTION.with(|e| e.replace(false));
+    // A command queued in MULTI is counted when EXEC runs it
+    // (`count_exec_step`); one refused as it was queued, now.
+    if let Some(i) = job.stat
+        && (!job.queued || rejected)
+    {
+        crate::server::count_command(i, usec, failed && !rejected, rejected);
+        // The latency monitor's `command` or `fast-command` event.
+        if !rejected {
+            let fast = crate::redis_tables::COMMANDS[i].flags.contains(&"fast");
+            let event = if fast {
+                crate::latency::FAST_COMMAND
+            } else {
+                crate::latency::COMMAND
+            };
+            crate::latency::record(event, usec / 1000);
+        }
     }
     let threshold = crate::config::get_i64("slowlog-log-slower-than");
     if threshold >= 0 && usec as i64 >= threshold && !job.rejected {

@@ -2783,6 +2783,11 @@ impl Command {
     /// Run on the SQL path. What it reaches of the memory engine — `COPY`,
     /// `DUMP`, `RESTORE` — looks keys up as the command would.
     pub fn execute(&self, client: &mut SpiClient<'_>, db: u8) -> Response {
+        // `maxmemory` is the server's, as in Redis: past it a write that can
+        // grow memory is refused on a logged database too.
+        if self.may_grow() && !crate::evict::make_room() {
+            return mem_out_of_memory();
+        }
         let access = crate::access::mode(self, crate::tracking::origin());
         crate::access::with_mode(access, || self.execute_scoped(client, db))
     }
@@ -3729,7 +3734,7 @@ impl Command {
                         "ERR source and destination objects are the same".to_string(),
                     );
                 }
-                if crate::storage::slot(dst_db).is_some() && !crate::evict::make_room() {
+                if !crate::evict::make_room() {
                     return mem_out_of_memory();
                 }
                 // Liveness, not row-presence: `sql_key_kinds` reports a key
@@ -3784,7 +3789,7 @@ impl Command {
                     return Response::Error("BUSYKEY Target key name already exists.".to_string());
                 }
                 // `denyoom`, for a key bound for the memory engine.
-                if crate::storage::slot(db).is_some() && !crate::evict::make_room() {
+                if !crate::evict::make_room() {
                     return mem_out_of_memory();
                 }
                 let dump = match crate::rdb::deserialize(payload) {
@@ -4415,11 +4420,7 @@ pub(crate) fn wrong_type() -> Response {
 /// Redis's own wording for a write refused because memory is full, so a
 /// client's existing OOM handling recognises it.
 pub(crate) fn mem_out_of_memory() -> Response {
-    Response::Error(
-        "OOM command not allowed when used memory > 'maxmemory'. Raise \
-         redis.maxmemory, set redis.maxmemory_policy, or use SELECT durable."
-            .to_string(),
-    )
+    Response::Error("OOM command not allowed when used memory > 'maxmemory'.".to_string())
 }
 
 fn pg_quote_ident(name: &str) -> String {

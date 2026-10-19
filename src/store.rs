@@ -7,7 +7,8 @@
 //! backend — one statement, or one critical section under the database lock —
 //! so the interface is drawn at the level of what a command does to a key
 //! (`hincrby`), not of reads and writes a command would have to compose
-//! (`hget` then `hset`), which another worker could interleave.
+//! (`hget` then `hset`), which another worker could interleave: an ordinary
+//! command holds its database's server-wide lock shared (`src/dblock.rs`).
 //!
 //! `run` returns `None` for what is not a single-backend data command —
 //! streams, composites, connection and server commands — which the executors

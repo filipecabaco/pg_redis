@@ -1494,6 +1494,16 @@ fn run_from_script(argv: &[Vec<u8>], ctx: &mut CallCtx<'_>) -> Result<Response, 
     };
     let db = ctx.db;
     crate::worker::feed_monitors_from_script(argv, db);
+    // Every database the command touches must be held, exclusive, by the
+    // run (`src/dblock.rs`). A database the script was not started with is
+    // only tried: waiting here, inside the transaction, could deadlock.
+    let reached = match &cmd {
+        Command::Select { db } => crate::dblock::bit(*db),
+        cmd => crate::dblock::dbs_of(cmd, db),
+    };
+    if let Err(d) = crate::dblock::reach(reached) {
+        return Ok(Response::Error(reach_error(d)));
+    }
     Ok(match cmd {
         Command::Select { db } => {
             ctx.db = db;
@@ -1583,6 +1593,9 @@ struct EvalEngine {
     sb: Sandbox,
     /// Compiled scripts by SHA1, with their shebang flags.
     scripts: HashMap<String, (Function, u32)>,
+    /// Whether each compiled script names a command that reaches another
+    /// database ([`names_other_db`]).
+    reach: HashMap<String, bool>,
     generation: u64,
 }
 
@@ -1597,6 +1610,9 @@ struct Library {
     name: String,
     code: Vec<u8>,
     functions: Vec<FuncInfo>,
+    /// Whether the code names a command that reaches another database
+    /// ([`names_other_db`]).
+    reaches: bool,
 }
 
 struct FuncEngine {
@@ -1623,6 +1639,7 @@ impl Engine {
             self.eval = Some(EvalEngine {
                 sb: Sandbox::new(false).map_err(sandbox_failed)?,
                 scripts: HashMap::new(),
+                reach: HashMap::new(),
                 generation,
             });
         }
@@ -1831,6 +1848,7 @@ fn compile_library(sb: &Sandbox, code: &[u8]) -> Result<Library, String> {
         name,
         code: code.to_vec(),
         functions,
+        reaches: names_other_db(code),
     })
 }
 
@@ -1986,6 +2004,75 @@ fn lua_array(lua: &Lua, items: &[Vec<u8>]) -> mlua::Result<Table> {
     Ok(t)
 }
 
+/// Whether the command runs Lua against the data: `EVAL`, `EVALSHA`, `FCALL`
+/// and their `_RO` forms. The rest manage the cache and the libraries.
+pub fn runs_code(cmd: &ScriptCmd) -> bool {
+    matches!(
+        cmd,
+        ScriptCmd::Eval { .. } | ScriptCmd::EvalSha { .. } | ScriptCmd::Fcall { .. }
+    )
+}
+
+/// Whether a script may reach a database other than the one it starts on, so
+/// its dispatcher locks every database before it runs (`src/dblock.rs`). True
+/// when its source names `SELECT`, `MOVE`, `COPY`, `SWAPDB` or `FLUSHALL`, and
+/// when this worker has not compiled it yet and cannot tell.
+pub fn reaches_other_dbs(cmd: &ScriptCmd) -> bool {
+    match cmd {
+        ScriptCmd::Eval { body, .. } => names_other_db(body),
+        // A SHA names one body, so what any compile of it found holds.
+        ScriptCmd::EvalSha { sha, .. } => ENGINE.with(|e| {
+            e.try_borrow()
+                .ok()
+                .and_then(|e| e.eval.as_ref().and_then(|ev| ev.reach.get(sha).copied()))
+                .unwrap_or(true)
+        }),
+        // A library can be replaced from another worker: only an engine at
+        // the current generation knows what the function runs.
+        ScriptCmd::Fcall { name, .. } => ENGINE.with(|e| {
+            let name = String::from_utf8_lossy(name);
+            e.try_borrow()
+                .ok()
+                .and_then(|e| {
+                    let func = e.func.as_ref()?;
+                    if func.generation != crate::server::functions_gen() {
+                        return None;
+                    }
+                    func.libs
+                        .iter()
+                        .find(|l| {
+                            l.functions
+                                .iter()
+                                .any(|f| f.name.eq_ignore_ascii_case(&name))
+                        })
+                        .map(|l| l.reaches)
+                })
+                .unwrap_or(true)
+        }),
+        _ => false,
+    }
+}
+
+/// Whether Lua source names, as a whole word in any case, a command that
+/// reaches another database. Comments and strings count too: a false match
+/// only locks more than needed.
+fn names_other_db(src: &[u8]) -> bool {
+    const WORDS: [&[u8]; 5] = [b"select", b"move", b"copy", b"swapdb", b"flushall"];
+    let word = |b: &u8| b.is_ascii_alphanumeric() || *b == b'_';
+    src.split(|b| !word(b))
+        .any(|w| WORDS.iter().any(|x| w.eq_ignore_ascii_case(x)))
+}
+
+/// The error a script gets when it reaches a database another client holds.
+fn reach_error(db: u8) -> String {
+    format!(
+        "ERR this script reached database {db}, which another client is using. \
+         A script that names SELECT, MOVE, COPY, SWAPDB or FLUSHALL in its source \
+         locks every database before it starts; one that builds those names at \
+         run time cannot wait for the lock"
+    )
+}
+
 /// Run one scripting command on the dispatcher.
 pub fn execute(cmd: &ScriptCmd, db: u8, host: &mut dyn Host) -> Response {
     ENGINE.with(|e| {
@@ -2009,6 +2096,7 @@ impl Engine {
                 let engine = self.eval_engine()?;
                 if !engine.scripts.contains_key(&sha) {
                     let compiled = compile_script(&engine.sb, body).map_err(err)?;
+                    engine.reach.insert(sha.clone(), names_other_db(body));
                     engine.scripts.insert(sha.clone(), compiled);
                     host.save_script(&sha, body);
                 }
@@ -2023,6 +2111,7 @@ impl Engine {
                         .flatten()
                         .ok_or_else(|| err(NOSCRIPT.into()))?;
                     let compiled = compile_script(&engine.sb, &body).map_err(err)?;
+                    engine.reach.insert(sha.clone(), names_other_db(&body));
                     engine.scripts.insert(sha.clone(), compiled);
                 }
                 Ok(run_eval(engine, sha, keys, args, inv, db, host))
@@ -2032,6 +2121,7 @@ impl Engine {
                 let engine = self.eval_engine()?;
                 if !engine.scripts.contains_key(&sha) {
                     let compiled = compile_script(&engine.sb, body).map_err(err)?;
+                    engine.reach.insert(sha.clone(), names_other_db(body));
                     engine.scripts.insert(sha.clone(), compiled);
                 }
                 host.save_script(&sha, body);
@@ -2471,6 +2561,30 @@ mod tests {
         match r {
             Response::Error(e) | Response::Value(Value::Error(e)) => e,
             other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_source_that_names_another_database_is_found() {
+        for src in [
+            "redis.call('SELECT', 1)",
+            "redis.call(\"select\",ARGV[1])",
+            "return redis.call('move', KEYS[1], 2)",
+            "redis.pcall('COPY', 'a', 'b', 'DB', '3')",
+            "redis.call('swapdb', 0, 1)",
+            "redis.call('FlushAll')",
+            "-- select\nreturn 1",
+        ] {
+            assert!(names_other_db(src.as_bytes()), "{src}");
+        }
+        for src in [
+            "return redis.call('get', KEYS[1])",
+            "redis.call('LMOVE', 'a', 'b', 'LEFT', 'LEFT')",
+            "redis.call('SMOVE', 'a', 'b', 'm')",
+            "local remove = 1 local selected = 2 return remove + selected",
+            "redis.call('FLUSHDB')",
+        ] {
+            assert!(!names_other_db(src.as_bytes()), "{src}");
         }
     }
 

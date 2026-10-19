@@ -8,9 +8,10 @@
 //! So a command added here works on both halves, and against any database a
 //! `MOVE` or `COPY` names, without knowing which is which.
 //!
-//! The price is atomicity on the memory half: each sub-command takes its own
-//! locks, so another worker can interleave between two of them. On the durable
-//! half the whole command runs in one subtransaction and its rows stay locked.
+//! Each sub-command takes its backend's own locks and releases them. What
+//! keeps the whole command atomic is the database lock its dispatcher holds
+//! exclusive around it (`src/dblock.rs`), unless [`Op::single_step`] says it
+//! makes only one call, which holds it shared like any command.
 #![forbid(unsafe_code)]
 
 use crate::commands::{Command, Response, Value};
@@ -334,6 +335,20 @@ impl Op {
                 .map(|w| (db, w[1].as_slice()))
                 .collect(),
             _ => vec![],
+        }
+    }
+
+    /// Whether the command makes a single storage call, and so is atomic
+    /// without holding its database exclusive. Every other composite reads
+    /// and writes, or reads twice, through separate calls.
+    pub fn single_step(&self) -> bool {
+        match self {
+            Op::BitPos { .. } | Op::GeoAdd { .. } | Op::CollectionScan { .. } | Op::PfSelfTest => {
+                true
+            }
+            // Only GETs: one read of the string.
+            Op::BitField { ops, .. } => ops.iter().all(|o| o.kind == BitFieldKind::Get),
+            _ => false,
         }
     }
 

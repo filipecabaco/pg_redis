@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-type PendingBatch = Option<(Vec<(Command, u8)>, u64, mpsc::SyncSender<Vec<Response>>)>;
+/// A batch's reply: `None` when an `EXEC` found a watched key changed.
+type BatchReply = mpsc::SyncSender<Option<Vec<Response>>>;
+type PendingBatch = Option<(Vec<(Command, u8)>, u64, BatchReply, BatchKind)>;
 
 const PUBSUB_NOT_LOADED: &str = "pub/sub requires shared_preload_libraries = 'pg_redis'";
 const WATCH_NOT_LOADED: &str = "WATCH requires shared_preload_libraries = 'pg_redis'";
@@ -33,19 +35,79 @@ fn pubsub_len_error(items: &[Vec<u8>], limit: usize, what: &str) -> Option<Strin
 /// a write's invalidations can skip a NOLOOP client's own.
 enum DispatchMsg {
     Cmd(Command, u8, u64, mpsc::SyncSender<Response>),
-    Batch(Vec<(Command, u8)>, u64, mpsc::SyncSender<Vec<Response>>),
+    /// One connection's commands, run in order in one go.
+    Batch(Vec<(Command, u8)>, u64, BatchReply, BatchKind),
     FireAndForget(Command, u8),
     /// Ahead of a command on a migrating database: its keys to move, each
     /// with its database, and the databases to drain (`storage::plan`).
     Move(Vec<(u8, Vec<u8>)>, Vec<u8>, mpsc::SyncSender<()>),
 }
 
-/// Carry out a `Move`: drains first, then the keys left to move.
+/// What a `Batch` is.
+enum BatchKind {
+    /// A transaction (`EXEC`), with the keys its connection WATCHed. It holds
+    /// every database it touches, and every watched key's, exclusive until
+    /// it has committed, and checks the WATCHes once it holds them, so no
+    /// write lands between that check and the commands.
+    Exec(Vec<((u8, Vec<u8>), Watched)>),
+    /// Probes that need no more than any command does.
+    Probe,
+}
+
+/// Carry out a `Move`: drains first, then the keys left to move. Each
+/// database involved is held shared, so no script or transaction on it sees a
+/// key half moved.
 fn run_move(keys: &[(u8, Vec<u8>)], drains: &[u8]) {
+    let dbs = keys
+        .iter()
+        .map(|(db, _)| *db)
+        .chain(drains.iter().copied())
+        .fold(0, |m, db| m | crate::dblock::bit(db));
+    let _held = crate::dblock::hold(crate::dblock::Plan::shared(dbs));
     for db in drains {
         crate::storage::drain(*db);
     }
     crate::storage::move_keys(keys);
+}
+
+/// Run commands with the database locks they need held around the whole run,
+/// commit included (`src/dblock.rs`): what each command needs on its own.
+/// Released before the replies go out.
+fn run_held(cmds: &[(Command, u8)], origins: &[u64], retry_conflicts: bool) -> Vec<Response> {
+    let _held = crate::dblock::hold(crate::dblock::plan_batch(cmds));
+    run_dispatch_batch(cmds, origins, retry_conflicts)
+}
+
+/// A `Batch` message. `None` when an `EXEC`'s WATCH broke.
+fn run_batch_msg(cmds: Vec<(Command, u8)>, origin: u64, kind: BatchKind) -> Option<Vec<Response>> {
+    let origins = vec![origin; cmds.len()];
+    match kind {
+        BatchKind::Probe => Some(run_held(&cmds, &origins, false)),
+        BatchKind::Exec(watched) => {
+            let watched_dbs = watched
+                .iter()
+                .fold(0, |m, ((db, _), _)| m | crate::dblock::bit(*db));
+            let plan =
+                crate::dblock::plan_exec(&cmds).union(crate::dblock::Plan::exclusive(watched_dbs));
+            let _held = crate::dblock::hold(plan);
+            if watch_broken(&watched) {
+                return None;
+            }
+            Some(run_dispatch_batch(&cmds, &origins, false))
+        }
+    }
+}
+
+/// Whether any watched key was written, flushed or expired since its WATCH.
+fn watch_broken(watched: &[((u8, Vec<u8>), Watched)]) -> bool {
+    // Without shared memory WATCH refused, so nothing is watched.
+    let Some(ctl) = crate::watch_state() else {
+        return false;
+    };
+    watched.iter().any(|((db, key), w)| {
+        let now = crate::watch::version(ctl, *db, key);
+        w.broken(now, crate::server::flush_epoch(*db))
+    })
 }
 
 thread_local! {
@@ -70,6 +132,10 @@ const WRITE_STALL: Duration = Duration::from_secs(60);
 
 pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
+    // A FATAL error exits without unwinding to the guards that release the
+    // database locks, and a worker that exits so is restarted with shared
+    // memory as it was: release them on the way out.
+    crate::pg::before_exit(crate::dblock::release_held);
     let db_oid = pgrx::pg_sys::Oid::from_u32(db_oid_datum.value() as u32);
     if db_oid == pgrx::pg_sys::InvalidOid {
         let db_name = crate::DATABASE
@@ -191,13 +257,15 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                     tx.send(()).ok();
                 }
                 DispatchMsg::FireAndForget(cmd, db) => {
-                    run_dispatch_batch(&[(cmd, db)], &[0], true);
+                    run_held(&[(cmd, db)], &[0], true);
                 }
-                DispatchMsg::Batch(cmds, origin, resp_tx) => {
-                    let origins = vec![origin; cmds.len()];
-                    let responses = run_dispatch_batch(&cmds, &origins, false);
-                    resp_tx.send(responses).ok();
+                DispatchMsg::Batch(cmds, origin, resp_tx, kind) => {
+                    resp_tx.send(run_batch_msg(cmds, origin, kind)).ok();
                 }
+                // A script or a multi-step command batches with the others:
+                // the batch then holds its databases exclusive (`plan_batch`).
+                // The commands run one after another on this thread, so each
+                // is still whole, and a table-backed batch shares one commit.
                 DispatchMsg::Cmd(first_cmd, first_db, first_origin, first_resp_tx) => {
                     let mut cmds: Vec<(Command, u8)> = Vec::with_capacity(batch_size);
                     let mut origins: Vec<u64> = Vec::with_capacity(batch_size);
@@ -216,8 +284,8 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                                 origins.push(o);
                                 txs.push(tx);
                             }
-                            Ok(DispatchMsg::Batch(batch_cmds, batch_origin, batch_tx)) => {
-                                pending_batch = Some((batch_cmds, batch_origin, batch_tx));
+                            Ok(DispatchMsg::Batch(batch_cmds, batch_origin, batch_tx, kind)) => {
+                                pending_batch = Some((batch_cmds, batch_origin, batch_tx, kind));
                                 break;
                             }
                             Ok(DispatchMsg::FireAndForget(c, d)) => {
@@ -232,20 +300,20 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                         }
                     }
 
-                    let responses = run_dispatch_batch(&cmds, &origins, true);
+                    let responses = run_held(&cmds, &origins, true);
                     for (tx, resp) in txs.into_iter().zip(responses) {
                         tx.send(resp).ok();
                     }
 
                     if !faf_cmds.is_empty() {
                         let zeros = vec![0; faf_cmds.len()];
-                        run_dispatch_batch(&faf_cmds, &zeros, true);
+                        run_held(&faf_cmds, &zeros, true);
                     }
 
-                    if let Some((batch_cmds, batch_origin, batch_tx)) = pending_batch {
-                        let o = vec![batch_origin; batch_cmds.len()];
-                        let responses = run_dispatch_batch(&batch_cmds, &o, false);
-                        batch_tx.send(responses).ok();
+                    if let Some((batch_cmds, batch_origin, batch_tx, kind)) = pending_batch {
+                        batch_tx
+                            .send(run_batch_msg(batch_cmds, batch_origin, kind))
+                            .ok();
                     }
                 }
             },
@@ -268,7 +336,8 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
             let until = Instant::now() + Duration::from_millis(50);
             for db in 0..crate::commands::NUM_DBS as u8 {
                 while crate::storage::migrating(db)
-                    && crate::storage::sweep(db, 256)
+                    && crate::dblock::try_hold_shared(db)
+                        .is_some_and(|_held| crate::storage::sweep(db, 256))
                     && Instant::now() < until
                 {}
             }
@@ -284,6 +353,13 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
             let notify = crate::notify::flags();
             let names = notify & crate::notify::EXPIRED != 0 || crate::server::tracking_active();
             for db in 0u8..16 {
+                // Shared, like a command: no script or transaction on the
+                // database sees a key expire in the middle of it. One that
+                // holds the database now is not waited for: its keys are
+                // swept next round.
+                let Some(held) = crate::dblock::try_hold_shared(db) else {
+                    continue;
+                };
                 let (count, keys) = if let Some(slot) = crate::storage::slot(db) {
                     crate::shm::with_db(slot, |m| m.sweep_expired(names)).unwrap_or_default()
                 } else if sql_tables_exist {
@@ -311,6 +387,7 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                 } else {
                     (0, Vec::new())
                 };
+                drop(held);
                 crate::server::count_expired(count as u64);
                 crate::tracking::invalidate(&keys, 0);
                 for key in keys {
@@ -1067,16 +1144,10 @@ fn conn_loop(
                         continue;
                     }
                     // Re-read the shared counters: any worker may have written
-                    // one of these keys since WATCH snapshotted it.
-                    let watch_dirty = match crate::watch_state() {
-                        Some(ctl) => watched.iter().any(|((w_db, key), w)| {
-                            let now = crate::watch::version(ctl, *w_db, key);
-                            w.broken(now, crate::server::flush_epoch(*w_db))
-                        }),
-                        // Without shared memory there is nothing to compare against.
-                        // WATCH already refused, so nothing can be watched here.
-                        None => false,
-                    };
+                    // one of these keys since WATCH snapshotted it. Checked
+                    // again by the dispatcher once it holds the databases.
+                    let watches: Vec<((u8, Vec<u8>), Watched)> = watched.drain().collect();
+                    let watch_dirty = watch_broken(&watches);
                     // A queued SELECT moves every command after it, and the
                     // connection itself once the transaction has run.
                     let mut exec_db = db;
@@ -1093,7 +1164,6 @@ fn conn_loop(
                             (cmd, at)
                         })
                         .collect();
-                    watched.clear();
                     if !watch_dirty {
                         for (line, at) in &lines {
                             feed_monitors(line, *at, &client);
@@ -1138,12 +1208,15 @@ fn conn_loop(
                                         std::mem::take(segment),
                                         client.id,
                                         tx,
+                                        // Checked above; the segments around
+                                        // a subscription each run atomically.
+                                        BatchKind::Exec(Vec::new()),
                                     ))
                                     .is_err()
                                 {
                                     return false;
                                 }
-                                let Ok(responses) = rx.recv() else {
+                                let Ok(Some(responses)) = rx.recv() else {
                                     return false;
                                 };
                                 for (resp, line) in responses.into_iter().zip(lines.drain(..)) {
@@ -1209,13 +1282,28 @@ fn conn_loop(
                     }
                     let (resp_tx, resp_rx) = mpsc::sync_channel(1);
                     if cmd_tx
-                        .send(DispatchMsg::Batch(cmds, client.id, resp_tx))
+                        .send(DispatchMsg::Batch(
+                            cmds,
+                            client.id,
+                            resp_tx,
+                            BatchKind::Exec(watches),
+                        ))
                         .is_err()
                     {
                         break;
                     }
                     match resp_rx.recv() {
-                        Ok(responses) => {
+                        // A watched key changed between the check above and
+                        // the dispatcher taking the databases.
+                        Ok(None) => {
+                            if proto == 3 {
+                                write!(&mut writer, "_\r\n").ok();
+                            } else {
+                                write_null_array(&mut writer).ok();
+                            }
+                            flush(&mut writer);
+                        }
+                        Ok(Some(responses)) => {
                             settle(unblocks, true);
                             db = exec_db;
                             write_array_header(&mut writer, responses.len()).ok();
@@ -1469,8 +1557,13 @@ fn conn_loop(
                         .iter()
                         .map(|k| (Command::PTtl { key: k.clone() }, db))
                         .collect();
-                    let ttls = match cmd_tx.send(DispatchMsg::Batch(probes, client.id, resp_tx)) {
-                        Ok(()) => resp_rx.recv().unwrap_or_default(),
+                    let ttls = match cmd_tx.send(DispatchMsg::Batch(
+                        probes,
+                        client.id,
+                        resp_tx,
+                        BatchKind::Probe,
+                    )) {
+                        Ok(()) => resp_rx.recv().ok().flatten().unwrap_or_default(),
                         Err(_) => Vec::new(),
                     };
                     let now = crate::server::now_ms();
@@ -3321,9 +3414,9 @@ mod tests {
                         db_tx.send(db).ok();
                         resp_tx.send(Response::Ok).ok();
                     }
-                    DispatchMsg::Batch(cmds, _, resp_tx) => {
+                    DispatchMsg::Batch(cmds, _, resp_tx, _) => {
                         resp_tx
-                            .send(cmds.iter().map(|_| Response::Ok).collect())
+                            .send(Some(cmds.iter().map(|_| Response::Ok).collect()))
                             .ok();
                     }
                     DispatchMsg::FireAndForget(..) => {}

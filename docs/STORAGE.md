@@ -166,8 +166,9 @@ replies live in the shared code; the backends only store.
   (one statement, or one critical section under the database's lock). The
   trait therefore works at the level of what a command does to a key
   (`hincrby`, `zadd`, `lmove`). It does not offer separate reads and writes for
-  the shared code to compose, because another worker could interleave between
-  them. Only what differs per backend sits below it.
+  the shared code to compose: an ordinary command holds its database's
+  server-wide lock shared, so another worker's command can run between two
+  such calls. Only what differs per backend sits below it.
 - **What it fixed.** Writing a command twice had let the halves drift. Moving
   each family surfaced and removed the differences: SQL `HINCRBYFLOAT`,
   `ZINCRBY`/`ZADD INCR`, `INCRBYFLOAT` and `SETBIT` are now read-modify-write
@@ -180,7 +181,10 @@ replies live in the shared code; the backends only store.
   HyperLogLog, `SORT`, `LCS`, `BITOP`, `MOVE`, `ZUNIONSTORE` and the rest of
   `src/composite.rs`) run their parts through whichever backend serves each
   database. `FLUSHALL`, `COPY`, `DUMP` and `RESTORE` run on the SQL path,
-  which reaches either half.
+  which reaches either half. The ones that make more than one call hold every
+  database they touch exclusive for the whole command, so they are atomic
+  across workers on both halves
+  ([Atomicity across workers](IMPLEMENTATION.md#atomicity-across-workers)).
 
 ## Growable shared memory (phase 6)
 
@@ -206,7 +210,10 @@ allocated from one arena in PostgreSQL's main shared segment.
   and `INFO memory` report it, and `used_memory` is the arena's real use.
 - **One lock per command.** A memory command takes its database's lock once
   and holds it for the type check and the whole operation, so no other worker
-  can interleave. The fixed tables locked once per table touched.
+  can interleave. The fixed tables locked once per table touched. Scripts,
+  `EXEC` and multi-step commands also hold the database's server-wide lock
+  exclusive for their whole run, so their steps do not interleave with other
+  workers' commands either.
 - **Memory safety.** `src/memdb` is safe Rust, generic over its allocator and
   unit-tested on the ordinary heap. All the `unsafe` is in `src/shm.rs`: the
   arena, the allocator handle and the lock that hands out a `&mut Db`. An

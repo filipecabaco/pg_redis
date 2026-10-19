@@ -86,3 +86,12 @@ pub fn futex_wait(_word: &AtomicU32, _expected: u32, timeout: Duration) {
 
 #[cfg(not(target_os = "linux"))]
 pub fn futex_wake(_word: &AtomicU32) {}
+
+/// Wake every process sleeping in [`futex_wait`] on `word`.
+#[cfg(target_os = "linux")]
+pub fn futex_wake_all(word: &AtomicU32) {
+    let _ = rustix::thread::futex::wake(word, rustix::thread::futex::Flags::empty(), u32::MAX);
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn futex_wake_all(_word: &AtomicU32) {}

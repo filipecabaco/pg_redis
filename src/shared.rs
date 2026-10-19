@@ -39,6 +39,9 @@ unsafe impl Shareable for crate::server::ServerCtl {}
 // slot is free and the lock open.
 unsafe impl Shareable for crate::cursor::CursorTable {}
 
+// SAFETY: two atomic words per database, zero when nobody holds the lock.
+unsafe impl Shareable for crate::dblock::DbLocks {}
+
 impl<T> Block<T> {
     pub const fn new() -> Self {
         Block {

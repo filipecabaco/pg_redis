@@ -81,6 +81,94 @@ executed through SPI per command, which for a plain `SET` cost more than the
 `SET` itself. It mirrors the save/restore sequence PL/pgSQL performs around its
 `EXCEPTION` blocks.
 
+### Atomicity across workers
+
+Redis runs every command on one thread, so nothing changes under a script, an
+`EXEC` or a command such as `ZUNIONSTORE` while it runs. Here several
+dispatchers run at once, so each of the 16 databases has a reader/writer lock
+in shared memory (`src/dblock.rs`). Only the dispatchers take them.
+
+- **Ordinary commands hold their database shared.** A batch takes each
+  database it touches once, for the whole batch, so commands keep running in
+  parallel on every worker.
+- **Multi-step commands hold it exclusive**, from before their first step until
+  their transaction has committed. While one runs, no other client's command on
+  that database runs on any worker; other databases are not affected. These
+  are:
+  - `EXEC`;
+  - `EVAL`, `EVALSHA`, `FCALL` and their `_RO` forms;
+  - the commands built from other commands in `src/composite.rs`: `LCS`,
+    `BITOP`, `BITFIELD` (unless every operation is a `GET`), `ZRANGESTORE`,
+    `LMPOP`, `ZMPOP`, `ZUNION`, `ZINTER`, `ZDIFF`, their `STORE` forms,
+    `ZINTERCARD`, `MOVE`, `SORT`, `SORT_RO`, `SWAPDB`, `PFADD`, `PFCOUNT`,
+    `PFMERGE`, `PFDEBUG`, `GEODIST`, `GEOHASH`, `GEOPOS`, `GEORADIUS`,
+    `GEORADIUSBYMEMBER`, `GEOSEARCH`, `GEOSEARCHSTORE` and the `_RO` forms;
+  - `COPY`, `RESTORE` and `FLUSHALL`;
+  - each try of `BLPOP`, `BRPOP`, `BLMOVE`, `BRPOPLPUSH`, `BLMPOP`, `BZPOPMIN`,
+    `BZPOPMAX` and `BZMPOP`, which checks the key's type and then pops;
+  - a stream write on a table-backed database, which reads the stream and
+    writes it back in a second statement.
+
+  `BITPOS`, `GEOADD`, `HSCAN`, `SSCAN`, `ZSCAN` and `PFSELFTEST` make a single
+  storage call and are held shared like any command.
+- **Several databases are taken in ascending order.** `MOVE`, `COPY ... DB`,
+  `SWAPDB`, `FLUSHALL` (all sixteen) and an `EXEC` whose queue contains
+  `SELECT` hold every database involved, exclusive. The set is known before
+  the run starts, so two runs whose sets overlap take them in the same order
+  and cannot deadlock. An `EXEC` also holds the databases of the keys its
+  connection `WATCH`ed, and checks the `WATCH`es once it holds them, so no
+  write lands between that check and the queued commands.
+- **Scripts that change database lock every database.** A script's databases
+  are only known as it runs. The rule: a script whose source names `SELECT`,
+  `MOVE`, `COPY`, `SWAPDB` or `FLUSHALL` as a whole word, in any case and
+  anywhere (a comment counts), holds all sixteen; any other script holds the
+  database it starts on. An `EVALSHA` or `FCALL` this worker has not compiled
+  yet also holds all sixteen, once. A script that still reaches a database it
+  does not hold, through a command name built at run time, gets that lock only
+  if it is free: the call fails with an error rather than wait, because the
+  script's transaction may already hold row locks that the other holder needs.
+  The trade-off is that a script naming one of those commands runs alone on
+  the whole server, as every script does in Redis, and that the run-time
+  case can fail under load instead of waiting.
+- **Writers are preferred.** Once an exclusive request waits, no new shared
+  holder gets in, so a stream of commands cannot starve a script.
+- **What is never held.** A connection waiting for its client, a blocking
+  command waiting for a key (each try is a dispatch of its own), and `WATCH`
+  hold nothing. Connection-local commands (`PING`, `SELECT`, `AUTH`, `MULTI`
+  queueing, pub/sub) never take a lock.
+- **Lock order.** The database locks are taken before the run's transaction
+  starts, ascending, and released after it commits. The memory engine's
+  per-database LWLocks and PostgreSQL's row and advisory locks are taken and
+  released inside the run. No path waits for a database lock while holding one
+  of those; the script case above only tries.
+- **Release.** The locks belong to a guard: an ERROR caught by
+  `pg::subtransaction` or `pg::transaction_or_abort`, or a Rust panic, unwinds
+  through it and releases them. A FATAL error exits without unwinding, so a
+  `before_shmem_exit` callback releases what the worker still holds; a worker
+  that exits with status 1 is restarted without the crash recovery that would
+  reset shared memory. A crash does reset it, and a zeroed lock is free.
+- **Background work.** The expiry sweep, snapshots and the key moves of a
+  policy change hold each database shared, like a command, so none of them
+  lands inside a script or a transaction. The sweeps and snapshots only try
+  the lock and skip a held database until their next round, so a long script
+  on one database does not stop a dispatcher serving the others. The keys
+  moved ahead of a client's command wait for it, as the command would.
+- **Batching.** A script or multi-step command joins the batch it arrives
+  in; the batch then holds that command's databases exclusive and the rest
+  shared. The commands run one after another on the dispatcher, so each is
+  still whole, and a table-backed batch still shares one commit. An `EXEC`
+  runs as a batch of its own.
+- **The cost.** Ordinary commands pay two atomic operations per database per
+  batch; the bench rig shows no change for them beyond noise. Commands that
+  hold a database exclusive on it run on one worker at a time. In memory that
+  costs little (`EVAL` of `GET` then `SET`, 50 clients: about 9% fewer per
+  second). On a logged database each batch waits for its commit, and those
+  commits no longer overlap across workers, so scripts and composites there
+  ran about a third as fast (`EVAL` 5,500 to 1,700 per second, `LMPOP` 11,400
+  to 3,100). A dispatcher waiting for a database also serves none of its other
+  clients meanwhile, so a long script on database 0 delays the commands queued
+  behind a database-0 command on another worker.
+
 ---
 
 ## 2. Storage backends
@@ -262,7 +350,9 @@ engine:
 command inside one `with_db`. Nothing another worker does can land between
 the type check and the write, or between the two halves of an
 `LMOVE`. What `store::run` does not know runs after the lock is released;
-composites re-enter `execute_mem` once per sub-command.
+composites re-enter `execute_mem` once per sub-command. What keeps a composite,
+a script or an `EXEC` whole is the database lock its dispatcher holds
+exclusive around it ([Atomicity across workers](#atomicity-across-workers)).
 
 ### Expiry
 
@@ -418,8 +508,10 @@ Error replies carry their own code when they have one. `write_error` prefixes
 
 ### Scripting
 
-`EVAL` and `FCALL` run Lua 5.1 on the dispatcher, whole, so a script is atomic
-against every other command its worker serves. `redis.call` builds an
+`EVAL` and `FCALL` run Lua 5.1 on the dispatcher, whole, holding their
+database exclusive ([Atomicity across workers](#atomicity-across-workers)), so
+no other client's command on it runs on any worker until the script ends.
+`redis.call` builds an
 ordinary command and routes it like a composite command's sub-commands, so one
 script reads and writes both storage halves. The environment is Redis's:
 `cjson`, `cmsgpack`, `struct` and `bit` are Redis's own C sources, compiled by
@@ -440,10 +532,13 @@ client get `BUSY`, on every worker, until it ends or `SCRIPT KILL` /
 
 ### Known differences from Redis
 
-- **Atomicity is per worker.** A script, a `MULTI`, or a composite command
-  holds its own dispatcher; on the memory half its sub-commands take their own
-  locks, so another worker's commands can interleave with them. Redis is one
-  thread, so nothing interleaves.
+- **A script that builds a command name at run time can be refused a
+  database.** A script whose source does not name `SELECT`, `MOVE`, `COPY`,
+  `SWAPDB` or `FLUSHALL` holds only its own database; if it reaches another
+  one anyway, the call fails with an error while another client uses that
+  database ([Atomicity across workers](#atomicity-across-workers)). Redis
+  runs it. A RESP3 `MULTI` that subscribes runs in segments around each
+  subscription command, each segment atomic on its own.
 - **Blocked clients are served before the writer replies, within a bound.**
   Redis serves the clients a write unblocks inside that write. Here they live
   on other threads and workers, so a write that touches a key someone is

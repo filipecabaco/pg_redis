@@ -9,6 +9,7 @@ mod commands;
 pub(crate) mod composite;
 pub(crate) mod config;
 pub(crate) mod cursor;
+pub(crate) mod dblock;
 #[cfg(test)]
 mod fuzz;
 pub(crate) mod geo;
@@ -78,6 +79,7 @@ static ROUTE_CTL: shared::Block<pubsub::RouteCtl> = shared::Block::new();
 static WATCH_CTL: shared::Block<watch::WatchCtl> = shared::Block::new();
 static SERVER_CTL: shared::Block<server::ServerCtl> = shared::Block::new();
 static CURSOR_TABLE: shared::Block<cursor::CursorTable> = shared::Block::new();
+static DB_LOCKS: shared::Block<dblock::DbLocks> = shared::Block::new();
 
 /// Everything this extension keeps in shared memory, reserved in the
 /// postmaster's request hook.
@@ -90,6 +92,7 @@ fn request_shmem() {
     shared::request(server::server_ctl_size());
     // The SCAN cursors of databases kept in tables.
     shared::request(cursor::cursor_table_size());
+    shared::request(dblock::db_locks_size());
     // The memory engine's arena: reserved at redis.maxmemory, backed by RAM
     // only as it fills.
     shm::request();
@@ -101,6 +104,7 @@ fn attach_shmem() {
     PUBSUB_SLOTS.attach(c"pg_redis_pubsub_slots", pubsub::pubsub_slots_size());
     ROUTE_CTL.attach(c"pg_redis_route_ctl", pubsub::route_ctl_size());
     WATCH_CTL.attach(c"pg_redis_watch_ctl", watch::watch_ctl_size());
+    DB_LOCKS.attach(c"pg_redis_db_locks", dblock::db_locks_size());
     if !SERVER_CTL.attach(c"pg_redis_server_ctl", server::server_ctl_size())
         && let Some(ctl) = SERVER_CTL.get()
     {
@@ -127,6 +131,11 @@ pub(crate) fn server_state() -> Option<&'static server::ServerCtl> {
 /// The SCAN cursor table, once it exists (`cursor.rs`).
 pub(crate) fn cursor_state() -> Option<&'static cursor::CursorTable> {
     CURSOR_TABLE.get()
+}
+
+/// The per-database reader/writer locks, once they exist (`dblock.rs`).
+pub(crate) fn db_locks() -> Option<&'static dblock::DbLocks> {
+    DB_LOCKS.get()
 }
 
 /// The WATCH counters, once they exist.

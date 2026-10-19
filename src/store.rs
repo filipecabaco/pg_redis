@@ -145,7 +145,9 @@ pub trait Store {
     fn incrby(&mut self, key: &[u8], delta: i64) -> Out<Num<i64>>;
     fn incrbyfloat(&mut self, key: &[u8], delta: LongDouble) -> Out<Num<String>>;
     /// Set or clear one bit; what it was.
-    fn setbit(&mut self, key: &[u8], offset: i64, on: bool) -> Out<bool>;
+    /// The bit as it was, and whether anything changed: the bit, or the
+    /// string created or grown to reach it.
+    fn setbit(&mut self, key: &[u8], offset: i64, on: bool) -> Out<(bool, bool)>;
 
     // ── hashes ──
     fn hget(&mut self, key: &[u8], field: &[u8]) -> Out<Option<Vec<u8>>>;
@@ -339,7 +341,11 @@ pub fn run(cmd: &Command, store: &mut dyn Store) -> Option<Response> {
             .keyspace()
             .map(|(k, e)| Response::IntegerArray(vec![k, e])),
         Command::RandomKey => store.random_key().map(bulk_or_nil),
-        Command::FlushDb => store.flushdb().map(|()| Response::Ok),
+        Command::FlushDb => store.dbsize().and_then(|n| {
+            store.flushdb()?;
+            crate::dirty::add(n.max(0) as u64);
+            Ok(Response::Ok)
+        }),
         Command::ObjectEncoding { key } => object_encoding(store, key),
         Command::ZsetToSkiplist { key } => store.zset_to_skiplist(key).map(|()| Response::Ok),
         Command::ObjectAccess { key, field } => object_access(store, key, *field),
@@ -434,9 +440,12 @@ pub fn run(cmd: &Command, store: &mut dyn Store) -> Option<Response> {
         Command::BitCount { key, range } => store.get(key).map(|v| {
             Response::Integer(crate::commands::count_bits(&v.unwrap_or_default(), *range))
         }),
-        Command::SetBit { key, offset, value } => store
-            .setbit(key, *offset, *value)
-            .map(|b| Response::Integer(b as i64)),
+        Command::SetBit { key, offset, value } => {
+            store.setbit(key, *offset, *value).map(|(was, changed)| {
+                crate::dirty::add(u64::from(changed));
+                Response::Integer(was as i64)
+            })
+        }
 
         Command::HGet { key, field } => store.hget(key, field).map(bulk_or_nil),
         Command::HMGet { key, fields } => store.hmget(key, fields).map(Response::Array),
@@ -740,7 +749,9 @@ pub fn run(cmd: &Command, store: &mut dyn Store) -> Option<Response> {
             }),
         _ => return None,
     };
-    Some(reply.unwrap_or_else(|e| e))
+    let reply = reply.unwrap_or_else(|e| e);
+    crate::dirty::add(crate::dirty::of(cmd, &reply));
+    Some(reply)
 }
 
 fn score(s: f64) -> Response {
@@ -2060,7 +2071,7 @@ impl Store for SqlStore<'_, '_> {
 
     /// Seeded if missing, then locked, edited and written back, so two at
     /// once cannot both edit the old value.
-    fn setbit(&mut self, key: &[u8], offset: i64, on: bool) -> Out<bool> {
+    fn setbit(&mut self, key: &[u8], offset: i64, on: bool) -> Out<(bool, bool)> {
         let db = self.db;
         self.client
             .update_kept(
@@ -2079,6 +2090,7 @@ impl Store for SqlStore<'_, '_> {
             .ok()
             .flatten()
             .unwrap_or_default();
+        let grows = value.len() <= (offset / 8) as usize;
         let was = crate::commands::set_bit_at(&mut value, offset, on);
         self.client
             .update_kept(
@@ -2086,7 +2098,7 @@ impl Store for SqlStore<'_, '_> {
                 &[key.into(), value.into()],
             )
             .map_err(|e| failed("SETBIT", e))?;
-        Ok(was)
+        Ok((was, grows || was != on))
     }
 
     fn hget(&mut self, key: &[u8], field: &[u8]) -> Out<Option<Vec<u8>>> {

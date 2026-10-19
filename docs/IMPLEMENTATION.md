@@ -731,9 +731,9 @@ client get `BUSY`, on every worker, until it ends or `SCRIPT KILL` /
   REFCOUNT` from the policy and `maxmemory` in force when asked, so the two
   differ for a key written before the policy changed. With no `CONFIG SET
   maxmemory`, `maxmemory` reports the arena's limit, never Redis's default 0.
-- **No dirty counter.** `rdb_changes_since_last_save` stays 0.
-  `SAVE`, `BGSAVE` and `LASTSAVE` act on `memory+snapshot` databases' snapshots
-  ([Storage policies](STORAGE.md#snapshots-phase-4)).
+- **`SAVE` and `BGSAVE` snapshot memory databases.** They, and `LASTSAVE`,
+  act on `memory+snapshot` databases' snapshots
+  ([Storage policies](STORAGE.md#snapshots-phase-4)); there is no RDB file.
 - **`SCAN` cursors on a table are kept by the server.** On the durable half
   a cursor names an entry in a shared-memory table of 4,096 iterations in
   progress ([SCAN cursors](#scan-cursors)). The cursor from the latest call,

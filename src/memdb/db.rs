@@ -936,10 +936,11 @@ impl<A: Allocator + Clone> Store for Db<A> {
         Ok(Num::Value(text))
     }
 
-    fn setbit(&mut self, key: &[u8], offset: i64, on: bool) -> Out<bool> {
+    fn setbit(&mut self, key: &[u8], offset: i64, on: bool) -> Out<(bool, bool)> {
         let v = self.string_mut(key)?;
         let byte = (offset / 8) as usize;
-        if v.len() <= byte {
+        let grows = v.len() <= byte;
+        if grows {
             v.resize(byte + 1, 0);
         }
         let mask = 0x80u8 >> (offset % 8);
@@ -949,7 +950,7 @@ impl<A: Allocator + Clone> Store for Db<A> {
         } else {
             v[byte] &= !mask;
         }
-        Ok(was)
+        Ok((was, grows || was != on))
     }
 
     // ── hashes ──

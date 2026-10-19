@@ -1753,7 +1753,46 @@ describe("Transactions", () => {
 	});
 });
 
+// INFO's rdb_changes_since_last_save counts as Redis's server.dirty does.
+describe("The dirty counter", () => {
+	const changes = async () => {
+		const info = (await raw.bulk("INFO", "persistence"))?.toString() ?? "";
+		return Number(/rdb_changes_since_last_save:(\d+)/.exec(info)?.[1]);
+	};
+	for (const db of ["0", "8"]) {
+		test(`writes count their changes (db ${db})`, async () => {
+			await raw.send("SELECT", db);
+			await raw.send("DEL", "dc:s", "dc:b", "dc:f", "dc:h");
+			let before = await changes();
+			await raw.send("SADD", "dc:s", "a", "b", "c");
+			await raw.send("SADD", "dc:s", "a");
+			await raw.send("HSET", "dc:h", "f1", "v", "f2", "v");
+			expect((await changes()) - before).toBe(5);
+			// SETBIT counts a created or grown string, or a changed bit.
+			before = await changes();
+			await raw.send("SETBIT", "dc:b", "0", "0");
+			await raw.send("SETBIT", "dc:b", "0", "0");
+			await raw.send("SETBIT", "dc:b", "0", "1");
+			await raw.send("SETBIT", "dc:b", "90", "0");
+			expect((await changes()) - before).toBe(3);
+			// BITFIELD counts each write that changed something.
+			before = await changes();
+			await raw.send("BITFIELD", "dc:f", "SET", "i5", "0", "0");
+			await raw.send("BITFIELD", "dc:f", "SET", "i5", "0", "0");
+			await raw.send("BITFIELD", "dc:f", "INCRBY", "i5", "0", "1", "INCRBY", "i5", "0", "1");
+			expect((await changes()) - before).toBe(3);
+			before = await changes();
+			await raw.send("DEL", "dc:s", "dc:b", "dc:f", "dc:h", "dc:none");
+			expect((await changes()) - before).toBe(4);
+			await raw.send("SAVE");
+			expect(await changes()).toBe(0);
+			await raw.send("SELECT", "durable");
+		});
+	}
+});
+
 describe("Binary safety", () => {
+
 	// Redis keys and values are arbitrary byte strings. These bytes are exactly
 	// what the previous TEXT columns could not store: a NUL, and sequences that
 	// are not valid UTF-8.

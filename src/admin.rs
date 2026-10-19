@@ -147,6 +147,7 @@ pub fn execute(a: &Admin, conn: &mut Conn, data: &mut Data) -> Response {
         // (`Command::execute_inner`), where SPI is to hand; what is left is
         // LASTSAVE when there was nothing to snapshot.
         "SAVE" => {
+            server::mark_saved();
             if !a.saved
                 && let Some(c) = server::ctl()
             {
@@ -158,6 +159,7 @@ pub fn execute(a: &Admin, conn: &mut Conn, data: &mut Data) -> Response {
             Response::Ok
         }
         "BGSAVE" => {
+            server::mark_saved();
             if !crate::storage::request_snapshots()
                 && let Some(c) = server::ctl()
             {
@@ -739,7 +741,10 @@ fn info_section(section: &str, conn: &Conn, data: &mut Data) -> String {
             lines.extend([
                 "loading:0".into(),
                 "async_loading:0".into(),
-                "rdb_changes_since_last_save:0".into(),
+                format!(
+                    "rdb_changes_since_last_save:{}",
+                    server::changes_since_save()
+                ),
                 "rdb_bgsave_in_progress:0".into(),
                 format!("rdb_last_save_time:{lastsave}"),
                 "rdb_last_bgsave_status:ok".into(),

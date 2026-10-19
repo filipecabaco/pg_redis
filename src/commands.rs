@@ -3715,6 +3715,7 @@ impl Command {
                 crate::storage::restore(client, dst_db, dst, &dump, deadline_us);
                 // A copy is a new object: a fresh access field.
                 crate::access::restored(dst_db, dst, None, None);
+                crate::dirty::add(1);
                 Response::Integer(1)
             }
 
@@ -3775,6 +3776,7 @@ impl Command {
                 };
                 crate::storage::restore(client, db, key, &dump, deadline_us);
                 crate::access::restored(db, key, *idletime, *freq);
+                crate::dirty::add(1);
                 Response::Ok
             }
 
@@ -3782,10 +3784,25 @@ impl Command {
             // and the reason the Redis port should not be exposed past
             // loopback without a password.
             Command::FlushAll => {
+                // `flushAllDataAndResetRDB`: every key removed counts, and
+                // with `save` set the server then saves, which starts the
+                // count again.
+                let removed: i64 = (0..NUM_DBS as u8)
+                    .map(|d| match Self::route(client, d, Command::DbSize) {
+                        Response::Integer(n) => n.max(0),
+                        _ => 0,
+                    })
+                    .sum();
                 crate::storage::flush_memory();
                 let all: Vec<usize> = (0..NUM_DBS).collect();
                 match client.update_kept(&sql::flush_dbs(&all), &[]) {
-                    Ok(_) => Response::Ok,
+                    Ok(_) => {
+                        crate::dirty::add(removed as u64);
+                        if !crate::config::get_str("save").trim().is_empty() {
+                            crate::server::mark_saved();
+                        }
+                        Response::Ok
+                    }
                     Err(e) => spi_failed("FLUSHALL", e),
                 }
             }

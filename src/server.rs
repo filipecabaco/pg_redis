@@ -286,6 +286,10 @@ pub struct ServerCtl {
     enc_limits_set: AtomicU32,
     /// Clients with tracking on: when 0, no write looks at the table.
     pub tracking_clients: AtomicU32,
+    /// Redis's `server.dirty`, and what it was at the last save
+    /// (`dirty.rs`).
+    dirty: AtomicU64,
+    dirty_at_save: AtomicU64,
     /// Each database's storage policy and memory slot (`storage.rs`).
     pub storage: crate::storage::PolicyTable,
 }
@@ -1540,6 +1544,29 @@ impl ClientHandle {
     pub fn proto(&self) -> u8 {
         self.slot
             .map_or(2, |s| s.proto.load(Ordering::Relaxed) as u8)
+    }
+}
+
+pub fn add_dirty(n: u64) {
+    if let Some(c) = ctl() {
+        c.dirty.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// INFO's `rdb_changes_since_last_save`.
+pub fn changes_since_save() -> u64 {
+    ctl().map_or(0, |c| {
+        c.dirty
+            .load(Ordering::Relaxed)
+            .saturating_sub(c.dirty_at_save.load(Ordering::Relaxed))
+    })
+}
+
+/// A save happened: the count starts again.
+pub fn mark_saved() {
+    if let Some(c) = ctl() {
+        c.dirty_at_save
+            .store(c.dirty.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 }
 

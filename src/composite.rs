@@ -356,7 +356,15 @@ impl Op {
         matches!(self, Op::SwapDb { .. })
     }
 
+    /// Run the command, its steps not counted as changes: it counts as
+    /// Redis counts it (`dirty::of_op`).
     pub fn run(&self, db: u8, exec: &mut Runner) -> Response {
+        let reply = crate::dirty::quietly(|| self.run_steps(db, exec));
+        crate::dirty::force(crate::dirty::of_op(self, &reply));
+        reply
+    }
+
+    fn run_steps(&self, db: u8, exec: &mut Runner) -> Response {
         let result = match self {
             Op::Lcs {
                 a,
@@ -1625,11 +1633,16 @@ fn run_bitfield(
         .map(|o| o.offset + o.bits as u64 - 1)
         .max();
     let mut changed = false;
+    // Redis counts each write that changes a value, or that runs on a
+    // string it created or grew.
+    let mut grew = false;
+    let mut changes = 0;
     if let Some(h) = highest {
         let need = (h >> 3) as usize + 1;
         if buf.len() < need {
             buf.resize(need, 0);
             changed = true;
+            grew = true;
         }
     }
     let mut out = Vec::with_capacity(ops.len());
@@ -1657,6 +1670,7 @@ fn run_bitfield(
                     out.push(Value::Int(ret));
                     set_unsigned(&mut buf, op.offset, op.bits, new as u64);
                     changed |= old != new;
+                    changes += u64::from(grew || old != new);
                 }
             }
             (kind, false) => {
@@ -1680,6 +1694,7 @@ fn run_bitfield(
                     out.push(Value::Int(ret as i64));
                     set_unsigned(&mut buf, op.offset, op.bits, new);
                     changed |= old != new;
+                    changes += u64::from(grew || old != new);
                 }
             }
         }
@@ -1687,6 +1702,7 @@ fn run_bitfield(
     if changed {
         ok(call(exec, db, &[b"SET", key, &buf, b"KEEPTTL"]))?;
     }
+    crate::dirty::force(changes);
     Ok(Response::Value(Value::Array(out)))
 }
 

@@ -303,7 +303,6 @@ redis-cli PING   <span class="o"># PONG</span></code></pre>
         <li><strong>Blocked clients are served just after the write.</strong> A write that unblocks <code>BLPOP</code> clients waits up to 500 ms for them to be served, where Redis serves them inside the write.</li>
         <li><strong>No access clock.</strong> <code>OBJECT IDLETIME</code> and <code>OBJECT FREQ</code> return nil, since tracking reads would turn every read on a table into a write.</li>
         <li><strong>Eviction is silent.</strong> A key evicted under <code>maxmemory-policy</code> raises no <code>evicted</code> keyspace event and no <code>CLIENT TRACKING</code> invalidation.</li>
-        <li><strong>Pub/sub has fixed limits.</strong> Past 256 subscribed connections, <code>SUBSCRIBE</code> returns an error. A subscription past the per-connection limit is refused with an error, and the rest of the command still applies. A subscriber that falls 256 messages behind is disconnected, as Redis disconnects one past its pub/sub output limit, so it never carries on with a gap it cannot see.</li>
         <li><strong>Memory data does not fail over.</strong> On a promoted standby, <code>memory</code> databases start empty, as a Redis primary without replicas would. A <code>memory+snapshot</code> database is snapshotted at shutdown, so a planned switchover keeps every write; after an unplanned one it loads its last snapshot.</li>
         <li><strong>A stand-alone server, with one user.</strong> <code>REPLICAOF</code>, <code>WAIT</code>, <code>CLUSTER</code> and <code>ACL</code> answer as Redis would with no replicas, no cluster and only the <code>default</code> user. Replication is PostgreSQL's.</li>
         <li><strong>Floats follow Redis on x86-64.</strong> <code>INCRBYFLOAT</code> and <code>HINCRBYFLOAT</code> add in 80-bit <code>long double</code> and print the digits Redis prints on x86-64. Redis builds on arm64 use a 128-bit <code>long double</code> and round GEO distances differently, so against them these can differ in the last digit. These are the only differences the reply-by-reply diff finds, and only against arm64 Redis.</li>
@@ -315,12 +314,8 @@ redis-cli PING   <span class="o"># PONG</span></code></pre>
         <div><dt>Memory databases</dt><dd><code>redis.maxmemory</code>, shared</dd></div>
         <div><dt>Keys and values</dt><dd>512 MB, as in Redis</dd></div>
         <div><dt>Values in tables</dt><dd>~1 GB per field, PostgreSQL's TOAST limit</dd></div>
-        <div><dt>Pub/sub channel or pattern</dt><dd>255 bytes</dd></div>
-        <div><dt>Pub/sub message</dt><dd>512 bytes</dd></div>
-        <div><dt>Pub/sub subscribed connections</dt><dd>256 per server</dd></div>
-        <div><dt>Pub/sub subscriptions</dt><dd>16 channels and 16 patterns per connection</dd></div>
-        <div><dt>Pub/sub queue</dt><dd>256 undelivered messages per subscriber, then it is disconnected</dd></div>
-        <div><dt>Client-side caching</dt><dd>16,384 tracked key–client pairs</dd></div>
+        <div><dt>Pub/sub and client-side caching</dt><dd><code>redis.pubsub_memory</code>, 128 MB by default</dd></div>
+        <div><dt>A slow subscriber</dt><dd><code>client-output-buffer-limit pubsub</code>, as in Redis</dd></div>
       </dl>
     </div>
   </div>

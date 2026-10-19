@@ -53,7 +53,7 @@ The limits that apply only to databases in memory are described once, in
 | `FAILOVER` | No replicas to fail over to |
 | `SHUTDOWN` | Refused; stop PostgreSQL instead |
 | `LOLWUT` |  |
-| `MONITOR` | Every worker's commands, admin and scripting commands excluded and passwords redacted as Redis does; a line past 512 bytes is cut short |
+| `MONITOR` | Every worker's commands, admin and scripting commands excluded and passwords redacted as Redis does |
 
 ## Strings
 

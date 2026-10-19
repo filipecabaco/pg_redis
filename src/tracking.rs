@@ -1,10 +1,11 @@
 //! Client-side caching: `CLIENT TRACKING`, `CLIENT CACHING`, and the
 //! invalidation messages they ask for.
 //!
-//! A tracking client's reads are remembered as (key, client) pairs in a
-//! table in shared memory — every worker's writes have to find them — and a
-//! write to a remembered key sends that client one invalidation and forgets
-//! the pair, as Redis does. In `BCAST` mode nothing is remembered: every
+//! A tracking client's reads are remembered in a table of key → readers in
+//! the pub/sub heap — every worker's writes have to find them — and a write
+//! to a remembered key sends each reader one invalidation and forgets the
+//! key, as Redis does. The table holds whole key names with no fixed size;
+//! `tracking-table-max-keys` bounds it as in Redis. In `BCAST` mode nothing is remembered: every
 //! write to a key under one of the client's prefixes is announced, one
 //! message per prefix per command or transaction.
 //!
@@ -18,10 +19,12 @@
 #![forbid(unsafe_code)]
 
 use std::cell::Cell;
-use std::sync::atomic::Ordering;
+use std::hash::{BuildHasher, RandomState};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::commands::{Response, Value};
-use crate::server::{self, TRACK_CAP};
+use crate::pubheap::{PubHeap, Shared, catching};
+use crate::server;
 
 pub const ON: u32 = 1;
 pub const BCAST: u32 = 2;
@@ -38,19 +41,6 @@ pub const TRACK_PREFIX: &[u8] = b"\x01track:";
 
 pub fn channel(id: u64) -> Vec<u8> {
     [TRACK_PREFIX, id.to_string().as_bytes()].concat()
-}
-
-const FREE: u64 = 0;
-const TOMBSTONE: u64 = 1;
-
-fn key_hash(key: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in key {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    // 0 and 1 mark free and deleted slots.
-    h.max(2)
 }
 
 thread_local! {
@@ -160,165 +150,210 @@ pub fn frame(payload: &[u8], proto: u8) -> Option<(&'static str, Value)> {
 
 // ──────────────────────────────── the table ─────────────────────────────────
 
-/// Remember that `client` read `keys`. The table holds `TRACK_CAP` pairs; a
-/// key with no room left makes room by invalidating another, picked at
-/// random, as Redis does past `tracking-table-max-keys`. Dropping the read
-/// instead would leave the client caching a key it is never told about.
-fn remember(client: u64, keys: &[Vec<u8>]) {
-    let unplaced = place(client, keys);
-    for key in unplaced {
-        if evict_one() {
-            place(client, std::slice::from_ref(&key));
+type HVec<T> = allocator_api2::vec::Vec<T, PubHeap>;
+
+/// A tracked key and the clients that read it since it last changed.
+struct Entry {
+    key: HVec<u8>,
+    readers: HVec<u64>,
+}
+
+/// Redis's `TrackingTable`: every key a tracking client read, with who read
+/// it, in the pub/sub heap so every worker's writes find it. The entries are
+/// kept dense so eviction can pick one at random; the index finds a key's
+/// entry by name.
+///
+/// As in Redis, turning tracking off forgets nothing: a key's stale readers
+/// go when the key is invalidated, and are skipped then if they no longer
+/// track it.
+pub struct Table {
+    entries: HVec<Entry>,
+    index: hashbrown::HashTable<u32, PubHeap>,
+    hasher: RandomState,
+    /// (key, client) pairs: `TrackingTableTotalItems`.
+    items: usize,
+}
+
+fn hash(hasher: &RandomState, key: &[u8]) -> u64 {
+    hasher.hash_one(key)
+}
+
+impl Table {
+    pub(crate) fn new() -> Table {
+        Table::with_hasher(RandomState::new())
+    }
+
+    fn with_hasher(hasher: RandomState) -> Table {
+        Table {
+            entries: HVec::new_in(PubHeap),
+            index: hashbrown::HashTable::new_in(PubHeap),
+            hasher,
+            items: 0,
         }
+    }
+
+    fn find(&self, key: &[u8]) -> Option<usize> {
+        let entries = &self.entries;
+        self.index
+            .find(hash(&self.hasher, key), |&i| {
+                entries[i as usize].key[..] == *key
+            })
+            .map(|&i| i as usize)
+    }
+
+    /// Note that `client` read `key`. Every allocation comes before any
+    /// change, so a full heap (a panic) leaves the table as it was.
+    fn remember(&mut self, client: u64, key: &[u8]) {
+        if let Some(i) = self.find(key) {
+            let readers = &mut self.entries[i].readers;
+            if !readers.contains(&client) {
+                readers.push(client);
+                self.items += 1;
+            }
+            return;
+        }
+        let mut name = HVec::with_capacity_in(key.len(), PubHeap);
+        name.extend_from_slice(key);
+        let mut readers = HVec::with_capacity_in(1, PubHeap);
+        readers.push(client);
+        let Table {
+            entries,
+            index,
+            hasher,
+            ..
+        } = self;
+        entries.reserve(1);
+        index.reserve(1, |&i| hash(hasher, &entries[i as usize].key));
+        index.insert_unique(hash(hasher, key), entries.len() as u32, |&i| {
+            hash(hasher, &entries[i as usize].key)
+        });
+        entries.push(Entry { key: name, readers });
+        self.items += 1;
+    }
+
+    /// Forget `key`, returning who read it.
+    fn take(&mut self, key: &[u8]) -> Vec<u64> {
+        let Some(i) = self.find(key) else {
+            return Vec::new();
+        };
+        let h = hash(&self.hasher, key);
+        if let Ok(e) = self.index.find_entry(h, |&j| j as usize == i) {
+            e.remove();
+        }
+        let gone = self.entries.swap_remove(i);
+        // The last entry moved into `i`: point its index there.
+        if let Some(moved) = self.entries.get(i) {
+            let from = self.entries.len() as u32;
+            if let Some(j) = self
+                .index
+                .find_mut(hash(&self.hasher, &moved.key), |&j| j == from)
+            {
+                *j = i as u32;
+            }
+        }
+        self.items -= gone.readers.len();
+        gone.readers.to_vec()
+    }
+
+    /// A tracked key chosen by `r`, for eviction.
+    fn pick(&self, r: usize) -> Option<Vec<u8>> {
+        (!self.entries.is_empty()).then(|| self.entries[r % self.entries.len()].key.to_vec())
     }
 }
 
-/// Store what fits; the keys that found no free pair.
-fn place(client: u64, keys: &[Vec<u8>]) -> Vec<Vec<u8>> {
-    server::with_track_table(|ctl| {
-        let mut unplaced = Vec::new();
-        for key in keys {
-            let h = key_hash(key);
-            let start = (h as usize) % TRACK_CAP;
-            let mut reuse = None;
-            for step in 0..TRACK_CAP {
-                let i = (start + step) % TRACK_CAP;
-                let k = ctl.track_keys[i].load(Ordering::Relaxed);
-                if k == h && ctl.track_owners[i].load(Ordering::Relaxed) == client {
-                    reuse = None;
-                    break;
-                }
-                if k == TOMBSTONE && reuse.is_none() {
-                    reuse = Some(i);
-                }
-                if k == FREE {
-                    reuse = reuse.or(Some(i));
-                    break;
-                }
-                if step == TRACK_CAP - 1 && reuse.is_none() {
-                    unplaced.push(key.clone());
-                }
-            }
-            if let Some(i) = reuse {
-                ctl.track_keys[i].store(h, Ordering::Relaxed);
-                ctl.track_owners[i].store(client, Ordering::Relaxed);
-                server::set_track_name(ctl, i, key);
+fn table() -> Option<&'static Shared<Table>> {
+    crate::pubheap::root().map(|r| &r.tracking)
+}
+
+/// `trackingRememberKeys`. A heap too full for the pair makes room by
+/// invalidating tracked keys picked at random, as the table's own limit
+/// does: dropping the read instead would leave the client caching a key it
+/// is never told about.
+fn remember(client: u64, keys: &[Vec<u8>]) {
+    let Some(t) = table() else { return };
+    for key in keys {
+        while catching(|| t.lock().remember(client, key)).is_none() {
+            if !evict_one() {
+                break;
             }
         }
-        unplaced
-    })
-    .unwrap_or_default()
+    }
 }
 
 /// Invalidate one tracked key picked at random, as if it had been written:
-/// its readers are told, and it is forgotten. A key too long for its name to
-/// be kept is told to the client holding it as a flush — every key — and the
-/// client's reads forgotten, which no cache can be wrong about. False when
-/// nothing is tracked.
+/// its readers are told, and it is forgotten. False when nothing is tracked.
 fn evict_one() -> bool {
-    let start = crate::memdb::fast_random() as usize % TRACK_CAP;
-    let victim = server::with_track_table(|ctl| {
-        (0..TRACK_CAP)
-            .map(|step| (start + step) % TRACK_CAP)
-            .find_map(|i| {
-                (ctl.track_keys[i].load(Ordering::Relaxed) > TOMBSTONE).then(|| {
-                    (
-                        server::track_name(ctl, i),
-                        ctl.track_owners[i].load(Ordering::Relaxed),
-                    )
-                })
-            })
-    })
-    .flatten();
-    match victim {
-        Some((name, _)) if !name.is_empty() => invalidate(&[name], 0),
-        Some((_, owner)) => {
-            forget_client(owner);
-            send(owner, Message::Flush);
-        }
-        None => return false,
-    }
+    let Some(t) = table() else { return false };
+    let Some(key) = t.lock().pick(crate::memdb::fast_random() as usize) else {
+        return false;
+    };
+    invalidate_key(&key, 0);
     true
 }
 
-/// Every client that read `key`, forgetting them.
-fn take(key: &[u8]) -> Vec<u64> {
-    let h = key_hash(key);
-    server::with_track_table(|ctl| {
-        let mut owners = Vec::new();
-        let start = (h as usize) % TRACK_CAP;
-        for step in 0..TRACK_CAP {
-            let i = (start + step) % TRACK_CAP;
-            let k = ctl.track_keys[i].load(Ordering::Relaxed);
-            if k == FREE {
-                break;
-            }
-            if k == h {
-                owners.push(ctl.track_owners[i].load(Ordering::Relaxed));
-                ctl.track_keys[i].store(TOMBSTONE, Ordering::Relaxed);
-            }
+/// `trackingInvalidateKey` for the table: forget `key`, and tell each client
+/// that read it, unless it no longer tracks, has since switched to BCAST, or
+/// wrote the key itself with NOLOOP on.
+fn invalidate_key(key: &[u8], origin: u64) {
+    let Some(t) = table() else { return };
+    let readers = t.lock().take(key);
+    for id in readers {
+        let Some(slot) = server::slot_of(id) else {
+            continue;
+        };
+        let flags = slot.tracking.load(Ordering::Relaxed);
+        if flags & (ON | BCAST) != ON || (flags & NOLOOP != 0 && id == origin) {
+            continue;
         }
-        owners
-    })
-    .unwrap_or_default()
-}
-
-/// Forget everything `client` read — tracking off, or the client gone.
-fn forget_client(client: u64) {
-    server::with_track_table(|ctl| {
-        for i in 0..TRACK_CAP {
-            let k = ctl.track_keys[i].load(Ordering::Relaxed);
-            if k > TOMBSTONE && ctl.track_owners[i].load(Ordering::Relaxed) == client {
-                ctl.track_keys[i].store(TOMBSTONE, Ordering::Relaxed);
-            }
-        }
-    });
+        send(id, Message::Keys(vec![key.to_vec()]));
+    }
 }
 
 fn clear_table() {
-    server::with_track_table(|ctl| {
-        for k in ctl.track_keys.iter() {
-            k.store(FREE, Ordering::Relaxed);
-        }
-    });
+    let Some(t) = table() else { return };
+    let old = {
+        let mut table = t.lock();
+        let hasher = table.hasher.clone();
+        std::mem::replace(&mut *table, Table::with_hasher(hasher))
+    };
+    // Let go of the old entries without holding the lock.
+    drop(old);
 }
 
-/// `trackingLimitUsedSlots`: while the table holds more distinct keys than
-/// `tracking-table-max-keys`, invalidate keys from a random point, as if each
-/// had been written — so its readers are told, and it is forgotten. Run
-/// periodically; at most `effort` keys a run.
-pub fn limit_used_slots(effort: usize) {
+/// Runs in a row that ended with the table still over its limit; each one
+/// tries harder, as Redis's `timeout_counter`.
+static OVER_LIMIT_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+/// `trackingLimitUsedSlots`: while the table holds more keys than
+/// `tracking-table-max-keys`, invalidate keys picked at random, as if each
+/// had been written, so their readers are told. At most 100 keys a run, and
+/// 100 more for every run before it that could not get under the limit.
+pub fn limit_used_slots() {
     if !server::tracking_active() {
         return;
     }
-    // A limit the table cannot reach — the default among them — needs no
-    // counting.
     let max = crate::config::get_i64("tracking-table-max-keys");
-    if max <= 0 || max as usize >= TRACK_CAP {
+    let over = || table_counts().1 as i64 > max;
+    if max <= 0 || !over() {
+        OVER_LIMIT_RUNS.store(0, Ordering::Relaxed);
         return;
     }
+    let effort = 100 * (OVER_LIMIT_RUNS.load(Ordering::Relaxed) + 1);
     for _ in 0..effort {
-        if table_counts().1 as i64 <= max || !evict_one() {
+        if !evict_one() || !over() {
+            OVER_LIMIT_RUNS.store(0, Ordering::Relaxed);
             return;
         }
     }
+    OVER_LIMIT_RUNS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// INFO's `tracking_total_items` and `tracking_total_keys`.
 pub fn table_counts() -> (usize, usize) {
-    server::with_track_table(|ctl| {
-        let mut keys = std::collections::HashSet::new();
-        let mut items = 0;
-        for i in 0..TRACK_CAP {
-            let k = ctl.track_keys[i].load(Ordering::Relaxed);
-            if k > TOMBSTONE {
-                items += 1;
-                keys.insert(k);
-            }
-        }
-        (items, keys.len())
+    table().map_or((0, 0), |t| {
+        let t = t.lock();
+        (t.items, t.entries.len())
     })
-    .unwrap_or((0, 0))
 }
 
 /// INFO's `tracking_total_prefixes`: distinct prefixes across BCAST clients.
@@ -463,11 +498,11 @@ fn offer_listener(target: u64) {
     {
         return;
     }
-    let Some((ctl, slots)) = crate::pubsub_state() else {
+    let Some(slots) = crate::pubsub_state() else {
         return;
     };
     let channel = [channel(target)];
-    let Some((idx, _)) = crate::pubsub::slot_alloc_and_subscribe(ctl, slots, &channel) else {
+    let Some((idx, _)) = crate::pubsub::slot_alloc_and_subscribe(slots, &channel) else {
         return;
     };
     let handed = t
@@ -492,7 +527,7 @@ fn offer_listener(target: u64) {
                 )
                 .is_ok());
     if withdrawn {
-        crate::pubsub::slot_free(ctl, slots, idx);
+        crate::pubsub::slot_free(slots, idx);
     }
 }
 
@@ -519,14 +554,14 @@ fn prefix_collision(existing: &[Vec<u8>], new: &[Vec<u8>]) -> Option<String> {
     None
 }
 
-/// Turn tracking off, forgetting what the client read.
+/// Turn tracking off. What the client read stays in the table, as in
+/// Redis, and is skipped when those keys change.
 pub fn disable(client: &server::ClientHandle) {
     let Some(slot) = client.slot() else { return };
-    if slot.tracking.swap(0, Ordering::Relaxed) & ON != 0 {
-        if let Some(ctl) = server::ctl() {
-            ctl.tracking_clients.fetch_sub(1, Ordering::Relaxed);
-        }
-        forget_client(client.id);
+    if slot.tracking.swap(0, Ordering::Relaxed) & ON != 0
+        && let Some(ctl) = server::ctl()
+    {
+        ctl.tracking_clients.fetch_sub(1, Ordering::Relaxed);
     }
     slot.track_redirect.store(0, Ordering::Relaxed);
     client.set_prefixes(&[]);
@@ -662,11 +697,7 @@ pub fn invalidate(keys: &[Vec<u8>], origin: u64) {
             && server::slot_of(id).is_some_and(|s| s.tracking.load(Ordering::Relaxed) & NOLOOP != 0)
     };
     for key in keys {
-        for owner in take(key) {
-            if !noloop(owner) {
-                send(owner, Message::Keys(vec![key.clone()]));
-            }
-        }
+        invalidate_key(key, origin);
     }
     for c in server::clients() {
         let Some(slot) = server::slot_of(c.id) else {
@@ -720,6 +751,65 @@ mod tests {
             Message::decode(&Message::RedirectBroken(7).encode()),
             Some(Message::RedirectBroken(7))
         ));
+    }
+
+    fn v(s: &str) -> Vec<u8> {
+        s.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn a_key_remembers_each_reader_once_and_forgets_them_together() {
+        crate::pubheap::for_tests();
+        let mut t = Table::new();
+        t.remember(1, b"k");
+        t.remember(1, b"k");
+        t.remember(2, b"k");
+        t.remember(1, b"other");
+        assert_eq!((t.items, t.entries.len()), (3, 2));
+        let mut readers = t.take(b"k");
+        readers.sort();
+        assert_eq!(readers, vec![1, 2]);
+        assert_eq!((t.items, t.entries.len()), (1, 1));
+        assert!(t.take(b"k").is_empty());
+        assert_eq!(t.take(b"other"), vec![1]);
+        assert_eq!((t.items, t.entries.len()), (0, 0));
+    }
+
+    /// Redis keeps whole key names, however long, and as many as
+    /// `tracking-table-max-keys` allows; so does this.
+    #[test]
+    fn the_table_holds_long_names_and_many_keys() {
+        crate::pubheap::for_tests();
+        let mut t = Table::new();
+        let long = vec![b'x'; 10_000];
+        t.remember(7, &long);
+        for i in 0..50_000 {
+            t.remember(7, format!("key:{i}").as_bytes());
+        }
+        assert_eq!(t.entries.len(), 50_001);
+        assert_eq!(t.pick(0), Some(long.clone()));
+        assert_eq!(t.take(&long), vec![7]);
+        // Removing entries out of order keeps every other key findable.
+        for i in (0..50_000).step_by(3) {
+            assert_eq!(t.take(format!("key:{i}").as_bytes()), vec![7]);
+        }
+        for i in 0..50_000 {
+            let found = t.find(format!("key:{i}").as_bytes()).is_some();
+            assert_eq!(found, i % 3 != 0, "key:{i}");
+        }
+        assert_eq!(t.items, t.entries.len());
+        assert!(t.pick(12345).is_some());
+    }
+
+    #[test]
+    fn a_key_names_itself_by_bytes() {
+        crate::pubheap::for_tests();
+        let mut t = Table::new();
+        t.remember(1, &v("a\0b"));
+        t.remember(1, b"");
+        assert!(t.find(b"a").is_none());
+        assert!(t.find(b"a\0b").is_some());
+        assert_eq!(t.take(b""), vec![1]);
     }
 
     #[test]

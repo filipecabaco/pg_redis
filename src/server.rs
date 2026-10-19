@@ -34,11 +34,6 @@ const CMD_LEN: usize = 48;
 const CONFIG_NAME_LEN: usize = 64;
 const CONFIG_VALUE_LEN: usize = 512;
 const TRACK_PREFIXES_LEN: usize = 512;
-/// Tracked (key, client) pairs across all clients.
-pub const TRACK_CAP: usize = 16384;
-/// The longest key name the tracking table keeps; a longer key is still
-/// tracked and invalidated by its writes, but never chosen for eviction.
-pub const TRACK_NAME_LEN: usize = 128;
 
 /// A string field with its length, written only under its owner's seqlock.
 #[repr(C)]
@@ -275,12 +270,6 @@ pub struct ServerCtl {
     enc_limits_set: AtomicU32,
     /// Clients with tracking on: when 0, no write looks at the table.
     pub tracking_clients: AtomicU32,
-    pub track_lock: AtomicU32,
-    /// (key hash, client id) pairs, 0 key when free, under `track_lock`.
-    pub track_keys: [AtomicU64; TRACK_CAP],
-    pub track_owners: [AtomicU64; TRACK_CAP],
-    /// The key each pair is for, so eviction can name what it invalidates.
-    track_names: [Field<TRACK_NAME_LEN>; TRACK_CAP],
     /// Each database's storage policy and memory slot (`storage.rs`).
     pub storage: crate::storage::PolicyTable,
 }
@@ -1397,30 +1386,8 @@ impl ClientHandle {
     }
 }
 
-/// Run `f` holding the tracking table's lock.
-pub fn with_track_table<R>(f: impl FnOnce(&ServerCtl) -> R) -> Option<R> {
-    let ctl = ctl()?;
-    spin_lock(&ctl.track_lock);
-    let r = f(ctl);
-    spin_unlock(&ctl.track_lock);
-    Some(r)
-}
-
 pub fn tracking_active() -> bool {
     ctl().is_some_and(|c| c.tracking_clients.load(Ordering::Relaxed) > 0)
-}
-
-/// The name stored with tracking pair `i`, under the table's lock.
-pub fn track_name(ctl: &ServerCtl, i: usize) -> Vec<u8> {
-    ctl.track_names[i].load()
-}
-
-pub fn set_track_name(ctl: &ServerCtl, i: usize, key: &[u8]) {
-    ctl.track_names[i].store(if key.len() <= TRACK_NAME_LEN {
-        key
-    } else {
-        b""
-    });
 }
 
 /// INFO's `total_blocking_keys` and `total_blocking_keys_on_nokey`: the

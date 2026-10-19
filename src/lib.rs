@@ -19,6 +19,7 @@ pub(crate) mod memdb;
 pub(crate) mod notify;
 pub(crate) mod pg;
 pub(crate) mod plans;
+pub(crate) mod pubheap;
 pub(crate) mod pubsub;
 pub(crate) mod rdb;
 pub(crate) mod redis_tables;
@@ -73,9 +74,9 @@ pub(crate) static MAXMEMORY_POLICY: GucSetting<Option<std::ffi::CString>> =
 /// Megabytes the memory engine may hold — Redis's `maxmemory`. The arena is
 /// reserved at this size (plus headroom) but backed only as it fills.
 pub(crate) static MAXMEMORY: GucSetting<i32> = GucSetting::<i32>::new(256);
+/// The pub/sub heap's size in MB: subscriptions and undelivered messages.
+pub(crate) static PUBSUB_MEMORY: GucSetting<i32> = GucSetting::<i32>::new(128);
 
-static PUBSUB_CTL: shared::Block<pubsub::PubsubCtl> = shared::Block::new();
-static PUBSUB_SLOTS: shared::Block<pubsub::Slots> = shared::Block::new();
 static ROUTE_CTL: shared::Block<pubsub::RouteCtl> = shared::Block::new();
 static WATCH_CTL: shared::Block<watch::WatchCtl> = shared::Block::new();
 static SERVER_CTL: shared::Block<server::ServerCtl> = shared::Block::new();
@@ -86,8 +87,7 @@ static DB_LOCKS: shared::Block<dblock::DbLocks> = shared::Block::new();
 /// postmaster's request hook.
 fn request_shmem() {
     // Pub/sub, its routes, the WATCH counters and the server-wide state.
-    shared::request(pubsub::pubsub_ctl_size());
-    shared::request(pubsub::pubsub_slots_size());
+    crate::pubheap::request();
     shared::request(pubsub::route_ctl_size());
     shared::request(watch::watch_ctl_size());
     shared::request(server::server_ctl_size());
@@ -101,8 +101,7 @@ fn request_shmem() {
 
 /// Attach the blocks `request_shmem` reserved, in the startup hook.
 fn attach_shmem() {
-    PUBSUB_CTL.attach(c"pg_redis_pubsub_ctl", pubsub::pubsub_ctl_size());
-    PUBSUB_SLOTS.attach(c"pg_redis_pubsub_slots", pubsub::pubsub_slots_size());
+    pubheap::startup();
     ROUTE_CTL.attach(c"pg_redis_route_ctl", pubsub::route_ctl_size());
     WATCH_CTL.attach(c"pg_redis_watch_ctl", watch::watch_ctl_size());
     DB_LOCKS.attach(c"pg_redis_db_locks", dblock::db_locks_size());
@@ -115,9 +114,9 @@ fn attach_shmem() {
     shm::startup();
 }
 
-/// Returns `Some((ctl, slots))` when pub/sub shared memory is initialised, `None` otherwise.
-pub(crate) fn pubsub_state() -> Option<(&'static pubsub::PubsubCtl, &'static pubsub::Slots)> {
-    Some((PUBSUB_CTL.get()?, PUBSUB_SLOTS.get()?))
+/// The pub/sub registry, when the extension was preloaded.
+pub(crate) fn pubsub_state() -> Option<&'static pubsub::Slots> {
+    pubsub::registry()
 }
 
 pub(crate) fn route_state() -> Option<&'static pubsub::RouteCtl> {
@@ -281,6 +280,20 @@ pub extern "C-unwind" fn _PG_init() {
           is refused with OOM unless redis.maxmemory_policy can evict enough first. \
           Reserved at startup but backed by RAM only as data fills it. Requires restart.",
         &MAXMEMORY,
+        8,
+        i32::MAX,
+        restart_only(),
+        GucFlags::UNIT_MB,
+    );
+
+    GucRegistry::define_int_guc(
+        c"redis.pubsub_memory",
+        c"Memory pub/sub and client tracking may use",
+        c"Holds every subscription, every undelivered pub/sub message and the client \
+          tracking table, without per-name or per-message limits. A subscriber is \
+          disconnected by client-output-buffer-limit pubsub, as in Redis. Reserved at \
+          startup but backed by RAM only as it fills. Requires restart.",
+        &PUBSUB_MEMORY,
         8,
         i32::MAX,
         restart_only(),

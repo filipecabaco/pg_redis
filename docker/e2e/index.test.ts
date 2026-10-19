@@ -2115,73 +2115,74 @@ describe("Sharded Pub/Sub", () => {
 	});
 });
 
-describe("Pub/Sub size limits", () => {
-	// Names and payloads live in fixed-size shared-memory slots. Truncating them
-	// would leave a client subscribed to a channel it can never receive on, so
-	// the server rejects them instead.
-	const MAX_CHANNEL = 255;
-	const MAX_PAYLOAD = 512;
+describe("Pub/Sub and client tracking without fixed limits", () => {
+	// Redis bounds none of these except by memory and the pubsub output
+	// buffer limit; neither does pg_redis.
 
-	test("a channel name at the limit works end to end", async () => {
-		const channel = "c".repeat(MAX_CHANNEL);
-		const subscriber = new Bun.RedisClient(redisUrl);
-		try {
-			await subscriber.send("SUBSCRIBE", [channel]);
-			await Bun.sleep(100);
-			expect(await client.send("PUBLISH", [channel, "hi"])).toBe(1);
-		} finally {
-			subscriber.close();
-		}
-	});
-
-	test("a payload at the limit is delivered", async () => {
-		const subscriber = new Bun.RedisClient(redisUrl);
-		try {
-			await subscriber.send("SUBSCRIBE", ["limit-chan"]);
-			await Bun.sleep(100);
-			const payload = "p".repeat(MAX_PAYLOAD);
-			expect(await client.send("PUBLISH", ["limit-chan", payload])).toBe(1);
-		} finally {
-			subscriber.close();
-		}
-	});
-
-	test("an over-long channel name is rejected, not truncated", async () => {
-		const tooLong = "c".repeat(MAX_CHANNEL + 1);
-		await expect(client.send("PUBLISH", [tooLong, "hi"])).rejects.toThrow(
-			/limit/,
-		);
-		const subscriber = new Bun.RedisClient(redisUrl);
-		try {
-			await expect(subscriber.send("SUBSCRIBE", [tooLong])).rejects.toThrow(
-				/limit/,
-			);
-		} finally {
-			subscriber.close();
-		}
-	});
-
-	// Every subscribed connection also holds its own client-tracking channel.
-	// It used to take one of the sixteen places, so the sixteenth SUBSCRIBE was
-	// refused by an error that said sixteen were allowed.
-	test("a connection holds sixteen channels, and the seventeenth is refused", async () => {
+	test("a 10,000-byte channel carries a 1 MB message", async () => {
+		const channel = "c".repeat(10_000);
+		const payload = "p".repeat(1 << 20);
 		const sub = await new RawRedis().connect();
 		try {
-			for (let i = 1; i <= 16; i++) {
-				const reply = (await sub.send("SUBSCRIBE", `cap-${i}`)).toString();
-				expect(reply.startsWith("-")).toBe(false);
-			}
-			const refused = (await sub.send("SUBSCRIBE", "cap-17")).toString();
-			expect(refused).toContain("at most 16 channels");
+			await sub.send("SUBSCRIBE", channel);
+			expect(await client.send("PUBLISH", [channel, payload])).toBe(1);
+			const message = (await sub.next()).toString();
+			expect(message).toContain(`$${channel.length}\r\n${channel}\r\n`);
+			expect(message).toContain(`$${payload.length}\r\n${payload}\r\n`);
 		} finally {
 			sub.close();
 		}
 	});
 
-	test("an over-long payload is rejected, not truncated", async () => {
-		await expect(
-			client.send("PUBLISH", ["limit-chan", "p".repeat(MAX_PAYLOAD + 1)]),
-		).rejects.toThrow(/limit/);
+	test("a connection holds a thousand channels", async () => {
+		const sub = await new RawRedis().connect();
+		try {
+			const names = Array.from({ length: 1000 }, (_, i) => `many-${i}`);
+			await sub.send("SUBSCRIBE", ...names);
+			// One confirmation per channel; the last counts all of them.
+			for (let i = 1; i < names.length; i++) await sub.next();
+			const numsub = await client.send("PUBSUB", ["NUMSUB", "many-0", "many-999"]);
+			expect(numsub).toEqual(["many-0", 1, "many-999", 1]);
+			expect(await client.send("PUBLISH", ["many-999", "x"])).toBe(1);
+		} finally {
+			sub.close();
+		}
+	});
+
+	test("more than 256 connections subscribe at once", async () => {
+		const subs = await Promise.all(
+			Array.from({ length: 300 }, () => new RawRedis().connect()),
+		);
+		try {
+			await Promise.all(subs.map((s) => s.send("SUBSCRIBE", "crowd")));
+			expect(await client.send("PUBLISH", ["crowd", "hello"])).toBe(300);
+		} finally {
+			for (const s of subs) s.close();
+		}
+	});
+
+	test("tracking remembers more than 16,384 keys, long ones included", async () => {
+		const tracker = await new RawRedis().connect();
+		try {
+			await tracker.send("HELLO", "3");
+			await tracker.send("CLIENT", "TRACKING", "ON");
+			const long = `track-long-${"k".repeat(5000)}`;
+			await tracker.send("GET", long);
+			const keys = Array.from({ length: 20_000 }, (_, i) => `track-many-${i}`);
+			for (let i = 0; i < keys.length; i += 1000) {
+				await tracker.send("MGET", ...keys.slice(i, i + 1000));
+			}
+			const info = (await client.send("INFO", ["stats"])) as string;
+			const total = Number(/tracking_total_keys:(\d+)/.exec(info)?.[1]);
+			expect(total).toBeGreaterThanOrEqual(20_001);
+			// A write to the long key names it in the invalidation.
+			await client.send("SET", [long, "v"]);
+			const push = (await tracker.next()).toString();
+			expect(push).toContain("invalidate");
+			expect(push).toContain(long);
+		} finally {
+			tracker.close();
+		}
 	});
 });
 

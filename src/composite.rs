@@ -343,9 +343,7 @@ impl Op {
     /// and writes, or reads twice, through separate calls.
     pub fn single_step(&self) -> bool {
         match self {
-            Op::BitPos { .. } | Op::GeoAdd { .. } | Op::CollectionScan { .. } | Op::PfSelfTest => {
-                true
-            }
+            Op::BitPos { .. } | Op::GeoAdd { .. } | Op::PfSelfTest => true,
             // Only GETs: one read of the string.
             Op::BitField { ops, .. } => ops.iter().all(|o| o.kind == BitFieldKind::Get),
             _ => false,

@@ -465,10 +465,21 @@ the arena was sized for; `CONFIG SET maxmemory-policy` changes the policy.
 Pub/sub is independent of storage policies and always allocated. It needs
 only `shared_preload_libraries`.
 
-Each subscribing connection claims one of 256 slots. A slot holds a ring buffer
-of 256 messages and the connection's subscriptions (16 channels and 16 patterns).
-`PUBLISH` writes into the ring of every matching slot and bumps that slot's tail
-counter.
+Subscriptions and undelivered messages live in a shared heap, a region of
+PostgreSQL's shared memory sized by `redis.pubsub_memory` (128 MB by default)
+with its own allocator. Pages are backed by RAM only once they are touched.
+Each subscribing connection has an entry there holding its channels, its
+patterns and a queue of messages. `PUBLISH` finds the channel's subscribers
+through an index, scans the patterns as Redis does, copies the message into
+each subscriber's queue and bumps that subscriber's tail counter.
+
+The client tracking table lives in the same heap: every key a tracking client
+read, by name, with the clients that read it, up to `tracking-table-max-keys`
+(1,000,000 by default) as in Redis. If the heap fills first, tracked keys
+picked at random are invalidated to make room, as the key limit does.
+Invalidations travel as pub/sub messages on a channel of the client's own; a
+RESP3 client that invalidations are redirected to is handed a subscription to
+it by the connection that sets up the redirect.
 
 Subscribers **wait on the tail counter**, not on the socket. A subscriber that
 discovered messages by letting a 5 ms socket read time out would cost ~200
@@ -482,27 +493,19 @@ no effect on delivery latency.
 Route lookups short-circuit on an atomic counter, so an installation with no
 routes configured pays nothing.
 
-### Size limits
+### Limits
 
-Everything runs through fixed-size slots, so these are hard caps:
+As in Redis, channel and pattern names, payloads, subscribers and
+subscriptions have no fixed limit. What bounds them:
 
 | | Limit | Over the limit |
 |---|---|---|
-| Channel / pattern name | 255 bytes | `SUBSCRIBE`, `PSUBSCRIBE`, `PUBLISH` error |
-| Message payload | 512 bytes | `PUBLISH` errors |
-| Concurrent subscriber connections | 256 | `SUBSCRIBE` returns "max pub/sub subscribers reached" |
-| Channels + patterns per connection | 16 each | A name past the limit gets an error; the rest of the command still applies. The connection's own client-tracking channel has a slot of its own and does not count |
-| Queued undelivered messages per subscriber | 256 | The subscriber is disconnected, as Redis does past its pub/sub output limit |
-| Active routes | 64 | — |
+| A subscriber's undelivered messages | `client-output-buffer-limit pubsub`, 32 MB at once or 8 MB for 60 seconds by default, counted in wire bytes | The subscriber is disconnected, as in Redis |
+| Everything subscribed and queued, server-wide | `redis.pubsub_memory` | The command that needs more gets `OOM pub/sub memory is full` |
+| Active routes | 64, channel names up to 255 bytes | `redis.route_publish` errors |
 
-Names and payloads over the limit are **rejected**. They are not truncated,
-because a truncated subscription would never match a publish to the same name
-and the client would wait on a channel it believed it was subscribed to.
-
-The payload cap deliberately does not track memory mode's value cap. Every slot in the
-ring reserves its payload whether or not anyone publishes, so tracking a 64 KiB
-cap would cost the ring 128× what it costs now. The slot table is ~66 MiB,
-allocated at server start whether or not pub/sub is used.
+A subscriber that is disconnected never carries on with a gap it cannot see.
+`CONFIG SET client-output-buffer-limit` takes effect at once.
 
 ### Table routing
 
@@ -631,15 +634,6 @@ client get `BUSY`, on every worker, until it ends or `SCRIPT KILL` /
   not wait.
 - **No ACL users, replicas or cluster mode.** `ACL`, `WAIT`, `REPLICAOF` and
   `CLUSTER` answer as a single-user, stand-alone server would.
-- **Client tracking keeps its table in shared memory, 16,384 (key, client)
-  pairs across every client.** Past that, or past `tracking-table-max-keys`
-  when it is set lower, a tracked key picked at random is invalidated to make
-  room, as Redis does at its own limit. Keys longer than 128 bytes are
-  tracked by hash only; when one is picked to make room, the client holding
-  it gets a flush (the "every key" invalidation) instead of the key's name.
-  A RESP3 client that invalidations are redirected to receives them as push
-  messages with no subscription of its own; the connection that sets up the
-  redirect hands it a pub/sub slot to receive them on.
 - **Eviction is silent.** A key evicted under `redis.maxmemory_policy` sends
   no `evicted` notification and no client-tracking invalidation. Keyspace
   notifications otherwise follow `notify-keyspace-events` event for
@@ -673,8 +667,8 @@ Everything pg_redis bounds that Redis does not, in one place.
 | | Limit | Where it comes from |
 |---|---|---|
 | Memory-mode data | `redis.maxmemory` | The arena, sized at start ([§3](#the-limit-and-eviction)) |
-| Channel / pattern | 255 bytes | Fixed pub/sub slot |
-| Pub/sub payload | 512 bytes | Fixed ring slot |
+| Pub/sub subscriptions, queued messages and the client tracking table | `redis.pubsub_memory` | One shared heap, sized at start ([§4](#4-pubsub)) |
+| Table route channel | 255 bytes | Fixed route entry |
 | Bulk string on the wire | 512 MiB | RESP parser, matches Redis |
 
 Keys, fields, members and values are as long as Redis allows on both halves:

@@ -69,6 +69,13 @@ export class RawRedis {
 		return done;
 	}
 
+	/** The next reply the server sends unasked: a pub/sub message, a push. */
+	next(): Promise<Buffer> {
+		const done = new Promise<Buffer>((resolve) => this.waiters.push(resolve));
+		this.drain();
+		return done;
+	}
+
 	private flush() {
 		while (this.pending.length > 0) {
 			const head = this.pending[0];

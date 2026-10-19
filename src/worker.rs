@@ -20,16 +20,9 @@ type PendingBatch = Option<(Vec<(Command, u8)>, u64, BatchReply, BatchKind)>;
 const PUBSUB_NOT_LOADED: &str = "pub/sub requires shared_preload_libraries = 'pg_redis'";
 const WATCH_NOT_LOADED: &str = "WATCH requires shared_preload_libraries = 'pg_redis'";
 
-/// Channel names and payloads live in fixed-size shared-memory slots. Silently
-/// truncating either is worse than refusing: a truncated subscription never
-/// matches a publish to the same name, so the client waits forever on a channel
-/// it believes it is subscribed to.
-fn pubsub_len_error(items: &[Vec<u8>], limit: usize, what: &str) -> Option<String> {
-    items
-        .iter()
-        .find(|i| i.len() > limit)
-        .map(|_| format!("{what} exceeds the pub/sub limit of {limit} bytes"))
-}
+/// The pub/sub heap (`redis.pubsub_memory`) has no room for another
+/// subscription.
+const PUBSUB_FULL: &str = "OOM pub/sub memory is full; raise redis.pubsub_memory";
 
 /// Each message names the client it came from (0 for the server itself), so
 /// a write's invalidations can skip a NOLOOP client's own.
@@ -153,6 +146,7 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
     BackgroundWorker::transaction(|| Spi::connect_mut(crate::storage::load));
 
     crate::shm::attach();
+    crate::pubheap::attach();
     // memory+snapshot databases filled back in before anyone is served.
     crate::storage::restore_snapshots();
     crate::storage::worker_started();
@@ -325,8 +319,9 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
         }
 
         // Redis keeps the tracking table to `tracking-table-max-keys` from
-        // its cron, invalidating keys at random to get back under it.
-        crate::tracking::limit_used_slots(100);
+        // its cron as well as before each command, invalidating keys at
+        // random to get back under it.
+        crate::tracking::limit_used_slots();
 
         // memory+snapshot databases whose interval has passed.
         crate::storage::snapshots_round();
@@ -1003,7 +998,7 @@ fn conn_loop(
                 let ready = match (sub_slot, crate::pubsub_state()) {
                     // Sleep until a message is published or a slice passes,
                     // then look at the socket: whichever comes first is served.
-                    (Some(idx), Some((_, slots))) => {
+                    (Some(idx), Some(slots)) => {
                         let tail = crate::pubsub::current_tail(slots, idx);
                         parser.wait_readable(Duration::ZERO) || {
                             crate::pubsub::wait_for_message(slots, idx, tail, SUBSCRIBE_POLL);
@@ -1460,8 +1455,8 @@ fn conn_loop(
                 continue;
             }
             Command::Reset => {
-                if let (Some(idx), Some((ctl, slots))) = (sub_slot.take(), crate::pubsub_state()) {
-                    crate::pubsub::slot_free(ctl, slots, idx);
+                if let (Some(idx), Some(slots)) = (sub_slot.take(), crate::pubsub_state()) {
+                    crate::pubsub::slot_free(slots, idx);
                     client.set_flag(crate::server::flag::PUBSUB, false);
                 }
                 crate::tracking::disable(&client);
@@ -1738,27 +1733,10 @@ fn conn_loop(
                 write_reply(&mut writer, response, &parts, proto).ok();
                 flush(&mut writer);
             }
-            Command::Publish { channel, message }
-                if channel.len() > crate::pubsub::MAX_CHANNEL_LEN
-                    || message.len() > crate::pubsub::PUBSUB_MSG_LEN =>
-            {
-                let err = if channel.len() > crate::pubsub::MAX_CHANNEL_LEN {
-                    format!(
-                        "channel name exceeds the pub/sub limit of {} bytes",
-                        crate::pubsub::MAX_CHANNEL_LEN
-                    )
-                } else {
-                    format!(
-                        "message exceeds the pub/sub limit of {} bytes",
-                        crate::pubsub::PUBSUB_MSG_LEN
-                    )
-                };
-                reply(&mut writer, |w| write_error(w, &err));
-            }
             Command::Publish { channel, message } => match crate::pubsub_state() {
                 None => reply(&mut writer, |w| write_error(w, PUBSUB_NOT_LOADED)),
-                Some((ctl, slots)) => {
-                    let n = crate::pubsub::publish(ctl, slots, channel, message);
+                Some(slots) => {
+                    let n = crate::pubsub::publish(slots, channel, message);
                     if let Some(route_ctl) = crate::route_state()
                         && let Some((schema, table)) =
                             crate::pubsub::route_lookup(route_ctl, channel)
@@ -1778,9 +1756,9 @@ fn conn_loop(
             },
             Command::PubSubChannels { pattern, shard } => match crate::pubsub_state() {
                 None => reply(&mut writer, |w| write_error(w, PUBSUB_NOT_LOADED)),
-                Some((ctl, slots)) => {
+                Some(slots) => {
                     let channels =
-                        crate::pubsub::pubsub_channels(ctl, slots, pattern.as_deref(), *shard);
+                        crate::pubsub::pubsub_channels(slots, pattern.as_deref(), *shard);
                     reply(&mut writer, |w| {
                         write_array_header(w, channels.len())?;
                         for ch in &channels {
@@ -1792,7 +1770,7 @@ fn conn_loop(
             },
             Command::PubSubNumSub { channels, shard } => match crate::pubsub_state() {
                 None => reply(&mut writer, |w| write_error(w, PUBSUB_NOT_LOADED)),
-                Some((ctl, slots)) => {
+                Some(slots) => {
                     let stored: Vec<Vec<u8>> = if *shard {
                         channels
                             .iter()
@@ -1801,7 +1779,7 @@ fn conn_loop(
                     } else {
                         channels.clone()
                     };
-                    let counts = crate::pubsub::pubsub_numsub(ctl, slots, &stored);
+                    let counts = crate::pubsub::pubsub_numsub(slots, &stored);
                     reply(&mut writer, |w| {
                         write_array_header(w, channels.len() * 2)?;
                         for (ch, n) in channels.iter().zip(&counts) {
@@ -1814,8 +1792,8 @@ fn conn_loop(
             },
             Command::PubSubNumPat => match crate::pubsub_state() {
                 None => reply(&mut writer, |w| write_error(w, PUBSUB_NOT_LOADED)),
-                Some((ctl, slots)) => {
-                    let n = crate::pubsub::pubsub_numpat(ctl, slots);
+                Some(slots) => {
+                    let n = crate::pubsub::pubsub_numpat(slots);
                     reply(&mut writer, |w| write_integer(w, n));
                 }
             },
@@ -1835,12 +1813,6 @@ fn conn_loop(
                 });
             }
             Command::Subscribe { channels } => {
-                if let Some(err) =
-                    pubsub_len_error(channels, crate::pubsub::MAX_CHANNEL_LEN, "channel name")
-                {
-                    reply(&mut writer, |w| write_error(w, &err));
-                    continue;
-                }
                 if proto == 3 {
                     subscribe_in_place(
                         &mut writer,
@@ -1871,12 +1843,6 @@ fn conn_loop(
                     .iter()
                     .map(|c| crate::pubsub::shard_name(c))
                     .collect();
-                if let Some(err) =
-                    pubsub_len_error(&stored, crate::pubsub::MAX_CHANNEL_LEN, "channel name")
-                {
-                    reply(&mut writer, |w| write_error(w, &err));
-                    continue;
-                }
                 if proto == 3 {
                     subscribe_in_place(
                         &mut writer,
@@ -1903,12 +1869,6 @@ fn conn_loop(
                 }
             }
             Command::PSubscribe { patterns } => {
-                if let Some(err) =
-                    pubsub_len_error(patterns, crate::pubsub::MAX_CHANNEL_LEN, "pattern")
-                {
-                    reply(&mut writer, |w| write_error(w, &err));
-                    continue;
-                }
                 if proto == 3 {
                     subscribe_in_place(
                         &mut writer,
@@ -1968,9 +1928,9 @@ fn conn_loop(
     }
     // A RESP3 subscriber's slot outlives no connection, and neither does one
     // handed to it and not yet taken.
-    if let Some((ctl, slots)) = crate::pubsub_state() {
+    if let Some(slots) = crate::pubsub_state() {
         if let Some(idx) = sub_slot {
-            crate::pubsub::slot_free(ctl, slots, idx);
+            crate::pubsub::slot_free(slots, idx);
         }
         let handed = client.slot().map_or(crate::server::HANDOFF_NONE, |s| {
             s.track_handoff.swap(
@@ -1979,7 +1939,7 @@ fn conn_loop(
             )
         });
         if handed >= 0 {
-            crate::pubsub::slot_free(ctl, slots, handed as usize);
+            crate::pubsub::slot_free(slots, handed as usize);
         }
     }
     crate::tracking::disable(&client);
@@ -2008,6 +1968,7 @@ fn track_read(
     argv: &[Vec<u8>],
     multi: bool,
 ) {
+    crate::tracking::limit_used_slots();
     let tracking = slot.is_some_and(|s| {
         s.tracking.load(std::sync::atomic::Ordering::Relaxed) & crate::tracking::ON != 0
     });
@@ -2107,8 +2068,8 @@ fn adopt_handoff(
                 *track_sub = listen_for_invalidations(sub_slot, client);
             }
             deliver_messages(writer, idx, proto);
-            if let Some((ctl, slots)) = crate::pubsub_state() {
-                crate::pubsub::slot_free(ctl, slots, idx);
+            if let Some(slots) = crate::pubsub_state() {
+                crate::pubsub::slot_free(slots, idx);
             }
         }
     }
@@ -2123,16 +2084,16 @@ fn listen_for_invalidations(
     sub_slot: &mut Option<usize>,
     client: &crate::server::ClientHandle,
 ) -> bool {
-    let Some((ctl, slots)) = crate::pubsub_state() else {
+    let Some(slots) = crate::pubsub_state() else {
         return false;
     };
     let channel = vec![crate::tracking::channel(client.id)];
     match *sub_slot {
         Some(idx) => {
-            crate::pubsub::subscribe(ctl, slots, idx, &channel);
+            crate::pubsub::subscribe(slots, idx, &channel);
             true
         }
-        None => match crate::pubsub::slot_alloc_and_subscribe(ctl, slots, &channel) {
+        None => match crate::pubsub::slot_alloc_and_subscribe(slots, &channel) {
             Some((idx, _)) => {
                 *sub_slot = Some(idx);
                 true
@@ -2161,7 +2122,7 @@ fn unsubscribe_here(
     };
     // A pub/sub frame goes out even under CLIENT REPLY OFF.
     let muted = std::mem::replace(&mut writer.muted, false);
-    if let (Some(idx), Some((ctl, slots))) = (*sub_slot, crate::pubsub_state()) {
+    if let (Some(idx), Some(slots)) = (*sub_slot, crate::pubsub_state()) {
         let stored: Vec<Vec<u8>> = if kind == SubKind::Shard {
             names.iter().map(|c| crate::pubsub::shard_name(c)).collect()
         } else {
@@ -2170,22 +2131,22 @@ fn unsubscribe_here(
         let mut freed = false;
         let done = handle_unsub(
             writer,
-            SubSlot { ctl, slots, idx },
+            SubSlot { slots, idx },
             proto,
             &stored,
             kind,
-            |ctl, slots, idx, items| {
+            |slots, idx, items| {
                 if kind == SubKind::Pattern {
-                    crate::pubsub::punsubscribe(ctl, slots, idx, items)
+                    crate::pubsub::punsubscribe(slots, idx, items)
                 } else {
-                    crate::pubsub::unsubscribe(ctl, slots, idx, items)
+                    crate::pubsub::unsubscribe(slots, idx, items)
                 }
             },
             &mut freed,
         );
         if done {
             if !freed {
-                crate::pubsub::slot_free(ctl, slots, idx);
+                crate::pubsub::slot_free(slots, idx);
             }
             *sub_slot = None;
             client.set_flag(crate::server::flag::PUBSUB, false);
@@ -2228,7 +2189,7 @@ fn subscription_command(cmd: &Command) -> bool {
 /// Deliver what is waiting in a RESP3 subscriber's ring. A pub/sub frame is a
 /// push: it goes out even under CLIENT REPLY OFF, as in Redis.
 fn deliver_messages(writer: &mut ConnWriter, idx: usize, proto: u8) {
-    let Some((_, slots)) = crate::pubsub_state() else {
+    let Some(slots) = crate::pubsub_state() else {
         return;
     };
     writer.limit_stalls();
@@ -2302,34 +2263,32 @@ fn subscribe_in_place(
     proto: u8,
     client: &crate::server::ClientHandle,
 ) {
-    let Some((ctl, slots)) = crate::pubsub_state() else {
+    let Some(slots) = crate::pubsub_state() else {
         reply(writer, |w| write_error(w, PUBSUB_NOT_LOADED));
         return;
     };
     let muted = std::mem::replace(&mut writer.muted, false);
     match *sub_slot {
-        Some(idx) => confirm_subscriptions(writer, ctl, slots, idx, proto, items, kind),
+        Some(idx) => confirm_subscriptions(writer, slots, idx, proto, items, kind),
         None => {
             let alloc = if kind == SubKind::Pattern {
-                crate::pubsub::slot_alloc_and_psubscribe(ctl, slots, &items[..1])
+                crate::pubsub::slot_alloc_and_psubscribe(slots, &items[..1])
             } else {
-                crate::pubsub::slot_alloc_and_subscribe(ctl, slots, &items[..1])
+                crate::pubsub::slot_alloc_and_subscribe(slots, &items[..1])
             };
             match alloc {
-                None => reply(writer, |w| {
-                    write_error(w, "max pub/sub subscribers reached")
-                }),
+                None => reply(writer, |w| write_error(w, PUBSUB_FULL)),
                 Some((idx, _)) => {
                     *sub_slot = Some(idx);
                     client.set_flag(crate::server::flag::PUBSUB, true);
                     // A client in pub/sub mode is where a REDIRECT can point.
                     let own = vec![crate::tracking::channel(client.id)];
-                    crate::pubsub::subscribe(ctl, slots, idx, &own);
+                    crate::pubsub::subscribe(slots, idx, &own);
                     write_pubsub_header(writer, 3, proto).ok();
                     write_bulk_string(writer, kind.verb()).ok();
                     write_bulk_string(writer, crate::pubsub::shown_name(&items[0])).ok();
-                    write_integer(writer, sub_count(ctl, slots, idx, kind) as i64).ok();
-                    confirm_subscriptions(writer, ctl, slots, idx, proto, &items[1..], kind);
+                    write_integer(writer, sub_count(slots, idx, kind) as i64).ok();
+                    confirm_subscriptions(writer, slots, idx, proto, &items[1..], kind);
                 }
             }
         }
@@ -2343,13 +2302,9 @@ fn enter_subscribe_mode(
     proto: u8,
     items: &[Vec<u8>],
     kind: SubKind,
-    alloc_fn: impl Fn(
-        &'static crate::pubsub::PubsubCtl,
-        &'static crate::pubsub::Slots,
-        &[Vec<u8>],
-    ) -> Option<(usize, u32)>,
+    alloc_fn: impl Fn(&'static crate::pubsub::Slots, &[Vec<u8>]) -> Option<(usize, u32)>,
 ) -> bool {
-    let Some((ctl, slots)) = crate::pubsub_state() else {
+    let Some(slots) = crate::pubsub_state() else {
         reply(writer, |w| write_error(w, PUBSUB_NOT_LOADED));
         return true;
     };
@@ -2359,21 +2314,19 @@ fn enter_subscribe_mode(
     // The slot is taken with the first name; the rest go through the same
     // path as a SUBSCRIBE already in subscribe mode, so duplicates and names
     // past the per-connection limit are answered the way Redis would.
-    match alloc_fn(ctl, slots, &items[..1]) {
+    match alloc_fn(slots, &items[..1]) {
         None => {
-            reply(writer, |w| {
-                write_error(w, "max pub/sub subscribers reached")
-            });
+            reply(writer, |w| write_error(w, PUBSUB_FULL));
             true
         }
         Some((idx, _)) => {
             // A client in pub/sub mode is where a REDIRECT can point.
-            crate::pubsub::subscribe(ctl, slots, idx, &own_channel);
+            crate::pubsub::subscribe(slots, idx, &own_channel);
             write_pubsub_header(writer, 3, proto).ok();
             write_bulk_string(writer, kind.verb()).ok();
             write_bulk_string(writer, crate::pubsub::shown_name(&items[0])).ok();
             write_integer(writer, 1).ok();
-            confirm_subscriptions(writer, ctl, slots, idx, proto, &items[1..], kind);
+            confirm_subscriptions(writer, slots, idx, proto, &items[1..], kind);
             subscribe_loop(writer, parser, idx, proto)
         }
     }
@@ -2386,7 +2339,7 @@ fn subscribe_loop(
     proto: u8,
 ) -> bool {
     // Capture state once — these pointers are stable for the lifetime of the process.
-    let Some((ctl, slots)) = crate::pubsub_state() else {
+    let Some(slots) = crate::pubsub_state() else {
         return true;
     };
     // Short enough that a command sent by a subscribed client is noticed
@@ -2458,15 +2411,15 @@ fn subscribe_loop(
 
         match cmd_name.as_str() {
             "SUBSCRIBE" if !args.is_empty() => {
-                confirm_subscriptions(writer, ctl, slots, slot_idx, proto, args, SubKind::Channel);
+                confirm_subscriptions(writer, slots, slot_idx, proto, args, SubKind::Channel);
             }
             "PSUBSCRIBE" if !args.is_empty() => {
-                confirm_subscriptions(writer, ctl, slots, slot_idx, proto, args, SubKind::Pattern);
+                confirm_subscriptions(writer, slots, slot_idx, proto, args, SubKind::Pattern);
             }
             "SSUBSCRIBE" if !args.is_empty() => {
                 let stored: Vec<Vec<u8>> =
                     args.iter().map(|c| crate::pubsub::shard_name(c)).collect();
-                confirm_subscriptions(writer, ctl, slots, slot_idx, proto, &stored, SubKind::Shard);
+                confirm_subscriptions(writer, slots, slot_idx, proto, &stored, SubKind::Shard);
             }
             "SUNSUBSCRIBE" => {
                 let stored: Vec<Vec<u8>> =
@@ -2474,7 +2427,6 @@ fn subscribe_loop(
                 if handle_unsub(
                     writer,
                     SubSlot {
-                        ctl,
                         slots,
                         idx: slot_idx,
                     },
@@ -2491,7 +2443,6 @@ fn subscribe_loop(
                 if handle_unsub(
                     writer,
                     SubSlot {
-                        ctl,
                         slots,
                         idx: slot_idx,
                     },
@@ -2508,7 +2459,6 @@ fn subscribe_loop(
                 if handle_unsub(
                     writer,
                     SubSlot {
-                        ctl,
                         slots,
                         idx: slot_idx,
                     },
@@ -2529,14 +2479,14 @@ fn subscribe_loop(
                 writer.flush().ok();
             }
             "RESET" => {
-                crate::pubsub::slot_free(ctl, slots, slot_idx);
+                crate::pubsub::slot_free(slots, slot_idx);
                 slot_freed = true;
                 write_simple_string(writer, "RESET").ok();
                 writer.flush().ok();
                 break 'outer;
             }
             "QUIT" => {
-                crate::pubsub::slot_free(ctl, slots, slot_idx);
+                crate::pubsub::slot_free(slots, slot_idx);
                 slot_freed = true;
                 writer.quit_reply = true;
                 keep_conn = false;
@@ -2550,7 +2500,7 @@ fn subscribe_loop(
     }
 
     if !slot_freed {
-        crate::pubsub::slot_free(ctl, slots, slot_idx);
+        crate::pubsub::slot_free(slots, slot_idx);
     }
     parser.set_read_timeout(Some(Duration::from_secs(30))).ok();
     keep_conn
@@ -2584,19 +2534,14 @@ impl SubKind {
 }
 
 /// What a slot holds of one kind, as the registry stores the names.
-fn names_of(
-    ctl: &'static crate::pubsub::PubsubCtl,
-    slots: &'static crate::pubsub::Slots,
-    slot_idx: usize,
-    kind: SubKind,
-) -> Vec<Vec<u8>> {
+fn names_of(slots: &'static crate::pubsub::Slots, slot_idx: usize, kind: SubKind) -> Vec<Vec<u8>> {
     match kind {
-        SubKind::Pattern => crate::pubsub::pattern_names(ctl, slots, slot_idx),
-        SubKind::Channel => crate::pubsub::channel_names(ctl, slots, slot_idx)
+        SubKind::Pattern => crate::pubsub::pattern_names(slots, slot_idx),
+        SubKind::Channel => crate::pubsub::channel_names(slots, slot_idx)
             .into_iter()
             .filter(|n| !crate::pubsub::is_internal(n))
             .collect(),
-        SubKind::Shard => crate::pubsub::channel_names(ctl, slots, slot_idx)
+        SubKind::Shard => crate::pubsub::channel_names(slots, slot_idx)
             .into_iter()
             .filter(|n| n.starts_with(crate::pubsub::SHARD_PREFIX))
             .collect(),
@@ -2605,17 +2550,12 @@ fn names_of(
 
 /// The count a confirmation reports: Redis counts sharded subscriptions apart
 /// from channels and patterns, which it counts together.
-fn sub_count(
-    ctl: &'static crate::pubsub::PubsubCtl,
-    slots: &'static crate::pubsub::Slots,
-    slot_idx: usize,
-    kind: SubKind,
-) -> usize {
+fn sub_count(slots: &'static crate::pubsub::Slots, slot_idx: usize, kind: SubKind) -> usize {
     match kind {
-        SubKind::Shard => names_of(ctl, slots, slot_idx, SubKind::Shard).len(),
+        SubKind::Shard => names_of(slots, slot_idx, SubKind::Shard).len(),
         _ => {
-            names_of(ctl, slots, slot_idx, SubKind::Channel).len()
-                + names_of(ctl, slots, slot_idx, SubKind::Pattern).len()
+            names_of(slots, slot_idx, SubKind::Channel).len()
+                + names_of(slots, slot_idx, SubKind::Pattern).len()
         }
     }
 }
@@ -2625,7 +2565,6 @@ fn sub_count(
 /// confirmed: a confirmed subscription that receives nothing is worse than none.
 fn confirm_subscriptions(
     writer: &mut ConnWriter,
-    ctl: &'static crate::pubsub::PubsubCtl,
     slots: &'static crate::pubsub::Slots,
     slot_idx: usize,
     proto: u8,
@@ -2634,33 +2573,21 @@ fn confirm_subscriptions(
 ) {
     for name in names {
         let one = std::slice::from_ref(name);
-        let before = names_of(ctl, slots, slot_idx, kind);
+        let before = names_of(slots, slot_idx, kind);
         if kind == SubKind::Pattern {
-            crate::pubsub::psubscribe(ctl, slots, slot_idx, one);
+            crate::pubsub::psubscribe(slots, slot_idx, one);
         } else {
-            crate::pubsub::subscribe(ctl, slots, slot_idx, one);
+            crate::pubsub::subscribe(slots, slot_idx, one);
         }
-        let now = names_of(ctl, slots, slot_idx, kind);
+        let now = names_of(slots, slot_idx, kind);
         if now.len() == before.len() && !before.contains(name) {
-            write_error(
-                writer,
-                &format!(
-                    "pg_redis allows at most {} {} per connection",
-                    crate::pubsub::MAX_SUBS_PER_SLOT,
-                    if kind == SubKind::Pattern {
-                        "patterns"
-                    } else {
-                        "channels"
-                    }
-                ),
-            )
-            .ok();
+            write_error(writer, PUBSUB_FULL).ok();
             continue;
         }
         write_pubsub_header(writer, 3, proto).ok();
         write_bulk_string(writer, kind.verb()).ok();
         write_bulk_string(writer, crate::pubsub::shown_name(name)).ok();
-        write_integer(writer, sub_count(ctl, slots, slot_idx, kind) as i64).ok();
+        write_integer(writer, sub_count(slots, slot_idx, kind) as i64).ok();
     }
     writer.flush().ok();
 }
@@ -2670,7 +2597,6 @@ fn confirm_subscriptions(
 /// A connection's pub/sub slot: the shared state and its index in it.
 #[derive(Clone, Copy)]
 struct SubSlot {
-    ctl: &'static crate::pubsub::PubsubCtl,
     slots: &'static crate::pubsub::Slots,
     idx: usize,
 }
@@ -2681,26 +2607,19 @@ fn handle_unsub(
     proto: u8,
     args: &[Vec<u8>],
     kind: SubKind,
-    unsub_fn: impl Fn(
-        &'static crate::pubsub::PubsubCtl,
-        &'static crate::pubsub::Slots,
-        usize,
-        &[Vec<u8>],
-    ) -> (u32, u32),
+    unsub_fn: impl Fn(&'static crate::pubsub::Slots, usize, &[Vec<u8>]) -> (u32, u32),
     slot_freed: &mut bool,
 ) -> bool {
     let SubSlot {
-        ctl,
         slots,
         idx: slot_idx,
     } = slot;
     let total = || {
-        sub_count(ctl, slots, slot_idx, SubKind::Channel)
-            + sub_count(ctl, slots, slot_idx, SubKind::Shard)
+        sub_count(slots, slot_idx, SubKind::Channel) + sub_count(slots, slot_idx, SubKind::Shard)
     };
     // A bare unsubscribe drops every name of its own kind, and only those.
     let to_unsub: Vec<Vec<u8>> = if args.is_empty() {
-        names_of(ctl, slots, slot_idx, kind)
+        names_of(slots, slot_idx, kind)
     } else {
         args.to_vec()
     };
@@ -2710,17 +2629,17 @@ fn handle_unsub(
         write_pubsub_header(writer, 3, proto).ok();
         write_bulk_string(writer, kind.unverb()).ok();
         write_null_bulk(writer).ok();
-        write_integer(writer, sub_count(ctl, slots, slot_idx, kind) as i64).ok();
+        write_integer(writer, sub_count(slots, slot_idx, kind) as i64).ok();
         writer.flush().ok();
         // Do not mark slot_freed — let subscribe_loop's cleanup call slot_free.
         return total() == 0;
     }
     for item in &to_unsub {
-        unsub_fn(ctl, slots, slot_idx, std::slice::from_ref(item));
+        unsub_fn(slots, slot_idx, std::slice::from_ref(item));
         write_pubsub_header(writer, 3, proto).ok();
         write_bulk_string(writer, kind.unverb()).ok();
         write_bulk_string(writer, crate::pubsub::shown_name(item)).ok();
-        write_integer(writer, sub_count(ctl, slots, slot_idx, kind) as i64).ok();
+        write_integer(writer, sub_count(slots, slot_idx, kind) as i64).ok();
     }
     writer.flush().ok();
     // No subscription left — but the slot still holds the connection's
@@ -3183,9 +3102,8 @@ fn feed_monitors_from(parts: &[Vec<u8>], db: u8, origin: impl FnOnce() -> String
         }
     }
     line.push_str("\r\n");
-    if let Some((pctl, slots)) = crate::pubsub_state() {
-        let msg = &line.as_bytes()[..line.len().min(crate::pubsub::PUBSUB_MSG_LEN)];
-        crate::pubsub::publish(pctl, slots, MONITOR_CHANNEL, msg);
+    if let Some(pslots) = crate::pubsub_state() {
+        crate::pubsub::publish(pslots, MONITOR_CHANNEL, line.as_bytes());
     }
 }
 
@@ -3196,16 +3114,14 @@ fn monitor_loop(
     parser: &mut RespParser,
     client: &crate::server::ClientHandle,
 ) -> bool {
-    let (Some(ctl), Some((pctl, slots))) = (crate::server::ctl(), crate::pubsub_state()) else {
+    let (Some(ctl), Some(pslots)) = (crate::server::ctl(), crate::pubsub_state()) else {
         reply(writer, |w| write_error(w, PUBSUB_NOT_LOADED));
         return true;
     };
     let Some((idx, _)) =
-        crate::pubsub::slot_alloc_and_subscribe(pctl, slots, &[MONITOR_CHANNEL.to_vec()])
+        crate::pubsub::slot_alloc_and_subscribe(pslots, &[MONITOR_CHANNEL.to_vec()])
     else {
-        reply(writer, |w| {
-            write_error(w, "max pub/sub subscribers reached")
-        });
+        reply(writer, |w| write_error(w, PUBSUB_FULL));
         return true;
     };
     ctl.monitors
@@ -3213,7 +3129,7 @@ fn monitor_loop(
     client.set_flag(crate::server::flag::MONITOR, true);
     reply(writer, |w| write_simple_string(w, "OK"));
     let keep = loop {
-        while let Some((_, _, payload)) = crate::pubsub::poll_message(slots, idx) {
+        while let Some((_, _, payload)) = crate::pubsub::poll_message(pslots, idx) {
             writer.write_all(&payload).ok();
         }
         writer.flush().ok();
@@ -3241,7 +3157,7 @@ fn monitor_loop(
     ctl.monitors
         .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     client.set_flag(crate::server::flag::MONITOR, false);
-    crate::pubsub::slot_free(pctl, slots, idx);
+    crate::pubsub::slot_free(pslots, idx);
     keep
 }
 

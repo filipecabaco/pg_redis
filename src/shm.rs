@@ -198,11 +198,20 @@ pub struct Usage {
 
 pub fn usage() -> Option<Usage> {
     let a = arena()?;
+    let used = used_bytes(a);
     Some(Usage {
-        used: a.used.load(Ordering::Relaxed),
-        peak: a.peak.load(Ordering::Relaxed),
+        used,
+        peak: a.peak.fetch_max(used, Ordering::Relaxed).max(used),
         limit: a.limit.load(Ordering::Relaxed),
     })
+}
+
+/// What the server has allocated, as Redis's `used_memory` counts it: the
+/// data, and the shared heap's subscriptions, queued messages, tracking table
+/// and ACL users (`pubheap.rs`). Redis counts its clients' output buffers
+/// against `maxmemory` too.
+fn used_bytes(a: &Arena) -> usize {
+    a.used.load(Ordering::Relaxed) + crate::pubheap::used()
 }
 
 /// `CONFIG SET maxmemory`: a new limit, no higher than the arena was sized
@@ -266,7 +275,7 @@ pub fn room() -> Option<usize> {
 /// Whether the arena holds more than the limit: Redis's
 /// `getMaxmemoryState` failing. What is done about it is `crate::evict`'s.
 pub fn over_limit() -> bool {
-    arena().is_some_and(|a| a.used.load(Ordering::Relaxed) > a.limit.load(Ordering::Relaxed))
+    arena().is_some_and(|a| used_bytes(a) > a.limit.load(Ordering::Relaxed))
 }
 
 /// The arena's allocator, as a handle that costs nothing to store: every

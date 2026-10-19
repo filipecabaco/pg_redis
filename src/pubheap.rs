@@ -291,6 +291,11 @@ unsafe impl Allocator for PubHeap {
     }
 }
 
+/// Bytes handed out from the heap now.
+pub fn used() -> usize {
+    header().map_or(0, |h| h.used.load(Ordering::Relaxed))
+}
+
 /// Run `f`, turning a full heap into `None` instead of a panic.
 pub fn catching<R>(f: impl FnOnce() -> R) -> Option<R> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {

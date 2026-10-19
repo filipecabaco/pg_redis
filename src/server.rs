@@ -213,6 +213,8 @@ pub struct SlowEntry {
 #[repr(C)]
 pub struct ServerCtl {
     initialised: AtomicU32,
+    /// `INFO`'s `run_id`: random, new at every server start, as in Redis.
+    run_id: [AtomicU64; 3],
     pub next_client_id: AtomicU64,
     pub started_ms: AtomicI64,
     pub stat_reset_ms: AtomicI64,
@@ -323,7 +325,25 @@ pub fn init(ctl: &ServerCtl) {
         ctl.stat_reset_ms.store(now, Ordering::Relaxed);
         ctl.active_expire.store(1, Ordering::Relaxed);
         ctl.lastsave.store(now / 1000, Ordering::Relaxed);
+        let mut bytes = [0u8; 24];
+        crate::sys::random_bytes(&mut bytes);
+        for (word, chunk) in ctl.run_id.iter().zip(bytes.as_chunks::<8>().0) {
+            word.store(u64::from_le_bytes(*chunk), Ordering::Relaxed);
+        }
     }
+}
+
+/// The 40 hex digits `INFO` reports as `run_id`.
+pub fn run_id() -> String {
+    let Some(ctl) = ctl() else {
+        return "0".repeat(40);
+    };
+    let hex: String = ctl
+        .run_id
+        .iter()
+        .map(|w| format!("{:016x}", w.load(Ordering::Relaxed)))
+        .collect();
+    hex[..40].to_string()
 }
 
 fn spin_lock(l: &AtomicU32) {

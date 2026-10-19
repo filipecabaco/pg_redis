@@ -89,6 +89,7 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
     crate::shm::attach();
     // memory+snapshot databases filled back in before anyone is served.
     crate::storage::restore_snapshots();
+    crate::storage::worker_started();
 
     // Load persisted routes into shared memory. Only the first BGW to win the CAS does the load;
     // others skip (routes are already in shared memory).
@@ -319,6 +320,8 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
             }
         }
     }
+    // Left on SIGTERM: shutdown or `redis.remove_workers`.
+    crate::storage::worker_exiting();
 }
 
 /// Whether this database has the `redis.kv_*` tables the SQL expiry sweep needs.
@@ -1333,7 +1336,7 @@ fn conn_loop(
                     reply(&mut writer, |w| {
                         write_map_header(w, 7)?;
                         write_bulk_string(w, b"server")?;
-                        write_bulk_string(w, b"pg_redis")?;
+                        write_bulk_string(w, b"redis")?;
                         write_bulk_string(w, b"version")?;
                         write_bulk_string(w, crate::commands::REDIS_VERSION.as_bytes())?;
                         write_bulk_string(w, b"proto")?;
@@ -1351,7 +1354,7 @@ fn conn_loop(
                     reply(&mut writer, |w| {
                         write_array_header(w, 14)?;
                         write_bulk_string(w, b"server")?;
-                        write_bulk_string(w, b"pg_redis")?;
+                        write_bulk_string(w, b"redis")?;
                         write_bulk_string(w, b"version")?;
                         write_bulk_string(w, crate::commands::REDIS_VERSION.as_bytes())?;
                         write_bulk_string(w, b"proto")?;

@@ -129,8 +129,10 @@ key's value is the same before and after.
 `memory+snapshot` is `memory` plus a copy of the slot in `redis.snapshot` (one
 row per key, with its `DUMP` payload and its deadline), replaced whole every
 `redis.snapshot_interval` seconds (60 by default) and reloaded into the slot
-when the server starts. It plays the role of Redis's RDB: a crash loses at most
-one interval of writes.
+when the server starts, and taken once more when the server shuts down
+cleanly. It plays the role of Redis's RDB, which Redis also saves on
+shutdown: a clean restart or a planned switchover loses nothing, and a crash
+loses at most one interval of writes.
 
 - **Taking one.** One worker claims the database and replaces its snapshot in
   a single transaction, so a crash mid-snapshot leaves the previous one whole.
@@ -144,6 +146,11 @@ one interval of writes.
   while the others wait, so no worker serves the database half loaded. No
   snapshot is taken of a slot until that is done; otherwise the empty slot
   would be saved over the snapshot it is about to be filled from.
+- **At shutdown.** The workers count themselves in and out. The last one to
+  leave cleanly (a shutdown, or `redis.remove_workers` of the last worker)
+  snapshots every `memory+snapshot` database, after the others have stopped
+  writing. PostgreSQL waits for its background workers before the shutdown
+  checkpoint, so the snapshot is in the WAL a standby receives.
 - **On demand.** `SAVE` snapshots every `memory+snapshot` database there and
   then; `BGSAVE` makes them due at the workers' next round. `LASTSAVE` and
   `INFO persistence`'s `rdb_last_save_time` report the last one taken. With no

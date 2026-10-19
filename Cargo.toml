@@ -21,7 +21,7 @@ pgrx = "=0.18.0"
 socket2 = { version = "0.5", features = ["all"] }
 libc = "0.2"
 # Safe wrappers for the system calls std does not have: poll, futexes (src/sys.rs).
-rustix = { version = "1.1", features = ["event", "thread", "time", "param"] }
+rustix = { version = "1.1", features = ["event", "thread", "time", "param", "system"] }
 subtle = "2"
 # The memory engine's collections, in the shared-memory arena (src/memdb, src/shm.rs).
 allocator-api2 = { version = "0.2", default-features = false, features = ["alloc"] }

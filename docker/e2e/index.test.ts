@@ -58,6 +58,22 @@ describe("Authentication", () => {
 		}
 	});
 
+	// The server says what Redis says: client libraries branch on HELLO's
+	// `server` field, and tools watch INFO's run_id to notice a restart.
+	test("HELLO and INFO identify the server as Redis does", async () => {
+		const conn = await new RawRedis().connect();
+		try {
+			const hello = (await conn.send("HELLO", "2")).toString();
+			expect(hello).toContain("$6\r\nserver\r\n$5\r\nredis\r\n");
+			const info = (await conn.bulk("INFO", "server"))?.toString() ?? "";
+			expect(info).toMatch(/run_id:[0-9a-f]{40}\r\n/);
+			expect(info).not.toContain(`run_id:${"0".repeat(40)}`);
+			expect(info).not.toContain("os:PostgreSQL");
+		} finally {
+			conn.close();
+		}
+	});
+
 	test("GET before AUTH returns NOAUTH", async () => {
 		const noAuthClient = new Bun.RedisClient(
 			`redis://${REDIS_HOST}:${REDIS_PORT}`,

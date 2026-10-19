@@ -87,7 +87,9 @@ services:
     profiles: ["clients"]
 
   redis:
-    image: redis:7-alpine
+    # The reference for parity: the Redis version pg_redis matches, pinned
+    # so a new 7.x tag cannot move it.
+    image: redis:7.2-alpine
     command: ["redis-server", "--requirepass", "testpass"]
     ports:
       - "6380:6379"

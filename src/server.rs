@@ -1535,6 +1535,12 @@ impl ClientHandle {
             s.proto.store(proto as u32, Ordering::Relaxed);
         }
     }
+
+    /// The protocol the connection speaks: 2 or 3.
+    pub fn proto(&self) -> u8 {
+        self.slot
+            .map_or(2, |s| s.proto.load(Ordering::Relaxed) as u8)
+    }
 }
 
 pub fn tracking_active() -> bool {

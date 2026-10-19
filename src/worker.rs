@@ -2918,6 +2918,8 @@ fn write_value(w: &mut impl std::io::Write, v: &crate::commands::Value) -> std::
         }
         Value::Bool(b) => write_integer(w, i64::from(*b)),
         Value::Verbatim(text) => write_bulk_string(w, text.as_bytes()),
+        Value::BigNum(n) => write_bulk_string(w, n.as_bytes()),
+        Value::Attributed(_, v) | Value::Pushed(_, v) => write_value(w, v),
     }
 }
 
@@ -2952,6 +2954,20 @@ fn write_value3(w: &mut impl std::io::Write, v: &crate::commands::Value) -> std:
             write!(w, "={}\r\ntxt:", text.len() + 4)?;
             w.write_all(text.as_bytes())?;
             write!(w, "\r\n")
+        }
+        Value::BigNum(n) => write!(w, "({n}\r\n"),
+        Value::Attributed(pairs, v) => {
+            write!(w, "|{}\r\n", pairs.len())?;
+            pairs.iter().try_for_each(|(k, v)| {
+                write_value3(w, k)?;
+                write_value3(w, v)
+            })?;
+            write_value3(w, v)
+        }
+        Value::Pushed(items, v) => {
+            write!(w, ">{}\r\n", items.len())?;
+            items.iter().try_for_each(|i| write_value3(w, i))?;
+            write_value3(w, v)
         }
     }
 }

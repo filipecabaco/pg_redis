@@ -983,16 +983,19 @@ in its own process, so a unit that aborts takes only itself down.
   forward. Most of the suite fails for a missing command (`BLPOP`, `BITOP`,
   `SSCAN`, ...), and gating on those would mean gating on
   commands not yet built.
-- **What is left out, on purpose.** Whole units for command families that do
-  not exist here (streams, geo, HyperLogLog, scripting, ...), and the units
-  that reconfigure or restart the server under test, which Redis itself tags
-  `external:skip`. Tests needing `DEBUG`, replication or `SAVE` are denied by
-  tag; tests needing a real `maxmemory` run on the memory half only. The
-  `maxmemory` unit, `external:skip` throughout, runs on the memory half from
-  a copy without the tag and without the blocks that start a replica, read
-  the replication stream or measure client output buffers (`REWRITTEN` in
-  `run.ts`). `--ignore-encoding` and `--ignore-digest`
-  turn off the assertions about Redis's internal encodings.
+- **What is left out, on purpose.** The units that restart the server under
+  test or need a replica, which Redis itself tags `external:skip` (aofrw,
+  client-eviction, limits, shutdown, wait), and the ones that measure Redis's
+  own allocator or internals (memefficiency, oom-score-adj, querybuf,
+  replybufsize, violations, tls). Tests needing replication or `SAVE` are
+  denied by tag; tests needing a real `maxmemory` run on the memory half only.
+  Tests needing `DEBUG` run: it answers `OBJECT`, `POPULATE`, `PROTOCOL`,
+  `SLEEP` and `SET-ACTIVE-EXPIRE`, and `RELOAD` and `LOADAOF` leave the data
+  as it was. `maxmemory`, `obuf-limits` and `pubsubshard`, `external:skip`
+  throughout, run from a copy without the tag and without the blocks that
+  start a replica or read the replication stream (`REWRITTEN` in `run.ts`).
+  `--ignore-encoding` and `--ignore-digest` turn off the assertions about
+  Redis's internal encodings.
 - **`skip.txt` is for hangs only.** A failing test belongs in the baseline,
   where it stays visible. Two groups hang instead of failing, and each entry
   says why. The pipelining one is a real defect in pg_redis, not a missing

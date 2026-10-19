@@ -1759,8 +1759,89 @@ fn latency(a: &Admin) -> Response {
 
 // ───────────────────────────────── DEBUG ────────────────────────────────────
 
-fn debug(a: &Admin, _conn: &mut Conn, _data: &mut Data) -> Response {
+/// `DEBUG OBJECT key`, in Redis's words. The address is the key's own and
+/// stays put while its value is changed in place; `lru` is the 24-bit clock
+/// `lru_seconds_idle` is measured from. Nothing here touches the key.
+fn debug_object(key: &[u8], conn: &mut Conn, data: &mut Data) -> Response {
+    use crate::commands::ObjectField;
+    let db = conn.db;
+    let enc = match data(Command::ObjectEncoding { key: key.to_vec() }, db) {
+        Response::BulkString(e) => String::from_utf8_lossy(&e).into_owned(),
+        Response::Null => return err("ERR no such key"),
+        r => return r,
+    };
+    let field = |field, data: &mut Data| match data(
+        Command::ObjectAccess {
+            key: key.to_vec(),
+            field,
+        },
+        db,
+    ) {
+        Response::Integer(n) => Some(n),
+        _ => None,
+    };
+    let refcount = field(ObjectField::Refcount, data).unwrap_or(1);
+    let idle = field(ObjectField::Idletime, data).unwrap_or(0);
+    // DUMP looks the key up as a read; a no-touch client's does not touch it.
+    let was = conn.client.slot().is_some_and(|s| {
+        s.flags.load(std::sync::atomic::Ordering::Relaxed) & server::flag::NO_TOUCH != 0
+    });
+    conn.client.set_flag(server::flag::NO_TOUCH, true);
+    let dump = data(Command::Dump { key: key.to_vec() }, db);
+    conn.client.set_flag(server::flag::NO_TOUCH, was);
+    // The payload less its type byte and its RDB version and checksum.
+    let serialized = match dump {
+        Response::BulkString(p) => p.len().saturating_sub(11),
+        _ => 0,
+    };
+    let clock = (server::now_ms() / 1000 - idle).rem_euclid(1 << 24);
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ u64::from(db);
+    for &b in key {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let at = 0x7f00_0000_0000 | (h & 0xff_ffff_fff0);
+    Response::SimpleString(format!(
+        "Value at:{at:#x} refcount:{refcount} encoding:{enc} serializedlength:{serialized} lru:{clock} lru_seconds_idle:{idle}"
+    ))
+}
+
+/// `DEBUG POPULATE count [prefix] [size]`: keys `prefix:0` .. holding
+/// `value:N`, cut or zero-padded to `size`; a key already there is left.
+fn debug_populate(args: &[Vec<u8>], conn: &mut Conn, data: &mut Data) -> Response {
+    let positive = |v: &[u8]| int(v).filter(|n| *n >= 0);
+    let Some(count) = positive(&args[0]) else {
+        return err("ERR value is out of range, must be positive");
+    };
+    let size = match args.get(2) {
+        Some(v) => match positive(v) {
+            Some(n) => Some(n as usize),
+            None => return err("ERR value is out of range, must be positive"),
+        },
+        None => None,
+    };
+    let prefix = args.get(1).map_or(b"key".as_slice(), Vec::as_slice);
+    for j in 0..count {
+        let key = [prefix, format!(":{j}").as_bytes()].concat();
+        let mut value = format!("value:{j}").into_bytes();
+        if let Some(n) = size {
+            value.resize(n, 0);
+        }
+        let set = Command::parse(vec![b"SET".to_vec(), key, value, b"NX".to_vec()]);
+        match set.map(|c| data(c, conn.db)) {
+            Ok(Response::Error(e)) | Err(e) => return Response::Error(e),
+            Ok(_) => {}
+        }
+    }
+    Response::Ok
+}
+
+fn debug(a: &Admin, conn: &mut Conn, data: &mut Data) -> Response {
     match a.sub().as_str() {
+        "OBJECT" if a.args.len() == 2 => debug_object(&a.args[1], conn, data),
+        "POPULATE" if (2..=4).contains(&(a.args.len() - 1)) => {
+            debug_populate(&a.args[1..], conn, data)
+        }
+
         "SLEEP" => {
             let secs: f64 = a
                 .args
@@ -1778,8 +1859,11 @@ fn debug(a: &Admin, _conn: &mut Conn, _data: &mut Data) -> Response {
             }
             Response::Ok
         }
-        // Reloading is a no-op: nothing here lives only in a dump.
+        // Reloading is a no-op: nothing here lives only in a dump, or in an
+        // append-only file to load again.
         "RELOAD"
+        | "LOADAOF"
+        | "SET-DISABLE-DENY-SCRIPTS"
         | "JMAP"
         | "CHANGE-REPL-ID"
         | "LOG"
@@ -1799,19 +1883,43 @@ fn debug(a: &Admin, _conn: &mut Conn, _data: &mut Data) -> Response {
         {
             Some("string") => bulk("Hello World"),
             Some("integer") => Response::Integer(12345),
-            Some("double") => bulk("3.141"),
-            Some("bignum") => bulk("1234567999999999999999999999999999999"),
+            // Redis's own test value, 3.141: not an approximation of pi.
+            Some("double") => Response::Value(Value::Double(f64::from(3141) / 1000.0)),
+            Some("bignum") => Response::Value(Value::BigNum(
+                "1234567999999999999999999999999999999".into(),
+            )),
             Some("null") => Response::Null,
             Some("array") => Response::Value(Value::Array((0..3).map(Value::Int).collect())),
-            Some("set") => Response::Value(Value::Array((0..3).map(Value::Int).collect())),
-            Some("map") => Response::Value(Value::Array(
+            Some("set") => Response::Value(Value::Set((0..3).map(Value::Int).collect())),
+            Some("map") => Response::Value(Value::Map(
                 (0..3)
-                    .flat_map(|i| [Value::Int(i), Value::Int(i % 2)])
+                    .map(|i| (Value::Int(i), Value::Bool(i == 1)))
                     .collect(),
             )),
-            Some("true") => Response::Integer(1),
-            Some("false") => Response::Integer(0),
-            Some("verbatim") => bulk("This is a verbatim\nstring"),
+            Some("attrib") => Response::Value(Value::Attributed(
+                vec![(
+                    Value::Bulk(b"key-popularity".to_vec()),
+                    Value::Array(vec![Value::Bulk(b"key:123".to_vec()), Value::Int(90)]),
+                )],
+                Box::new(Value::Bulk(
+                    b"Some real reply following the attribute".to_vec(),
+                )),
+            )),
+            Some("push") if conn.client.proto() < 3 => {
+                err("ERR RESP2 is not supported by this command")
+            }
+            Some("push") => Response::Value(Value::Pushed(
+                vec![Value::Bulk(b"server-cpu-usage".to_vec()), Value::Int(42)],
+                Box::new(Value::Bulk(
+                    b"Some real reply following the push reply".to_vec(),
+                )),
+            )),
+            Some("true") => Response::Value(Value::Bool(true)),
+            Some("false") => Response::Value(Value::Bool(false)),
+            Some("verbatim") => {
+                Response::Value(Value::Verbatim("This is a verbatim\nstring".into()))
+            }
+
             _ => err(
                 "ERR Wrong protocol type name. Please use one of the following: string|integer|double|bignum|null|array|set|map|attrib|push|verbatim|true|false",
             ),
@@ -1824,6 +1932,13 @@ fn debug(a: &Admin, _conn: &mut Conn, _data: &mut Data) -> Response {
             "    Setting it to 0 disables expiring keys in background.",
             "RELOAD",
             "    Accepted; pg_redis keeps no dump to reload from.",
+            "OBJECT <key>",
+            "    Show low level info about the key and associated value.",
+            "POPULATE <count> [<prefix>] [<size>]",
+            "    Create <count> string keys named key:<num>. If <prefix> is specified then",
+            "    it is used instead of the 'key' prefix. These are not propagated to",
+            "    replicas. Cluster slots are not respected so keys not belonging to the",
+            "    current node can be created in cluster mode.",
             "PROTOCOL <type>",
             "    Reply with a test value of the specified type.",
             "HELP",

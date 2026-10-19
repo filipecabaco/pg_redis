@@ -1257,6 +1257,13 @@ pub enum Value {
     Set(Vec<Value>),
     Bool(bool),
     Verbatim(String),
+    /// A RESP3 big number; a bulk string to RESP2.
+    BigNum(String),
+    /// A RESP3 attribute ahead of the reply it describes. RESP2, and a
+    /// script, get only the reply.
+    Attributed(Vec<(Value, Value)>, Box<Value>),
+    /// An out-of-band RESP3 push ahead of the reply.
+    Pushed(Vec<Value>, Box<Value>),
 }
 
 impl Response {

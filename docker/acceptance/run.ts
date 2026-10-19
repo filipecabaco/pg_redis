@@ -112,10 +112,13 @@ const REWRITTEN: Record<string, { halves: Half[]; drop: RegExp[] }> = {
 
 /**
  * Tags whose tests cannot pass against any external server that is not Redis:
- * they need DEBUG, replication, or SAVE/BGSAVE to set up the case at all.
- * Denying them keeps the report about the command under test.
+ * they need replication, or SAVE/BGSAVE to set up the case at all. Denying
+ * them keeps the report about the command under test. `needs:debug` tests
+ * run: DEBUG answers what pg_redis can answer truthfully (OBJECT, POPULATE,
+ * PROTOCOL, SLEEP, SET-ACTIVE-EXPIRE, and RELOAD and LOADAOF, after which the
+ * data is as it was), and a test that needs more fails in the report.
  */
-const DENY_TAGS = ["needs:debug", "needs:repl", "needs:save", "needs:reset"];
+const DENY_TAGS = ["needs:repl", "needs:save", "needs:reset"];
 
 /**
  * `needs:config-maxmemory` tests set a memory limit and expect eviction or

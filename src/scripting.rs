@@ -1296,6 +1296,14 @@ fn value_to_lua(lua: &Lua, v: Value) -> mlua::Result<Lv> {
             Lv::Table(t)
         }
         Value::Verbatim(text) => Lv::String(lua.create_string(text)?),
+        Value::BigNum(n) if resp3 => {
+            let t = lua.create_table()?;
+            t.raw_set("big_number", n)?;
+            Lv::Table(t)
+        }
+        Value::BigNum(n) => Lv::String(lua.create_string(n)?),
+        // `redisProtocolToLuaType_Attribute`: read and dropped.
+        Value::Attributed(_, v) | Value::Pushed(_, v) => value_to_lua(lua, *v)?,
     })
 }
 

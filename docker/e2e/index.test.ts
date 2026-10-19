@@ -2161,7 +2161,65 @@ describe("Pub/Sub and client tracking without fixed limits", () => {
 		}
 	});
 
+	// Redis's `obuf-limits`: a normal client whose replies pass the hard
+	// limit gets none of them and is closed; HRANDFIELD with a huge negative
+	// count stops part way instead of building the whole reply.
+	test("a normal client past its output limit is closed with no reply", async () => {
+		const name = `obuf-${Date.now()}`;
+		await client.send("DEL", ["obuf:list"]);
+		for (let i = 0; i < 150; i++) await client.send("LPUSH", ["obuf:list", "x".repeat(1000)]);
+		await client.send("CONFIG", ["SET", "client-output-buffer-limit", "normal 100000 0 0"]);
+		try {
+			let got = 0;
+			let closed = false;
+			await new Promise<void>((resolve) => {
+				Bun.connect({
+					hostname: process.env.REDIS_HOST ?? "localhost",
+					port: Number(process.env.REDIS_PORT ?? 6379),
+					socket: {
+						open: (s) => {
+							const pw = process.env.REDIS_PASSWORD ?? "testpass";
+							const auth = pw ? `*2\r\n$4\r\nAUTH\r\n$${pw.length}\r\n${pw}\r\n` : "";
+							s.write(
+								`${auth}*3\r\n$6\r\nCLIENT\r\n$7\r\nSETNAME\r\n$${name.length}\r\n${name}\r\n` +
+									"*4\r\n$6\r\nLRANGE\r\n$9\r\nobuf:list\r\n$1\r\n0\r\n$2\r\n-1\r\n",
+							);
+						},
+						data: (_s, chunk) => {
+							got += chunk.length;
+						},
+						close: () => {
+							closed = true;
+							resolve();
+						},
+						error: () => resolve(),
+					},
+				});
+				setTimeout(resolve, 3000);
+			});
+			expect(closed).toBe(true);
+			// AUTH's +OK and SETNAME's +OK, nothing of the list.
+			expect(got).toBeLessThan(100);
+			expect((await client.send("CLIENT", ["LIST"])) as string).not.toContain(`name=${name}`);
+
+			const raw2 = await new RawRedis().connect();
+			await raw2.send("HSET", "obuf:h", "a", "b");
+			raw2.close();
+			// Bounded by the limit, so it ends quickly rather than building
+			// 999,999,999 entries.
+			const started = performance.now();
+			const r = new Bun.RedisClient(redisUrl);
+			await expect(r.send("HRANDFIELD", ["obuf:h", "-999999999"])).rejects.toThrow();
+			r.close();
+			expect(performance.now() - started).toBeLessThan(5000);
+		} finally {
+			await client.send("CONFIG", ["SET", "client-output-buffer-limit", "normal 0 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60"]);
+			await client.send("DEL", ["obuf:list", "obuf:h"]);
+		}
+	});
+
 	test("tracking remembers more than 16,384 keys, long ones included", async () => {
+
 		const tracker = await new RawRedis().connect();
 		try {
 			await tracker.send("HELLO", "3");

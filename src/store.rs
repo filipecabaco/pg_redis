@@ -513,7 +513,7 @@ pub fn run(cmd: &Command, store: &mut dyn Store) -> Option<Response> {
                 .srandmember(key, 1)
                 .map(|v| bulk_or_nil(v.into_iter().next())),
             Some(0) => Ok(Response::Array(vec![])),
-            Some(n) => store.srandmember(key, *n).map(array),
+            Some(n) => store.srandmember(key, repeats(*n)).map(array),
         },
         // `smoveCommand`: onto itself, only whether the member is there, and
         // nothing changes; otherwise the destination is signalled only if
@@ -670,7 +670,9 @@ pub fn run(cmd: &Command, store: &mut dyn Store) -> Option<Response> {
                 .zrandmember(key, 1)
                 .map(|v| bulk_or_nil(v.into_iter().next().map(|(m, _)| m))),
             Some(0) => Ok(Response::Array(vec![])),
-            Some(n) => store.zrandmember(key, *n).map(|v| scored(v, *with_scores)),
+            Some(n) => store
+                .zrandmember(key, repeats(*n))
+                .map(|v| scored(v, *with_scores)),
         },
         Command::ZRemRangeByRank { key, start, stop } => store
             .zremrange_rank(key, *start, *stop)
@@ -993,6 +995,16 @@ fn collection_scan(
 
 /// `HRANDFIELD`: a positive count below the hash's size picks at random, in
 /// the hash's order when it is a listpack.
+/// A negative count (repeats allowed) no larger than the client's output
+/// limit lets its reply be (`pubsub::cap_repeats`).
+fn repeats(n: i64) -> i64 {
+    if n < 0 {
+        -(crate::pubsub::cap_repeats(n.unsigned_abs()) as i64)
+    } else {
+        n
+    }
+}
+
 fn hrandfield(
     store: &mut dyn Store,
     key: &[u8],

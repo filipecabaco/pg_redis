@@ -88,8 +88,8 @@ fn name(bytes: &[u8]) -> HVec<u8> {
     v
 }
 
-/// `client-output-buffer-limit`'s pubsub class: bytes queued at once that
-/// close the connection, bytes that close it when held for `soft_secs`.
+/// A class of `client-output-buffer-limit`: bytes queued at once that close
+/// the connection, bytes that close it when held for `soft_secs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     pub hard: usize,
@@ -113,10 +113,55 @@ const DEFAULT_LIMITS: Limits = Limits {
 
 /// The pubsub class out of `normal … replica … pubsub hard soft secs`.
 fn parse_limits(setting: &str) -> Limits {
+    class_limits(setting, "pubsub").unwrap_or(DEFAULT_LIMITS)
+}
+
+/// Bytes Redis's static reply buffer holds before a client's replies count
+/// against its output limit (`PROTO_REPLY_CHUNK_BYTES`).
+pub const REPLY_CHUNK: usize = 16 * 1024;
+
+/// The normal class: the output limit of every client that is not a
+/// subscriber, none by default. Parsed again only after a `CONFIG SET`.
+pub fn normal_limits() -> Limits {
+    thread_local! {
+        static CACHE: std::cell::Cell<Option<(u32, Limits)>> = const { std::cell::Cell::new(None) };
+    }
+    let generation = crate::server::config_generation();
+    CACHE.with(|c| match c.get() {
+        Some((g, l)) if g == generation => l,
+        _ => {
+            let l = class_limits(
+                &crate::config::get_str("client-output-buffer-limit"),
+                "normal",
+            )
+            .unwrap_or(Limits {
+                hard: 0,
+                soft: 0,
+                soft_secs: 0,
+            });
+            c.set(Some((generation, l)));
+            l
+        }
+    })
+}
+
+/// How many elements of a reply with repeats (`HRANDFIELD`, `SRANDMEMBER`,
+/// `ZRANDMEMBER` with a negative count) to build: `n`, or under a normal
+/// output limit, just enough that the reply passes it. Redis stops such a
+/// reply part way once the client is past its limit, and closes it.
+pub fn cap_repeats(n: u64) -> u64 {
+    match normal_limits().hard {
+        0 => n,
+        // The shortest element on the wire is `$0\r\n\r\n`.
+        hard => n.min(((hard + REPLY_CHUNK) / 6 + 1) as u64),
+    }
+}
+
+fn class_limits(setting: &str, class: &str) -> Option<Limits> {
     let words: Vec<&str> = setting.split_whitespace().collect();
     words
         .windows(4)
-        .find(|w| w[0].eq_ignore_ascii_case("pubsub"))
+        .find(|w| w[0].eq_ignore_ascii_case(class))
         .and_then(|w| {
             Some(Limits {
                 hard: memory(w[1])?,
@@ -124,7 +169,6 @@ fn parse_limits(setting: &str) -> Limits {
                 soft_secs: w[3].parse().ok()?,
             })
         })
-        .unwrap_or(DEFAULT_LIMITS)
 }
 
 /// A size as Redis writes one: bytes, or with k, kb, m, mb, g, gb (k is

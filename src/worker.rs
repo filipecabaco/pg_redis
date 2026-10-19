@@ -1078,6 +1078,7 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<DispatchMsg>, default_d
             .first()
             .map(|p| String::from_utf8_lossy(p).to_uppercase())
             .unwrap_or_default();
+        writer.more_input = parser.has_buffered();
 
         // What `CLIENT LIST` reports as this client's query buffer while the
         // command runs: the command as it came over the wire.
@@ -3042,6 +3043,14 @@ struct ConnWriter {
     quit_reply: bool,
     /// Writes time out after `WRITE_STALL`; set once the client subscribes.
     stall_limited: bool,
+    /// Replies not yet sent, while a normal-class output limit is set: Redis
+    /// keeps a client's replies until the event they answer is done, and a
+    /// client whose replies pass the limit gets none of them and is closed.
+    held: Vec<u8>,
+    /// The command being answered has more of a pipeline behind it, already
+    /// read: under a normal-class limit its reply waits for theirs, as
+    /// Redis's waits for the whole read to be processed.
+    more_input: bool,
 }
 
 struct PendingRead {
@@ -3060,6 +3069,8 @@ impl ConnWriter {
             pending_read: None,
             quit_reply: false,
             stall_limited: false,
+            held: Vec::new(),
+            more_input: false,
         }
     }
 
@@ -3087,19 +3098,49 @@ impl ConnWriter {
 
 impl Write for ConnWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if self.muted {
+        if self.muted || self.broken {
             return Ok(buf.len());
         }
-        let r = self.inner.write(buf);
+        // A subscriber's limit is the pubsub class's, on its queue.
+        let hard = if self.stall_limited {
+            0
+        } else {
+            crate::pubsub::normal_limits().hard
+        };
+        if hard > 0 {
+            self.held.extend_from_slice(buf);
+            if self.held.len() > crate::pubsub::REPLY_CHUNK + hard {
+                self.held = Vec::new();
+                self.broken = true;
+            }
+            return Ok(buf.len());
+        }
+        let r = self.send_held().and_then(|()| self.inner.write(buf));
         self.broken |= r.is_err();
         r
     }
 
     fn flush(&mut self) -> io::Result<()> {
         self.remember_read();
-        let r = self.inner.flush();
+        if self.broken {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        if self.more_input && !self.held.is_empty() {
+            return Ok(());
+        }
+        let r = self.send_held().and_then(|()| self.inner.flush());
         self.broken |= r.is_err();
         r
+    }
+}
+
+impl ConnWriter {
+    fn send_held(&mut self) -> io::Result<()> {
+        if self.held.is_empty() {
+            return Ok(());
+        }
+        let held = std::mem::take(&mut self.held);
+        self.inner.write_all(&held)
     }
 }
 

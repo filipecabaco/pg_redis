@@ -118,7 +118,7 @@ pub fn random_picks(n: usize, count: i64) -> std::vec::Vec<usize> {
         return vec![];
     }
     if count < 0 {
-        return (0..count.unsigned_abs())
+        return (0..crate::pubsub::cap_repeats(count.unsigned_abs()))
             .map(|_| (fast_random() % n as u64) as usize)
             .collect();
     }

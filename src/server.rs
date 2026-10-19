@@ -684,13 +684,16 @@ impl ClientInfo {
 }
 
 /// [`clients`], each with its output memory, for `CLIENT LIST` and `CLIENT
-/// INFO`: what waits in its pub/sub queue.
+/// INFO`: what waits in its pub/sub queue. A subscriber past its output
+/// limit is being closed and is left out, as Redis has freed it by the next
+/// command.
 pub fn clients_with_output() -> Vec<ClientInfo> {
     let mut all = clients();
     if let Some(slots) = crate::pubsub_state() {
         let out = crate::pubsub::output_bytes(slots);
+        all.retain(|c| !out.get(&c.id).is_some_and(|(_, closing)| *closing));
         for c in &mut all {
-            c.omem = out.get(&c.id).copied().unwrap_or(0);
+            c.omem = out.get(&c.id).map_or(0, |(bytes, _)| *bytes);
         }
     }
     all

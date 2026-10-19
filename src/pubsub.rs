@@ -560,13 +560,16 @@ pub fn slot_alloc_and_psubscribe(
     alloc_and(slots, owner, patterns, List::Patterns)
 }
 
-/// Each client's undelivered pub/sub bytes, for `CLIENT LIST`'s `omem`.
-pub fn output_bytes(slots: &Slots) -> std::collections::HashMap<u64, usize> {
+/// Each client's undelivered pub/sub bytes, for `CLIENT LIST`'s `omem`, and
+/// whether it is past its output limit and being closed.
+pub fn output_bytes(slots: &Slots) -> std::collections::HashMap<u64, (usize, bool)> {
     let l = lock(slots);
     let mut out = std::collections::HashMap::new();
     for sub in l.inner.subs.iter().flatten() {
         if sub.owner != 0 {
-            *out.entry(sub.owner).or_insert(0) += sub.queued;
+            let e = out.entry(sub.owner).or_insert((0, false));
+            e.0 += sub.queued;
+            e.1 |= sub.overflowed;
         }
     }
     out
@@ -1168,10 +1171,10 @@ mod tests {
         publish(r, b"t9", b"hi");
         assert_eq!(
             output_bytes(r).get(&4242),
-            Some(&frame_bytes(b"t9", b"", b"hi"))
+            Some(&(frame_bytes(b"t9", b"", b"hi"), false))
         );
         poll_message(r, idx);
-        assert_eq!(output_bytes(r).get(&4242), Some(&0));
+        assert_eq!(output_bytes(r).get(&4242), Some(&(0, false)));
         slot_free(r, idx);
         assert_eq!(output_bytes(r).get(&4242), None);
     }

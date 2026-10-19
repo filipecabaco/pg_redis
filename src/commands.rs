@@ -2818,6 +2818,16 @@ impl Command {
         let guarded = self.collection_read_guarded();
         if !writes && !guarded && self.reads_a_collection() {
             self.sql_reap_expired(client, db);
+        } else if !writes && someone_hears_expiry() {
+            // A read finds an expired string missing without deleting it,
+            // which spares every GET a write. Redis deletes it on that read,
+            // invalidates it and raises `expired`: when a tracking client or
+            // a keyspace subscriber would hear that, reap first.
+            let mut keys: Vec<&[u8]> = self.typed_keys().iter().map(|(k, _)| *k).collect();
+            if let Command::MGet { keys: named } = self {
+                keys.extend(named.iter().map(Vec::as_slice));
+            }
+            Self::reap_keys(client, db, &keys);
         }
         // The probe reaped these already, in the same statement.
         let stale = self.lazily_expires();
@@ -5695,6 +5705,12 @@ pub(crate) fn zadd_sql(db: u8, flags: &ZAddFlags) -> String {
                      FROM ups u LEFT JOIN existing e ON e.member = u.member) AS changed"
         )
     }
+}
+
+/// Whether an expiry noticed on a read would be heard: a client tracks keys,
+/// or `notify-keyspace-events` asks for `expired`.
+fn someone_hears_expiry() -> bool {
+    crate::server::tracking_active() || crate::notify::flags() & crate::notify::EXPIRED != 0
 }
 
 #[cfg(test)]

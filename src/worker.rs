@@ -1140,6 +1140,7 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<DispatchMsg>, default_d
             id: client.id,
             args: parts.clone(),
             multi,
+            exec: Vec::new(),
         });
 
         // The ACL, once the connection is past AUTH: Redis checks it after a
@@ -1320,6 +1321,16 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<DispatchMsg>, default_d
                     }
                     if let Some(job) = in_flight.as_mut() {
                         job.exec = lines.clone();
+                    }
+                    // The reads the transaction runs are remembered for
+                    // tracking as each runs in Redis, before EXEC replies.
+                    if let Some(p) = writer.pending_read.as_mut() {
+                        p.exec = lines
+                            .iter()
+                            .zip(&refused)
+                            .filter(|(_, no)| no.is_none())
+                            .map(|((line, _), _)| line.clone())
+                            .collect();
                     }
                     let unblocks: Option<Vec<(u8, Vec<u8>)>> = crate::server::waiters_active()
                         .then(|| {
@@ -3131,6 +3142,8 @@ struct PendingRead {
     id: u64,
     args: Vec<Vec<u8>>,
     multi: bool,
+    /// For an EXEC: the queued commands it ran, each a read to remember.
+    exec: Vec<Vec<Vec<u8>>>,
 }
 
 impl ConnWriter {
@@ -3201,6 +3214,9 @@ impl ConnWriter {
             && !crate::resp::REPLIED_ERROR.with(|e| e.get())
         {
             track_read(p.slot, p.id, &p.args, p.multi);
+            for line in &p.exec {
+                track_read(p.slot, p.id, line, false);
+            }
         }
     }
 }

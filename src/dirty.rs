@@ -101,8 +101,7 @@ pub fn of(cmd: &Command, reply: &Response) -> u64 {
         | Command::SUnionStore { .. }
         | Command::SInterStore { .. }
         | Command::SDiffStore { .. }
-        | Command::LSet { .. }
-        | Command::LTrim { .. } => 1,
+        | Command::LSet { .. } => 1,
         Command::SetRange { value, .. } => one_if(!value.is_empty()),
         Command::GetDel { .. } => one_if(found),
         Command::GetEx { expiry, .. } => one_if(found && !matches!(expiry, GetExExpiry::Keep)),

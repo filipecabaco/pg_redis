@@ -734,9 +734,12 @@ pub fn run(cmd: &Command, store: &mut dyn Store) -> Option<Response> {
         Command::LRem { key, count, value } => {
             store.lrem(key, *count, value).map(Response::Integer)
         }
-        Command::LTrim { key, start, stop } => {
-            store.ltrim(key, *start, *stop).map(|()| Response::Ok)
-        }
+        // `server.dirty += ltrim + rtrim`: the elements removed.
+        Command::LTrim { key, start, stop } => store.llen(key).and_then(|before| {
+            store.ltrim(key, *start, *stop)?;
+            crate::dirty::add((before - store.llen(key)?).max(0) as u64);
+            Ok(Response::Ok)
+        }),
         Command::LMove {
             src,
             dst,

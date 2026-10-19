@@ -3468,6 +3468,21 @@ impl Command {
     }
 
     /// Run a sub-command on the backend that serves `db`.
+    /// An admin command reaching the dispatcher, from inside `EXEC` or a
+    /// script, run as the connection would run it.
+    fn admin(client: &mut SpiClient<'_>, db: u8, a: &crate::admin::Admin) -> Response {
+        let origin = crate::tracking::origin();
+        let handle = crate::server::ClientHandle::detached(origin);
+        let mut conn = crate::admin::Conn {
+            client: &handle,
+            db,
+            reply: crate::admin::ReplyMode::On,
+            session: crate::acl::session_of(origin),
+            may_wait: false,
+        };
+        crate::admin::execute(a, &mut conn, &mut |cmd, d| Self::route(client, d, cmd))
+    }
+
     fn route(client: &mut SpiClient<'_>, db: u8, cmd: Command) -> Response {
         if uses_shared_memory(db) && !cmd.needs_sql() {
             cmd.execute_mem(db)
@@ -3629,23 +3644,14 @@ impl Command {
             // Answered on the connection's thread, never dispatched.
             // An admin command reaches the dispatcher only from inside EXEC:
             // run it here, as a script's admin sub-commands are run.
+            // Snapshot first, then answer as any admin command. Not through
+            // `execute_inner` again: with nothing to snapshot `saved` stays
+            // false, and this arm would match itself until the stack ran out.
             Command::Admin(a) if a.name == "SAVE" && !a.saved => {
                 let saved = crate::storage::save_now(client);
-                let a = crate::admin::Admin { saved, ..a.clone() };
-                Command::Admin(a).execute_inner(client, db)
+                Self::admin(client, db, &crate::admin::Admin { saved, ..a.clone() })
             }
-            Command::Admin(a) => {
-                let origin = crate::tracking::origin();
-                let handle = crate::server::ClientHandle::detached(origin);
-                let mut conn = crate::admin::Conn {
-                    client: &handle,
-                    db,
-                    reply: crate::admin::ReplyMode::On,
-                    session: crate::acl::session_of(origin),
-                    may_wait: false,
-                };
-                crate::admin::execute(a, &mut conn, &mut |cmd, d| Self::route(client, d, cmd))
-            }
+            Command::Admin(a) => Self::admin(client, db, a),
             Command::Monitor => Response::Error("ERR connection command dispatched".to_string()),
             // Pub/sub reaches the dispatcher only from inside EXEC.
             Command::Publish { channel, message } => {

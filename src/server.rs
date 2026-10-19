@@ -286,9 +286,10 @@ pub struct ServerCtl {
     enc_limits_set: AtomicU32,
     /// Clients with tracking on: when 0, no write looks at the table.
     pub tracking_clients: AtomicU32,
-    /// Redis's `server.dirty`, and what it was at the last save
-    /// (`dirty.rs`).
-    dirty: AtomicU64,
+    /// Redis's `server.dirty` (`dirty.rs`), in shards so that workers
+    /// counting their writes do not share a cache line, and what the shards
+    /// summed to at the last save.
+    dirty: [DirtyShard; DIRTY_SHARDS],
     dirty_at_save: AtomicU64,
     /// Each database's storage policy and memory slot (`storage.rs`).
     pub storage: crate::storage::PolicyTable,
@@ -1547,26 +1548,41 @@ impl ClientHandle {
     }
 }
 
+const DIRTY_SHARDS: usize = 64;
+
+#[repr(C, align(64))]
+pub struct DirtyShard(AtomicU64);
+
+/// Each worker's commands run on its main thread, one per process: the
+/// process picks the shard.
+fn dirty_shard() -> usize {
+    std::process::id() as usize % DIRTY_SHARDS
+}
+
 pub fn add_dirty(n: u64) {
     if let Some(c) = ctl() {
-        c.dirty.fetch_add(n, Ordering::Relaxed);
+        c.dirty[dirty_shard()].0.fetch_add(n, Ordering::Relaxed);
     }
+}
+
+fn dirty_total(c: &ServerCtl) -> u64 {
+    c.dirty
+        .iter()
+        .map(|s| s.0.load(Ordering::Relaxed))
+        .fold(0, u64::wrapping_add)
 }
 
 /// INFO's `rdb_changes_since_last_save`.
 pub fn changes_since_save() -> u64 {
     ctl().map_or(0, |c| {
-        c.dirty
-            .load(Ordering::Relaxed)
-            .saturating_sub(c.dirty_at_save.load(Ordering::Relaxed))
+        dirty_total(c).wrapping_sub(c.dirty_at_save.load(Ordering::Relaxed))
     })
 }
 
 /// A save happened: the count starts again.
 pub fn mark_saved() {
     if let Some(c) = ctl() {
-        c.dirty_at_save
-            .store(c.dirty.load(Ordering::Relaxed), Ordering::Relaxed);
+        c.dirty_at_save.store(dirty_total(c), Ordering::Relaxed);
     }
 }
 

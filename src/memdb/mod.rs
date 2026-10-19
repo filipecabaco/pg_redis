@@ -77,14 +77,6 @@ pub fn parse_stored_int(bytes: &[u8]) -> Option<i64> {
     s.parse().ok()
 }
 
-pub fn parse_stored_float(bytes: &[u8]) -> Option<f64> {
-    std::str::from_utf8(bytes).ok()?.parse().ok()
-}
-
-pub fn format_float(f: f64) -> String {
-    format!("{f}")
-}
-
 /// The inclusive index range a range command selects, or `None` for none.
 /// Negative indexes count back from the end.
 pub fn range_bounds(start: i64, stop: i64, len: usize) -> Option<(usize, usize)> {

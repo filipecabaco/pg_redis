@@ -88,8 +88,10 @@ services:
 
   redis:
     # The reference for parity: the Redis version pg_redis matches, pinned
-    # so a new 7.x tag cannot move it.
-    image: redis:7.2-alpine
+    # so a new 7.x tag cannot move it. The Debian image, on glibc, as most
+    # Redis runs: Alpine's musl strtold rounds some out-of-range floats
+    # differently.
+    image: redis:7.2
     command: ["redis-server", "--requirepass", "testpass"]
     ports:
       - "6380:6379"

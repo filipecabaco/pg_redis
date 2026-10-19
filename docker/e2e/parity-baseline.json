@@ -1,26 +1,6 @@
 [
 	{
 		"half": "cache",
-		"case": "how a float counter is printed back",
-		"at": 3,
-		"cmd": "INCRBYFLOAT n2 1.000000000000000005",
-		"kind": "value",
-		"pg_redis": "$1\\n4\\n",
-		"redis": "$19\\n4.00000000000000001\\n",
-		"note": "x86 Redis: long double is 80-bit there, so it keeps digits an f64 drops. On arm64 Redis prints 4 too."
-	},
-	{
-		"half": "durable",
-		"case": "how a float counter is printed back",
-		"at": 3,
-		"cmd": "INCRBYFLOAT n2 1.000000000000000005",
-		"kind": "value",
-		"pg_redis": "$1\\n4\\n",
-		"redis": "$19\\n4.00000000000000001\\n",
-		"note": "x86 Redis: long double is 80-bit there, so it keeps digits an f64 drops. On arm64 Redis prints 4 too."
-	},
-	{
-		"half": "cache",
 		"case": "GEO",
 		"at": 20,
 		"cmd": "ZRANGE dst 0 -1 WITHSCORES",

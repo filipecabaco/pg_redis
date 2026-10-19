@@ -677,7 +677,10 @@ pub enum Command {
     },
     IncrByFloat {
         key: Vec<u8>,
-        delta: f64,
+        /// `None` when the increment does not parse. Redis checks the key's
+        /// type and the stored value before the increment, so the refusal
+        /// waits until the command runs.
+        delta: Option<crate::longdouble::LongDouble>,
     },
     Append {
         key: Vec<u8>,
@@ -725,7 +728,7 @@ pub enum Command {
     HIncrByFloat {
         key: Vec<u8>,
         field: Vec<u8>,
-        delta: f64,
+        delta: crate::longdouble::LongDouble,
     },
     RenameNx {
         key: Vec<u8>,
@@ -1647,13 +1650,7 @@ impl Command {
             }),
             "INCRBYFLOAT" => Ok(Command::IncrByFloat {
                 key: bytes_arg(args, 0, "INCRBYFLOAT")?,
-                // NaN is refused as an argument; an infinite increment parses
-                // and fails on the result, which is where Redis draws the line.
-                delta: str_arg(args, 1, "INCRBYFLOAT")?
-                    .parse::<f64>()
-                    .ok()
-                    .filter(|d| !d.is_nan())
-                    .ok_or_else(|| NOT_A_FLOAT.to_string())?,
+                delta: crate::longdouble::LongDouble::parse(&bytes_arg(args, 1, "INCRBYFLOAT")?),
             }),
             "APPEND" => Ok(Command::Append {
                 key: bytes_arg(args, 0, "APPEND")?,
@@ -1761,15 +1758,14 @@ impl Command {
             "HINCRBYFLOAT" => {
                 let key = bytes_arg(args, 0, "HINCRBYFLOAT")?;
                 let field = bytes_arg(args, 1, "HINCRBYFLOAT")?;
-                let delta: f64 = str_arg(args, 2, "HINCRBYFLOAT")?
-                    .parse()
-                    .map_err(|_| NOT_A_FLOAT.to_string())?;
-                // A NaN never parses. Unlike `INCRBYFLOAT`, which only checks
-                // the result, Redis refuses an infinite increment up front.
-                if delta.is_nan() {
-                    return Err(NOT_A_FLOAT.to_string());
-                }
-                if delta.is_infinite() {
+                // Redis checks the increment before anything else, and
+                // refuses an infinite one up front: unlike `INCRBYFLOAT`,
+                // which only checks the result.
+                let delta = crate::longdouble::LongDouble::parse(
+                    bytes_arg(args, 2, "HINCRBYFLOAT")?.as_slice(),
+                )
+                .ok_or_else(|| NOT_A_FLOAT.to_string())?;
+                if !delta.is_finite() {
                     return Err("ERR value is NaN or Infinity".to_string());
                 }
                 Ok(Command::HIncrByFloat { key, field, delta })
@@ -6058,7 +6054,8 @@ mod tests {
         &["DECR", "counter"] => Command::Decr { key } if key == b"counter",
         &["INCRBY", "counter", "5"] => Command::IncrBy { key, delta } if key == b"counter" && delta == 5,
         &["DECRBY", "counter", "3"] => Command::DecrBy { key, delta } if key == b"counter" && delta == 3,
-        &["INCRBYFLOAT", "f", "1.5"] => Command::IncrByFloat { key, delta } if key == b"f" && delta == 1.5,
+        &["INCRBYFLOAT", "f", "1.5"] => Command::IncrByFloat { key, delta } if key == b"f" && delta == crate::longdouble::LongDouble::parse(b"1.5"),
+        &["INCRBYFLOAT", "f", "notafloat"] => Command::IncrByFloat { delta: None, .. },
         &["APPEND", "k", "suffix"] => Command::Append { key, value } if key == b"k" && value == b"suffix",
         &["STRLEN", "k"] => Command::Strlen { key } if key == b"k",
         &["GETDEL", "k"] => Command::GetDel { key } if key == b"k",
@@ -6276,7 +6273,6 @@ mod tests {
             // String increment commands
             &["INCR"],
             &["INCRBY", "counter", "abc"],
-            &["INCRBYFLOAT", "f", "notafloat"],
             &["MSETNX", "k1"],
             // Key inspection commands
             &["UNLINK"],

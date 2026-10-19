@@ -13,6 +13,7 @@ pub(crate) mod cursor;
 mod fuzz;
 pub(crate) mod geo;
 pub(crate) mod hll;
+pub(crate) mod longdouble;
 pub(crate) mod memdb;
 pub(crate) mod notify;
 pub(crate) mod pg;

@@ -629,7 +629,60 @@
   display: grid;
   gap: 0.9rem;
   align-content: start;
+}
+
+/* Tour, Apps, Recipes: each tab's steps count from 1 */
+.pr-tabs {
+  display: flex;
+  gap: 0.25rem;
+  padding: 0.2rem;
+  border: 1px solid var(--pr-line);
+  border-radius: 0.5rem;
+}
+
+.pr-tab {
+  all: unset;
+  box-sizing: border-box;
+  flex: 1;
+  cursor: pointer;
+  text-align: center;
+  padding: 0.35rem 0.5rem;
+  border-radius: 0.35rem;
+  font-size: 0.62rem;
+  font-weight: 600;
+  color: var(--pr-muted);
+  transition: background-color 120ms, color 120ms;
+}
+
+.pr-tab:hover {
+  color: var(--md-default-fg-color);
+}
+
+.pr-tab:focus-visible {
+  outline: 2px solid var(--pr-green);
+  outline-offset: 1px;
+}
+
+.pr-tab[aria-selected="true"] {
+  background: color-mix(in srgb, var(--pr-green) 14%, transparent);
+  color: var(--md-default-fg-color);
+}
+
+.pr-panel {
+  display: grid;
+  gap: 0.9rem;
+  align-content: start;
   counter-reset: step;
+}
+
+.pr-panel[hidden] {
+  display: none;
+}
+
+.md-typeset .pr-panel__note {
+  margin: 0;
+  font-size: 0.6rem;
+  color: var(--pr-muted);
 }
 
 .pr-phase {
@@ -727,6 +780,11 @@
 .pr-step__pane--sql {
   color: #e8f0ff;
   background: #336791;
+}
+
+.pr-step__pane--app {
+  color: #2b1d05;
+  background: #e3b341;
 }
 
 .md-typeset .pr-step code {
@@ -917,5 +975,102 @@
 
 @media (prefers-reduced-motion: reduce) {
   .pr-demo__poster i { animation: none; }
-  .pr-btn, .pr-step { transition: none; }
+  .pr-btn, .pr-step, .pr-tab { transition: none; }
+}
+
+/* ── Examples page (overrides/examples.html) ──────────────────────────── */
+
+/* The page's text beside the machine, which stays in view while the text
+   scrolls, so a block's Run and its output are seen together. */
+.pr-ex {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr);
+  gap: 1.6rem;
+  align-items: start;
+}
+
+.pr-ex__machine {
+  position: sticky;
+  top: 3.4rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  height: calc(100vh - 4.4rem);
+}
+
+.pr-ex__machine .pr-demo__stage {
+  flex: 1;
+  min-height: 0;
+}
+
+.pr-ex__machine .pr-demo__screen {
+  min-height: 0;
+}
+
+.md-typeset .pr-ex__keys {
+  margin: 0;
+  font-size: 0.6rem;
+  color: var(--pr-muted);
+}
+
+.md-typeset .pr-ex__keys kbd {
+  font-size: 0.55rem;
+}
+
+/* Run: on the code block it types, opposite the copy button */
+.md-typeset .pr-runnable {
+  position: relative;
+}
+
+.md-typeset .pr-run {
+  position: absolute;
+  top: 0.4rem;
+  right: 2.4rem;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.2rem 0.55rem;
+  border: 1px solid var(--pr-green-lo);
+  border-radius: 0.3rem;
+  background: var(--md-code-bg-color);
+  color: var(--pr-green);
+  font: 600 0.6rem/1 var(--md-text-font-family, Inter, sans-serif);
+  cursor: pointer;
+  transition: background-color 120ms, color 120ms;
+}
+
+.md-typeset .pr-run svg {
+  width: 0.6rem;
+  height: 0.6rem;
+  fill: currentColor;
+}
+
+.md-typeset .pr-run:hover,
+.md-typeset .pr-run:focus-visible {
+  background: var(--pr-green);
+  color: #0d2b1d;
+}
+
+.md-typeset .pr-run.is-done {
+  border-color: var(--pr-line);
+  color: var(--pr-muted);
+}
+
+/* Narrower than text and machine side by side: the machine first, a
+   screen's height, and Run brings it back into view. */
+@media (max-width: 76.2344em) {
+  .pr-ex {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .pr-ex__machine {
+    position: static;
+    order: -1;
+    height: clamp(22rem, 62vh, 32rem);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .md-typeset .pr-run { transition: none; }
 }

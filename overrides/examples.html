@@ -1,0 +1,37 @@
+{% extends "main.html" %}
+
+{#- The examples page: its markdown beside the in-browser machine, which stays
+    in view as the page scrolls. Every redis, sql and console block in the
+    page gets a Run button that types it into the machine (javascripts/demo.js). -#}
+
+{% block content %}
+<div class="pr-ex pr-demo" data-demo="{{ 'demo/' | url }}" data-runnable data-warm="system/warm-examples.pack" data-state="idle">
+  <div class="pr-ex__text">
+    {{ super() }}
+  </div>
+  <aside class="pr-ex__machine" aria-label="Live terminal">
+    <div class="pr-demo__stage" tabindex="0" aria-label="Live terminal: redis-cli, psql and a shell">
+      <div class="pr-term__bar">
+        <span></span><span></span><span></span>
+        <em class="pr-demo__status" role="status">not started</em>
+      </div>
+      <div class="pr-demo__screen">
+        <div class="pr-demo__poster" aria-hidden="true">
+          <div><b>redis-cli :6379</b><code>127.0.0.1:6379&gt; <i></i></code></div>
+          <div><b>psql :5432</b><code>sql=#</code></div>
+        </div>
+        <button type="button" class="pr-btn pr-btn--primary pr-demo__boot">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11l9-5.5z"/></svg>
+          Boot Postgres here
+        </button>
+        <p class="pr-demo__note">It downloads about 40 MB once, then runs offline, sandboxed in the tab. Node and the showcases load the first time one runs.</p>
+      </div>
+    </div>
+    <p class="pr-ex__keys">
+      <b>Run</b> types a block into the machine. <kbd>alt</kbd>+<kbd>1</kbd> redis-cli,
+      <kbd>alt</kbd>+<kbd>2</kbd> psql, <kbd>alt</kbd>+<kbd>3</kbd> the shell in <code>/examples</code>.
+    </p>
+  </aside>
+</div>
+<script src="{{ 'javascripts/demo.js' | url }}" defer></script>
+{% endblock %}

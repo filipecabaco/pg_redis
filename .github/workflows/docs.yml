@@ -15,6 +15,7 @@ on:
       - "overrides/**"
       - "mkdocs.yml"
       - "docker/demo/**"
+      - "examples/**"
       - "Dockerfile"
       - "src/**"
       - "sql/**"
@@ -62,8 +63,21 @@ jobs:
       - name: Build the extension image (arm64)
         run: docker build -t pg_redis:alpine-arm64 .
 
+      # The demo carries the showcases in examples/, from their own image
       - name: Build the in-browser demo
-        run: snowglobe build docker/demo --out docs/demo
+        run: |
+          docker build -t pg_redis:examples-arm64 examples
+          snowglobe build docker/demo --out docs/demo
+
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        with:
+          otp-version: "28"
+          elixir-version: "1.18"
+
+      # Runs every block of the examples page in the built machine and packs the files it reads
+      # that the home page's warm pack does not hold, for the examples page to preload
+      - name: Warm the examples page
+        run: elixir docker/demo/warm.exs
 
       - name: Build the site
         run: mkdocs build --strict
@@ -72,8 +86,10 @@ jobs:
         with:
           path: site
 
+  # Only main publishes; a run dispatched on a branch builds and stops here.
   deploy:
     needs: build
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       pages: write

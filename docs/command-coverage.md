@@ -109,7 +109,7 @@ The limits that apply only to databases in memory are described once, in
 | `OBJECT` | `ENCODING` reports the encoding Redis would use. `IDLETIME` and `FREQ` read Redis's 24-bit access field, with its errors under the wrong policy; on a `logged` database from a lossy table in shared memory. `REFCOUNT` is 2147483647 for a shared small integer, else 1 |
 | `MEMORY` | `USAGE` only, an estimate from the key's serialised size; `SAMPLES` accepted and ignored |
 | `DBSIZE` | Counts keys of every type |
-| `FLUSHDB` | ASYNC and SYNC accepted and ignored |
+| `FLUSHDB` | Runs immediately either way; `ASYNC` counts its keys in `lazyfreed_objects`, as Redis does |
 | `FLUSHALL` | The same, over all sixteen databases, the durable half included |
 | `MOVE` | Across the storage halves too; the TTL moves with the key |
 | `MODULE` | As a Redis with no modules loaded: `LIST` is empty, `LOAD` and `LOADEX` fail as a failed load does |

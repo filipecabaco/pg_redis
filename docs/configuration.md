@@ -20,8 +20,11 @@
 ## When a change takes effect
 
 `postmaster` settings change only at server start: `redis.port`, `redis.listen_address`,
-`redis.database`, `redis.workers` and `redis.maxmemory`. The listener is bound once, and the
-shared memory and the worker pool are sized when the server starts.
+`redis.database`, `redis.workers` and `redis.maxmemory`. The shared memory and the worker
+pool are sized when the server starts. As in Redis, `CONFIG SET port` moves the listener
+while the server runs, after checking the new port is free (`port 0` stops listening), and
+`CONFIG SET maxmemory` lowers or raises the limit up to `redis.maxmemory`. Neither outlives
+a restart, which binds `redis.port` again.
 
 Every other setting takes effect on a reload. Each worker reads the configuration again on
 `pg_reload_conf()` (or `SIGHUP`), as a backend does. A new `redis.password` becomes the

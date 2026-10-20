@@ -446,14 +446,17 @@ keyspace notifications or tracking want them.
 
 ### The limit and eviction
 
-Before every command on a memory database, as Redis's `performEvictions`
-runs before every command, `evict::perform` compares the arena's use with
-the limit. If use is under the limit, the command runs and may overshoot
-into the headroom. If it is over, keys are evicted under
-`redis.maxmemory_policy` (or `CONFIG SET maxmemory-policy`) until use is
-under the limit again. A write that could grow memory (Redis's `denyoom`) is
-refused with `OOM command not allowed when used memory > 'maxmemory'` when
-the policy finds nothing more it may evict; reads and removals still run.
+Before every command, as Redis's `performEvictions` runs before every
+command, `evict::perform` compares the memory in use (the arena and the
+shared heap) with the limit. If use is under the limit, the command runs and
+may overshoot into the headroom. If it is over, keys of the memory databases
+are evicted under `redis.maxmemory_policy` (or `CONFIG SET
+maxmemory-policy`) until use is under the limit again. A write that could
+grow memory (Redis's `denyoom`) is refused with `OOM command not allowed
+when used memory > 'maxmemory'` when the policy finds nothing more it may
+evict, on a `logged` database too, as the limit is the server's; reads and
+removals still run. Commands the connection threads answer themselves,
+`INFO` and `CONFIG` among them, ask the main thread for the round first.
 
 | `redis.maxmemory_policy` | Evicts |
 |---|---|

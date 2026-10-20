@@ -35,13 +35,14 @@
 | `RENAMENX key newkey` | The same, but returns `0` and leaves an occupied `newkey` in place |
 | `COPY src dst [DB n] [REPLACE]` | Duplicate a key of any type; see below |
 | `DUMP key` / <code>RESTORE key ttl payload [REPLACE&#124;ABSTTL]</code> | Redis's serialisation format, interchangeable with a real 7.2; see below |
-| `OBJECT ENCODING key` | Redis's name for the representation; every other subcommand answers nil. See below |
+| `OBJECT ENCODING key` | Redis's name for the representation; `FREQ`, `IDLETIME`, `REFCOUNT` and `HELP` as in Redis. See below |
 | <code>FLUSHDB [ASYNC&#124;SYNC]</code> | Empty the current database |
 | <code>FLUSHALL [ASYNC&#124;SYNC]</code> | Empty **all sixteen**, the durable half included; see below |
 
-Bits are numbered from the most significant of byte 0, as in Redis. `ASYNC` and
-`SYNC` are accepted and ignored. The flush always runs immediately, so neither
-flag changes anything.
+Bits are numbered from the most significant of byte 0, as in Redis. A flush always
+runs immediately; `ASYNC` (or `lazyfree-lazy-user-flush`) only decides whether its
+keys are counted in `INFO memory`'s `lazyfreed_objects`, as Redis counts what it
+frees in the background.
 
 > **`FLUSHALL` destroys the durable half.** Databases with the `logged` policy
 > (8–15 by default) are WAL-backed and survive a restart. The Redis port bypasses PostgreSQL authentication, so any

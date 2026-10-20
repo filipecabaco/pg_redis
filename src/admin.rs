@@ -742,7 +742,7 @@ fn info_section(section: &str, conn: &Conn, data: &mut Data) -> String {
                 "mem_not_counted_for_evict:0".into(),
                 "mem_allocator:postgresql".into(),
                 "lazyfree_pending_objects:0".into(),
-                "lazyfreed_objects:0".into(),
+                format!("lazyfreed_objects:{}", stat(|c| &c.lazyfreed_objects)),
             ]);
         }
         "persistence" => {

@@ -226,6 +226,8 @@ pub struct ServerCtl {
     pub keyspace_hits: AtomicU64,
     pub keyspace_misses: AtomicU64,
     pub expired_keys: AtomicU64,
+    /// INFO's `lazyfreed_objects` (`lazyfree.rs`).
+    pub lazyfreed_objects: AtomicU64,
     /// INFO's `evicted_keys`.
     pub evicted_keys: AtomicU64,
     /// When the arena went over the limit and stayed there (unix ms, 0 when
@@ -832,6 +834,7 @@ pub fn reset_stats() {
         &ctl.keyspace_hits,
         &ctl.keyspace_misses,
         &ctl.expired_keys,
+        &ctl.lazyfreed_objects,
         &ctl.evicted_keys,
         &ctl.eviction_exceeded_total,
         &ctl.net_input,
@@ -1420,6 +1423,13 @@ pub fn count_expired(n: u64) {
         && let Some(ctl) = ctl()
     {
         ctl.expired_keys.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// Values Redis would have freed in the background (`lazyfree.rs`).
+pub fn count_lazyfreed(n: u64) {
+    if let Some(ctl) = ctl() {
+        ctl.lazyfreed_objects.fetch_add(n, Ordering::Relaxed);
     }
 }
 

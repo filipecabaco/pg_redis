@@ -544,6 +544,28 @@ pub fn list_encoding<'a>(items: impl IntoIterator<Item = &'a [u8]>, l: &Limits) 
     if fits { "listpack" } else { "quicklist" }
 }
 
+/// How many quicklist nodes the elements fill, pushed in order: a node takes
+/// elements while it stays within the limit `list_encoding` applies.
+pub fn list_nodes<'a>(items: impl IntoIterator<Item = &'a [u8]>, l: &Limits) -> usize {
+    let (count_limit, byte_limit) = if l.list_size >= 0 {
+        (l.list_size.max(1) as usize, LIST_SAFETY_LIMIT)
+    } else {
+        let level = (l.list_size.unsigned_abs() - 1).min(LIST_SIZE_LEVELS.len() as u64 - 1);
+        (usize::MAX, LIST_SIZE_LEVELS[level as usize])
+    };
+    let (mut nodes, mut bytes, mut count) = (0, 0, 0);
+    for e in items {
+        let len = crate::rdb::listpack_entry_len(e);
+        if nodes == 0 || count == count_limit || bytes + len > byte_limit {
+            nodes += 1;
+            (bytes, count) = (crate::rdb::LISTPACK_OVERHEAD, 0);
+        }
+        bytes += len;
+        count += 1;
+    }
+    nodes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

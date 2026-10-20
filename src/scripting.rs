@@ -815,7 +815,7 @@ impl Sandbox {
             "as_error",
             lua.create_function(|lua, v: Lv| match &v {
                 Lv::Error(e) => match redis_error(e) {
-                    Some(msg) => Ok(err_table(lua, &msg)),
+                    Some(r) => Ok(r.table(lua)),
                     None => Ok(v),
                 },
                 _ => Ok(v),
@@ -935,9 +935,10 @@ impl Sandbox {
             let call =
                 scope.create_function(|lua, args: MultiValue| {
                     match dispatch_from_script(lua, args, &mut ctx.borrow_mut()) {
-                        (true, Lv::Table(t)) => Err(mlua::Error::external(RedisError(
-                            t.raw_get::<Option<String>>("err")?.unwrap_or_default(),
-                        ))),
+                        (true, Lv::Table(t)) => Err(mlua::Error::external(RedisError {
+                            msg: t.raw_get::<Option<String>>("err")?.unwrap_or_default(),
+                            counted: counted(&t),
+                        })),
                         (_, v) => Ok(v),
                     }
                 })?;
@@ -953,6 +954,9 @@ impl Sandbox {
         });
         match outcome {
             Ok((true, v)) => Response::Value(lua_to_value(v, 0)),
+            Ok((false, Lv::Table(t))) if counted(&t) => {
+                Response::Value(Value::CountedError(script_error(&t, funcname)))
+            }
             Ok((false, Lv::Table(t))) => Response::Value(Value::Error(script_error(&t, funcname))),
             Ok((false, other)) => Response::Error(format!(
                 "ERR Error running script {funcname}, {:.100}",
@@ -965,23 +969,48 @@ impl Sandbox {
 
 /// A failed `redis.call`, carried through Lua as an mlua error and turned
 /// back into Redis's `{err=...}` table by the error handler and `pcall`.
-#[derive(Debug)]
-struct RedisError(String);
+#[derive(Debug, Clone)]
+struct RedisError {
+    msg: String,
+    /// Already counted in `errorstats` where the command failed.
+    counted: bool,
+}
+
+impl RedisError {
+    fn table(&self, lua: &Lua) -> Lv {
+        let t = err_table(lua, &self.msg);
+        if self.counted
+            && let Lv::Table(t) = &t
+        {
+            let _ = t.raw_set(COUNTED, true);
+        }
+        t
+    }
+}
 
 impl std::fmt::Display for RedisError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.msg)
     }
 }
 
 impl std::error::Error for RedisError {}
 
-fn redis_error(e: &mlua::Error) -> Option<String> {
+fn redis_error(e: &mlua::Error) -> Option<RedisError> {
     match e {
         mlua::Error::CallbackError { cause, .. } => redis_error(cause),
-        mlua::Error::ExternalError(x) => x.downcast_ref::<RedisError>().map(|r| r.0.clone()),
+        mlua::Error::ExternalError(x) => x.downcast_ref::<RedisError>().cloned(),
         _ => None,
     }
+}
+
+/// The field Redis sets on the error table of a command a script called,
+/// whose error `call()` has already counted: a script reply carrying it is
+/// not counted again.
+const COUNTED: &str = "ignore_error_stats_update";
+
+fn counted(t: &Table) -> bool {
+    matches!(t.raw_get::<Lv>(COUNTED), Ok(Lv::Boolean(true)))
 }
 
 /// `luaCallFunction`'s error reply: the message, then where it was raised.
@@ -1025,11 +1054,10 @@ fn error_handler(lua: &Lua, err: Lv) -> mlua::Result<Table> {
             t
         }
         (None, Lv::Table(t)) => t,
-        (None, Lv::Error(e)) if redis_error(&e).is_some() => {
-            let t = lua.create_table()?;
-            t.raw_set("err", redis_error(&e))?;
-            t
-        }
+        (None, Lv::Error(e)) if let Some(r) = redis_error(&e) => match r.table(lua) {
+            Lv::Table(t) => t,
+            _ => lua.create_table()?,
+        },
         (None, other) => {
             let t = lua.create_table()?;
             t.raw_set("err", format!("ERR {}", describe(&other)))?;
@@ -1273,6 +1301,11 @@ fn value_to_lua(lua: &Lua, v: Value) -> mlua::Result<Lv> {
             t.raw_set("err", command_error_text(&e))?;
             Lv::Table(t)
         }
+        Value::CountedError(e) => RedisError {
+            msg: command_error_text(&e),
+            counted: true,
+        }
+        .table(lua),
         Value::Array(items) => {
             let t = lua.create_table_with_capacity(items.len(), 0)?;
             for (i, item) in items.into_iter().enumerate() {
@@ -1353,7 +1386,11 @@ fn lua_to_value(v: Lv, depth: usize) -> Value {
         Lv::Number(n) => Value::Int(n as i64),
         Lv::Table(t) => {
             if let Ok(Lv::String(e)) = t.raw_get::<Lv>("err") {
-                return Value::Error(e.to_string_lossy());
+                return if counted(&t) {
+                    Value::CountedError(e.to_string_lossy())
+                } else {
+                    Value::Error(e.to_string_lossy())
+                };
             }
             if let Ok(Lv::String(ok)) = t.raw_get::<Lv>("ok") {
                 return Value::Simple(ok.to_string_lossy().replace(['\r', '\n'], " "));
@@ -1461,21 +1498,29 @@ fn dispatch_from_script(lua: &Lua, args: MultiValue, ctx: &mut &mut CallCtx<'_>)
         Err(e) => return (true, err_table(lua, &format!("ERR {e}"))),
     };
     let started = std::time::Instant::now();
-    let ran = run_from_script(&argv, ctx);
-    // Counted as Redis's `call()` counts a script's commands: in
-    // `commandstats`, and an error reply in `errorstats` though `pcall`
-    // catches it.
-    if let Ok(r) = &ran
-        && let Some(i) = crate::worker::stat_index(&crate::worker::stat_name(&argv))
-    {
-        let failed = matches!(r, Response::Error(_));
-        crate::server::count_command(i, started.elapsed().as_micros() as u64, failed, false);
-        if let Response::Error(e) = r {
-            crate::server::count_error(crate::resp::error_code(e));
+    // Counted as Redis's `scriptCall` and `call()` count a script's
+    // commands: a refusal (`scriptCall`'s checks, OOM, ACL) as a rejected
+    // call, a command's error as a failed one, and either in `errorstats`
+    // here, once, whether `pcall` catches it or the script returns it.
+    let ran = match run_from_script(&argv, ctx) {
+        Err(e) => Err((format!("ERR {e}"), true)),
+        Ok(Response::Error(e)) => {
+            let e = command_error_text(&e);
+            let rejected = crate::resp::is_rejection(&e);
+            Err((e, rejected))
         }
+        Ok(r) => Ok(r),
+    };
+    if let Some(i) = crate::worker::stat_index(&crate::worker::stat_name(&argv)) {
+        let usec = started.elapsed().as_micros() as u64;
+        let rejected = ran.as_ref().is_err_and(|e| e.1);
+        crate::server::count_command(i, usec, ran.is_err(), rejected);
     }
     match ran {
-        Ok(Response::Error(e)) => (true, err_table(lua, &command_error_text(&e))),
+        Err((msg, _)) => {
+            crate::server::count_error(crate::resp::error_code(&msg));
+            (true, RedisError { msg, counted: true }.table(lua))
+        }
         Ok(r) => match value_to_lua(lua, {
             // After `redis.setresp(3)` a script sees replies as a RESP3
             // client would.
@@ -1489,12 +1534,9 @@ fn dispatch_from_script(lua: &Lua, args: MultiValue, ctx: &mut &mut CallCtx<'_>)
             Ok(v) => (false, v),
             Err(e) => (true, err_table(lua, &format!("ERR {e}"))),
         },
-        Err(e) => (true, err_table(lua, &format!("ERR {e}"))),
     }
 }
 
-/// `scriptCall`: the checks a command passes before a script may run it,
-/// then the command. `Err` is a scripting error, `Ok` the command's reply.
 /// Whether the command running now was called from a script.
 pub(crate) fn in_script_call() -> bool {
     IN_CALL.get()
@@ -1530,6 +1572,8 @@ impl Drop for InCall {
     }
 }
 
+/// `scriptCall`: the checks a command passes before a script may run it,
+/// then the command. `Err` is a scripting error, `Ok` the command's reply.
 fn run_from_script(argv: &[Vec<u8>], ctx: &mut CallCtx<'_>) -> Result<Response, String> {
     let _in_call = InCall(IN_CALL.replace(true));
     // Redis's own table, not just what pg_redis serves: a command Redis has
@@ -1632,8 +1676,8 @@ fn run_from_script(argv: &[Vec<u8>], ctx: &mut CallCtx<'_>) -> Result<Response, 
         }
         cmd => {
             match cmd {
-                Command::FlushDb => crate::server::bump_flush_epoch(db),
-                Command::FlushAll => {
+                Command::FlushDb { .. } => crate::server::bump_flush_epoch(db),
+                Command::FlushAll { .. } => {
                     (0..crate::commands::NUM_DBS as u8).for_each(crate::server::bump_flush_epoch)
                 }
                 _ => {}
@@ -1656,7 +1700,9 @@ fn run_from_script(argv: &[Vec<u8>], ctx: &mut CallCtx<'_>) -> Result<Response, 
             let before = notified
                 .as_ref()
                 .and_then(|c| crate::notify::before(c, db, &mut exists));
+            let lazy = crate::lazyfree::before(&cmd, db, &mut |d, c| host.exec(d, c));
             let r = host.exec(db, cmd);
+            crate::lazyfree::after(lazy, &r);
             crate::access::after_command(
                 db,
                 argv,
@@ -2759,7 +2805,9 @@ mod tests {
 
     fn error_of(r: Response) -> String {
         match r {
-            Response::Error(e) | Response::Value(Value::Error(e)) => e,
+            Response::Error(e)
+            | Response::Value(Value::Error(e))
+            | Response::Value(Value::CountedError(e)) => e,
             other => panic!("expected an error, got {other:?}"),
         }
     }

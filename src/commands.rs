@@ -737,10 +737,15 @@ pub enum Command {
         pattern: Vec<u8>,
     },
     DbSize,
-    /// `FLUSHDB [ASYNC|SYNC]` — empty the current database.
-    FlushDb,
+    /// `FLUSHDB [ASYNC|SYNC]` — empty the current database. `lazy` when it
+    /// runs `ASYNC`, as `lazyfree.rs` counts it; the work is the same.
+    FlushDb {
+        lazy: bool,
+    },
     /// `FLUSHALL [ASYNC|SYNC]` — empty all sixteen, the durable half included.
-    FlushAll,
+    FlushAll {
+        lazy: bool,
+    },
     SetRange {
         key: Vec<u8>,
         offset: i64,
@@ -1248,6 +1253,9 @@ pub enum Value {
     Simple(String),
     /// An error passed through as given — a script's own error reply.
     Error(String),
+    /// The same, already counted in `errorstats` where a command a script
+    /// called failed, so writing it counts nothing more.
+    CountedError(String),
     Array(Vec<Value>),
     Map(Vec<(Value, Value)>),
     /// The RESP3 types. A RESP2 client gets what Redis gives it: a double as
@@ -1751,21 +1759,24 @@ impl Command {
                 pattern: bytes_arg(args, 0, "KEYS")?,
             }),
             "DBSIZE" => Ok(Command::DbSize),
-            // ASYNC and SYNC are accepted and ignored: nothing here defers the
-            // work, so both spellings describe what already happens.
+            // Nothing here defers the work: ASYNC only decides what
+            // `lazyfreed_objects` counts. Without either, as Redis,
+            // `lazyfree-lazy-user-flush` decides.
             "FLUSHDB" | "FLUSHALL" => {
-                if let Some(mode) = args.first() {
-                    let mode = String::from_utf8_lossy(mode).to_uppercase();
-                    if mode != "ASYNC" && mode != "SYNC" {
-                        return Err("ERR syntax error".to_string());
-                    }
-                }
+                let lazy = match args.first() {
+                    None => crate::config::get_bool("lazyfree-lazy-user-flush"),
+                    Some(mode) => match String::from_utf8_lossy(mode).to_uppercase().as_str() {
+                        "ASYNC" => true,
+                        "SYNC" => false,
+                        _ => return Err("ERR syntax error".to_string()),
+                    },
+                };
                 if args.len() > 1 {
                     return Err(wrong_arity(&cmd));
                 }
                 Ok(match cmd.as_str() {
-                    "FLUSHDB" => Command::FlushDb,
-                    _ => Command::FlushAll,
+                    "FLUSHDB" => Command::FlushDb { lazy },
+                    _ => Command::FlushAll { lazy },
                 })
             }
             "UNLINK" => {
@@ -3465,7 +3476,7 @@ impl Command {
             self,
             Command::TablePublish { .. }
                 | Command::AclTable(_)
-                | Command::FlushAll
+                | Command::FlushAll { .. }
                 | Command::Copy { .. }
                 | Command::Dump { .. }
                 | Command::MemoryUsage { .. }
@@ -3621,7 +3632,7 @@ impl Command {
             | Command::DbSize
             | Command::Keyspace
             | Command::RandomKey
-            | Command::FlushDb
+            | Command::FlushDb { .. }
             | Command::ObjectEncoding { .. }
             | Command::ZsetToSkiplist { .. }
             | Command::ObjectAccess { .. }
@@ -3821,7 +3832,7 @@ impl Command {
             // Every database, the durable half included — Redis's own reach,
             // and the reason the Redis port should not be exposed past
             // loopback without a password.
-            Command::FlushAll => {
+            Command::FlushAll { .. } => {
                 // `flushAllDataAndResetRDB`: every key removed counts, and
                 // with `save` set the server then saves, which starts the
                 // count again.
@@ -3955,7 +3966,7 @@ impl Command {
             // Routed to the SQL path by `run_dispatch_batch`, which is where it
             // can reach both halves. Unreachable here, and answered rather than
             // ignored in case that routing ever changes.
-            Command::FlushAll => {
+            Command::FlushAll { .. } => {
                 crate::storage::flush_memory();
                 Response::Ok
             }
@@ -4341,8 +4352,8 @@ impl Command {
                     | Command::ExpireAt { .. }
                     | Command::PExpireAt { .. }
                     | Command::Persist { .. }
-                    | Command::FlushDb
-                    | Command::FlushAll
+                    | Command::FlushDb { .. }
+                    | Command::FlushAll { .. }
             )
     }
 

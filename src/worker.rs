@@ -34,6 +34,9 @@ enum DispatchMsg {
     /// Ahead of a command on a migrating database: its keys to move, each
     /// with its database, and the databases to drain (`storage::plan`).
     Move(Vec<(u8, Vec<u8>)>, Vec<u8>, mpsc::SyncSender<()>),
+    /// A round of eviction ahead of a command the connection thread serves,
+    /// as Redis evicts before every command.
+    Evict(mpsc::SyncSender<()>),
 }
 
 /// What a `Batch` is.
@@ -310,6 +313,10 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                     run_move(&keys, &drains);
                     tx.send(()).ok();
                 }
+                DispatchMsg::Evict(tx) => {
+                    crate::evict::perform();
+                    tx.send(()).ok();
+                }
                 DispatchMsg::FireAndForget(cmd, db) => {
                     run_held(&[(cmd, db)], &[0], true);
                 }
@@ -348,6 +355,10 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                             // Another connection's; independent of these.
                             Ok(DispatchMsg::Move(keys, drains, tx)) => {
                                 run_move(&keys, &drains);
+                                tx.send(()).ok();
+                            }
+                            Ok(DispatchMsg::Evict(tx)) => {
+                                crate::evict::perform();
                                 tx.send(()).ok();
                             }
                             Err(_) => break,
@@ -675,19 +686,26 @@ fn run_dispatch_batch(
     // fall through to SQL, where it would land in `kv_N`, a table the memory
     // half never reads.
     let on_mem = |cmd: &Command, db: u8| crate::storage::slot(db).is_some() && !cmd.needs_sql();
-    // Whether a key is there, on whichever backend serves its database — what
-    // keyspace notifications look up around a command.
-    let exists = |client: Option<&mut pgrx::spi::SpiClient<'_>>, d: u8, k: &[u8]| {
-        let probe = Command::Exists {
-            keys: vec![k.to_vec()],
-        };
-        let r = if on_mem(&probe, d) {
+    // A lookup on whichever backend serves its database: what keyspace
+    // notifications and the lazy-free count ask around a command.
+    let probe = |client: Option<&mut pgrx::spi::SpiClient<'_>>, d: u8, probe: Command| {
+        if on_mem(&probe, d) {
             probe.execute_mem(d)
         } else if let Some(client) = client {
             probe.execute(client, d)
         } else {
-            return false;
-        };
+            Response::Null
+        }
+    };
+    // Whether a key is there.
+    let exists = |client: Option<&mut pgrx::spi::SpiClient<'_>>, d: u8, k: &[u8]| {
+        let r = probe(
+            client,
+            d,
+            Command::Exists {
+                keys: vec![k.to_vec()],
+            },
+        );
         matches!(r, Response::Integer(n) if n > 0)
     };
     // With each reply, the keys the command named as written and left as
@@ -697,6 +715,7 @@ fn run_dispatch_batch(
     STEP_USEC.with_borrow_mut(Vec::clear);
     let run_as = |client: &mut pgrx::spi::SpiClient<'_>, cmd: &Command, db: u8, guarded: bool| {
         let started = Instant::now();
+        let lazy = crate::lazyfree::before(cmd, db, &mut |d, c| probe(Some(&mut *client), d, c));
         let before = crate::notify::before(cmd, db, &mut |d, k| exists(Some(&mut *client), d, k));
         let r = if on_mem(cmd, db) {
             cmd.execute_mem(db)
@@ -708,6 +727,7 @@ fn run_dispatch_batch(
         crate::notify::after(before, cmd, db, &r, &mut |d, k| {
             exists(Some(&mut *client), d, k)
         });
+        crate::lazyfree::after(lazy, &r);
         STEP_USEC.with_borrow_mut(|t| t.push(started.elapsed().as_micros() as i64));
         (r, crate::notify::take_untouched())
     };
@@ -739,10 +759,12 @@ fn run_dispatch_batch(
             .map(|((cmd, db), origin)| {
                 crate::tracking::set_origin(*origin);
                 let started = Instant::now();
+                let lazy = crate::lazyfree::before(cmd, *db, &mut |d, c| probe(None, d, c));
                 let before = crate::notify::before(cmd, *db, &mut |d, k| exists(None, d, k));
                 let r = cmd.execute_mem(*db);
                 STEP_USEC.with_borrow_mut(|t| t.push(started.elapsed().as_micros() as i64));
                 crate::notify::after(before, cmd, *db, &r, &mut |d, k| exists(None, d, k));
+                crate::lazyfree::after(lazy, &r);
                 (r, crate::notify::take_untouched())
             })
             .collect()
@@ -807,13 +829,13 @@ fn run_dispatch_batch(
                 continue;
             }
             match cmd {
-                Command::FlushDb => crate::server::bump_flush_epoch(*db),
-                Command::FlushAll => {
+                Command::FlushDb { .. } => crate::server::bump_flush_epoch(*db),
+                Command::FlushAll { .. } => {
                     (0..crate::commands::NUM_DBS as u8).for_each(crate::server::bump_flush_epoch)
                 }
                 _ => {}
             }
-            if matches!(cmd, Command::FlushDb | Command::FlushAll)
+            if matches!(cmd, Command::FlushDb { .. } | Command::FlushAll { .. })
                 && !matches!(resp, Response::Error(_))
             {
                 flushed = true;
@@ -876,7 +898,7 @@ pub(crate) fn watch_targets(cmd: &Command, db: u8) -> Option<Vec<(u8, Vec<u8>)>>
         Command::Block(op) | Command::BlockTry { op, .. } => Some(owned(op.write_targets(db))),
         // A flush breaks the WATCH on every key that existed, through the
         // flush epoch, not the per-key counters.
-        Command::FlushDb | Command::FlushAll => Some(Vec::new()),
+        Command::FlushDb { .. } | Command::FlushAll { .. } => Some(Vec::new()),
         // SWAPDB breaks the WATCH on the keys it moved itself.
         Command::Composite(crate::composite::Op::SwapDb { .. }) => Some(Vec::new()),
         // A composite names the database of each key it may write.
@@ -2017,6 +2039,15 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<DispatchMsg>, default_d
                 flush(&mut writer);
             }
             Command::Admin(a) => {
+                // Redis evicts before every command, so what INFO reports
+                // after a CONFIG SET maxmemory below what is held already
+                // counts the keys that went. Eviction runs on the main thread.
+                if crate::shm::over_limit() {
+                    let (tx, rx) = mpsc::sync_channel(1);
+                    if cmd_tx.send(DispatchMsg::Evict(tx)).is_ok() {
+                        rx.recv().ok();
+                    }
+                }
                 let mut conn = crate::admin::Conn {
                     client: &client,
                     db,
@@ -3055,6 +3086,7 @@ fn write_value(w: &mut impl std::io::Write, v: &crate::commands::Value) -> std::
         Value::Bulk(b) => write_bulk_string(w, b),
         Value::Simple(s) => write_simple_string(w, s),
         Value::Error(e) => write_error_verbatim(w, e),
+        Value::CountedError(e) => write_counted_error(w, e),
         Value::Array(items) => {
             write_array_header(w, items.len())?;
             items.iter().try_for_each(|i| write_value(w, i))
@@ -3088,6 +3120,7 @@ fn write_value3(w: &mut impl std::io::Write, v: &crate::commands::Value) -> std:
         Value::Bulk(b) => write_bulk_string(w, b),
         Value::Simple(s) => write_simple_string(w, s),
         Value::Error(e) => write_error_verbatim(w, e),
+        Value::CountedError(e) => write_counted_error(w, e),
         Value::Array(items) => {
             write_array_header(w, items.len())?;
             items.iter().try_for_each(|i| write_value3(w, i))
@@ -3951,7 +3984,7 @@ mod tests {
                             .ok();
                     }
                     DispatchMsg::FireAndForget(..) => {}
-                    DispatchMsg::Move(_, _, tx) => {
+                    DispatchMsg::Move(_, _, tx) | DispatchMsg::Evict(tx) => {
                         tx.send(()).ok();
                     }
                 }

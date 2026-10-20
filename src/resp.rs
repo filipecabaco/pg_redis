@@ -291,7 +291,7 @@ thread_local! {
 /// The refusals Redis's `processCommand` answers before calling a command:
 /// an unknown command or subcommand, the wrong arity, ACL, `OOM`, a busy
 /// script.
-fn is_rejection(msg: &str) -> bool {
+pub(crate) fn is_rejection(msg: &str) -> bool {
     [
         "ERR unknown command",
         "ERR unknown subcommand",
@@ -388,6 +388,14 @@ pub fn write_error_verbatim(w: &mut impl Write, msg: &str) -> io::Result<()> {
         .unwrap_or("ERR");
     crate::server::count_error(code);
     write!(w, "-{}\r\n", msg)
+}
+
+/// A script's error that a command it called raised and already counted
+/// (`ERR_REPLY_FLAG_NO_STATS_UPDATE`): the script still fails, but the
+/// error is not counted twice.
+pub fn write_counted_error(w: &mut impl Write, msg: &str) -> io::Result<()> {
+    REPLIED_ERROR.with(|e| e.set(true));
+    write!(w, "-{}\r\n", msg.replace(['\r', '\n'], " ").trim_end())
 }
 
 pub(crate) fn has_error_code(msg: &str) -> bool {

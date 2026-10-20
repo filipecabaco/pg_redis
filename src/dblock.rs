@@ -421,7 +421,7 @@ pub fn held() -> Option<Plan> {
 pub fn dbs_of(cmd: &Command, db: u8) -> Mask {
     use crate::composite::Op;
     match cmd {
-        Command::FlushAll => ALL,
+        Command::FlushAll { .. } => ALL,
         Command::Copy {
             db: Some(target), ..
         } => bit(db) | bit(*target),
@@ -460,7 +460,7 @@ pub fn needs_exclusive(cmd: &Command, db: u8) -> bool {
         // replaced: three calls.
         Command::Copy { .. } | Command::Restore { .. } => true,
         // Sixteen databases, one after another.
-        Command::FlushAll => true,
+        Command::FlushAll { .. } => true,
         _ => false,
     }
 }

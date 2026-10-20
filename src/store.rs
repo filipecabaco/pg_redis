@@ -342,7 +342,7 @@ pub fn run(cmd: &Command, store: &mut dyn Store) -> Option<Response> {
             .keyspace()
             .map(|(k, e)| Response::IntegerArray(vec![k, e])),
         Command::RandomKey => store.random_key().map(bulk_or_nil),
-        Command::FlushDb => store.dbsize().and_then(|n| {
+        Command::FlushDb { .. } => store.dbsize().and_then(|n| {
             store.flushdb()?;
             crate::dirty::add(n.max(0) as u64);
             Ok(Response::Ok)

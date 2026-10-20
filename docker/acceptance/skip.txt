@@ -13,3 +13,10 @@ PIPELINING stresser (also a regression for the old epoll bug)
 # cannot be killed, so it then holds the server BUSY for every unit after it.
 # Remove once scripts batch their writes.
 LATENCY of expire events are correctly collected
+
+# Holds a port open in the test client's own container and expects the server
+# to fail to listen on it, which only works when both share a host. Driven
+# from outside, the port is free where the server runs, so CONFIG SET moves
+# the server to it and every unit after this one finds nothing listening.
+# Redis driven from another host does the same.
+CONFIG SET rollback on apply error

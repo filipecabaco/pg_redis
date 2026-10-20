@@ -7,7 +7,8 @@
 //! backend — one statement, or one critical section under the database lock —
 //! so the interface is drawn at the level of what a command does to a key
 //! (`hincrby`), not of reads and writes a command would have to compose
-//! (`hget` then `hset`), which another worker could interleave.
+//! (`hget` then `hset`), which another worker could interleave: an ordinary
+//! command holds its database's server-wide lock shared (`src/dblock.rs`).
 //!
 //! `run` returns `None` for what is not a single-backend data command —
 //! streams, composites, connection and server commands — which the executors
@@ -20,7 +21,9 @@ use pgrx::spi::SpiClient;
 use crate::commands::{
     Command, ExpireCond, GetExExpiry, LexBound, RangeBy, Response, ScoreBound, format_score,
 };
+use crate::longdouble::LongDouble;
 use crate::memdb::KeyKind;
+use crate::memdb::encoding::{self, Enc, Limits, SetBuilder};
 use crate::plans::Kept;
 
 /// A store's answer, or the reply for a failure of the store itself.
@@ -93,6 +96,15 @@ pub trait Store {
     /// `None` when the key is not there; then its deadline in microseconds
     /// since the epoch, or `None` for no expiry.
     fn deadline(&mut self, key: &[u8]) -> Out<Option<Option<i64>>>;
+    /// `TOUCH`: how many of `keys` exist, looked up as a read that updates
+    /// each one's access field.
+    fn touch(&mut self, keys: &[Vec<u8>]) -> Out<i64> {
+        self.exists(keys)
+    }
+    /// What `OBJECT` reads of a live key, without touching it: its access
+    /// field (`memdb::lru`), and the integer it holds when it is a string
+    /// that reads as one.
+    fn access(&mut self, key: &[u8]) -> Out<Option<(u32, Option<i64>)>>;
     /// Give a live key the deadline when `cond` allows; whether it did.
     fn expire(&mut self, key: &[u8], deadline_us: i64, cond: ExpireCond) -> Out<bool>;
     fn persist(&mut self, key: &[u8]) -> Out<bool>;
@@ -101,6 +113,10 @@ pub trait Store {
     fn rename(&mut self, key: &[u8], newkey: &[u8]) -> Out<bool>;
     /// Every live key matching the glob, or every one without it.
     fn keys(&mut self, pattern: Option<&[u8]>) -> Out<Vec<Vec<u8>>>;
+    /// One step of `SCAN`: about `count` keys from `cursor` (0 starts), live
+    /// ones only, and the cursor to continue from, 0 when the iteration is
+    /// done. A key present for the whole iteration is returned at least once.
+    fn scan_keys(&mut self, cursor: u64, count: usize) -> Out<(u64, Vec<Vec<u8>>)>;
     fn dbsize(&mut self) -> Out<i64>;
     /// INFO keyspace's keys and keys with an expiry.
     fn keyspace(&mut self) -> Out<(i64, i64)>;
@@ -127,14 +143,19 @@ pub trait Store {
     /// `value` is not empty.
     fn setrange(&mut self, key: &[u8], offset: i64, value: &[u8]) -> Out<i64>;
     fn incrby(&mut self, key: &[u8], delta: i64) -> Out<Num<i64>>;
-    fn incrbyfloat(&mut self, key: &[u8], delta: f64) -> Out<Num<String>>;
+    fn incrbyfloat(&mut self, key: &[u8], delta: LongDouble) -> Out<Num<String>>;
     /// Set or clear one bit; what it was.
-    fn setbit(&mut self, key: &[u8], offset: i64, on: bool) -> Out<bool>;
+    /// The bit as it was, and whether anything changed: the bit, or the
+    /// string created or grown to reach it.
+    fn setbit(&mut self, key: &[u8], offset: i64, on: bool) -> Out<(bool, bool)>;
 
     // ── hashes ──
     fn hget(&mut self, key: &[u8], field: &[u8]) -> Out<Option<Vec<u8>>>;
     fn hmget(&mut self, key: &[u8], fields: &[Vec<u8>]) -> Out<Vec<Option<Vec<u8>>>>;
     fn hgetall(&mut self, key: &[u8]) -> Out<Vec<(Vec<u8>, Vec<u8>)>>;
+    /// One step of `HSCAN`, as `scan_keys` is of `SCAN`: fields and values.
+    fn hscan(&mut self, key: &[u8], cursor: u64, count: usize)
+    -> Out<crate::cursor::Page<Vec<u8>>>;
     fn hkeys(&mut self, key: &[u8]) -> Out<Vec<Vec<u8>>>;
     fn hvals(&mut self, key: &[u8]) -> Out<Vec<Vec<u8>>>;
     fn hlen(&mut self, key: &[u8]) -> Out<i64>;
@@ -143,12 +164,20 @@ pub trait Store {
         Ok(self.hget(key, field)?.map_or(0, |v| v.len() as i64))
     }
     /// Set every pair — each field once — and count the fields that are new.
-    fn hset(&mut self, key: &[u8], pairs: &[(Vec<u8>, Vec<u8>)]) -> Out<i64>;
+    /// `named` is how many pairs the command named, repeats included, which
+    /// is what Redis sizes a hash by before writing.
+    fn hset(&mut self, key: &[u8], pairs: &[(Vec<u8>, Vec<u8>)], named: usize) -> Out<i64>;
     fn hsetnx(&mut self, key: &[u8], field: &[u8], value: &[u8]) -> Out<bool>;
     fn hdel(&mut self, key: &[u8], fields: &[Vec<u8>]) -> Out<i64>;
     fn hincrby(&mut self, key: &[u8], field: &[u8], delta: i64) -> Out<Num<i64>>;
     /// The new value as Redis spells it.
-    fn hincrbyfloat(&mut self, key: &[u8], field: &[u8], delta: f64) -> Out<Num<String>>;
+    fn hincrbyfloat(&mut self, key: &[u8], field: &[u8], delta: LongDouble) -> Out<Num<String>>;
+    /// The encoding Redis would have given the hash, set or sorted set at
+    /// `key` (`memdb::encoding`); `None` when there is none.
+    fn collection_encoding(&mut self, key: &[u8]) -> Out<Option<Enc>>;
+    /// `zsetConvert(zobj, OBJ_ENCODING_SKIPLIST)`: the sorted set at `key`
+    /// becomes a skiplist, as `SORT` makes it before reading it.
+    fn zset_to_skiplist(&mut self, key: &[u8]) -> Out<()>;
 
     // ── sets ──
     fn sadd(&mut self, key: &[u8], members: &[Vec<u8>]) -> Out<i64>;
@@ -156,6 +185,8 @@ pub trait Store {
     fn sismember(&mut self, key: &[u8], member: &[u8]) -> Out<bool>;
     fn smismember(&mut self, key: &[u8], members: &[Vec<u8>]) -> Out<Vec<bool>>;
     fn smembers(&mut self, key: &[u8]) -> Out<Vec<Vec<u8>>>;
+    /// One step of `SSCAN`.
+    fn sscan(&mut self, key: &[u8], cursor: u64, count: usize) -> Out<(u64, Vec<Vec<u8>>)>;
     fn scard(&mut self, key: &[u8]) -> Out<i64>;
     /// Remove and return up to `n` members picked at random.
     fn spop(&mut self, key: &[u8], n: i64) -> Out<Vec<Vec<u8>>>;
@@ -178,12 +209,15 @@ pub trait Store {
     // ── sorted sets ──
     /// Every pair, in order, under the conditions: how many were added — or,
     /// with CH, added or changed.
-    fn zadd(&mut self, key: &[u8], pairs: &[(f64, Vec<u8>)], opts: ZaddOpts) -> Out<i64>;
+    /// Members added, and members added or whose score changed.
+    fn zadd(&mut self, key: &[u8], pairs: &[(f64, Vec<u8>)], opts: ZaddOpts) -> Out<(i64, i64)>;
     fn zadd_incr(&mut self, key: &[u8], member: &[u8], delta: f64, opts: ZaddOpts) -> Out<Incr>;
     fn zrem(&mut self, key: &[u8], members: &[Vec<u8>]) -> Out<i64>;
     fn zscore(&mut self, key: &[u8], member: &[u8]) -> Out<Option<f64>>;
     fn zmscore(&mut self, key: &[u8], members: &[Vec<u8>]) -> Out<Vec<Option<f64>>>;
     fn zcard(&mut self, key: &[u8]) -> Out<i64>;
+    /// One step of `ZSCAN`: members and their scores.
+    fn zscan(&mut self, key: &[u8], cursor: u64, count: usize) -> Out<crate::cursor::Page<f64>>;
     fn zcount(&mut self, key: &[u8], min: ScoreBound, max: ScoreBound) -> Out<i64>;
     fn zlexcount(&mut self, key: &[u8], min: &LexBound, max: &LexBound) -> Out<i64>;
     /// The member's rank, counted from the low end (or the high end, `rev`),
@@ -266,11 +300,9 @@ pub trait Store {
 pub fn run(cmd: &Command, store: &mut dyn Store) -> Option<Response> {
     let reply = match cmd {
         Command::Del { keys } | Command::Unlink { keys } => store.del(keys).map(Response::Integer),
-        // TOUCH answers as EXISTS does; the access time it refreshes in Redis
-        // feeds an LRU clock this server does not keep.
-        Command::Exists { keys } | Command::Touch { keys } => {
-            store.exists(keys).map(Response::Integer)
-        }
+        Command::Exists { keys } => store.exists(keys).map(Response::Integer),
+        // TOUCH counts as EXISTS does, and updates each key's access field.
+        Command::Touch { keys } => store.touch(keys).map(Response::Integer),
         Command::Type { key } => store
             .kind(key)
             .map(|k| Response::SimpleString(k.map_or("none", |k| k.name()).to_string())),
@@ -292,15 +324,58 @@ pub fn run(cmd: &Command, store: &mut dyn Store) -> Option<Response> {
         }),
         Command::RenameNx { key, newkey } => renamenx(store, key, newkey),
         Command::Keys { pattern } => store.keys(Some(pattern)).map(array),
-        Command::Scan { pattern, kind, .. } => scan(store, pattern.as_deref(), *kind),
+        Command::Scan {
+            cursor,
+            pattern,
+            count,
+            kind,
+        } => scan(store, *cursor, *count, pattern.as_deref(), *kind),
+        Command::CollectionScan {
+            kind,
+            key,
+            cursor,
+            count,
+            pattern,
+        } => collection_scan(store, *kind, key, *cursor, *count, pattern.as_deref()),
         Command::DbSize => store.dbsize().map(Response::Integer),
         Command::Keyspace => store
             .keyspace()
             .map(|(k, e)| Response::IntegerArray(vec![k, e])),
         Command::RandomKey => store.random_key().map(bulk_or_nil),
-        Command::FlushDb => store.flushdb().map(|()| Response::Ok),
+        Command::FlushDb { .. } => store.dbsize().and_then(|n| {
+            store.flushdb()?;
+            crate::dirty::add(n.max(0) as u64);
+            Ok(Response::Ok)
+        }),
         Command::ObjectEncoding { key } => object_encoding(store, key),
-        Command::ObjectOther => Ok(Response::Null),
+        Command::ZsetToSkiplist { key } => store.zset_to_skiplist(key).map(|()| Response::Ok),
+        Command::ObjectAccess { key, field } => object_access(store, key, *field),
+        Command::ObjectOther(sub) if sub == "HELP" => Ok(Response::Value(crate::commands::Value::Array(
+            [
+                "OBJECT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                "ENCODING <key>",
+                "    Return the kind of internal representation used in order to store the value",
+                "    associated with a <key>.",
+                "FREQ <key>",
+                "    Return the access frequency index of the <key>. The returned integer is",
+                "    proportional to the logarithm of the recent access frequency of the key.",
+                "IDLETIME <key>",
+                "    Return the idle time of the <key>, that is the approximated number of",
+                "    seconds elapsed since the last access to the key.",
+                "REFCOUNT <key>",
+                "    Return the number of references of the value associated with the specified",
+                "    <key>.",
+                "HELP",
+                "    Print this help.",
+            ]
+            .into_iter()
+            .map(|l| crate::commands::Value::Simple(l.to_string()))
+            .collect(),
+        ))),
+        Command::ObjectOther(sub) => Ok(Response::Error(format!(
+            "ERR unknown subcommand '{}'. Try OBJECT HELP.",
+            sub.to_ascii_lowercase()
+        ))),
 
         Command::Get { key } => store.get(key).map(bulk_or_nil),
         Command::Set {
@@ -372,7 +447,15 @@ pub fn run(cmd: &Command, store: &mut dyn Store) -> Option<Response> {
             None => Ok(Response::Error("ERR decrement would overflow".into())),
             Some(d) => store.incrby(key, d).map(integer_reply),
         },
-        Command::IncrByFloat { key, delta } => store.incrbyfloat(key, *delta).map(|n| match n {
+        // Refused here, after the type check, as Redis orders it. Redis
+        // reads the stored value first, but a bad one gets the same error.
+        Command::IncrByFloat { delta: None, .. } => {
+            Ok(Response::Error("ERR value is not a valid float".into()))
+        }
+        Command::IncrByFloat {
+            key,
+            delta: Some(delta),
+        } => store.incrbyfloat(key, *delta).map(|n| match n {
             Num::Value(text) => Response::BulkString(text.into_bytes()),
             Num::NotNumber => Response::Error("ERR value is not a valid float".into()),
             Num::Overflow => Response::Error("ERR increment would produce NaN or Infinity".into()),
@@ -383,9 +466,12 @@ pub fn run(cmd: &Command, store: &mut dyn Store) -> Option<Response> {
         Command::BitCount { key, range } => store.get(key).map(|v| {
             Response::Integer(crate::commands::count_bits(&v.unwrap_or_default(), *range))
         }),
-        Command::SetBit { key, offset, value } => store
-            .setbit(key, *offset, *value)
-            .map(|b| Response::Integer(b as i64)),
+        Command::SetBit { key, offset, value } => {
+            store.setbit(key, *offset, *value).map(|(was, changed)| {
+                crate::dirty::add(u64::from(changed));
+                Response::Integer(was as i64)
+            })
+        }
 
         Command::HGet { key, field } => store.hget(key, field).map(bulk_or_nil),
         Command::HMGet { key, fields } => store.hmget(key, fields).map(Response::Array),
@@ -404,19 +490,13 @@ pub fn run(cmd: &Command, store: &mut dyn Store) -> Option<Response> {
             .hexists(key, field)
             .map(|b| Response::Integer(b as i64)),
         Command::HStrLen { key, field } => store.hstrlen(key, field).map(Response::Integer),
-        // A field named twice is set once, to its last value, and counted
-        // once if it is new.
+        // A field named twice is set once, to its last value, where it was
+        // first named, and counted once if it is new.
         Command::HSet { key, pairs } => store
-            .hset(
-                key,
-                &crate::commands::dedup_last(pairs, |(f, _)| f.as_slice()),
-            )
+            .hset(key, &crate::commands::dedup_fields(pairs), pairs.len())
             .map(Response::Integer),
         Command::HMSet { key, pairs } => store
-            .hset(
-                key,
-                &crate::commands::dedup_last(pairs, |(f, _)| f.as_slice()),
-            )
+            .hset(key, &crate::commands::dedup_fields(pairs), pairs.len())
             .map(|_| Response::Ok),
         Command::HSetNx { key, field, value } => store
             .hsetnx(key, field, value)
@@ -444,9 +524,7 @@ pub fn run(cmd: &Command, store: &mut dyn Store) -> Option<Response> {
             key,
             count,
             withvalues,
-        } => store
-            .hgetall(key)
-            .map(|pairs| crate::commands::random_fields(&pairs, *count, *withvalues)),
+        } => hrandfield(store, key, *count, *withvalues),
 
         Command::SAdd { key, members } => store.sadd(key, members).map(Response::Integer),
         Command::SRem { key, members } => store.srem(key, members).map(Response::Integer),
@@ -470,7 +548,7 @@ pub fn run(cmd: &Command, store: &mut dyn Store) -> Option<Response> {
                 .srandmember(key, 1)
                 .map(|v| bulk_or_nil(v.into_iter().next())),
             Some(0) => Ok(Response::Array(vec![])),
-            Some(n) => store.srandmember(key, *n).map(array),
+            Some(n) => store.srandmember(key, repeats(*n)).map(array),
         },
         // `smoveCommand`: onto itself, only whether the member is there, and
         // nothing changes; otherwise the destination is signalled only if
@@ -519,12 +597,19 @@ pub fn run(cmd: &Command, store: &mut dyn Store) -> Option<Response> {
             if *incr {
                 let (delta, member) = &pairs[0];
                 store.zadd_incr(key, member, *delta, opts).map(|r| match r {
-                    Incr::Score(s) => score(s),
+                    Incr::Score(s) => {
+                        crate::dirty::add(1);
+                        score(s)
+                    }
                     Incr::Skipped => Response::Null,
                     Incr::NotANumber => Response::Error(crate::commands::NAN_SCORE.into()),
                 })
             } else {
-                store.zadd(key, pairs, opts).map(Response::Integer)
+                // `server.dirty += added + updated`, whatever CH answers.
+                store.zadd(key, pairs, opts).map(|(added, changed)| {
+                    crate::dirty::add(changed.max(0) as u64);
+                    Response::Integer(if *ch { changed } else { added })
+                })
             }
         }
         Command::ZIncrBy {
@@ -627,7 +712,9 @@ pub fn run(cmd: &Command, store: &mut dyn Store) -> Option<Response> {
                 .zrandmember(key, 1)
                 .map(|v| bulk_or_nil(v.into_iter().next().map(|(m, _)| m))),
             Some(0) => Ok(Response::Array(vec![])),
-            Some(n) => store.zrandmember(key, *n).map(|v| scored(v, *with_scores)),
+            Some(n) => store
+                .zrandmember(key, repeats(*n))
+                .map(|v| scored(v, *with_scores)),
         },
         Command::ZRemRangeByRank { key, start, stop } => store
             .zremrange_rank(key, *start, *stop)
@@ -672,9 +759,12 @@ pub fn run(cmd: &Command, store: &mut dyn Store) -> Option<Response> {
         Command::LRem { key, count, value } => {
             store.lrem(key, *count, value).map(Response::Integer)
         }
-        Command::LTrim { key, start, stop } => {
-            store.ltrim(key, *start, *stop).map(|()| Response::Ok)
-        }
+        // `server.dirty += ltrim + rtrim`: the elements removed.
+        Command::LTrim { key, start, stop } => store.llen(key).and_then(|before| {
+            store.ltrim(key, *start, *stop)?;
+            crate::dirty::add((before - store.llen(key)?).max(0) as u64);
+            Ok(Response::Ok)
+        }),
         Command::LMove {
             src,
             dst,
@@ -695,7 +785,9 @@ pub fn run(cmd: &Command, store: &mut dyn Store) -> Option<Response> {
             }),
         _ => return None,
     };
-    Some(reply.unwrap_or_else(|e| e))
+    let reply = reply.unwrap_or_else(|e| e);
+    crate::dirty::add(crate::dirty::of(cmd, &reply));
+    Some(reply)
 }
 
 fn score(s: f64) -> Response {
@@ -865,15 +957,33 @@ fn renamenx(store: &mut dyn Store, key: &[u8], newkey: &[u8]) -> Out<Response> {
     })
 }
 
-/// `SCAN`: one pass, cursor 0. A TYPE pg_redis has no table for matches
-/// nothing, as in Redis 7.2.
+/// `COUNT`'s default, as in Redis.
+const SCAN_COUNT: i64 = 10;
+
+fn scan_count(count: Option<i64>) -> usize {
+    usize::try_from(count.unwrap_or(SCAN_COUNT)).unwrap_or(usize::MAX)
+}
+
+fn matches(pattern: Option<&[u8]>, item: &[u8]) -> bool {
+    pattern.is_none_or(|p| crate::pubsub::glob_match(p, item))
+}
+
+/// `SCAN`: one step of the backend's cursor. MATCH and TYPE filter what the
+/// step found, as in Redis, so a step can return nothing and still not be
+/// the last. A TYPE pg_redis has no table for matches nothing, as in Redis
+/// 7.2.
 fn scan(
     store: &mut dyn Store,
+    cursor: u64,
+    count: Option<i64>,
     pattern: Option<&[u8]>,
     kind: Option<Option<KeyKind>>,
 ) -> Out<Response> {
-    let mut keys = store.keys(pattern)?;
-    if let Some(want) = kind {
+    let (next, mut keys) = store.scan_keys(cursor, scan_count(count))?;
+    keys.retain(|k| matches(pattern, k));
+    if let Some(want) = kind
+        && !keys.is_empty()
+    {
         let kinds = store.kinds(&keys)?;
         keys = keys
             .into_iter()
@@ -883,42 +993,149 @@ fn scan(
             .collect();
     }
     Ok(Response::ScanResult {
+        cursor: next,
         keys: keys.into_iter().map(Some).collect(),
     })
 }
 
-/// The encoding Redis would use, from the key's shape against Redis's default
-/// thresholds — this server stores none of them. A missing key is nil, not an
-/// error, as in Redis.
+/// `HSCAN`, `SSCAN` and `ZSCAN`: one step over a collection, MATCH applied
+/// to fields and members afterwards. A missing key is an empty collection.
+fn collection_scan(
+    store: &mut dyn Store,
+    kind: KeyKind,
+    key: &[u8],
+    cursor: u64,
+    count: Option<i64>,
+    pattern: Option<&[u8]>,
+) -> Out<Response> {
+    let count = scan_count(count);
+    let (next, items): (u64, Vec<Vec<u8>>) = match kind {
+        KeyKind::Hash => {
+            let (next, pairs) = store.hscan(key, cursor, count)?;
+            let items = pairs
+                .into_iter()
+                .filter(|(f, _)| matches(pattern, f))
+                .flat_map(|(f, v)| [f, v])
+                .collect();
+            (next, items)
+        }
+        KeyKind::Zset => {
+            let (next, pairs) = store.zscan(key, cursor, count)?;
+            let items = pairs
+                .into_iter()
+                .filter(|(m, _)| matches(pattern, m))
+                .flat_map(|(m, s)| [m, format_score(s).into_bytes()])
+                .collect();
+            (next, items)
+        }
+        _ => {
+            let (next, mut members) = store.sscan(key, cursor, count)?;
+            members.retain(|m| matches(pattern, m));
+            (next, members)
+        }
+    };
+    Ok(Response::ScanResult {
+        cursor: next,
+        keys: items.into_iter().map(Some).collect(),
+    })
+}
+
+/// `HRANDFIELD`: a positive count below the hash's size picks at random, in
+/// the hash's order when it is a listpack.
+/// A negative count (repeats allowed) no larger than the client's output
+/// limit lets its reply be (`pubsub::cap_repeats`).
+fn repeats(n: i64) -> i64 {
+    if n < 0 {
+        -(crate::pubsub::cap_repeats(n.unsigned_abs()) as i64)
+    } else {
+        n
+    }
+}
+
+fn hrandfield(
+    store: &mut dyn Store,
+    key: &[u8],
+    count: Option<i64>,
+    withvalues: bool,
+) -> Out<Response> {
+    let pairs = store.hgetall(key)?;
+    let ordered = match count {
+        Some(n) if n > 1 && (n as u64) < pairs.len() as u64 => {
+            store.collection_encoding(key)? == Some(Enc::Listpack)
+        }
+        _ => true,
+    };
+    Ok(crate::commands::random_fields(
+        &pairs, count, withvalues, ordered,
+    ))
+}
+
+/// The encoding Redis would give the key. A hash, set or sorted set carries
+/// its own, kept as Redis keeps it (`memdb::encoding`); a list's is worked
+/// out from its elements, a string's from its value. A missing key is nil,
+/// not an error, as in Redis.
 fn object_encoding(store: &mut dyn Store, key: &[u8]) -> Out<Response> {
-    use crate::commands::collection_encoding;
     let Some(kind) = store.kind(key)? else {
         return Ok(Response::Null);
     };
     let name = match kind {
         KeyKind::Stream => "stream",
         KeyKind::String => crate::commands::string_encoding(&store.get(key)?.unwrap_or_default()),
-        KeyKind::List => collection_encoding(kind, &store.lrange(key, 0, -1)?),
-        KeyKind::Set => collection_encoding(kind, &store.smembers(key)?),
-        // Fields and values both, which is what Redis measures.
-        KeyKind::Hash => collection_encoding(
-            kind,
-            &store
-                .hgetall(key)?
-                .into_iter()
-                .flat_map(|(f, v)| [f, v])
-                .collect::<Vec<_>>(),
+        KeyKind::List => crate::memdb::encoding::list_encoding(
+            store.lrange(key, 0, -1)?.iter().map(Vec::as_slice),
+            &crate::memdb::encoding::Limits::current(),
         ),
-        KeyKind::Zset => collection_encoding(
-            kind,
-            &store
-                .zrange_index(key, 0, -1, false)?
-                .into_iter()
-                .map(|(m, _)| m)
-                .collect::<Vec<_>>(),
-        ),
+        KeyKind::Set | KeyKind::Hash | KeyKind::Zset => match store.collection_encoding(key)? {
+            Some(enc) => enc.name(),
+            None => return Ok(Response::Null),
+        },
     };
-    Ok(Response::SimpleString(name.to_string()))
+    // A bulk string, as Redis's `addReplyBulkCString`: `$8 listpack`, not
+    // `+listpack`.
+    Ok(Response::BulkString(name.as_bytes().to_vec()))
+}
+
+/// `OBJECT REFCOUNT | IDLETIME | FREQ`, with Redis's replies and errors.
+fn object_access(
+    store: &mut dyn Store,
+    key: &[u8],
+    field: crate::commands::ObjectField,
+) -> Out<Response> {
+    use crate::commands::ObjectField;
+    use crate::memdb::lru;
+    const SWITCHING: &str = "Please note that when switching between policies at runtime \
+                             LRU and LFU data will take some time to adjust.";
+    let Some((lru_field, int)) = store.access(key)? else {
+        return Ok(Response::Null);
+    };
+    let s = crate::access::settings();
+    let now = crate::server::now_ms();
+    Ok(match field {
+        // Redis shares one object for each of 0..9999 unless the policy
+        // needs every key to have its own access field.
+        ObjectField::Refcount => Response::Integer(
+            if int.is_some_and(|n| (0..10_000).contains(&n)) && s.shares_integers() {
+                i64::from(i32::MAX)
+            } else {
+                1
+            },
+        ),
+        ObjectField::Idletime if s.policy.lfu() => Response::Error(format!(
+            "ERR An LFU maxmemory policy is selected, idle time not tracked. {SWITCHING}"
+        )),
+        ObjectField::Idletime => {
+            Response::Integer((lru::idle_ms(lru_field, lru::lru_clock(now)) / 1000) as i64)
+        }
+        ObjectField::Freq if !s.policy.lfu() => Response::Error(format!(
+            "ERR An LFU maxmemory policy is not selected, access frequency not tracked. \
+             {SWITCHING}"
+        )),
+        ObjectField::Freq => Response::Integer(i64::from(lru::lfu_decr_and_return(
+            lru_field,
+            s.decay_time,
+            lru::lfu_minutes(now),
+        ))),
+    })
 }
 
 fn integer_reply(n: Num<i64>) -> Response {
@@ -1015,6 +1232,323 @@ impl SqlStore<'_, '_> {
     }
 }
 
+// ─────────────────────────── encodings on the tables ──────────────────────────
+//
+// A hash, set or sorted set on the tables keeps the encoding Redis would have
+// given it as a row of `redis.encoding_N`, written only when the key changes
+// encoding, and the order of a hash's fields and a set's members as `seq`.
+// A key with no row is in the encoding its contents imply (`natural_enc`):
+// a hash or sorted set that never converted is a listpack, a set of integers
+// an intset, any other set a listpack. So the row is needed for a converted
+// key, and for a listpack set that holds an integer, which its contents
+// would make an intset once its strings were removed.
+//
+// Every write that can create a key reads the row and the key's size before
+// it writes, in the same statement (`pre_cte`), works out the encoding as
+// Redis would, and writes the row only if it changed. A key the write finds
+// absent starts afresh, so a row left behind by a key that emptied cannot
+// leak into the next key of that name.
+
+/// The row `redis.encoding_N` holds for a collection of `kind` in `enc`.
+/// `has_int`: whether a set may hold an integer.
+pub(crate) fn enc_row(kind: KeyKind, enc: Enc, has_int: bool) -> Option<Enc> {
+    match (kind, enc) {
+        (KeyKind::Set, Enc::Intset) => None,
+        (KeyKind::Set, Enc::Listpack) => has_int.then_some(Enc::Listpack),
+        (_, Enc::Listpack) => None,
+        (_, e) => Some(e),
+    }
+}
+
+/// Write `row` as `key`'s encoding row, or remove its row.
+pub(crate) fn put_enc_row(
+    client: &mut SpiClient<'_>,
+    db: u8,
+    key: &[u8],
+    row: Option<Enc>,
+) -> Result<(), pgrx::spi::SpiError> {
+    match row {
+        Some(e) => client.update_kept(
+            &format!(
+                "INSERT INTO redis.encoding_{db} (key, encoding) VALUES ($1, $2) \
+                 ON CONFLICT (key) DO UPDATE SET encoding = EXCLUDED.encoding"
+            ),
+            &[key.into(), e.code().into()],
+        ),
+        None => client.update_kept(
+            &format!("DELETE FROM redis.encoding_{db} WHERE key = $1"),
+            &[key.into()],
+        ),
+    }
+    .map(|_| ())
+}
+
+/// The encoding of a collection the tables hold: its row, or what its
+/// contents imply. `items` are a set's members, a hash's fields and values,
+/// or a sorted set's members.
+pub(crate) fn natural_enc(kind: KeyKind, row: Option<Enc>, items: &[&[u8]]) -> Enc {
+    if let Some(e) = row {
+        return e;
+    }
+    let l = crate::memdb::encoding::Limits::current();
+    let widest = items.iter().map(|m| m.len()).max().unwrap_or(0);
+    match kind {
+        KeyKind::Set => crate::memdb::encoding::set_natural(items.iter().copied(), &l),
+        KeyKind::Hash => crate::memdb::encoding::hash_shape(items.len() / 2, widest, &l),
+        _ => crate::memdb::encoding::zset_shape(items.len(), widest, &l),
+    }
+}
+
+/// A set's members, read in `seq` order, in the order its encoding keeps
+/// them: an intset's sorted.
+pub(crate) fn set_order(mut members: Vec<Vec<u8>>, row: Option<Enc>) -> (Vec<Vec<u8>>, Enc) {
+    let slices: Vec<&[u8]> = members.iter().map(Vec::as_slice).collect();
+    let enc = natural_enc(KeyKind::Set, row, &slices);
+    if enc == Enc::Intset {
+        crate::memdb::encoding::sort_ints(&mut members, |m| m);
+    }
+    (members, enc)
+}
+
+/// The CTE `pre`: the encoding row of the key in parameter `$k`, whether
+/// `redis.<table>_N` holds it, and how many rows it has there before the
+/// statement's write. The rows are counted no further than parameter `$cap`,
+/// only when `counted_if` holds (a write that adds nothing cannot pass a
+/// size limit), and not at all once the key converted: a converted key never
+/// converts again. Every part reads the snapshot the statement started from,
+/// whichever CTE it follows.
+fn pre_cte(db: u8, table: &str, k: usize, cap: usize, counted_if: &str) -> String {
+    format!(
+        "pre AS (SELECT e.enc, \
+                        EXISTS (SELECT 1 FROM redis.{table}_{db} WHERE key = ${k}) AS live, \
+                        CASE WHEN e.enc IN (3, 4) OR NOT ({counted_if}) THEN NULL \
+                             ELSE (SELECT count(*) FROM (SELECT 1 FROM redis.{table}_{db} \
+                                                          WHERE key = ${k} LIMIT ${cap}) c) \
+                        END AS n \
+                 FROM (SELECT (SELECT encoding FROM redis.encoding_{db} WHERE key = ${k}) AS enc) e)"
+    )
+}
+
+/// The columns a statement with `pre_cte` adds to its reply.
+const PRE_COLS: &str = "(SELECT enc FROM pre), (SELECT live FROM pre), (SELECT n FROM pre)";
+
+/// What `pre_cte` found.
+#[derive(Clone, Copy)]
+struct Pre {
+    row: Option<Enc>,
+    live: bool,
+    /// Rows before the write, up to the cap; `None` once converted.
+    n: Option<usize>,
+}
+
+/// `Pre` from a reply's columns `$at`, `$at + 1` and `$at + 2`: a row of an
+/// iterated table, or a table's current row.
+macro_rules! pre_at {
+    ($row:expr, $at:expr) => {
+        Pre {
+            row: $row.get::<i16>($at).ok().flatten().and_then(Enc::from_code),
+            live: $row.get::<bool>($at + 1).ok().flatten().unwrap_or(false),
+            n: $row
+                .get::<i64>($at + 2)
+                .ok()
+                .flatten()
+                .map(|n| n.max(0) as usize),
+        }
+    };
+}
+
+impl Pre {
+    /// The encoding the key was in: `None` when it was not there, which
+    /// leaves any row behind it out of account.
+    fn enc(&self, default: Enc) -> Option<Enc> {
+        self.live.then(|| self.row.unwrap_or(default))
+    }
+
+    /// How many elements the key held, as far as counted.
+    fn len(&self) -> usize {
+        if self.live {
+            self.n.unwrap_or(usize::MAX / 2)
+        } else {
+            0
+        }
+    }
+}
+
+/// A cap for `pre_cte`: one past the largest packed size, so a key the count
+/// stops at is known to be past it.
+fn cap(n: usize) -> i64 {
+    i64::try_from(n.saturating_add(1)).unwrap_or(i64::MAX)
+}
+
+/// A set on the tables, as the set operations read it.
+struct SqlSet {
+    members: Vec<Vec<u8>>,
+    index: std::collections::HashSet<Vec<u8>>,
+}
+
+impl crate::memdb::encoding::SetView for SqlSet {
+    fn size(&self) -> usize {
+        self.members.len()
+    }
+
+    fn has(&self, m: &[u8]) -> bool {
+        self.index.contains(m)
+    }
+
+    fn members(&self) -> Vec<&[u8]> {
+        self.members.iter().map(Vec::as_slice).collect()
+    }
+}
+
+impl SqlStore<'_, '_> {
+    /// Write the encoding row a key in `enc` needs, if it is not the row
+    /// `pre` found.
+    fn sync_enc(
+        &mut self,
+        cmd: &str,
+        key: &[u8],
+        pre: &Pre,
+        kind: KeyKind,
+        enc: Enc,
+        has_int: bool,
+    ) -> Out<()> {
+        let want = enc_row(kind, enc, has_int);
+        if want != pre.row {
+            put_enc_row(self.client, self.db, key, want).map_err(|e| failed(cmd, e))?;
+        }
+        Ok(())
+    }
+
+    /// Every named set, its members in its order; `None` for a key with no
+    /// set. A key named twice is read twice.
+    fn sets_in_order(&mut self, cmd: &str, keys: &[Vec<u8>]) -> Out<Vec<Option<SqlSet>>> {
+        let db = self.db;
+        let sql = format!(
+            "SELECT k.i, s.member, (SELECT encoding FROM redis.encoding_{db} e WHERE e.key = k.key) \
+             FROM unnest($1::bytea[]) WITH ORDINALITY AS k(key, i) \
+             JOIN redis.set_{db} s ON s.key = k.key \
+             ORDER BY k.i, s.seq"
+        );
+        let tbl = self
+            .client
+            .select_kept(&sql, &[arr(keys).into()])
+            .map_err(|e| failed(cmd, e))?;
+        let mut found: Vec<(Vec<Vec<u8>>, Option<Enc>)> = vec![(Vec::new(), None); keys.len()];
+        for r in tbl {
+            let (Ok(Some(i)), Ok(Some(m))) = (r.get::<i64>(1), r.get::<Vec<u8>>(2)) else {
+                continue;
+            };
+            if let Some(slot) = found.get_mut((i - 1) as usize) {
+                slot.0.push(m);
+                slot.1 = r.get::<i16>(3).ok().flatten().and_then(Enc::from_code);
+            }
+        }
+        Ok(found
+            .into_iter()
+            .map(|(members, row)| {
+                if members.is_empty() {
+                    return None;
+                }
+                let (members, _) = set_order(members, row);
+                let index = members.iter().cloned().collect();
+                Some(SqlSet { members, index })
+            })
+            .collect())
+    }
+
+    /// `SINTER` on the tables: the set it walks is read in its order and
+    /// filtered by the others there, so only the result comes back. With
+    /// the encoding of the set walked.
+    fn inter_in_order(&mut self, cmd: &str, keys: &[Vec<u8>]) -> Out<(Vec<Vec<u8>>, Enc)> {
+        let db = self.db;
+        let sizes_sql = format!(
+            "SELECT (SELECT count(*) FROM redis.set_{db} s WHERE s.key = k.key), \
+                    (SELECT encoding FROM redis.encoding_{db} e WHERE e.key = k.key), \
+                    (SELECT member FROM redis.set_{db} s WHERE s.key = k.key LIMIT 1) \
+             FROM unnest($1::bytea[]) WITH ORDINALITY AS k(key, i) ORDER BY k.i"
+        );
+        let tbl = self
+            .client
+            .select_kept(&sizes_sql, &[arr(keys).into()])
+            .map_err(|e| failed(cmd, e))?;
+        let mut sizes = Vec::new();
+        let mut kinds = Vec::new();
+        for r in tbl {
+            sizes.push(r.get::<i64>(1).ok().flatten().unwrap_or(0).max(0) as usize);
+            let row = r.get::<i16>(2).ok().flatten().and_then(Enc::from_code);
+            let sample = r.get::<Vec<u8>>(3).ok().flatten().unwrap_or_default();
+            kinds.push(row.unwrap_or_else(|| {
+                if crate::memdb::parse_stored_int(&sample).is_some() {
+                    Enc::Intset
+                } else {
+                    Enc::Listpack
+                }
+            }));
+        }
+        if sizes.len() != keys.len() || sizes.contains(&0) {
+            return Ok((Vec::new(), Enc::Listpack));
+        }
+        let walked = crate::memdb::encoding::inter_order(&sizes)[0];
+        let others: Vec<Vec<u8>> = keys
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != walked)
+            .map(|(_, k)| k.clone())
+            .collect();
+        let sql = format!(
+            "SELECT s.member FROM redis.set_{db} s WHERE s.key = $1 \
+               AND NOT EXISTS (SELECT 1 FROM unnest($2::bytea[]) AS o(key) \
+                               WHERE NOT EXISTS (SELECT 1 FROM redis.set_{db} t \
+                                                 WHERE t.key = o.key AND t.member = s.member)) \
+             ORDER BY s.seq"
+        );
+        let mut members = self.column(
+            cmd,
+            &sql,
+            &[keys[walked].as_slice().into(), arr(&others).into()],
+        )?;
+        if kinds[walked] == Enc::Intset {
+            crate::memdb::encoding::sort_ints(&mut members, |m| m);
+        }
+        Ok((members, kinds[walked]))
+    }
+
+    /// Replace `dst` with a set of `members`, in their order and in `enc`.
+    /// Its size.
+    fn store_set(&mut self, cmd: &str, dst: &[u8], members: &[Vec<u8>], enc: Enc) -> Out<i64> {
+        let db = self.db;
+        let has_int = members
+            .iter()
+            .any(|m| crate::memdb::parse_stored_int(m).is_some());
+        let row = enc_row(KeyKind::Set, enc, has_int).map(Enc::code);
+        // Members kept are renumbered to the new order, the rest go; the two
+        // touch different rows, so they can share a statement.
+        let sql = format!(
+            "WITH new_data AS (SELECT m, i FROM unnest($2::bytea[]) WITH ORDINALITY AS u(m, i)), \
+                  del AS (DELETE FROM redis.set_{db} WHERE key = $1 AND member <> ALL($2::bytea[])), \
+                  ins AS (INSERT INTO redis.set_{db} (key, member) \
+                          SELECT $1, m FROM new_data ORDER BY i \
+                          ON CONFLICT (key, member) DO UPDATE SET seq = EXCLUDED.seq), \
+                  {} \
+             SELECT count(*)::bigint FROM new_data",
+            enc_write_ctes(db, 1, 3)
+        );
+        self.write_int(cmd, &sql, &[dst.into(), arr(members).into(), row.into()])
+    }
+}
+
+/// CTEs that make the encoding row of the key in `$k` the value in `$e` (a
+/// `smallint`), removing it when that is NULL. The two touch the row under
+/// opposite conditions, so they can share a statement.
+pub(crate) fn enc_write_ctes(db: u8, k: usize, e: usize) -> String {
+    format!(
+        "encdel AS (DELETE FROM redis.encoding_{db} WHERE key = ${k} AND ${e}::smallint IS NULL), \
+         encput AS (INSERT INTO redis.encoding_{db} (key, encoding) \
+                    SELECT ${k}, ${e}::smallint WHERE ${e}::smallint IS NOT NULL \
+                    ON CONFLICT (key) DO UPDATE SET encoding = EXCLUDED.encoding)"
+    )
+}
+
 impl Store for SqlStore<'_, '_> {
     fn del(&mut self, keys: &[Vec<u8>]) -> Out<i64> {
         let db = self.db;
@@ -1028,7 +1562,11 @@ impl Store for SqlStore<'_, '_> {
             .map(|i| format!("SELECT key FROM d{i}"))
             .collect::<Vec<_>>()
             .join(" UNION ALL ");
-        let sql = format!("WITH {deletes} SELECT count(DISTINCT key)::bigint FROM ({union}) u");
+        let sql = format!(
+            "WITH {deletes}, \
+                  denc AS (DELETE FROM redis.encoding_{db} WHERE key = ANY($1::bytea[])) \
+             SELECT count(DISTINCT key)::bigint FROM ({union}) u"
+        );
         self.write_int("DEL", &sql, &[arr(keys).into()])
     }
 
@@ -1052,6 +1590,21 @@ impl Store for SqlStore<'_, '_> {
         Ok(Command::sql_key_kinds(self.client, self.db, &[key])
             .first()
             .and_then(|(_, k)| *k))
+    }
+
+    /// A logged key's access field lives in shared memory, not in its rows
+    /// (`crate::access`), so reading it costs no write.
+    fn access(&mut self, key: &[u8]) -> Out<Option<(u32, Option<i64>)>> {
+        let Some(kind) = self.kind(key)? else {
+            return Ok(None);
+        };
+        let int = match kind {
+            KeyKind::String => self
+                .get(key)?
+                .and_then(|v| crate::memdb::parse_stored_int(&v)),
+            _ => None,
+        };
+        Ok(Some((crate::access::logged_field(self.db, key), int)))
     }
 
     fn kinds(&mut self, keys: &[Vec<u8>]) -> Out<Vec<Option<KeyKind>>> {
@@ -1125,18 +1678,59 @@ impl Store for SqlStore<'_, '_> {
         )
     }
 
+    /// Keyset pagination over the six tables a key can be in: each yields
+    /// its first `count` keys after the bound through its primary key, and
+    /// the first `count` of their union are the page. A key in a table that
+    /// is not among them would sort after all of them, so the page has no
+    /// gap. The cursor follows the page's last key, live or not; a key past
+    /// its deadline is dropped from the reply and reaped, as Redis's
+    /// `scanCallback` expires each key it looks up.
+    fn scan_keys(&mut self, cursor: u64, count: usize) -> Out<(u64, Vec<Vec<u8>>)> {
+        let db = self.db;
+        let scope = crate::cursor::scope(db, 0, b"");
+        let (next, rows) = crate::cursor::step(
+            crate::cursor_state(),
+            cursor,
+            scope,
+            count,
+            token_random(),
+            |range, limit| {
+                let (from, upto) = range_args(range);
+                let tbl = self
+                    .client
+                    .select_kept(
+                        &scan_page_sql(db, range),
+                        &[from.into(), limit.into(), upto.into()],
+                    )
+                    .map_err(|e| failed("SCAN", e))?;
+                Ok(tbl
+                    .filter_map(|r| {
+                        Some((
+                            r.get::<Vec<u8>>(1).ok()??,
+                            r.get::<bool>(2).ok().flatten().unwrap_or(true),
+                        ))
+                    })
+                    .collect())
+            },
+        )?;
+        let (live, expired): (Vec<_>, Vec<_>) = rows.into_iter().partition(|(_, live)| *live);
+        let expired: Vec<&[u8]> = expired.iter().map(|(k, _)| k.as_slice()).collect();
+        Command::reap_keys(self.client, db, &expired);
+        Ok((next, live.into_iter().map(|(k, _)| k).collect()))
+    }
+
     fn dbsize(&mut self) -> Out<i64> {
         let db = self.db;
         let sql = format!(
+            // Every key held, expired or not, as Redis's dictionary counts
+            // them until they are reaped.
             "SELECT count(DISTINCT key)::bigint FROM ( \
-                 SELECT key FROM redis.kv_{db} WHERE (expires_at IS NULL OR expires_at > now()) \
-                 UNION ALL \
-                 SELECT c.key FROM (SELECT DISTINCT key FROM redis.hash_{db} \
-                                    UNION SELECT DISTINCT key FROM redis.list_{db} \
-                                    UNION SELECT DISTINCT key FROM redis.set_{db} \
-                                    UNION SELECT DISTINCT key FROM redis.zset_{db} \
-                                    UNION SELECT key FROM redis.stream_{db}) c \
-                  WHERE NOT EXISTS (SELECT 1 FROM redis.expiry_{db} e WHERE e.key = c.key AND e.expires_at <= now()) \
+                 SELECT key FROM redis.kv_{db} \
+                 UNION ALL SELECT DISTINCT key FROM redis.hash_{db} \
+                 UNION ALL SELECT DISTINCT key FROM redis.list_{db} \
+                 UNION ALL SELECT DISTINCT key FROM redis.set_{db} \
+                 UNION ALL SELECT DISTINCT key FROM redis.zset_{db} \
+                 UNION ALL SELECT key FROM redis.stream_{db} \
              ) u"
         );
         self.int("DBSIZE", &sql, &[])
@@ -1146,13 +1740,12 @@ impl Store for SqlStore<'_, '_> {
         let db = self.db;
         let sql = format!(
             "SELECT \
-               (SELECT count(*) FROM redis.kv_{db} WHERE expires_at IS NULL OR expires_at > now()) \
+               (SELECT count(*) FROM redis.kv_{db}) \
                + (SELECT count(*) FROM (SELECT key FROM redis.hash_{db} UNION SELECT key FROM redis.list_{db} \
                     UNION SELECT key FROM redis.set_{db} UNION SELECT key FROM redis.zset_{db} \
-                    UNION SELECT key FROM redis.stream_{db}) c \
-                  WHERE NOT EXISTS (SELECT 1 FROM redis.expiry_{db} e WHERE e.key = c.key AND e.expires_at <= now())), \
-               (SELECT count(*) FROM redis.kv_{db} WHERE expires_at > now()) \
-               + (SELECT count(*) FROM redis.expiry_{db} WHERE expires_at > now())"
+                    UNION SELECT key FROM redis.stream_{db}) c), \
+               (SELECT count(*) FROM redis.kv_{db} WHERE expires_at IS NOT NULL) \
+               + (SELECT count(*) FROM redis.expiry_{db})"
         );
         let tbl = self
             .client
@@ -1477,7 +2070,7 @@ impl Store for SqlStore<'_, '_> {
 
     /// As `hincrbyfloat`: seeded if missing, locked, summed in Rust and
     /// written back, spelt as the memory half spells it.
-    fn incrbyfloat(&mut self, key: &[u8], delta: f64) -> Out<Num<String>> {
+    fn incrbyfloat(&mut self, key: &[u8], delta: LongDouble) -> Out<Num<String>> {
         let db = self.db;
         self.client
             .update_kept(
@@ -1496,17 +2089,10 @@ impl Store for SqlStore<'_, '_> {
             .ok()
             .flatten()
             .unwrap_or_default();
-        let Some(base) = std::str::from_utf8(&current)
-            .ok()
-            .and_then(|t| t.parse::<f64>().ok())
-        else {
-            return Ok(Num::NotNumber);
+        let text = match crate::longdouble::increment(Some(&current), delta) {
+            Num::Value(text) => text,
+            refused => return Ok(refused),
         };
-        let sum = base + delta;
-        if !sum.is_finite() {
-            return Ok(Num::Overflow);
-        }
-        let text = crate::memdb::format_float(sum);
         self.client
             .update_kept(
                 &format!("UPDATE redis.kv_{db} SET value = $2 WHERE key = $1"),
@@ -1518,7 +2104,7 @@ impl Store for SqlStore<'_, '_> {
 
     /// Seeded if missing, then locked, edited and written back, so two at
     /// once cannot both edit the old value.
-    fn setbit(&mut self, key: &[u8], offset: i64, on: bool) -> Out<bool> {
+    fn setbit(&mut self, key: &[u8], offset: i64, on: bool) -> Out<(bool, bool)> {
         let db = self.db;
         self.client
             .update_kept(
@@ -1537,6 +2123,7 @@ impl Store for SqlStore<'_, '_> {
             .ok()
             .flatten()
             .unwrap_or_default();
+        let grows = value.len() <= (offset / 8) as usize;
         let was = crate::commands::set_bit_at(&mut value, offset, on);
         self.client
             .update_kept(
@@ -1544,7 +2131,7 @@ impl Store for SqlStore<'_, '_> {
                 &[key.into(), value.into()],
             )
             .map_err(|e| failed("SETBIT", e))?;
-        Ok(was)
+        Ok((was, grows || was != on))
     }
 
     fn hget(&mut self, key: &[u8], field: &[u8]) -> Out<Option<Vec<u8>>> {
@@ -1578,6 +2165,54 @@ impl Store for SqlStore<'_, '_> {
             .collect())
     }
 
+    /// A listpack comes back whole, in its order, cursor 0, as Redis scans
+    /// one; a hash table pages by its primary key.
+    fn hscan(
+        &mut self,
+        key: &[u8],
+        cursor: u64,
+        count: usize,
+    ) -> Out<crate::cursor::Page<Vec<u8>>> {
+        let db = self.db;
+        let l = Limits::current();
+        let whole = format!(
+            "SELECT field, value FROM redis.hash_{db} WHERE key = $1 \
+               AND NOT EXISTS (SELECT 1 FROM redis.encoding_{db} WHERE key = $1 AND encoding = 3) \
+             ORDER BY seq LIMIT $2"
+        );
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = self
+            .rows("HSCAN", &whole, &[key.into(), cap(l.hash_entries).into()])?
+            .into_iter()
+            .filter_map(|(f, v)| Some((f, v?)))
+            .collect();
+        let packed = !rows.is_empty()
+            && rows.len() <= l.hash_entries
+            && rows
+                .iter()
+                .all(|(f, v)| f.len().max(v.len()) <= l.hash_value);
+        if packed {
+            return Ok((0, rows));
+        }
+        let scope = crate::cursor::scope(db, KeyKind::Hash as u8, key);
+        crate::cursor::step(
+            crate::cursor_state(),
+            cursor,
+            scope,
+            count,
+            token_random(),
+            |range, limit| {
+                let (from, upto) = range_args(range);
+                let sql = collection_page_sql(db, "hash", "field, value", "field", range);
+                let args = [key.into(), from.into(), limit.into(), upto.into()];
+                Ok(self
+                    .rows("HSCAN", &sql, &args)?
+                    .into_iter()
+                    .filter_map(|(f, v)| Some((f, v?)))
+                    .collect())
+            },
+        )
+    }
+
     fn hkeys(&mut self, key: &[u8]) -> Out<Vec<Vec<u8>>> {
         let sql = &crate::commands::sql::HKEYS[self.db as usize];
         self.column("HKEYS", sql, &[key.into()])
@@ -1607,52 +2242,97 @@ impl Store for SqlStore<'_, '_> {
         self.int("HSTRLEN", sql, &[key.into(), field.into()])
     }
 
-    fn hset(&mut self, key: &[u8], pairs: &[(Vec<u8>, Vec<u8>)]) -> Out<i64> {
+    /// A new field takes the next `seq`; an updated one keeps its own, which
+    /// is where a listpack keeps it.
+    fn hset(&mut self, key: &[u8], pairs: &[(Vec<u8>, Vec<u8>)], named: usize) -> Out<i64> {
+        let db = self.db;
+        let l = Limits::current();
         // `xmax = 0` marks a row this statement inserted rather than updated,
         // which is the count Redis returns.
         let sql = format!(
             "WITH ins AS ( \
                  INSERT INTO redis.hash_{db} (key, field, value) \
-                 SELECT $1, unnest($2::bytea[]), unnest($3::bytea[]) \
+                 SELECT $1, f, v FROM unnest($2::bytea[], $3::bytea[]) WITH ORDINALITY AS t(f, v, i) \
+                 ORDER BY i \
                  ON CONFLICT (key, field) DO UPDATE SET value = EXCLUDED.value \
                  RETURNING (xmax = 0) AS added \
-             ) \
-             SELECT count(*) FILTER (WHERE added)::bigint FROM ins",
-            db = self.db
+             ), {} \
+             SELECT count(*) FILTER (WHERE added)::bigint, {PRE_COLS} FROM ins",
+            pre_cte(db, "hash", 1, 4, "EXISTS (SELECT 1 FROM ins WHERE added)")
         );
         let fields: Vec<Option<Vec<u8>>> = pairs.iter().map(|(f, _)| Some(f.clone())).collect();
         let vals: Vec<Option<Vec<u8>>> = pairs.iter().map(|(_, v)| Some(v.clone())).collect();
         let tbl = self
             .client
-            .update_kept(&sql, &[key.into(), fields.into(), vals.into()])
+            .update_kept(
+                &sql,
+                &[
+                    key.into(),
+                    fields.into(),
+                    vals.into(),
+                    cap(l.hash_entries).into(),
+                ],
+            )
             .map_err(|e| failed("HSET", e))?;
-        Ok(tbl.first().get::<i64>(1).ok().flatten().unwrap_or(0))
+        let row = tbl.first();
+        let added = row.get::<i64>(1).ok().flatten().unwrap_or(0);
+        let pre = pre_at!(row, 2);
+        let lens = pairs.iter().flat_map(|(f, v)| [f.len(), v.len()]);
+        let mut enc = pre.enc(Enc::Listpack).unwrap_or(Enc::Listpack);
+        enc = encoding::hash_presize(enc, named, lens, &l);
+        if added > 0 {
+            enc = encoding::hash_grown(enc, pre.len() + added as usize, &l);
+        }
+        self.sync_enc("HSET", key, &pre, KeyKind::Hash, enc, false)?;
+        Ok(added)
     }
 
     fn hsetnx(&mut self, key: &[u8], field: &[u8], value: &[u8]) -> Out<bool> {
+        let db = self.db;
+        let l = Limits::current();
         let sql = format!(
-            "INSERT INTO redis.hash_{} (key, field, value) VALUES ($1, $2, $3) \
-             ON CONFLICT (key, field) DO NOTHING",
-            self.db
+            "WITH ins AS (INSERT INTO redis.hash_{db} (key, field, value) VALUES ($1, $2, $3) \
+                          ON CONFLICT (key, field) DO NOTHING RETURNING 1), \
+                  {} \
+             SELECT (SELECT count(*) FROM ins)::bigint, {PRE_COLS}",
+            pre_cte(db, "hash", 1, 4, "EXISTS (SELECT 1 FROM ins)")
         );
         let tbl = self
             .client
-            .update_kept(&sql, &[key.into(), field.into(), value.into()])
+            .update_kept(
+                &sql,
+                &[
+                    key.into(),
+                    field.into(),
+                    value.into(),
+                    cap(l.hash_entries).into(),
+                ],
+            )
             .map_err(|e| failed("HSETNX", e))?;
-        Ok(!tbl.is_empty())
+        let row = tbl.first();
+        let added = row.get::<i64>(1).ok().flatten().unwrap_or(0) > 0;
+        if added {
+            let pre = pre_at!(row, 2);
+            let mut enc = pre.enc(Enc::Listpack).unwrap_or(Enc::Listpack);
+            enc = encoding::hash_presize(enc, 1, [field.len(), value.len()], &l);
+            enc = encoding::hash_grown(enc, pre.len() + 1, &l);
+            self.sync_enc("HSETNX", key, &pre, KeyKind::Hash, enc, false)?;
+        }
+        Ok(added)
     }
 
+    /// The encoding row goes with the last field.
     fn hdel(&mut self, key: &[u8], fields: &[Vec<u8>]) -> Out<i64> {
+        let db = self.db;
         let sql = format!(
-            "DELETE FROM redis.hash_{} WHERE key = $1 AND field = ANY($2::bytea[])",
-            self.db
+            "WITH d AS (DELETE FROM redis.hash_{db} WHERE key = $1 AND field = ANY($2::bytea[]) \
+                        RETURNING 1), \
+                  e AS (DELETE FROM redis.encoding_{db} WHERE key = $1 \
+                          AND NOT EXISTS (SELECT 1 FROM redis.hash_{db} h \
+                                          WHERE h.key = $1 AND h.field <> ALL($2::bytea[]))) \
+             SELECT count(*)::bigint FROM d"
         );
-        let arg: Vec<Option<Vec<u8>>> = fields.iter().cloned().map(Some).collect();
-        let tbl = self
-            .client
-            .update_kept(&sql, &[key.into(), arg.into()])
-            .map_err(|e| failed("HDEL", e))?;
-        Ok(tbl.len() as i64)
+        self.write_int("HDEL", &sql, &[key.into(), arr(fields).into()])
     }
 
     /// One statement. The sum is taken as `numeric` and must land in range,
@@ -1660,8 +2340,9 @@ impl Store for SqlStore<'_, '_> {
     /// told apart by looking at the value.
     fn hincrby(&mut self, key: &[u8], field: &[u8], delta: i64) -> Out<Num<i64>> {
         let db = self.db;
+        let l = Limits::current();
         let sql = format!(
-            "INSERT INTO redis.hash_{db} (key, field, value) \
+            "WITH up AS (INSERT INTO redis.hash_{db} (key, field, value) \
              VALUES ($1, $2, convert_to($3::text, 'UTF8')) \
              ON CONFLICT (key, field) DO UPDATE \
              SET value = convert_to((encode(redis.hash_{db}.value, 'escape')::numeric + $3)::text, 'UTF8') \
@@ -1670,13 +2351,34 @@ impl Store for SqlStore<'_, '_> {
                    BETWEEN -9223372036854775808 AND 9223372036854775807 \
                AND encode(redis.hash_{db}.value, 'escape')::numeric + $3 \
                    BETWEEN -9223372036854775808 AND 9223372036854775807 \
-             RETURNING CAST(encode(value, 'escape') AS bigint)"
+             RETURNING CAST(encode(value, 'escape') AS bigint) AS v, (xmax = 0) AS added), \
+                  {} \
+             SELECT (SELECT v FROM up), (SELECT added FROM up), {PRE_COLS}",
+            pre_cte(db, "hash", 1, 4, "EXISTS (SELECT 1 FROM up WHERE added)")
         );
         let tbl = self
             .client
-            .update_kept(&sql, &[key.into(), field.into(), delta.into()])
+            .update_kept(
+                &sql,
+                &[
+                    key.into(),
+                    field.into(),
+                    delta.into(),
+                    cap(l.hash_entries).into(),
+                ],
+            )
             .map_err(|e| failed("HINCRBY", e))?;
-        if let Some(v) = tbl.first().get::<i64>(1).ok().flatten() {
+        let row = tbl.first();
+        if let Some(v) = row.get::<i64>(1).ok().flatten() {
+            let added = row.get::<bool>(2).ok().flatten().unwrap_or(false);
+            let pre = pre_at!(row, 3);
+            let mut enc = pre.enc(Enc::Listpack).unwrap_or(Enc::Listpack);
+            let text_len = v.to_string().len();
+            enc = encoding::hash_presize(enc, 0, [field.len(), text_len], &l);
+            if added {
+                enc = encoding::hash_grown(enc, pre.len() + 1, &l);
+            }
+            self.sync_enc("HINCRBY", key, &pre, KeyKind::Hash, enc, false)?;
             return Ok(Num::Value(v));
         }
         Ok(match self.hget(key, field)? {
@@ -1689,18 +2391,27 @@ impl Store for SqlStore<'_, '_> {
     /// is missing — so there is a row to lock even for a new field — then
     /// locked, read and written back. The sum is formatted the way Redis
     /// spells it, which SQL's float text is not.
-    fn hincrbyfloat(&mut self, key: &[u8], field: &[u8], delta: f64) -> Out<Num<String>> {
+    fn hincrbyfloat(&mut self, key: &[u8], field: &[u8], delta: LongDouble) -> Out<Num<String>> {
         let db = self.db;
+        let l = Limits::current();
         let args: &[DatumWithOid] = &[key.into(), field.into()];
-        self.client
+        let seeded = self
+            .client
             .update_kept(
                 &format!(
-                    "INSERT INTO redis.hash_{db} (key, field, value) VALUES ($1, $2, '\\x30') \
-                     ON CONFLICT (key, field) DO NOTHING"
+                    "WITH ins AS (INSERT INTO redis.hash_{db} (key, field, value) \
+                                  VALUES ($1, $2, '\\x30') \
+                                  ON CONFLICT (key, field) DO NOTHING RETURNING 1), \
+                          {} \
+                     SELECT (SELECT count(*) FROM ins)::bigint, {PRE_COLS}",
+                    pre_cte(db, "hash", 1, 3, "EXISTS (SELECT 1 FROM ins)")
                 ),
-                args,
+                &[key.into(), field.into(), cap(l.hash_entries).into()],
             )
             .map_err(|e| failed("HINCRBYFLOAT", e))?;
+        let seeded = seeded.first();
+        let added = seeded.get::<i64>(1).ok().flatten().unwrap_or(0) > 0;
+        let pre = pre_at!(seeded, 2);
         let current = self
             .client
             .update_kept(
@@ -1715,41 +2426,203 @@ impl Store for SqlStore<'_, '_> {
             .ok()
             .flatten()
             .unwrap_or_default();
-        let base = match std::str::from_utf8(&current)
-            .ok()
-            .and_then(|t| t.parse::<f64>().ok())
-        {
-            Some(v) if v.is_finite() => v,
-            _ => return Ok(Num::NotNumber),
+        let text = match crate::longdouble::increment(Some(&current), delta) {
+            Num::Value(text) => text,
+            refused => return Ok(refused),
         };
-        let sum = base + delta;
-        if !sum.is_finite() {
-            return Ok(Num::Overflow);
-        }
-        let text = crate::memdb::format_float(sum);
         self.client
             .update_kept(
                 &format!("UPDATE redis.hash_{db} SET value = $3 WHERE key = $1 AND field = $2"),
                 &[key.into(), field.into(), text.as_bytes().into()],
             )
             .map_err(|e| failed("HINCRBYFLOAT", e))?;
+        let mut enc = pre.enc(Enc::Listpack).unwrap_or(Enc::Listpack);
+        enc = encoding::hash_presize(enc, 0, [field.len(), text.len()], &l);
+        if added {
+            enc = encoding::hash_grown(enc, pre.len() + 1, &l);
+        }
+        self.sync_enc("HINCRBYFLOAT", key, &pre, KeyKind::Hash, enc, false)?;
         Ok(Num::Value(text))
     }
 
-    fn sadd(&mut self, key: &[u8], members: &[Vec<u8>]) -> Out<i64> {
-        let sql = format!(
-            "WITH ins AS (INSERT INTO redis.set_{} (key, member) SELECT $1, unnest($2::bytea[]) \
-             ON CONFLICT DO NOTHING RETURNING 1) SELECT count(*)::bigint FROM ins",
-            self.db
-        );
-        self.write_int("SADD", &sql, &[key.into(), arr(members).into()])
+    fn zset_to_skiplist(&mut self, key: &[u8]) -> Out<()> {
+        if self.kind(key)? == Some(KeyKind::Zset) {
+            let row = enc_row(KeyKind::Zset, Enc::Skiplist, false);
+            put_enc_row(self.client, self.db, key, row).map_err(|e| failed("SORT", e))?;
+        }
+        Ok(())
     }
 
-    fn srem(&mut self, key: &[u8], members: &[Vec<u8>]) -> Out<i64> {
+    /// The row, or what the contents imply, read no further than a packed
+    /// collection could reach: one past that is a hash table or skiplist
+    /// whatever the rest holds.
+    fn collection_encoding(&mut self, key: &[u8]) -> Out<Option<Enc>> {
+        let db = self.db;
+        let l = Limits::current();
+        let Some(kind) = self.kind(key)? else {
+            return Ok(None);
+        };
+        let (items_sql, limit, converted) = match kind {
+            KeyKind::Hash => (
+                format!(
+                    "SELECT field, value FROM redis.hash_{db} WHERE key = $1 ORDER BY seq LIMIT $2"
+                ),
+                l.hash_entries,
+                Enc::Hashtable,
+            ),
+            KeyKind::Set => (
+                format!("SELECT member, NULL::bytea FROM redis.set_{db} WHERE key = $1 LIMIT $2"),
+                l.set_intset.max(l.set_entries),
+                Enc::Hashtable,
+            ),
+            KeyKind::Zset => (
+                format!("SELECT member, NULL::bytea FROM redis.zset_{db} WHERE key = $1 LIMIT $2"),
+                l.zset_entries,
+                Enc::Skiplist,
+            ),
+            _ => return Ok(None),
+        };
+        let row = self
+            .client
+            .select_kept(
+                &format!("SELECT encoding FROM redis.encoding_{db} WHERE key = $1"),
+                &[key.into()],
+            )
+            .map_err(|e| failed("OBJECT", e))?
+            .first()
+            .get::<i16>(1)
+            .ok()
+            .flatten()
+            .and_then(Enc::from_code);
+        if let Some(e) = row {
+            return Ok(Some(e));
+        }
+        let rows = self.rows("OBJECT", &items_sql, &[key.into(), cap(limit).into()])?;
+        if rows.len() > limit {
+            return Ok(Some(converted));
+        }
+        let items: Vec<&[u8]> = rows
+            .iter()
+            .flat_map(|(a, b)| std::iter::once(a.as_slice()).chain(b.as_deref()))
+            .collect();
+        Ok(Some(natural_enc(kind, None, &items)))
+    }
+
+    // ── sets ──
+
+    /// The members it adds take the next `seq` in the order named. An intset
+    /// that becomes a listpack is put in its sorted order first, which the
+    /// listpack then keeps (`setTypeConvert`).
+    fn sadd(&mut self, key: &[u8], members: &[Vec<u8>]) -> Out<i64> {
+        let Some(first) = members.first() else {
+            return Ok(0);
+        };
+        let db = self.db;
+        let l = Limits::current();
         let sql = format!(
-            "WITH d AS (DELETE FROM redis.set_{} WHERE key = $1 AND member = ANY($2::bytea[]) RETURNING 1) \
-             SELECT count(*)::bigint FROM d",
-            self.db
+            "WITH {}, \
+                  sample AS (SELECT member FROM redis.set_{db} WHERE key = $1 LIMIT 1), \
+                  ins AS (INSERT INTO redis.set_{db} (key, member) \
+                          SELECT $1, m FROM unnest($2::bytea[]) WITH ORDINALITY AS t(m, i) \
+                          ORDER BY i ON CONFLICT DO NOTHING RETURNING member) \
+             SELECT i.member, (SELECT member FROM sample), {PRE_COLS} FROM ins i",
+            pre_cte(db, "set", 1, 3, "true")
+        );
+        let tbl = self
+            .client
+            .update_kept(
+                &sql,
+                &[
+                    key.into(),
+                    arr(members).into(),
+                    cap(l.set_intset.max(l.set_entries)).into(),
+                ],
+            )
+            .map_err(|e| failed("SADD", e))?;
+        // A row per member added, each carrying what the key held before.
+        let mut added = std::collections::HashSet::new();
+        let mut found = None;
+        for r in tbl {
+            if let Ok(Some(m)) = r.get::<Vec<u8>>(1) {
+                added.insert(m);
+            }
+            found = Some((r.get::<Vec<u8>>(2).ok().flatten(), pre_at!(r, 3)));
+        }
+        let Some((sample, pre)) = found else {
+            return Ok(0);
+        };
+        // With no row, a set holding an integer is an intset.
+        let sample_int = sample
+            .as_deref()
+            .is_some_and(|m| crate::memdb::parse_stored_int(m).is_some());
+        let before = pre.enc(if sample_int {
+            Enc::Intset
+        } else {
+            Enc::Listpack
+        });
+        let mut has_int = before.is_some() && (pre.row.is_some() || sample_int);
+        let mut enc = match before {
+            None => encoding::set_create(first, members.len(), &l),
+            Some(e) => encoding::set_presize(e, members.len(), &l),
+        };
+        let widest = if l.set_value < 20 {
+            self.int(
+                "SADD",
+                &format!(
+                    "SELECT max(octet_length(member))::bigint FROM redis.set_{db} WHERE key = $1"
+                ),
+                &[key.into()],
+            )? as usize
+        } else {
+            0
+        };
+        let mut len = pre.len();
+        let mut seen = std::collections::HashSet::new();
+        let mut after_conversion: Vec<Vec<u8>> = Vec::new();
+        let mut converted = false;
+        for m in members {
+            if !added.contains(m) || !seen.insert(m.as_slice()) {
+                continue;
+            }
+            let next = encoding::set_add(enc, len, m, || widest, &l);
+            if enc == Enc::Intset && next != Enc::Intset {
+                converted = true;
+            }
+            if converted {
+                after_conversion.push(m.clone());
+            }
+            enc = next;
+            len += 1;
+            has_int |= crate::memdb::parse_stored_int(m).is_some();
+        }
+        if converted {
+            // The integers held before the conversion take the order they
+            // had as an intset, ahead of everything added since.
+            let renumber = format!(
+                "UPDATE redis.set_{db} s SET seq = o.rn - 9223372036854775807 \
+                 FROM (SELECT member, row_number() OVER \
+                         (ORDER BY CASE WHEN encode(member, 'escape') ~ '^(0|-?[1-9][0-9]*)$' THEN encode(member, 'escape')::numeric END, seq) AS rn \
+                       FROM redis.set_{db} WHERE key = $1 AND member <> ALL($2::bytea[])) o \
+                 WHERE s.key = $1 AND s.member = o.member"
+            );
+            self.client
+                .update_kept(&renumber, &[key.into(), arr(&after_conversion).into()])
+                .map_err(|e| failed("SADD", e))?;
+        }
+        self.sync_enc("SADD", key, &pre, KeyKind::Set, enc, has_int)?;
+        Ok(added.len() as i64)
+    }
+
+    /// The encoding row goes with the last member.
+    fn srem(&mut self, key: &[u8], members: &[Vec<u8>]) -> Out<i64> {
+        let db = self.db;
+        let sql = format!(
+            "WITH d AS (DELETE FROM redis.set_{db} WHERE key = $1 AND member = ANY($2::bytea[]) \
+                        RETURNING 1), \
+                  e AS (DELETE FROM redis.encoding_{db} WHERE key = $1 \
+                          AND NOT EXISTS (SELECT 1 FROM redis.set_{db} s \
+                                          WHERE s.key = $1 AND s.member <> ALL($2::bytea[]))) \
+             SELECT count(*)::bigint FROM d"
         );
         self.write_int("SREM", &sql, &[key.into(), arr(members).into()])
     }
@@ -1782,7 +2655,70 @@ impl Store for SqlStore<'_, '_> {
 
     fn smembers(&mut self, key: &[u8]) -> Out<Vec<Vec<u8>>> {
         let sql = &crate::commands::sql::SMEMBERS[self.db as usize];
-        self.column("SMEMBERS", sql, &[key.into()])
+        let tbl = self
+            .client
+            .select_kept(sql, &[key.into()])
+            .map_err(|e| failed("SMEMBERS", e))?;
+        let mut row = None;
+        let mut members = Vec::new();
+        for r in tbl {
+            if let Ok(Some(m)) = r.get::<Vec<u8>>(1) {
+                members.push(m);
+            }
+            row = r.get::<i16>(2).ok().flatten().and_then(Enc::from_code);
+        }
+        Ok(set_order(members, row).0)
+    }
+
+    /// An intset or a listpack comes back whole, in its order, cursor 0, as
+    /// Redis scans one; a hash table pages by its primary key.
+    fn sscan(&mut self, key: &[u8], cursor: u64, count: usize) -> Out<(u64, Vec<Vec<u8>>)> {
+        let db = self.db;
+        let l = Limits::current();
+        let whole = format!(
+            "SELECT member, (SELECT encoding FROM redis.encoding_{db} WHERE key = $1) \
+             FROM redis.set_{db} WHERE key = $1 \
+               AND NOT EXISTS (SELECT 1 FROM redis.encoding_{db} WHERE key = $1 AND encoding = 3) \
+             ORDER BY seq LIMIT $2"
+        );
+        let limit = l.set_intset.max(l.set_entries);
+        let tbl = self
+            .client
+            .select_kept(&whole, &[key.into(), cap(limit).into()])
+            .map_err(|e| failed("SSCAN", e))?;
+        let mut row = None;
+        let mut members = Vec::new();
+        for r in tbl {
+            if let Ok(Some(m)) = r.get::<Vec<u8>>(1) {
+                members.push(m);
+            }
+            row = r.get::<i16>(2).ok().flatten().and_then(Enc::from_code);
+        }
+        if !members.is_empty() && members.len() <= limit {
+            let (members, enc) = set_order(members, row);
+            if enc.is_packed() {
+                return Ok((0, members));
+            }
+        }
+        let scope = crate::cursor::scope(db, KeyKind::Set as u8, key);
+        let (next, rows) = crate::cursor::step(
+            crate::cursor_state(),
+            cursor,
+            scope,
+            count,
+            token_random(),
+            |range, limit| {
+                let (from, upto) = range_args(range);
+                let sql = collection_page_sql(db, "set", "member", "member", range);
+                let args = [key.into(), from.into(), limit.into(), upto.into()];
+                Ok(self
+                    .column("SSCAN", &sql, &args)?
+                    .into_iter()
+                    .map(|m| (m, ()))
+                    .collect())
+            },
+        )?;
+        Ok((next, rows.into_iter().map(|(m, ())| m).collect()))
     }
 
     fn scard(&mut self, key: &[u8]) -> Out<i64> {
@@ -1790,131 +2726,225 @@ impl Store for SqlStore<'_, '_> {
         self.int("SCARD", sql, &[key.into()])
     }
 
+    /// `spopWithCountCommand`'s cases, as the memory half follows them
+    /// (`memdb::db`): the whole set as `SUNION` gives it, a listpack's choice
+    /// in its order, an intset's large share sorted, and a hash table popped
+    /// down to a few members rebuilt as a listpack.
     fn spop(&mut self, key: &[u8], n: i64) -> Out<Vec<Vec<u8>>> {
-        if n == 0 {
+        if n <= 0 {
             return Ok(Vec::new());
         }
         let db = self.db;
+        let l = Limits::current();
         let sql = format!(
-            "WITH picked AS (SELECT ctid FROM redis.set_{db} WHERE key = $1 ORDER BY random() LIMIT $2) \
-             DELETE FROM redis.set_{db} t USING picked WHERE t.ctid = picked.ctid RETURNING t.member"
+            "WITH pre AS (SELECT (SELECT encoding FROM redis.encoding_{db} WHERE key = $1) AS enc, \
+                                 (SELECT count(*) FROM redis.set_{db} WHERE key = $1) AS n), \
+                  picked AS (SELECT ctid FROM redis.set_{db} WHERE key = $1 ORDER BY random() LIMIT $2), \
+                  d AS (DELETE FROM redis.set_{db} t USING picked WHERE t.ctid = picked.ctid \
+                        RETURNING t.member, t.seq) \
+             SELECT d.member, pre.enc, pre.n FROM d, pre ORDER BY d.seq"
         );
-        self.write_column("SPOP", &sql, &[key.into(), n.into()])
+        let tbl = self
+            .client
+            .update_kept(&sql, &[key.into(), n.into()])
+            .map_err(|e| failed("SPOP", e))?;
+        let mut popped = Vec::new();
+        let (mut row, mut size) = (None, 0usize);
+        for r in tbl {
+            if let Ok(Some(m)) = r.get::<Vec<u8>>(1) {
+                popped.push(m);
+            }
+            row = r.get::<i16>(2).ok().flatten().and_then(Enc::from_code);
+            size = r.get::<i64>(3).ok().flatten().unwrap_or(0).max(0) as usize;
+        }
+        if popped.is_empty() {
+            return Ok(popped);
+        }
+        let n = n as usize;
+        if n >= size {
+            put_enc_row(self.client, db, key, None).map_err(|e| failed("SPOP", e))?;
+            let (whole, _) = set_order(popped, row);
+            let view = SqlSet {
+                index: std::collections::HashSet::new(),
+                members: whole,
+            };
+            return Ok(encoding::union(&[Some(view)], l).finish().0);
+        }
+        let enc = row.unwrap_or_else(|| {
+            if crate::memdb::parse_stored_int(&popped[0]).is_some() {
+                Enc::Intset
+            } else {
+                Enc::Listpack
+            }
+        });
+        let remaining = size - n;
+        let most = remaining * 5 <= n;
+        match enc {
+            Enc::Intset if most => encoding::sort_ints(&mut popped, |m| m),
+            Enc::Hashtable if most => {
+                let left = self.column(
+                    "SPOP",
+                    &format!("SELECT member FROM redis.set_{db} WHERE key = $1 ORDER BY seq"),
+                    &[key.into()],
+                )?;
+                let mut rebuilt = SetBuilder::new(Enc::Listpack, l);
+                for m in &left {
+                    rebuilt.add(m);
+                }
+                let has_int = left
+                    .iter()
+                    .any(|m| crate::memdb::parse_stored_int(m).is_some());
+                let want = enc_row(KeyKind::Set, rebuilt.enc(), has_int);
+                if want != row {
+                    put_enc_row(self.client, db, key, want).map_err(|e| failed("SPOP", e))?;
+                }
+            }
+            _ => {}
+        }
+        Ok(popped)
     }
 
+    /// `srandmemberWithCountCommand`: a count covering the set returns all
+    /// of it in its order, and a listpack gives its choice in its order.
     fn srandmember(&mut self, key: &[u8], n: i64) -> Out<Vec<Vec<u8>>> {
         let db = self.db;
         // With a negative count Redis allows repeats: LATERAL re-evaluates
         // random() per outer row, so each pick is independent.
-        let sql = if n < 0 {
-            format!(
+        if n < 0 {
+            let sql = format!(
                 "WITH cnt AS (SELECT count(*)::int AS c FROM redis.set_{db} WHERE key = $1) \
                  SELECT p.member FROM cnt, generate_series(1, $2::int) g, \
                    LATERAL (SELECT member FROM redis.set_{db} WHERE key = $1 \
                             OFFSET floor(random() * cnt.c)::int LIMIT 1) p \
                  WHERE cnt.c > 0"
-            )
-        } else {
-            format!("SELECT member FROM redis.set_{db} WHERE key = $1 ORDER BY random() LIMIT $2")
-        };
-        self.column(
-            "SRANDMEMBER",
-            &sql,
-            &[
-                key.into(),
-                n.unsigned_abs().min(i64::MAX as u64).cast_signed().into(),
-            ],
-        )
+            );
+            let count = n.unsigned_abs().min(i64::MAX as u64).cast_signed();
+            return self.column("SRANDMEMBER", &sql, &[key.into(), count.into()]);
+        }
+        let sql = format!(
+            "SELECT member, (SELECT encoding FROM redis.encoding_{db} WHERE key = $1) \
+             FROM (SELECT member, seq FROM redis.set_{db} WHERE key = $1 \
+                   ORDER BY random() LIMIT $2) s ORDER BY seq"
+        );
+        let tbl = self
+            .client
+            .select_kept(&sql, &[key.into(), n.into()])
+            .map_err(|e| failed("SRANDMEMBER", e))?;
+        let mut row = None;
+        let mut members = Vec::new();
+        for r in tbl {
+            if let Ok(Some(m)) = r.get::<Vec<u8>>(1) {
+                members.push(m);
+            }
+            row = r.get::<i16>(2).ok().flatten().and_then(Enc::from_code);
+        }
+        Ok(set_order(members, row).0)
     }
 
     fn smove(&mut self, src: &[u8], dst: &[u8], member: &[u8]) -> Out<(bool, bool)> {
         let db = self.db;
+        let l = Limits::current();
         let sql = format!(
-            "WITH d AS (DELETE FROM redis.set_{db} WHERE key = $1 AND member = $3 RETURNING member), \
+            "WITH {}, \
+                  sample AS (SELECT member FROM redis.set_{db} WHERE key = $2 LIMIT 1), \
+                  d AS (DELETE FROM redis.set_{db} WHERE key = $1 AND member = $3 RETURNING member), \
                   ins AS (INSERT INTO redis.set_{db} (key, member) SELECT $2, d.member FROM d \
-                          ON CONFLICT DO NOTHING RETURNING 1) \
-             SELECT (SELECT count(*)::bigint FROM d), (SELECT count(*)::bigint FROM ins)"
+                          ON CONFLICT DO NOTHING RETURNING 1), \
+                  e AS (DELETE FROM redis.encoding_{db} WHERE key = $1 AND EXISTS (SELECT 1 FROM d) \
+                          AND NOT EXISTS (SELECT 1 FROM redis.set_{db} s \
+                                          WHERE s.key = $1 AND s.member <> $3)) \
+             SELECT (SELECT count(*)::bigint FROM d), (SELECT count(*)::bigint FROM ins), \
+                    (SELECT member FROM sample), {PRE_COLS}",
+            pre_cte(db, "set", 2, 4, "true")
         );
         let tbl = self
             .client
-            .update_kept(&sql, &[src.into(), dst.into(), member.into()])
+            .update_kept(
+                &sql,
+                &[
+                    src.into(),
+                    dst.into(),
+                    member.into(),
+                    cap(l.set_intset.max(l.set_entries)).into(),
+                ],
+            )
             .map_err(|e| failed("SMOVE", e))?;
         let row = tbl.first();
         let moved = row.get::<i64>(1).ok().flatten().unwrap_or(0) > 0;
         let added = row.get::<i64>(2).ok().flatten().unwrap_or(0) > 0;
+        if added {
+            let sample = row.get::<Vec<u8>>(3).ok().flatten();
+            let pre = pre_at!(row, 4);
+            let sample_int = sample
+                .as_deref()
+                .is_some_and(|m| crate::memdb::parse_stored_int(m).is_some());
+            let before = pre.enc(if sample_int {
+                Enc::Intset
+            } else {
+                Enc::Listpack
+            });
+            let start = before.unwrap_or_else(|| encoding::set_create(member, 1, &l));
+            let enc = encoding::set_add(start, pre.len(), member, || 0, &l);
+            let is_int = crate::memdb::parse_stored_int(member).is_some();
+            let has_int = (before.is_some() && (pre.row.is_some() || sample_int)) || is_int;
+            if start == Enc::Intset && enc != Enc::Intset {
+                let renumber = format!(
+                    "UPDATE redis.set_{db} s SET seq = o.rn - 9223372036854775807 \
+                     FROM (SELECT member, row_number() OVER \
+                             (ORDER BY CASE WHEN encode(member, 'escape') ~ '^(0|-?[1-9][0-9]*)$' THEN encode(member, 'escape')::numeric END, seq) AS rn \
+                           FROM redis.set_{db} WHERE key = $1 AND member <> $2) o \
+                     WHERE s.key = $1 AND s.member = o.member"
+                );
+                self.client
+                    .update_kept(&renumber, &[dst.into(), member.into()])
+                    .map_err(|e| failed("SMOVE", e))?;
+            }
+            self.sync_enc("SMOVE", dst, &pre, KeyKind::Set, enc, has_int)?;
+        }
         Ok((moved, added))
     }
 
     fn sunion(&mut self, keys: &[Vec<u8>]) -> Out<Vec<Vec<u8>>> {
-        let sql = format!(
-            "SELECT DISTINCT member FROM redis.set_{} WHERE key = ANY($1::bytea[])",
-            self.db
-        );
-        self.column("SUNION", &sql, &[arr(keys).into()])
+        let sets = self.sets_in_order("SUNION", keys)?;
+        Ok(encoding::union(&sets, Limits::current()).finish().0)
     }
 
     fn sinter(&mut self, keys: &[Vec<u8>]) -> Out<Vec<Vec<u8>>> {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        let sql = crate::commands::build_inter_sql(self.db, keys.len(), 1);
-        let args: Vec<DatumWithOid> = keys.iter().map(|k| k.as_slice().into()).collect();
-        self.column("SINTER", &sql, &args)
+        Ok(self.inter_in_order("SINTER", keys)?.0)
     }
 
     fn sdiff(&mut self, keys: &[Vec<u8>]) -> Out<Vec<Vec<u8>>> {
-        let Some((first, rest)) = keys.split_first() else {
-            return Ok(Vec::new());
-        };
-        let db = self.db;
-        let sql = format!(
-            "SELECT DISTINCT member FROM redis.set_{db} WHERE key = $1 \
-             EXCEPT SELECT member FROM redis.set_{db} WHERE key = ANY($2::bytea[])"
-        );
-        self.column("SDIFF", &sql, &[first.as_slice().into(), arr(rest).into()])
+        let sets = self.sets_in_order("SDIFF", keys)?;
+        let same = keys.len() > 1 && keys[1..].contains(&keys[0]);
+        Ok(encoding::diff(&sets, same, Limits::current()).finish().0)
     }
 
     fn sunionstore(&mut self, dst: &[u8], keys: &[Vec<u8>]) -> Out<i64> {
-        let db = self.db;
-        let sql = crate::commands::set_store_sql(
-            db,
-            &format!("SELECT DISTINCT member FROM redis.set_{db} WHERE key = ANY($2::bytea[])"),
-        );
-        self.write_int("SUNIONSTORE", &sql, &[dst.into(), arr(keys).into()])
+        let sets = self.sets_in_order("SUNIONSTORE", keys)?;
+        let (members, enc) = encoding::union(&sets, Limits::current()).finish();
+        self.store_set("SUNIONSTORE", dst, &members, enc)
     }
 
     fn sinterstore(&mut self, dst: &[u8], keys: &[Vec<u8>]) -> Out<i64> {
         if keys.is_empty() {
             return Ok(0);
         }
-        let sql = crate::commands::set_store_sql(
-            self.db,
-            &crate::commands::build_inter_sql(self.db, keys.len(), 2),
-        );
-        let mut args: Vec<DatumWithOid> = vec![dst.into()];
-        args.extend(keys.iter().map(|k| DatumWithOid::from(k.as_slice())));
-        self.write_int("SINTERSTORE", &sql, &args)
+        let (members, walked) = self.inter_in_order("SINTERSTORE", keys)?;
+        let built =
+            encoding::inter_store(walked, members.iter().map(Vec::as_slice), Limits::current());
+        let (members, enc) = built.finish();
+        self.store_set("SINTERSTORE", dst, &members, enc)
     }
 
     fn sdiffstore(&mut self, dst: &[u8], keys: &[Vec<u8>]) -> Out<i64> {
-        let Some((first, rest)) = keys.split_first() else {
-            return Ok(0);
-        };
-        let db = self.db;
-        let sql = crate::commands::set_store_sql(
-            db,
-            &format!(
-                "SELECT DISTINCT member FROM redis.set_{db} WHERE key = $2 \
-                 EXCEPT SELECT member FROM redis.set_{db} WHERE key = ANY($3::bytea[])"
-            ),
-        );
-        self.write_int(
-            "SDIFFSTORE",
-            &sql,
-            &[dst.into(), first.as_slice().into(), arr(rest).into()],
-        )
+        let sets = self.sets_in_order("SDIFFSTORE", keys)?;
+        let same = keys.len() > 1 && keys[1..].contains(&keys[0]);
+        let (members, enc) = encoding::diff(&sets, same, Limits::current()).finish();
+        self.store_set("SDIFFSTORE", dst, &members, enc)
     }
-
     fn sintercard(&mut self, keys: &[Vec<u8>], limit: Option<i64>) -> Out<i64> {
         let db = self.db;
         let sql = format!(
@@ -1936,7 +2966,14 @@ impl Store for SqlStore<'_, '_> {
         )
     }
 
-    fn zadd(&mut self, key: &[u8], pairs: &[(f64, Vec<u8>)], o: ZaddOpts) -> Out<i64> {
+    fn zadd(&mut self, key: &[u8], pairs: &[(f64, Vec<u8>)], o: ZaddOpts) -> Out<(i64, i64)> {
+        let db = self.db;
+        let l = Limits::current();
+        // Redis sizes the sorted set by the pairs named, repeats included,
+        // and a new one by the first member's length.
+        let named = pairs.len();
+        let first = pairs.first().map_or(0, |(_, m)| m.len());
+        let widest = pairs.iter().map(|(_, m)| m.len()).max().unwrap_or(0);
         // One statement can touch a row once, so a member named twice is
         // set once, to its last score.
         let pairs = crate::commands::dedup_last(pairs, |(_, m)| m.as_slice());
@@ -1949,15 +2986,46 @@ impl Store for SqlStore<'_, '_> {
             lt: o.lt,
             ch: o.ch,
         };
-        let sql = crate::commands::zadd_sql(self.db, &flags);
+        let sql = crate::commands::zadd_sql(db, &flags)
+            .replacen(
+                "WITH input AS",
+                &format!("WITH {}, input AS", pre_cte(db, "zset", 1, 4, "true")),
+                1,
+            )
+            .replacen("AS changed", &format!("AS changed, {PRE_COLS}"), 1);
         let tbl = self
             .client
-            .update_kept(&sql, &[key.into(), members.into(), scores.into()])
+            .update_kept(
+                &sql,
+                &[
+                    key.into(),
+                    members.into(),
+                    scores.into(),
+                    cap(l.zset_entries).into(),
+                ],
+            )
             .map_err(|e| failed("ZADD", e))?;
         let row = tbl.first();
         let added = row.get::<i64>(1).ok().flatten().unwrap_or(0);
         let changed = row.get::<i64>(2).ok().flatten().unwrap_or(0);
-        Ok(if o.ch { added + changed } else { added })
+        let pre = pre_at!(row, 3);
+        if pre.live || added > 0 {
+            let mut enc = match pre.enc(Enc::Listpack) {
+                Some(e) => encoding::zset_presize(e, named, &l),
+                None => encoding::zset_create(named, first, &l),
+            };
+            // A new member longer than the limit converts it; so does the
+            // count passing it. Which members were new is not asked for: a
+            // listpack holds none longer than the limit already.
+            if added > 0
+                && enc == Enc::Listpack
+                && (pre.len() + added as usize > l.zset_entries || widest > l.zset_value)
+            {
+                enc = Enc::Skiplist;
+            }
+            self.sync_enc("ZADD", key, &pre, KeyKind::Zset, enc, false)?;
+        }
+        Ok((added, added + changed))
     }
 
     /// A new member is inserted outright; an existing one is locked, and its
@@ -1967,17 +3035,35 @@ impl Store for SqlStore<'_, '_> {
     fn zadd_incr(&mut self, key: &[u8], member: &[u8], delta: f64, o: ZaddOpts) -> Out<Incr> {
         let db = self.db;
         if !o.xx {
+            let l = Limits::current();
             let inserted = self
                 .client
                 .update_kept(
                     &format!(
-                        "INSERT INTO redis.zset_{db} (key, member, score) VALUES ($1, $2, $3) \
-                         ON CONFLICT (key, member) DO NOTHING RETURNING score"
+                        "WITH {}, \
+                              ins AS (INSERT INTO redis.zset_{db} (key, member, score) \
+                                      VALUES ($1, $2, $3) \
+                                      ON CONFLICT (key, member) DO NOTHING RETURNING score) \
+                         SELECT (SELECT count(*) FROM ins)::bigint, {PRE_COLS}",
+                        pre_cte(db, "zset", 1, 4, "true")
                     ),
-                    &[key.into(), member.into(), delta.into()],
+                    &[
+                        key.into(),
+                        member.into(),
+                        delta.into(),
+                        cap(l.zset_entries).into(),
+                    ],
                 )
                 .map_err(|e| failed("ZADD", e))?;
-            if !inserted.is_empty() {
+            let row = inserted.first();
+            if row.get::<i64>(1).ok().flatten().unwrap_or(0) > 0 {
+                let pre = pre_at!(row, 2);
+                let start = match pre.enc(Enc::Listpack) {
+                    Some(e) => e,
+                    None => encoding::zset_create(1, member.len(), &l),
+                };
+                let enc = encoding::zset_add(start, pre.len(), member.len(), &l);
+                self.sync_enc("ZADD", key, &pre, KeyKind::Zset, enc, false)?;
                 return Ok(Incr::Score(delta));
             }
         }
@@ -2016,15 +3102,19 @@ impl Store for SqlStore<'_, '_> {
         Ok(Incr::Score(new))
     }
 
+    /// The encoding row goes with the last member.
     fn zrem(&mut self, key: &[u8], members: &[Vec<u8>]) -> Out<i64> {
+        let db = self.db;
         let sql = format!(
-            "WITH d AS (DELETE FROM redis.zset_{} WHERE key = $1 AND member = ANY($2::bytea[]) RETURNING 1) \
-             SELECT count(*)::bigint FROM d",
-            self.db
+            "WITH d AS (DELETE FROM redis.zset_{db} WHERE key = $1 AND member = ANY($2::bytea[]) \
+                        RETURNING 1), \
+                  e AS (DELETE FROM redis.encoding_{db} WHERE key = $1 \
+                          AND NOT EXISTS (SELECT 1 FROM redis.zset_{db} z \
+                                          WHERE z.key = $1 AND z.member <> ALL($2::bytea[]))) \
+             SELECT count(*)::bigint FROM d"
         );
         self.write_int("ZREM", &sql, &[key.into(), arr(members).into()])
     }
-
     fn zscore(&mut self, key: &[u8], member: &[u8]) -> Out<Option<f64>> {
         let sql = &crate::commands::sql::ZSCORE[self.db as usize];
         let tbl = self
@@ -2050,6 +3140,49 @@ impl Store for SqlStore<'_, '_> {
     fn zcard(&mut self, key: &[u8]) -> Out<i64> {
         let sql = &crate::commands::sql::ZCARD[self.db as usize];
         self.int("ZCARD", sql, &[key.into()])
+    }
+
+    /// A listpack comes back whole, in score order, cursor 0, as Redis scans
+    /// one; a skiplist pages by its primary key.
+    fn zscan(&mut self, key: &[u8], cursor: u64, count: usize) -> Out<crate::cursor::Page<f64>> {
+        let db = self.db;
+        let l = Limits::current();
+        let whole = format!(
+            "SELECT member, score FROM redis.zset_{db} WHERE key = $1 \
+               AND NOT EXISTS (SELECT 1 FROM redis.encoding_{db} WHERE key = $1 AND encoding = 4) \
+             ORDER BY score, member LIMIT $2"
+        );
+        let rows = self.pairs("ZSCAN", &whole, &[key.into(), cap(l.zset_entries).into()])?;
+        if !rows.is_empty()
+            && rows.len() <= l.zset_entries
+            && rows.iter().all(|(m, _)| m.len() <= l.zset_value)
+        {
+            return Ok((0, rows));
+        }
+        let scope = crate::cursor::scope(db, KeyKind::Zset as u8, key);
+        crate::cursor::step(
+            crate::cursor_state(),
+            cursor,
+            scope,
+            count,
+            token_random(),
+            |range, limit| {
+                let (from, upto) = range_args(range);
+                let sql = collection_page_sql(db, "zset", "member, score", "member", range);
+                let tbl = self
+                    .client
+                    .select_kept(&sql, &[key.into(), from.into(), limit.into(), upto.into()])
+                    .map_err(|e| failed("ZSCAN", e))?;
+                Ok(tbl
+                    .filter_map(|r| {
+                        Some((
+                            r.get::<Vec<u8>>(1).ok()??,
+                            r.get::<f64>(2).ok().flatten().unwrap_or(0.0),
+                        ))
+                    })
+                    .collect())
+            },
+        )
     }
 
     fn zcount(&mut self, key: &[u8], min: ScoreBound, max: ScoreBound) -> Out<i64> {
@@ -2220,6 +3353,22 @@ impl Store for SqlStore<'_, '_> {
                    LATERAL (SELECT member, score FROM redis.zset_{db} WHERE key = $1 \
                             OFFSET floor(random() * cnt.c)::int LIMIT 1) p \
                  WHERE cnt.c > 0"
+            )
+        } else if n > 1 {
+            // A count covering the sorted set returns all of it from the
+            // highest score down, as Redis's iterator walks it; a listpack
+            // gives its choice in its order; a skiplist's comes as drawn.
+            format!(
+                "WITH whole AS (SELECT (SELECT count(*) FROM redis.zset_{db} WHERE key = $1) <= $2 AS w), \
+                      skip AS (SELECT EXISTS (SELECT 1 FROM redis.encoding_{db} \
+                                              WHERE key = $1 AND encoding = 4) AS s) \
+                 SELECT member, score FROM (SELECT member, score, random() AS r \
+                                            FROM redis.zset_{db} WHERE key = $1 \
+                                            ORDER BY r LIMIT $2) p, whole, skip \
+                 ORDER BY CASE WHEN whole.w THEN NULL WHEN skip.s THEN r END, \
+                          CASE WHEN whole.w THEN score END DESC, \
+                          CASE WHEN whole.w THEN member END DESC, \
+                          score, member"
             )
         } else {
             format!(
@@ -2650,6 +3799,89 @@ impl SqlStore<'_, '_> {
 /// Byte strings as a `bytea[]` parameter.
 fn arr(items: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
     items.iter().cloned().map(Some).collect()
+}
+
+// ───────────────────────────── keyset cursors ───────────────────────────────
+
+/// Random bits for a cursor token. Each worker's generator is seeded from
+/// the clock and may have been seeded before the fork, so the pid is mixed
+/// in for workers drawing at once.
+fn token_random() -> u64 {
+    crate::memdb::fast_random() ^ u64::from(std::process::id()).rotate_left(32)
+}
+
+/// The predicate a page's range puts on `col`, the bound being parameter
+/// `$from` and the upper bound `$upto`. Each range is its own statement text,
+/// so each keeps a plan that can use the index.
+fn range_sql(range: &crate::cursor::Range, col: &str, from: usize, upto: usize) -> String {
+    use crate::cursor::Range;
+    match range {
+        Range::All => "TRUE".to_string(),
+        Range::After(_) => format!("{col} > ${from}"),
+        Range::From(_) => format!("{col} >= ${from}"),
+        Range::Between(..) => format!("{col} > ${from} AND {col} < ${upto}"),
+    }
+}
+
+/// The two bounds as parameters, empty where the range has none: a
+/// statement may leave a parameter unused, so every range takes the same
+/// list.
+fn range_args(range: &crate::cursor::Range) -> (Vec<u8>, Vec<u8>) {
+    use crate::cursor::Range;
+    match range {
+        Range::All => (Vec::new(), Vec::new()),
+        Range::After(b) | Range::From(b) => (b.clone(), Vec::new()),
+        Range::Between(a, b) => (a.clone(), b.clone()),
+    }
+}
+
+/// One `SCAN` page of database `db`: the next `$2` keys in `range` (all of
+/// them for a NULL `$2`) across every table a key can be in, each with
+/// whether it is live. Parameters: `$1` the bound, `$3` the upper bound.
+fn scan_page_sql(db: u8, range: &crate::cursor::Range) -> String {
+    let pred = range_sql(range, "key", 1, 3);
+    let from = |tbl: &str, distinct: &str| {
+        format!("(SELECT {distinct}key FROM redis.{tbl}_{db} WHERE {pred} ORDER BY key LIMIT $2)")
+    };
+    // A collection keeps a row per element, so its keys are DISTINCT; the
+    // index on (key, ...) still delivers them in order.
+    let tables = [
+        from("kv", ""),
+        from("hash", "DISTINCT "),
+        from("list", "DISTINCT "),
+        from("set", "DISTINCT "),
+        from("zset", "DISTINCT "),
+        from("stream", ""),
+    ]
+    .join(" UNION ");
+    format!(
+        "WITH page AS (SELECT key FROM ({tables}) u ORDER BY key LIMIT $2) \
+         SELECT p.key, \
+                NOT EXISTS (SELECT 1 FROM redis.kv_{db} t \
+                             WHERE t.key = p.key AND t.expires_at <= now()) \
+            AND NOT EXISTS (SELECT 1 FROM redis.expiry_{db} e \
+                             WHERE e.key = p.key AND e.expires_at <= now()) \
+           FROM page p ORDER BY p.key"
+    )
+}
+
+/// One `HSCAN`/`SSCAN`/`ZSCAN` page: `cols` of the collection `$1` in table
+/// `tbl`, ordered by `col`, the next `$3` of them in `range` (all for a NULL
+/// `$3`), nothing once the key has expired. `$2` is the bound and `$4` the
+/// upper bound.
+fn collection_page_sql(
+    db: u8,
+    tbl: &str,
+    cols: &str,
+    col: &str,
+    range: &crate::cursor::Range,
+) -> String {
+    format!(
+        "SELECT {cols} FROM redis.{tbl}_{db} WHERE key = $1 AND {pred} AND {live} \
+         ORDER BY {col} LIMIT $3",
+        pred = range_sql(range, col, 2, 4),
+        live = crate::commands::sql::live(db as usize),
+    )
 }
 
 #[cfg(test)]

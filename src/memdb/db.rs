@@ -15,12 +15,13 @@ use allocator_api2::alloc::Allocator;
 
 use super::deque::Deque;
 use super::dict::{Dict, Seed};
+use super::encoding::{self, Enc, Limits, SetBuilder, SetView};
+use super::keyspace::{Entry, Keyspace};
+use super::lru::{self, Tracking};
 use super::zset::ZSet;
-use super::{
-    Bytes, KeyKind, bytes_in, fast_random, format_float, parse_stored_float, parse_stored_int,
-    random_picks, range_bounds,
-};
+use super::{Bytes, KeyKind, bytes_in, fast_random, parse_stored_int, random_picks, range_bounds};
 use crate::commands::{ExpireCond, GetExExpiry, KeyDump, LexBound, Response, ScoreBound};
+use crate::longdouble::{LongDouble, increment};
 use crate::store::{Incr, LSet, Num, Out, SetArgs, SetDone, Store, ZaddOpts};
 
 /// `proto-max-bulk-len`: no string grows past this.
@@ -29,9 +30,11 @@ const MAX_STRING_LEN: usize = 512 * 1024 * 1024;
 pub enum Value<A: Allocator + Clone> {
     Str(Bytes<A>),
     List(Deque<Bytes<A>, A>),
-    Hash(Dict<Bytes<A>, A>),
-    Set(Dict<(), A>),
-    Zset(ZSet<A>),
+    /// A hash, a set and a sorted set carry the encoding Redis would have
+    /// given them (`encoding.rs`), which decides their order.
+    Hash(Dict<Bytes<A>, A>, Enc),
+    Set(Dict<(), A>, Enc),
+    Zset(ZSet<A>, Enc),
     /// A stream's serialised value — see `stream.rs`.
     Stream(Bytes<A>),
 }
@@ -41,9 +44,9 @@ impl<A: Allocator + Clone> Value<A> {
         match self {
             Value::Str(_) => KeyKind::String,
             Value::List(_) => KeyKind::List,
-            Value::Hash(_) => KeyKind::Hash,
-            Value::Set(_) => KeyKind::Set,
-            Value::Zset(_) => KeyKind::Zset,
+            Value::Hash(..) => KeyKind::Hash,
+            Value::Set(..) => KeyKind::Set,
+            Value::Zset(..) => KeyKind::Zset,
             Value::Stream(_) => KeyKind::Stream,
         }
     }
@@ -52,32 +55,40 @@ impl<A: Allocator + Clone> Value<A> {
     fn is_empty_collection(&self) -> bool {
         match self {
             Value::List(l) => l.is_empty(),
-            Value::Hash(h) => h.is_empty(),
-            Value::Set(s) => s.is_empty(),
-            Value::Zset(z) => z.is_empty(),
+            Value::Hash(h, _) => h.is_empty(),
+            Value::Set(s, _) => s.is_empty(),
+            Value::Zset(z, _) => z.is_empty(),
             Value::Str(_) | Value::Stream(_) => false,
         }
     }
 }
 
-pub struct Entry<A: Allocator + Clone> {
-    pub value: Value<A>,
-    /// Microseconds since the Unix epoch; 0 for none.
-    pub deadline: i64,
-}
-
-impl<A: Allocator + Clone> Entry<A> {
-    fn expired(&self, now: i64) -> bool {
-        self.deadline != 0 && self.deadline <= now
-    }
-
-    fn deadline(&self) -> Option<i64> {
-        (self.deadline != 0).then_some(self.deadline)
-    }
+fn held_deadline<A: Allocator + Clone>(e: &Entry<A>) -> Option<i64> {
+    (e.deadline() != 0).then_some(e.deadline())
 }
 
 fn now() -> i64 {
     crate::server::now_ms().saturating_mul(1000)
+}
+
+/// The access field a new key starts with under the policy in force.
+fn fresh() -> u32 {
+    lru::access().tracking.fresh(crate::server::now_ms())
+}
+
+/// A key the eviction sampler drew, with its score: higher goes first.
+pub struct Sample {
+    pub score: u64,
+    pub key: Vec<u8>,
+}
+
+/// What the eviction sampler scores a key by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Score {
+    /// Idle time or inverse frequency, from the access field.
+    Access(Tracking),
+    /// `volatile-ttl`: the sooner the deadline, the higher.
+    Deadline,
 }
 
 thread_local! {
@@ -86,6 +97,14 @@ thread_local! {
     /// event, INFO's `expired_keys`, a tracking invalidation — and that is
     /// done outside the database's lock, by whoever ran the command.
     static REAPED: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Set for a command run during CLIENT PAUSE: a key past its deadline
+    /// reads as gone but is not deleted, as Redis pauses expiry with writes.
+    static EXPIRY_PAUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the commands this thread runs next may delete expired keys.
+pub fn pause_expiry(paused: bool) {
+    EXPIRY_PAUSED.set(paused);
 }
 
 /// The keys expired on access since the last call.
@@ -102,7 +121,7 @@ fn vecs<'a>(items: impl Iterator<Item = &'a [u8]>) -> Vec<Vec<u8>> {
 }
 
 pub struct Db<A: Allocator + Clone> {
-    keys: Dict<Entry<A>, A>,
+    keys: Keyspace<A>,
     seed: Seed,
 }
 
@@ -121,9 +140,8 @@ macro_rules! typed {
         fn $make(&mut self, key: &[u8]) -> Out<&mut $ty> {
             let (seed, alloc) = (self.seed, self.keys.alloc());
             self.entry(key);
-            let (e, _) = self.keys.get_or_insert_with(key, || Entry {
-                value: Value::$variant(($new)(seed, alloc)),
-                deadline: 0,
+            let (e, _) = self.keys.get_or_insert_with(key, || {
+                Entry::new(Value::$variant(($new)(seed, alloc)), 0, fresh())
             });
             match &mut e.value {
                 Value::$variant(v) => Ok(v),
@@ -133,10 +151,102 @@ macro_rules! typed {
     };
 }
 
+/// `typed!` for the collections that carry an encoding: `$get` without it,
+/// `$get_enc` with it, and `$make` creating the collection in the encoding
+/// `enc` gives — and saying whether it did.
+macro_rules! typed_enc {
+    ($get:ident, $get_enc:ident, $make:ident, $variant:ident, $ty:ty, $new:expr) => {
+        fn $get(&mut self, key: &[u8]) -> Option<&mut $ty> {
+            self.$get_enc(key).map(|(v, _)| v)
+        }
+
+        fn $get_enc(&mut self, key: &[u8]) -> Option<(&mut $ty, &mut Enc)> {
+            match &mut self.entry(key)?.value {
+                Value::$variant(v, e) => Some((v, e)),
+                _ => None,
+            }
+        }
+
+        fn $make(
+            &mut self,
+            key: &[u8],
+            enc: impl FnOnce() -> Enc,
+        ) -> Out<(&mut $ty, &mut Enc, bool)> {
+            let (seed, alloc) = (self.seed, self.keys.alloc());
+            self.entry(key);
+            let (e, created) = self.keys.get_or_insert_with(key, || {
+                Entry::new(Value::$variant(($new)(seed, alloc), enc()), 0, fresh())
+            });
+            match &mut e.value {
+                Value::$variant(v, e) => Ok((v, e, created)),
+                _ => Err(crate::commands::wrong_type()),
+            }
+        }
+    };
+}
+
+/// A set as the set operations read it: its members in its own order — an
+/// intset's sorted — and its encoding.
+struct MemSet<'a, A: Allocator + Clone> {
+    d: &'a Dict<(), A>,
+    enc: Enc,
+}
+
+impl<A: Allocator + Clone> SetView for MemSet<'_, A> {
+    fn size(&self) -> usize {
+        self.d.len()
+    }
+
+    fn has(&self, m: &[u8]) -> bool {
+        self.d.contains(m)
+    }
+
+    fn members(&self) -> Vec<&[u8]> {
+        set_order(self.d, self.enc)
+    }
+}
+
+/// A set's members in the order its encoding keeps them.
+fn set_order<A: Allocator + Clone>(d: &Dict<(), A>, enc: Enc) -> Vec<&[u8]> {
+    let mut out: Vec<&[u8]> = d.keys().collect();
+    if enc == Enc::Intset {
+        encoding::sort_ints(&mut out, |m| m);
+    }
+    out
+}
+
+/// Remove `key` from a collection the way its encoding does: in place for a
+/// listpack, so the rest keep their order.
+fn remove_in<V, A: Allocator + Clone>(d: &mut Dict<V, A>, enc: Enc, key: &[u8]) -> Option<V> {
+    if enc == Enc::Listpack {
+        d.remove_ordered(key)
+    } else {
+        d.remove(key)
+    }
+}
+
+/// The longest member of a set, as text: what an intset converting to a
+/// listpack measures.
+fn widest<A: Allocator + Clone>(d: &Dict<(), A>) -> usize {
+    d.keys().map(<[u8]>::len).max().unwrap_or(0)
+}
+
+/// Add `m`, known to be absent, to a set, converting it first as Redis
+/// would. An intset becoming anything else is put in its sorted order, which
+/// a listpack then keeps.
+fn set_insert<A: Allocator + Clone>(s: &mut Dict<(), A>, enc: &mut Enc, m: &[u8], l: &Limits) {
+    let next = encoding::set_add(*enc, s.len(), m, || widest(s), l);
+    if *enc == Enc::Intset && next != Enc::Intset {
+        s.sort_by_cached_key(|k, _| super::parse_stored_int(k).unwrap_or(0));
+    }
+    *enc = next;
+    s.insert(m, ());
+}
+
 impl<A: Allocator + Clone> Db<A> {
     pub fn new_in(seed: Seed, alloc: A) -> Self {
         Db {
-            keys: Dict::new_in(seed, alloc),
+            keys: Keyspace::new_in(seed, alloc),
             seed,
         }
     }
@@ -145,22 +255,69 @@ impl<A: Allocator + Clone> Db<A> {
         bytes_in(s, self.keys.alloc())
     }
 
-    /// The live entry at `key`. One past its deadline is removed on the way.
+    /// The live entry at `key`, as Redis's `lookupKey` finds it: one past its
+    /// deadline is removed on the way, and a live one has its access field
+    /// updated unless the command runs without touching (`lru::Access`).
     pub fn entry(&mut self, key: &[u8]) -> Option<&mut Entry<A>> {
+        let access = lru::access();
+        let e = self.lookup(key)?;
+        if access.touch {
+            e.lru = access.tracking.touched(e.lru, crate::server::now_ms());
+        }
+        Some(e)
+    }
+
+    /// `entry` with `LOOKUP_NOTOUCH`: expires, never touches.
+    fn lookup(&mut self, key: &[u8]) -> Option<&mut Entry<A>> {
         if self.keys.get(key)?.expired(now()) {
-            self.keys.remove(key);
-            REAPED.with_borrow_mut(|r| r.push(key.to_vec()));
+            if !EXPIRY_PAUSED.get() {
+                self.keys.remove(key);
+                REAPED.with_borrow_mut(|r| r.push(key.to_vec()));
+            }
             return None;
         }
         self.keys.get_mut(key)
     }
 
-    pub fn key_kind(&mut self, key: &[u8]) -> Option<KeyKind> {
-        self.entry(key).map(|e| e.value.kind())
+    /// Look the keys up as a command reading them does, for the commands
+    /// that then read them without `entry`.
+    fn touch_all(&mut self, keys: &[Vec<u8>]) {
+        for k in keys {
+            self.entry(k);
+        }
     }
 
+    /// What a live key holds, without touching it: the type check before a
+    /// command, whose own lookup is the one that touches. Touching here too
+    /// counted every read twice under an LFU policy.
+    pub fn key_kind(&mut self, key: &[u8]) -> Option<KeyKind> {
+        self.lookup(key).map(|e| e.value.kind())
+    }
+
+    /// The access field of a live key without touching it, and the integer
+    /// a string key holds: what `OBJECT` reads.
+    pub fn access_of(&mut self, key: &[u8]) -> Option<(u32, Option<i64>)> {
+        let e = self.lookup(key)?;
+        let int = match &e.value {
+            Value::Str(v) => parse_stored_int(v),
+            _ => None,
+        };
+        Some((e.lru, int))
+    }
+
+    /// Set a live key's access field: `RESTORE ... IDLETIME | FREQ`.
+    pub fn set_access(&mut self, key: &[u8], field: u32) {
+        if let Some(e) = self.lookup(key) {
+            e.lru = field;
+        }
+    }
+
+    /// Write `value` at `key`. A key that was there keeps its access field,
+    /// as Redis's `dbSetValue` keeps the old object's: the lookup before the
+    /// write has already updated it. A new key starts fresh.
     fn put(&mut self, key: &[u8], value: Value<A>, deadline: i64) {
-        self.keys.insert(key, Entry { value, deadline });
+        let lru = self.keys.get(key).map_or_else(fresh, |e| e.lru);
+        self.keys.insert(key, Entry::new(value, deadline, lru));
     }
 
     fn put_str(&mut self, key: &[u8], value: &[u8], deadline: i64) {
@@ -185,17 +342,32 @@ impl<A: Allocator + Clone> Db<A> {
     typed!(list, list_mut, List, Deque<Bytes<A>, A>, |_, a| {
         Deque::new_in(a)
     });
-    typed!(hash, hash_mut, Hash, Dict<Bytes<A>, A>, Dict::new_in);
-    typed!(set, set_mut, Set, Dict<(), A>, Dict::new_in);
-    typed!(zset, zset_mut, Zset, ZSet<A>, ZSet::new_in);
+    typed_enc!(
+        hash,
+        hash_enc,
+        hash_mut,
+        Hash,
+        Dict<Bytes<A>, A>,
+        Dict::new_in
+    );
+    typed_enc!(set, set_enc, set_mut, Set, Dict<(), A>, Dict::new_in);
+    typed_enc!(zset, zset_enc, zset_mut, Zset, ZSet<A>, ZSet::new_in);
 
     /// The set at `key`, live at `now`, without touching it.
-    fn peek_set(&self, key: &[u8], now: i64) -> Option<&Dict<(), A>> {
+    fn peek_set(&self, key: &[u8], now: i64) -> Option<MemSet<'_, A>> {
         match self.keys.get(key) {
             Some(e) if !e.expired(now) => match &e.value {
-                Value::Set(v) => Some(v),
+                Value::Set(d, enc) => Some(MemSet { d, enc: *enc }),
                 _ => None,
             },
+            _ => None,
+        }
+    }
+
+    /// The encoding of the hash, set or sorted set at `key`.
+    pub fn encoding_of(&mut self, key: &[u8]) -> Option<Enc> {
+        match &self.entry(key)?.value {
+            Value::Hash(_, e) | Value::Set(_, e) | Value::Zset(_, e) => Some(*e),
             _ => None,
         }
     }
@@ -216,8 +388,8 @@ impl<A: Allocator + Clone> Db<A> {
     }
 
     pub fn set_deadline(&mut self, key: &[u8], deadline_us: i64) {
-        if let Some(e) = self.entry(key) {
-            e.deadline = deadline_us;
+        if self.lookup(key).is_some() {
+            self.keys.set_deadline(key, deadline_us);
         }
     }
 
@@ -229,13 +401,16 @@ impl<A: Allocator + Clone> Db<A> {
             Value::Str(v) => KeyDump::String(v.to_vec()),
             Value::Stream(v) => KeyDump::Stream(v.to_vec()),
             Value::List(l) => KeyDump::List(l.iter().map(|v| v.to_vec()).collect()),
-            Value::Set(s) => KeyDump::Set(vecs(s.keys())),
-            Value::Hash(h) => {
-                KeyDump::Hash(h.iter().map(|(f, v)| (f.to_vec(), v.to_vec())).collect())
+            Value::Set(s, enc) => KeyDump::Set(vecs(set_order(s, *enc).into_iter()), *enc),
+            Value::Hash(h, enc) => KeyDump::Hash(
+                h.iter().map(|(f, v)| (f.to_vec(), v.to_vec())).collect(),
+                *enc,
+            ),
+            Value::Zset(z, enc) => {
+                KeyDump::Zset(z.iter().map(|(m, s)| (m.to_vec(), s)).collect(), *enc)
             }
-            Value::Zset(z) => KeyDump::Zset(z.iter().map(|(m, s)| (m.to_vec(), s)).collect()),
         };
-        Some((dump, e.deadline))
+        Some((dump, e.deadline()))
     }
 
     /// Write `dump` as `key` with a deadline (0 for none), replacing whatever
@@ -250,142 +425,164 @@ impl<A: Allocator + Clone> Db<A> {
                 l.replace_with(items.iter().map(|v| bytes_in(v, a.clone())));
                 Value::List(l)
             }
-            KeyDump::Set(items) => {
+            KeyDump::Set(items, enc) => {
                 let mut s = Dict::new_in(seed, a);
                 for m in items {
                     s.insert(m, ());
                 }
-                Value::Set(s)
+                Value::Set(s, *enc)
             }
-            KeyDump::Hash(pairs) => {
+            KeyDump::Hash(pairs, enc) => {
                 let mut h = Dict::new_in(seed, a.clone());
                 for (f, v) in pairs {
                     h.insert(f, bytes_in(v, a.clone()));
                 }
-                Value::Hash(h)
+                Value::Hash(h, *enc)
             }
-            KeyDump::Zset(pairs) => {
+            KeyDump::Zset(pairs, enc) => {
                 let mut z = ZSet::new_in(seed, a);
                 for (m, s) in pairs {
                     z.insert(m, *s);
                 }
-                Value::Zset(z)
+                Value::Zset(z, *enc)
             }
         };
+        // A new object, as `rdbLoadObject` makes one: a fresh access field.
         if value.is_empty_collection() {
             self.keys.remove(key);
         } else {
-            self.put(key, value, deadline_us);
+            self.keys
+                .insert(key, Entry::new(value, deadline_us, fresh()));
         }
     }
 
     /// Remove every key past its deadline: how many, and — when `names` —
-    /// which, for keyspace notifications and tracking.
+    /// which, for keyspace notifications and tracking. Only the keys with a
+    /// deadline are looked at.
     pub fn sweep_expired(&mut self, names: bool) -> (usize, Vec<Vec<u8>>) {
         let now = now();
-        let mut count = 0;
-        let mut gone = Vec::new();
-        self.keys.retain(|k, e| {
-            if !e.expired(now) {
-                return true;
-            }
-            count += 1;
-            if names {
-                gone.push(k.to_vec());
-            }
-            false
-        });
-        (count, gone)
+        let dead: Vec<Vec<u8>> = (0..self.keys.volatile_len())
+            .filter_map(|j| self.keys.volatile_at(j))
+            .filter_map(|i| self.keys.at(i))
+            .filter(|(_, e)| e.expired(now))
+            .map(|(k, _)| k.to_vec())
+            .collect();
+        for k in &dead {
+            self.keys.remove(k);
+        }
+        let count = dead.len();
+        (count, if names { dead } else { Vec::new() })
     }
 
-    /// Evict one key to make room: a random one, or under `volatile-ttl` the
-    /// soonest to expire of a sample of keys with a deadline. False when
-    /// there is nothing the policy may take.
-    pub fn evict(&mut self, volatile_only: bool) -> bool {
-        const SAMPLES: usize = 16;
-        let n = self.keys.len();
-        if n == 0 {
-            return false;
-        }
-        let pick = if volatile_only {
-            let mut best: Option<(usize, i64)> = None;
-            for _ in 0..SAMPLES.min(n) {
-                let i = (fast_random() % n as u64) as usize;
-                if let Some((_, e)) = self.keys.at(i)
-                    && e.deadline != 0
-                    && best.is_none_or(|(_, d)| e.deadline < d)
-                {
-                    best = Some((i, e.deadline));
-                }
-            }
-            // A sample can miss a few volatile keys among many; look for
-            // any before giving up.
-            best.map(|(i, _)| i)
-                .or_else(|| self.keys.iter().position(|(_, e)| e.deadline != 0))
+    /// Keys the policy may evict here: all of them, or under a `volatile-*`
+    /// policy the ones with a deadline.
+    pub fn evictable(&self, volatile: bool) -> usize {
+        if volatile {
+            self.keys.volatile_len()
         } else {
-            Some((fast_random() % n as u64) as usize)
-        };
-        match pick {
-            Some(i) => {
-                self.keys.remove_at(i);
+            self.keys.len()
+        }
+    }
+
+    /// `evictionPoolPopulate`'s sample: up to `count` keys drawn at random,
+    /// from every key or only the volatile ones, each with its score.
+    pub fn sample(&self, volatile: bool, count: usize, score: Score, out: &mut Vec<Sample>) {
+        let n = self.evictable(volatile);
+        if n == 0 {
+            return;
+        }
+        let now_ms = crate::server::now_ms();
+        for _ in 0..count.min(n) {
+            let j = (fast_random() % n as u64) as usize;
+            let i = if volatile {
+                match self.keys.volatile_at(j) {
+                    Some(i) => i,
+                    None => continue,
+                }
+            } else {
+                j
+            };
+            if let Some((k, e)) = self.keys.at(i) {
+                let score = match score {
+                    Score::Access(t) => t.score(e.lru, now_ms),
+                    Score::Deadline => u64::MAX - e.deadline().max(0) as u64,
+                };
+                out.push(Sample {
+                    score,
+                    key: k.to_vec(),
+                });
+            }
+        }
+    }
+
+    /// Evict `key` if it is still there and, under a `volatile-*` policy,
+    /// still has a deadline; whether it was.
+    pub fn evict_key(&mut self, key: &[u8], volatile: bool) -> bool {
+        match self.keys.get(key) {
+            Some(e) if !volatile || e.deadline() != 0 => {
+                self.keys.remove(key);
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 
-    fn members_of(&self, keys: &[Vec<u8>], now: i64) -> Vec<Option<&Dict<(), A>>> {
+    /// `allkeys-random` / `volatile-random`: evict one key at random; which.
+    pub fn evict_random(&mut self, volatile: bool) -> Option<Vec<u8>> {
+        let n = self.evictable(volatile);
+        if n == 0 {
+            return None;
+        }
+        let j = (fast_random() % n as u64) as usize;
+        let i = if volatile {
+            self.keys.volatile_at(j)?
+        } else {
+            j
+        };
+        let (k, _) = self.keys.remove_at(i);
+        Some(k.to_vec())
+    }
+
+    fn members_of(&self, keys: &[Vec<u8>], now: i64) -> Vec<Option<MemSet<'_, A>>> {
         keys.iter().map(|k| self.peek_set(k, now)).collect()
     }
 
-    fn union(&self, keys: &[Vec<u8>]) -> Vec<Vec<u8>> {
-        let mut seen = std::collections::HashSet::new();
-        let mut out = Vec::new();
-        for s in self.members_of(keys, now()).into_iter().flatten() {
-            for m in s.keys() {
-                if seen.insert(m) {
-                    out.push(m.to_vec());
-                }
-            }
-        }
-        out
+    /// `SUNION`'s result set, built as Redis builds it.
+    fn union(&mut self, keys: &[Vec<u8>]) -> SetBuilder {
+        self.touch_all(keys);
+        encoding::union(&self.members_of(keys, now()), Limits::current())
     }
 
-    fn inter(&self, keys: &[Vec<u8>], limit: usize) -> Vec<Vec<u8>> {
-        let Some(sets) = self
-            .members_of(keys, now())
-            .into_iter()
-            .collect::<Option<Vec<_>>>()
-        else {
-            return Vec::new();
-        };
-        let Some(smallest) = sets.iter().min_by_key(|s| s.len()) else {
-            return Vec::new();
-        };
-        smallest
-            .keys()
-            .filter(|m| sets.iter().all(|s| s.contains(m)))
-            .take(limit)
-            .map(<[u8]>::to_vec)
-            .collect()
-    }
-
-    fn diff(&self, keys: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    /// `SINTER`: the members and the encoding of the set it walked.
+    fn inter(&mut self, keys: &[Vec<u8>]) -> (Vec<Vec<u8>>, Enc) {
+        self.touch_all(keys);
         let sets = self.members_of(keys, now());
-        let Some(Some(first)) = sets.first() else {
-            return Vec::new();
-        };
-        let rest: Vec<_> = sets[1..].iter().flatten().collect();
-        first
-            .keys()
-            .filter(|m| !rest.iter().any(|s| s.contains(m)))
-            .map(<[u8]>::to_vec)
-            .collect()
+        let walked = sets
+            .iter()
+            .map(|s| s.as_ref().map(|s| (s.size(), s.enc)))
+            .collect::<Option<Vec<_>>>()
+            .and_then(|s| {
+                let order = encoding::inter_order(&s.iter().map(|x| x.0).collect::<Vec<_>>());
+                order.first().map(|&i| s[i].1)
+            })
+            .unwrap_or(Enc::Listpack);
+        (vecs(encoding::inter(&sets).into_iter()), walked)
     }
 
-    /// Replace `dst` with a set of `members`; its size.
-    fn store_set(&mut self, dst: &[u8], members: Vec<Vec<u8>>) -> i64 {
-        self.keys.remove(dst);
+    fn diff(&mut self, keys: &[Vec<u8>]) -> SetBuilder {
+        self.touch_all(keys);
+        let same = keys.len() > 1 && keys[1..].contains(&keys[0]);
+        encoding::diff(&self.members_of(keys, now()), same, Limits::current())
+    }
+
+    /// Replace `dst` with a set of `members`, in their order and `enc`; its
+    /// size.
+    fn store_set(&mut self, dst: &[u8], members: Vec<Vec<u8>>, enc: Enc) -> i64 {
+        // Looked up for writing, as `setKey` does: a destination that was
+        // there keeps its (updated) access field.
+        if self.entry(dst).is_some() && members.is_empty() {
+            self.keys.remove(dst);
+        }
         if members.is_empty() {
             return 0;
         }
@@ -394,7 +591,7 @@ impl<A: Allocator + Clone> Db<A> {
             s.insert(m, ());
         }
         let n = s.len() as i64;
-        self.put(dst, Value::Set(s), 0);
+        self.put(dst, Value::Set(s, enc), 0);
         n
     }
 
@@ -461,38 +658,50 @@ impl<A: Allocator + Clone> Store for Db<A> {
         Ok(n)
     }
 
+    // EXISTS, TYPE and the TTL family look up with `LOOKUP_NOTOUCH`.
     fn exists(&mut self, keys: &[Vec<u8>]) -> Out<i64> {
+        Ok(keys.iter().filter(|k| self.lookup(k).is_some()).count() as i64)
+    }
+
+    fn touch(&mut self, keys: &[Vec<u8>]) -> Out<i64> {
         Ok(keys.iter().filter(|k| self.entry(k).is_some()).count() as i64)
     }
 
     fn kind(&mut self, key: &[u8]) -> Out<Option<KeyKind>> {
-        Ok(self.key_kind(key))
+        Ok(self.lookup(key).map(|e| e.value.kind()))
     }
 
     fn kinds(&mut self, keys: &[Vec<u8>]) -> Out<Vec<Option<KeyKind>>> {
-        Ok(keys.iter().map(|k| self.key_kind(k)).collect())
+        Ok(keys
+            .iter()
+            .map(|k| self.lookup(k).map(|e| e.value.kind()))
+            .collect())
     }
 
     fn deadline(&mut self, key: &[u8]) -> Out<Option<Option<i64>>> {
-        Ok(self.entry(key).map(|e| e.deadline()))
+        Ok(self.lookup(key).map(|e| held_deadline(e)))
+    }
+
+    fn access(&mut self, key: &[u8]) -> Out<Option<(u32, Option<i64>)>> {
+        Ok(self.access_of(key))
     }
 
     fn expire(&mut self, key: &[u8], deadline_us: i64, cond: ExpireCond) -> Out<bool> {
         let Some(e) = self.entry(key) else {
             return Ok(false);
         };
-        if !cond.allows(e.deadline(), deadline_us) {
+        if !cond.allows(held_deadline(e), deadline_us) {
             return Ok(false);
         }
         // 0 means no deadline, so the earliest one held is 1.
-        e.deadline = deadline_us.max(1);
+        self.keys.set_deadline(key, deadline_us.max(1));
         Ok(true)
     }
 
     fn persist(&mut self, key: &[u8]) -> Out<bool> {
         Ok(match self.entry(key) {
-            Some(e) if e.deadline != 0 => {
-                e.deadline = 0;
+            Some(e) if e.deadline() != 0 => {
+                self.keys.set_deadline(key, 0);
                 true
             }
             _ => false,
@@ -523,15 +732,37 @@ impl<A: Allocator + Clone> Store for Db<A> {
             .collect())
     }
 
-    fn dbsize(&mut self) -> Out<i64> {
+    /// A key past its deadline is passed over, not removed: removing it would
+    /// move another key, and the sweep or the next access removes it anyway.
+    fn scan_keys(&mut self, cursor: u64, count: usize) -> Out<(u64, Vec<Vec<u8>>)> {
         let now = now();
-        Ok(self.keys.values().filter(|e| !e.expired(now)).count() as i64)
+        let (mut out, mut expired) = (Vec::new(), Vec::new());
+        let next = self.keys.scan(cursor, count, |k, e| {
+            if e.expired(now) {
+                expired.push(k.to_vec());
+            } else {
+                out.push(k.to_vec());
+            }
+        });
+        // `scanCallback` looks each key up, so one past its deadline is
+        // reaped, not just skipped. The dictionary's cursor holds across it.
+        for k in &expired {
+            self.lookup(k);
+        }
+        Ok((next, out))
+    }
+
+    /// Every key held, as Redis's dictionary counts them: one past its
+    /// deadline counts until it is reaped.
+    fn dbsize(&mut self) -> Out<i64> {
+        Ok(self.keys.values().count() as i64)
     }
 
     fn keyspace(&mut self) -> Out<(i64, i64)> {
-        let now = now();
-        let live = self.keys.values().filter(|e| !e.expired(now));
-        let (keys, volatile) = live.fold((0, 0), |(k, v), e| (k + 1, v + (e.deadline != 0) as i64));
+        let (keys, volatile) = self
+            .keys
+            .values()
+            .fold((0, 0), |(k, v), e| (k + 1, v + (e.deadline() != 0) as i64));
         Ok((keys, volatile))
     }
 
@@ -580,7 +811,7 @@ impl<A: Allocator + Clone> Store for Db<A> {
                     (Value::Str(v), true) => Some(v.to_vec()),
                     _ => None,
                 };
-                (true, e.deadline, old)
+                (true, e.deadline(), old)
             }
         };
         if (a.nx && exists) || (a.xx && !exists) {
@@ -601,6 +832,7 @@ impl<A: Allocator + Clone> Store for Db<A> {
     }
 
     fn setex(&mut self, key: &[u8], value: &[u8], ttl_ms: i64) -> Out<()> {
+        self.entry(key);
         let deadline = now().saturating_add(ttl_ms.saturating_mul(1000)).max(1);
         self.put_str(key, value, deadline);
         Ok(())
@@ -651,6 +883,7 @@ impl<A: Allocator + Clone> Store for Db<A> {
 
     fn mset(&mut self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Out<()> {
         for (k, v) in pairs {
+            self.entry(k);
             self.put_str(k, v, 0);
         }
         Ok(())
@@ -707,34 +940,28 @@ impl<A: Allocator + Clone> Store for Db<A> {
         Ok(Num::Value(n))
     }
 
-    fn incrbyfloat(&mut self, key: &[u8], delta: f64) -> Out<Num<String>> {
+    fn incrbyfloat(&mut self, key: &[u8], delta: LongDouble) -> Out<Num<String>> {
         let existed = self.string(key).is_some();
         let v = self.string_mut(key)?;
-        let current = if existed {
-            parse_stored_float(v)
-        } else {
-            Some(0.0)
-        };
-        let Some(current) = current else {
-            return Ok(Num::NotNumber);
-        };
-        let n = current + delta;
-        if !n.is_finite() {
-            if !existed {
-                self.keys.remove(key);
+        let text = match increment(existed.then_some(&v[..]), delta) {
+            Num::Value(text) => text,
+            refused => {
+                if !existed {
+                    self.keys.remove(key);
+                }
+                return Ok(refused);
             }
-            return Ok(Num::Overflow);
-        }
-        let text = format_float(n);
+        };
         v.clear();
         v.extend_from_slice(text.as_bytes());
         Ok(Num::Value(text))
     }
 
-    fn setbit(&mut self, key: &[u8], offset: i64, on: bool) -> Out<bool> {
+    fn setbit(&mut self, key: &[u8], offset: i64, on: bool) -> Out<(bool, bool)> {
         let v = self.string_mut(key)?;
         let byte = (offset / 8) as usize;
-        if v.len() <= byte {
+        let grows = v.len() <= byte;
+        if grows {
             v.resize(byte + 1, 0);
         }
         let mask = 0x80u8 >> (offset % 8);
@@ -744,7 +971,7 @@ impl<A: Allocator + Clone> Store for Db<A> {
         } else {
             v[byte] &= !mask;
         }
-        Ok(was)
+        Ok((was, grows || was != on))
     }
 
     // ── hashes ──
@@ -770,6 +997,25 @@ impl<A: Allocator + Clone> Store for Db<A> {
         }))
     }
 
+    /// A listpack comes back whole, cursor 0, as Redis scans one.
+    fn hscan(
+        &mut self,
+        key: &[u8],
+        cursor: u64,
+        count: usize,
+    ) -> Out<crate::cursor::Page<Vec<u8>>> {
+        let mut out = Vec::new();
+        let next = match self.hash_enc(key) {
+            None => 0,
+            Some((h, enc)) if enc.is_packed() => {
+                out.extend(h.iter().map(|(f, v)| (f.to_vec(), v.to_vec())));
+                0
+            }
+            Some((h, _)) => h.scan(cursor, count, |f, v| out.push((f.to_vec(), v.to_vec()))),
+        };
+        Ok((next, out))
+    }
+
     fn hkeys(&mut self, key: &[u8]) -> Out<Vec<Vec<u8>>> {
         Ok(self.hash(key).map_or_else(Vec::new, |h| vecs(h.keys())))
     }
@@ -788,37 +1034,50 @@ impl<A: Allocator + Clone> Store for Db<A> {
         Ok(self.hash(key).is_some_and(|h| h.contains(field)))
     }
 
-    fn hset(&mut self, key: &[u8], pairs: &[(Vec<u8>, Vec<u8>)]) -> Out<i64> {
+    fn hset(&mut self, key: &[u8], pairs: &[(Vec<u8>, Vec<u8>)], named: usize) -> Out<i64> {
+        let l = Limits::current();
         let a = self.keys.alloc();
-        let h = self.hash_mut(key)?;
-        Ok(pairs
+        let (h, enc, _) = self.hash_mut(key, || Enc::Listpack)?;
+        let lens = pairs.iter().flat_map(|(f, v)| [f.len(), v.len()]);
+        *enc = encoding::hash_presize(*enc, named, lens, &l);
+        let added = pairs
             .iter()
             .filter(|(f, v)| h.insert(f, bytes_in(v, a.clone())).is_none())
-            .count() as i64)
+            .count();
+        *enc = encoding::hash_grown(*enc, h.len(), &l);
+        Ok(added as i64)
     }
 
     fn hsetnx(&mut self, key: &[u8], field: &[u8], value: &[u8]) -> Out<bool> {
+        let l = Limits::current();
         let a = self.keys.alloc();
-        let h = self.hash_mut(key)?;
+        let (h, enc, _) = self.hash_mut(key, || Enc::Listpack)?;
         if h.contains(field) {
             return Ok(false);
         }
+        *enc = encoding::hash_presize(*enc, 1, [field.len(), value.len()], &l);
         h.insert(field, bytes_in(value, a));
+        *enc = encoding::hash_grown(*enc, h.len(), &l);
         Ok(true)
     }
 
     fn hdel(&mut self, key: &[u8], fields: &[Vec<u8>]) -> Out<i64> {
-        let Some(h) = self.hash(key) else {
+        let Some((h, enc)) = self.hash_enc(key) else {
             return Ok(0);
         };
-        let n = fields.iter().filter(|f| h.remove(f).is_some()).count();
+        let enc = *enc;
+        let n = fields
+            .iter()
+            .filter(|f| remove_in(h, enc, f).is_some())
+            .count();
         self.tidy(key);
         Ok(n as i64)
     }
 
     fn hincrby(&mut self, key: &[u8], field: &[u8], delta: i64) -> Out<Num<i64>> {
+        let l = Limits::current();
         let a = self.keys.alloc();
-        let h = self.hash_mut(key)?;
+        let (h, enc, _) = self.hash_mut(key, || Enc::Listpack)?;
         let (v, _) = h.get_or_insert_with(field, || bytes_in(b"0", a));
         let Some(current) = parse_stored_int(v) else {
             return Ok(Num::NotNumber);
@@ -826,41 +1085,74 @@ impl<A: Allocator + Clone> Store for Db<A> {
         let Some(n) = current.checked_add(delta) else {
             return Ok(Num::Overflow);
         };
+        let text = n.to_string();
         v.clear();
-        v.extend_from_slice(n.to_string().as_bytes());
+        v.extend_from_slice(text.as_bytes());
+        // `hashTypeSet`: the field and the value it now holds are measured.
+        *enc = encoding::hash_presize(*enc, 0, [field.len(), text.len()], &l);
+        *enc = encoding::hash_grown(*enc, h.len(), &l);
         Ok(Num::Value(n))
     }
 
-    fn hincrbyfloat(&mut self, key: &[u8], field: &[u8], delta: f64) -> Out<Num<String>> {
+    fn hincrbyfloat(&mut self, key: &[u8], field: &[u8], delta: LongDouble) -> Out<Num<String>> {
+        let l = Limits::current();
         let a = self.keys.alloc();
-        let h = self.hash_mut(key)?;
-        let current = match h.get(field) {
-            Some(v) => match parse_stored_float(v) {
-                Some(c) => c,
-                None => return Ok(Num::NotNumber),
-            },
-            None => 0.0,
+        let (h, enc, _) = self.hash_mut(key, || Enc::Listpack)?;
+        let text = match increment(h.get(field).map(|v| &v[..]), delta) {
+            Num::Value(text) => text,
+            refused => {
+                self.tidy(key);
+                return Ok(refused);
+            }
         };
-        let n = current + delta;
-        if !n.is_finite() {
-            self.tidy(key);
-            return Ok(Num::Overflow);
-        }
-        let text = format_float(n);
         h.insert(field, bytes_in(text.as_bytes(), a));
+        *enc = encoding::hash_presize(*enc, 0, [field.len(), text.len()], &l);
+        *enc = encoding::hash_grown(*enc, h.len(), &l);
         Ok(Num::Value(text))
+    }
+
+    fn collection_encoding(&mut self, key: &[u8]) -> Out<Option<Enc>> {
+        Ok(self.encoding_of(key))
+    }
+
+    fn zset_to_skiplist(&mut self, key: &[u8]) -> Out<()> {
+        if let Some((_, enc)) = self.zset_enc(key) {
+            *enc = Enc::Skiplist;
+        }
+        Ok(())
     }
 
     // ── sets ──
 
     fn sadd(&mut self, key: &[u8], members: &[Vec<u8>]) -> Out<i64> {
-        let s = self.set_mut(key)?;
-        Ok(members.iter().filter(|m| s.insert(m, ()).is_none()).count() as i64)
+        let Some(first) = members.first() else {
+            return Ok(0);
+        };
+        let l = Limits::current();
+        let (s, enc, created) =
+            self.set_mut(key, || encoding::set_create(first, members.len(), &l))?;
+        if !created {
+            *enc = encoding::set_presize(*enc, members.len(), &l);
+        }
+        let mut added = 0;
+        for m in members {
+            if !s.contains(m) {
+                set_insert(s, enc, m, &l);
+                added += 1;
+            }
+        }
+        Ok(added)
     }
 
     fn srem(&mut self, key: &[u8], members: &[Vec<u8>]) -> Out<i64> {
-        let Some(s) = self.set(key) else { return Ok(0) };
-        let n = members.iter().filter(|m| s.remove(m).is_some()).count();
+        let Some((s, enc)) = self.set_enc(key) else {
+            return Ok(0);
+        };
+        let enc = *enc;
+        let n = members
+            .iter()
+            .filter(|m| remove_in(s, enc, m).is_some())
+            .count();
         self.tidy(key);
         Ok(n as i64)
     }
@@ -878,90 +1170,174 @@ impl<A: Allocator + Clone> Store for Db<A> {
     }
 
     fn smembers(&mut self, key: &[u8]) -> Out<Vec<Vec<u8>>> {
-        Ok(self.set(key).map_or_else(Vec::new, |s| vecs(s.keys())))
+        Ok(self
+            .set_enc(key)
+            .map_or_else(Vec::new, |(s, enc)| vecs(set_order(s, *enc).into_iter())))
+    }
+
+    /// An intset or a listpack comes back whole, cursor 0, as Redis scans one.
+    fn sscan(&mut self, key: &[u8], cursor: u64, count: usize) -> Out<(u64, Vec<Vec<u8>>)> {
+        let mut out = Vec::new();
+        let next = match self.set_enc(key) {
+            None => 0,
+            Some((s, enc)) if enc.is_packed() => {
+                out = vecs(set_order(s, *enc).into_iter());
+                0
+            }
+            Some((s, _)) => s.scan(cursor, count, |m, _| out.push(m.to_vec())),
+        };
+        Ok((next, out))
     }
 
     fn scard(&mut self, key: &[u8]) -> Out<i64> {
         Ok(self.set(key).map_or(0, |s| s.len() as i64))
     }
 
+    /// `spopWithCountCommand`'s cases. A count covering the set returns it
+    /// as `SUNION` would and deletes the key. Otherwise the members popped
+    /// are random: a listpack gives them in its order, and an intset gives a
+    /// large share in its sorted order. Popping most of a hash table leaves a
+    /// set Redis rebuilds from what remains, which can be a listpack again.
     fn spop(&mut self, key: &[u8], n: i64) -> Out<Vec<Vec<u8>>> {
-        let Some(s) = self.set(key) else {
+        let l = Limits::current();
+        let n = n.max(0) as usize;
+        let Some((s, enc)) = self.set_enc(key) else {
             return Ok(Vec::new());
         };
-        let mut out = Vec::new();
-        for _ in 0..(n.max(0) as usize).min(s.len()) {
-            let i = (fast_random() % s.len() as u64) as usize;
-            out.push(s.remove_at(i).0.to_vec());
+        if n == 0 {
+            return Ok(Vec::new());
         }
-        self.tidy(key);
+        let size = s.len();
+        if n >= size {
+            let whole = MemSet { d: s, enc: *enc };
+            let (members, _) = encoding::union(&[Some(whole)], l).finish();
+            self.keys.remove(key);
+            return Ok(members);
+        }
+        // CASE 3: the members to keep are the few.
+        let most = (size - n) * 5 <= n;
+        let mut picks = random_picks(size, n as i64);
+        if *enc == Enc::Listpack || (*enc == Enc::Intset && most) {
+            picks.sort_unstable();
+        }
+        let mut out: Vec<Vec<u8>> = picks
+            .iter()
+            .filter_map(|&i| s.at(i).map(|(m, _)| m.to_vec()))
+            .collect();
+        if *enc == Enc::Intset && most {
+            encoding::sort_ints(&mut out, |m| m);
+        }
+        if *enc == Enc::Listpack {
+            // In place, from the back, so the positions still to go hold.
+            for &i in picks.iter().rev() {
+                s.remove_at_ordered(i);
+            }
+        } else {
+            for m in &out {
+                s.remove(m);
+            }
+        }
+        if *enc == Enc::Hashtable && most {
+            let mut rebuilt = SetBuilder::new(Enc::Listpack, l);
+            for m in s.keys() {
+                rebuilt.add(m);
+            }
+            *enc = rebuilt.enc();
+        }
         Ok(out)
     }
 
+    /// `srandmemberWithCountCommand`: a count covering the set returns all
+    /// of it in its order; a listpack gives a random choice in its order;
+    /// otherwise the choice comes in random order. A negative count draws
+    /// with repeats.
     fn srandmember(&mut self, key: &[u8], n: i64) -> Out<Vec<Vec<u8>>> {
-        let Some(s) = self.set(key) else {
+        let Some((s, enc)) = self.set_enc(key) else {
             return Ok(Vec::new());
         };
-        Ok(random_picks(s.len(), n)
+        if n > 1 && n as usize >= s.len() {
+            return Ok(vecs(set_order(s, *enc).into_iter()));
+        }
+        let mut picks = random_picks(s.len(), n);
+        if n > 1 && *enc == Enc::Listpack {
+            picks.sort_unstable();
+        }
+        Ok(picks
             .into_iter()
             .filter_map(|i| s.at(i).map(|(m, _)| m.to_vec()))
             .collect())
     }
 
     fn smove(&mut self, src: &[u8], dst: &[u8], member: &[u8]) -> Out<(bool, bool)> {
-        let removed = self.set(src).is_some_and(|s| s.remove(member).is_some());
+        let removed = self
+            .set_enc(src)
+            .is_some_and(|(s, enc)| remove_in(s, *enc, member).is_some());
         if !removed {
             return Ok((false, false));
         }
         self.tidy(src);
-        let added = self.set_mut(dst)?.insert(member, ()).is_none();
-        Ok((true, added))
+        let l = Limits::current();
+        let (s, enc, _) = self.set_mut(dst, || encoding::set_create(member, 1, &l))?;
+        if s.contains(member) {
+            return Ok((true, false));
+        }
+        set_insert(s, enc, member, &l);
+        Ok((true, true))
     }
 
     fn sunion(&mut self, keys: &[Vec<u8>]) -> Out<Vec<Vec<u8>>> {
-        Ok(self.union(keys))
+        Ok(self.union(keys).finish().0)
     }
 
     fn sinter(&mut self, keys: &[Vec<u8>]) -> Out<Vec<Vec<u8>>> {
-        Ok(self.inter(keys, usize::MAX))
+        Ok(self.inter(keys).0)
     }
 
     fn sdiff(&mut self, keys: &[Vec<u8>]) -> Out<Vec<Vec<u8>>> {
-        Ok(self.diff(keys))
+        Ok(self.diff(keys).finish().0)
     }
 
     fn sunionstore(&mut self, dst: &[u8], keys: &[Vec<u8>]) -> Out<i64> {
-        let m = self.union(keys);
-        Ok(self.store_set(dst, m))
+        let (m, enc) = self.union(keys).finish();
+        Ok(self.store_set(dst, m, enc))
     }
 
     fn sinterstore(&mut self, dst: &[u8], keys: &[Vec<u8>]) -> Out<i64> {
-        let m = self.inter(keys, usize::MAX);
-        Ok(self.store_set(dst, m))
+        let (m, walked) = self.inter(keys);
+        let built = encoding::inter_store(walked, m.iter().map(Vec::as_slice), Limits::current());
+        let (m, enc) = built.finish();
+        Ok(self.store_set(dst, m, enc))
     }
 
     fn sdiffstore(&mut self, dst: &[u8], keys: &[Vec<u8>]) -> Out<i64> {
-        let m = self.diff(keys);
-        Ok(self.store_set(dst, m))
+        let (m, enc) = self.diff(keys).finish();
+        Ok(self.store_set(dst, m, enc))
     }
 
     fn sintercard(&mut self, keys: &[Vec<u8>], limit: Option<i64>) -> Out<i64> {
         let limit = limit.filter(|l| *l > 0).map_or(usize::MAX, |l| l as usize);
-        Ok(self.inter(keys, limit).len() as i64)
+        Ok(self.inter(keys).0.len().min(limit) as i64)
     }
 
     // ── sorted sets ──
 
-    fn zadd(&mut self, key: &[u8], pairs: &[(f64, Vec<u8>)], o: ZaddOpts) -> Out<i64> {
+    fn zadd(&mut self, key: &[u8], pairs: &[(f64, Vec<u8>)], o: ZaddOpts) -> Out<(i64, i64)> {
         if o.xx && self.zset(key).is_none() {
-            return Ok(0);
+            return Ok((0, 0));
         }
-        let z = self.zset_mut(key)?;
+        let l = Limits::current();
+        let first = pairs.first().map_or(0, |(_, m)| m.len());
+        let (z, enc, created) =
+            self.zset_mut(key, || encoding::zset_create(pairs.len(), first, &l))?;
+        if !created {
+            *enc = encoding::zset_presize(*enc, pairs.len(), &l);
+        }
         let (mut added, mut changed) = (0, 0);
         for (score, member) in pairs {
             match z.score(member) {
                 None if o.xx => {}
                 None => {
+                    *enc = encoding::zset_add(*enc, z.len(), member.len(), &l);
                     z.insert(member, *score);
                     added += 1;
                     changed += 1;
@@ -983,7 +1359,7 @@ impl<A: Allocator + Clone> Store for Db<A> {
             }
         }
         self.tidy(key);
-        Ok(if o.ch { changed } else { added })
+        Ok((added, changed))
     }
 
     fn zadd_incr(&mut self, key: &[u8], member: &[u8], delta: f64, o: ZaddOpts) -> Out<Incr> {
@@ -1003,10 +1379,14 @@ impl<A: Allocator + Clone> Store for Db<A> {
                 new
             }
         };
-        self.zset_mut(key)?.insert(member, new);
+        let l = Limits::current();
+        let (z, enc, _) = self.zset_mut(key, || encoding::zset_create(1, member.len(), &l))?;
+        if old.is_none() {
+            *enc = encoding::zset_add(*enc, z.len(), member.len(), &l);
+        }
+        z.insert(member, new);
         Ok(Incr::Score(new))
     }
-
     fn zrem(&mut self, key: &[u8], members: &[Vec<u8>]) -> Out<i64> {
         let Some(z) = self.zset(key) else {
             return Ok(0);
@@ -1030,6 +1410,21 @@ impl<A: Allocator + Clone> Store for Db<A> {
 
     fn zcard(&mut self, key: &[u8]) -> Out<i64> {
         Ok(self.zset(key).map_or(0, |z| z.len() as i64))
+    }
+
+    /// A listpack comes back whole, in score order, cursor 0, as Redis scans
+    /// one.
+    fn zscan(&mut self, key: &[u8], cursor: u64, count: usize) -> Out<crate::cursor::Page<f64>> {
+        let mut out = Vec::new();
+        let next = match self.zset_enc(key) {
+            None => 0,
+            Some((z, enc)) if enc.is_packed() => {
+                out.extend(z.iter().map(|(m, s)| (m.to_vec(), s)));
+                0
+            }
+            Some((z, _)) => z.scan(cursor, count, |m, s| out.push((m.to_vec(), s))),
+        };
+        Ok((next, out))
     }
 
     fn zcount(&mut self, key: &[u8], min: ScoreBound, max: ScoreBound) -> Out<i64> {
@@ -1129,10 +1524,32 @@ impl<A: Allocator + Clone> Store for Db<A> {
         Ok(picked)
     }
 
+    /// `zrandmemberWithCountCommand`: a count covering the sorted set
+    /// returns all of it from the highest score down, as Redis's iterator
+    /// walks it, and a listpack gives a random choice in its order; otherwise
+    /// the choice comes in random order.
     fn zrandmember(&mut self, key: &[u8], n: i64) -> Out<Vec<(Vec<u8>, f64)>> {
-        let Some(z) = self.zset(key) else {
+        let Some((z, enc)) = self.zset_enc(key) else {
             return Ok(Vec::new());
         };
+        if n > 1 && n as usize >= z.len() {
+            let mut all: Vec<(Vec<u8>, f64)> = z.iter().map(|(m, s)| (m.to_vec(), s)).collect();
+            all.reverse();
+            return Ok(all);
+        }
+        if n > 1 && *enc == Enc::Listpack {
+            let mut ranks = random_picks(z.len(), n);
+            ranks.sort_unstable();
+            let mut want = ranks.into_iter().peekable();
+            let mut out = Vec::new();
+            for (rank, (m, s)) in z.iter().enumerate() {
+                if want.peek() == Some(&rank) {
+                    want.next();
+                    out.push((m.to_vec(), s));
+                }
+            }
+            return Ok(out);
+        }
         Ok(random_picks(z.len(), n)
             .into_iter()
             .filter_map(|i| z.nth_unordered(i).map(|(m, s)| (m.to_vec(), s)))
@@ -1370,7 +1787,7 @@ impl<A: Allocator + Clone> crate::stream::StreamStore for Db<A> {
 
     /// Replace the stream's value, keeping the key's deadline.
     fn store(&mut self, key: &[u8], s: &crate::stream::Stream) -> Result<(), Response> {
-        let deadline = self.entry(key).map_or(0, |e| e.deadline);
+        let deadline = self.entry(key).map_or(0, |e| e.deadline());
         let v = self.bytes(&s.encode());
         self.put(key, Value::Stream(v), deadline);
         Ok(())
@@ -1485,6 +1902,170 @@ mod tests {
         assert_eq!(int(run(&mut d, "EXISTS z")), 0);
     }
 
+    fn encoding(d: &mut Db<Global>, key: &str) -> String {
+        match run(d, &format!("OBJECT ENCODING {key}")) {
+            Response::BulkString(v) => String::from_utf8(v).unwrap(),
+            other => panic!("not a bulk string: {other:?}"),
+        }
+    }
+
+    fn args(prefix: &str, items: impl Iterator<Item = String>) -> String {
+        std::iter::once(prefix.to_string())
+            .chain(items)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// What Redis 7.2 answers, observed: a listpack keeps insertion order
+    /// through deletes and updates, and once converted stays converted.
+    #[test]
+    fn hashes_keep_insertion_order_and_their_encoding() {
+        let mut d = db();
+        run(&mut d, "HSET h c 1 a 2 b 3");
+        run(&mut d, "HDEL h a");
+        run(&mut d, "HSET h d 4");
+        run(&mut d, "HSET h c 9");
+        assert_eq!(bulks(run(&mut d, "HKEYS h")), ["c", "b", "d"]);
+        assert_eq!(bulks(run(&mut d, "HVALS h")), ["9", "3", "4"]);
+        assert_eq!(encoding(&mut d, "h"), "listpack");
+        // HSCAN returns a listpack whole, whatever COUNT asks for.
+        match run(&mut d, "HSCAN h 0 COUNT 1") {
+            Response::ScanResult { cursor, keys } => assert_eq!((cursor, keys.len()), (0, 6)),
+            other => panic!("{other:?}"),
+        }
+        // A field named twice in one HSET stays where it was first named.
+        run(&mut d, "HSET n x 1 y 2 x 3");
+        assert_eq!(bulks(run(&mut d, "HGETALL n")), ["x", "3", "y", "2"]);
+
+        run(
+            &mut d,
+            &args("HSET big", (0..513).map(|i| format!("f{i} v"))),
+        );
+        assert_eq!(encoding(&mut d, "big"), "hashtable");
+        run(&mut d, &args("HDEL big", (3..513).map(|i| format!("f{i}"))));
+        assert_eq!(encoding(&mut d, "big"), "hashtable");
+        run(&mut d, "HSET long a 1");
+        run(&mut d, &format!("HSET long b {}", "x".repeat(65)));
+        run(&mut d, "HDEL long b");
+        assert_eq!(encoding(&mut d, "long"), "hashtable");
+        run(&mut d, &format!("HINCRBY inc {} 1", "f".repeat(65)));
+        assert_eq!(encoding(&mut d, "inc"), "hashtable");
+    }
+
+    #[test]
+    fn sets_follow_intset_listpack_and_hashtable_order() {
+        let mut d = db();
+        run(&mut d, "SADD s 5 -3 100 2");
+        assert_eq!(bulks(run(&mut d, "SMEMBERS s")), ["-3", "2", "5", "100"]);
+        assert_eq!(encoding(&mut d, "s"), "intset");
+        // A string converts it: the integers keep their sorted order.
+        run(&mut d, "SADD s x 1");
+        assert_eq!(encoding(&mut d, "s"), "listpack");
+        assert_eq!(
+            bulks(run(&mut d, "SMEMBERS s")),
+            ["-3", "2", "5", "100", "x", "1"]
+        );
+        run(&mut d, "SREM s x 100");
+        assert_eq!(bulks(run(&mut d, "SMEMBERS s")), ["-3", "2", "5", "1"]);
+        assert_eq!(encoding(&mut d, "s"), "listpack");
+        // SUNION builds its own set: integers alone come back sorted.
+        assert_eq!(bulks(run(&mut d, "SUNION s")), ["-3", "1", "2", "5"]);
+        assert_eq!(int(run(&mut d, "SINTERSTORE t s s")), 4);
+        assert_eq!(encoding(&mut d, "t"), "intset");
+
+        run(&mut d, "SADD l c a b d");
+        run(&mut d, "SREM l a");
+        run(&mut d, "SADD l e");
+        assert_eq!(bulks(run(&mut d, "SMEMBERS l")), ["c", "b", "d", "e"]);
+        // A whole-set SRANDMEMBER and SPOP come back in order.
+        assert_eq!(bulks(run(&mut d, "SRANDMEMBER l 10")), ["c", "b", "d", "e"]);
+        let chosen = bulks(run(&mut d, "SRANDMEMBER l 2"));
+        let order = ["c", "b", "d", "e"];
+        let pos: Vec<usize> = chosen
+            .iter()
+            .map(|m| order.iter().position(|o| o == m).unwrap())
+            .collect();
+        assert!(pos[0] < pos[1], "{chosen:?} is not in the set's order");
+
+        for (key, first) in [("i", "1"), ("w", "w")] {
+            run(
+                &mut d,
+                &args(
+                    &format!("SADD {key} {first}"),
+                    (2..=600).map(|i| i.to_string()),
+                ),
+            );
+            assert_eq!(encoding(&mut d, key), "hashtable");
+            run(
+                &mut d,
+                &args(&format!("SREM {key}"), (4..=600).map(|i| i.to_string())),
+            );
+            assert_eq!(encoding(&mut d, key), "hashtable");
+        }
+        // SADD sizes a set by the members named, repeats included.
+        run(&mut d, &args("SADD dup", (0..200).map(|_| "a".to_string())));
+        assert_eq!(encoding(&mut d, "dup"), "hashtable");
+        // Popping most of a hash table leaves a listpack.
+        run(&mut d, &args("SADD pop", (0..300).map(|i| format!("m{i}"))));
+        assert_eq!(bulks(run(&mut d, "SPOP pop 290")).len(), 290);
+        assert_eq!(encoding(&mut d, "pop"), "listpack");
+    }
+
+    #[test]
+    fn sorted_sets_stay_skiplists_and_scan_whole_as_listpacks() {
+        let mut d = db();
+        run(&mut d, "ZADD z 2 b 1 a 3 c");
+        assert_eq!(encoding(&mut d, "z"), "listpack");
+        match run(&mut d, "ZSCAN z 0 COUNT 1") {
+            Response::ScanResult { keys, .. } => assert_eq!(
+                keys.into_iter()
+                    .map(|k| String::from_utf8(k.unwrap()).unwrap())
+                    .collect::<Vec<_>>(),
+                ["a", "1", "b", "2", "c", "3"]
+            ),
+            other => panic!("{other:?}"),
+        }
+        run(
+            &mut d,
+            &args("ZADD big", (0..129).map(|i| format!("{i} m{i}"))),
+        );
+        assert_eq!(encoding(&mut d, "big"), "skiplist");
+        run(&mut d, "ZREMRANGEBYRANK big 0 100");
+        assert_eq!(encoding(&mut d, "big"), "skiplist");
+        run(&mut d, &format!("ZADD long 1 a 2 {}", "x".repeat(65)));
+        run(&mut d, &format!("ZREM long {}", "x".repeat(65)));
+        assert_eq!(encoding(&mut d, "long"), "skiplist");
+        // Updating members already there converts nothing.
+        run(
+            &mut d,
+            &args("ZADD up", (0..100).map(|i| format!("{i} m{i}"))),
+        );
+        run(
+            &mut d,
+            &args("ZADD up", (0..50).map(|i| format!("{} m{i}", i + 1000))),
+        );
+        assert_eq!(encoding(&mut d, "up"), "listpack");
+    }
+
+    #[test]
+    fn a_dump_carries_the_order_and_the_encoding() {
+        let mut d = db();
+        run(&mut d, "SADD s a 3 1");
+        run(&mut d, "SREM s a");
+        let (dump, _) = d.dump(b"s").unwrap();
+        d.restore(b"t", &dump, 0);
+        assert_eq!(bulks(run(&mut d, "SMEMBERS t")), ["3", "1"]);
+        assert_eq!(encoding(&mut d, "t"), "listpack");
+        run(&mut d, &args("HSET h", (0..600).map(|i| format!("f{i} v"))));
+        run(&mut d, &args("HDEL h", (2..600).map(|i| format!("f{i}"))));
+        let (dump, _) = d.dump(b"h").unwrap();
+        d.restore(b"g", &dump, 0);
+        assert_eq!(encoding(&mut d, "g"), "hashtable");
+        // RENAME moves the entry, encoding and all.
+        run(&mut d, "RENAME g g2");
+        assert_eq!(encoding(&mut d, "g2"), "hashtable");
+    }
+
     #[test]
     fn keyspace_rename_and_dump_round_trip() {
         let mut d = db();
@@ -1500,7 +2081,76 @@ mod tests {
         assert_eq!(d.keyspace().unwrap(), (2, 2));
         d.set_deadline(b"n", 1);
         assert_eq!(d.sweep_expired(true), (1, vec![b"n".to_vec()]));
-        assert!(d.evict(false));
+        assert_eq!(d.evict_random(false), Some(b"m".to_vec()));
         assert_eq!(int(run(&mut d, "DBSIZE")), 0);
+    }
+
+    const LFU: Tracking = Tracking::Lfu {
+        log_factor: 10,
+        decay_time: 1,
+    };
+
+    fn under(touch: bool, tracking: Tracking) {
+        lru::set_access(lru::Access { touch, tracking });
+    }
+
+    #[test]
+    fn lookups_touch_and_notouch_lookups_do_not() {
+        let mut d = db();
+        under(true, LFU);
+        run(&mut d, "SET k v");
+        let field = |d: &mut Db<Global>| d.access_of(b"k").unwrap().0;
+        assert_eq!(field(&mut d) & 255, 5, "a new key starts at LFU_INIT_VAL");
+        // At 5 any access increments.
+        run(&mut d, "GET k");
+        assert_eq!(field(&mut d) & 255, 6);
+        // EXISTS, TYPE and TTL look without touching.
+        for c in ["EXISTS k", "TYPE k", "TTL k", "PTTL k"] {
+            run(&mut d, c);
+        }
+        assert_eq!(field(&mut d) & 255, 6);
+        // An overwrite keeps the field its lookup updated.
+        let before = field(&mut d) & 255;
+        run(&mut d, "SET k w");
+        assert!(field(&mut d) & 255 >= before);
+        // No touching at all: GET leaves it.
+        under(false, LFU);
+        let held = field(&mut d);
+        run(&mut d, "GET k");
+        assert_eq!(field(&mut d), held);
+        // A rename carries the field.
+        run(&mut d, "RENAME k k2");
+        assert_eq!(d.access_of(b"k2").unwrap().0, held);
+        under(false, Tracking::Lru);
+    }
+
+    #[test]
+    fn volatile_sampling_sees_only_keys_with_a_deadline() {
+        let mut d = db();
+        under(false, Tracking::Lru);
+        for i in 0..200 {
+            run(&mut d, &format!("SET p{i} v"));
+        }
+        for i in 0..5 {
+            run(&mut d, &format!("SET t{i} v EX 1000"));
+        }
+        assert_eq!(d.evictable(true), 5);
+        let mut out = Vec::new();
+        d.sample(true, 50, Score::Deadline, &mut out);
+        assert_eq!(out.len(), 5);
+        assert!(out.iter().all(|s| s.key.starts_with(b"t")));
+        assert!(
+            !d.evict_key(b"p1", true),
+            "volatile-* never takes a persistent key"
+        );
+        assert!(d.evict_key(b"t1", true));
+        while d.evict_random(true).is_some() {}
+        assert_eq!(int(run(&mut d, "DBSIZE")), 200);
+        // PERSIST takes a key out of the volatile set, EXPIRE puts it in.
+        run(&mut d, "EXPIRE p3 100");
+        run(&mut d, "EXPIRE p4 100");
+        run(&mut d, "PERSIST p3");
+        assert_eq!(d.evict_random(true), Some(b"p4".to_vec()));
+        assert_eq!(d.evict_random(true), None);
     }
 }

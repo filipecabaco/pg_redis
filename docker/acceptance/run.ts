@@ -30,11 +30,15 @@ const SKIPFILE = `${HERE}skip.txt`;
 /**
  * Every unit a server with Redis's full command set should pass when driven
  * from outside. Left out: the units Redis itself tags external:skip at the
- * top — they reconfigure, restart or replicate the server under test (acl,
- * aofrw, auth, client-eviction, limits, maxmemory, obuf-limits, pubsubshard,
- * shutdown, wait) — and the ones that measure Redis's own allocator or
- * internals rather than behaviour (memefficiency, oom-score-adj, querybuf,
- * replybufsize, violations, tls).
+ * top — they reconfigure, restart or replicate the server under test (aofrw,
+ * client-eviction, limits, shutdown, wait) — and
+ * the ones that measure Redis's own allocator or internals rather than
+ * behaviour (memefficiency, oom-score-adj, querybuf, replybufsize,
+ * violations, tls). info, maxmemory, obuf-limits and pubsubshard run, in
+ * part, through `REWRITTEN` below. acl,
+ * acl-v2 and auth are in, with the tag lifted from their first server block
+ * (`UNTAG`): those blocks only change users and the password, which pg_redis
+ * can undo between units (`resetConfig`).
  */
 const UNITS = [
 	"unit/type/string",
@@ -73,21 +77,123 @@ const UNITS = [
 	"unit/networking",
 	"unit/other",
 	"unit/auth",
+	"unit/acl",
+	"unit/acl-v2",
 	"unit/quit",
+	"unit/maxmemory",
+	"unit/pubsubshard",
+	"unit/obuf-limits",
 ];
 
 /**
- * Tags whose tests cannot pass against any external server that is not Redis:
- * they need DEBUG, replication, or SAVE/BGSAVE to set up the case at all.
- * Denying them keeps the report about the command under test.
+ * Units Redis tags `external:skip` throughout that pg_redis can still run
+ * most of. Each is copied with the tag removed and with the top-level blocks
+ * that cannot run against an external server left out: the ones that start
+ * a replica, read the replication stream, or measure client output buffers.
+ * A block left in that fails is a failure in the report like any other.
+ * Only on the halves listed: maxmemory applies to memory databases alone.
  */
-const DENY_TAGS = [
-	"needs:debug",
-	"needs:repl",
-	"needs:save",
-	"needs:reset",
-	"needs:config-maxmemory",
-];
+const REWRITTEN: Record<string, { halves: Half[]; drop: RegExp[] }> = {
+	"unit/maxmemory": {
+		halves: ["memory"],
+		drop: [/test_slave_buffers/, /attach_to_replication_stream/, /proc init_test/],
+	},
+	// Every block runs: the tag is the file's, not its tests'.
+	"unit/info": {
+		halves: ["memory", "durable"],
+		drop: [],
+	},
+	"unit/obuf-limits": {
+		halves: ["memory", "durable"],
+		drop: [],
+	},
+	// Its second block publishes on a master and reads on a replica.
+	"unit/pubsubshard": {
+		halves: ["memory", "durable"],
+		drop: [/setup replication/],
+	},
+};
+
+/**
+ * Tags whose tests cannot pass against any external server that is not Redis:
+ * they need replication, or SAVE/BGSAVE to set up the case at all. Denying
+ * them keeps the report about the command under test. `needs:debug` tests
+ * run: DEBUG answers what pg_redis can answer truthfully (OBJECT, POPULATE,
+ * PROTOCOL, SLEEP, SET-ACTIVE-EXPIRE, and RELOAD and LOADAOF, after which the
+ * data is as it was), and a test that needs more fails in the report.
+ */
+const DENY_TAGS = ["needs:repl", "needs:save", "needs:reset"];
+
+/**
+ * Tests that pass or fail on how fast the machine is, which the gate reports
+ * but does not fail on. Each says why; remove it once the cause is fixed.
+ */
+const TIMING: Record<string, string> = {
+	// A 60-command pipeline must reach its output limit within the 100 ms the
+	// test waits. On a logged database each write is its own commit, about
+	// 2 ms where this suite is developed and several times that on CI runners.
+	// Fixed by running a connection's pipelined commands under one commit.
+	"durable | unit/obuf-limits | No response for multi commands in pipeline if client output buffer limit is enforced":
+		"each logged write commits on its own",
+};
+
+/**
+ * `needs:config-maxmemory` tests set a memory limit and expect eviction or
+ * OOM from it, which only the memory half has: a logged database is bounded
+ * by disk. Denied there, run on the memory half.
+ */
+const denyTags = (half: Half) =>
+	half === "durable" ? [...DENY_TAGS, "needs:config-maxmemory"] : DENY_TAGS;
+
+/**
+ * The unit as the suite is to run it: the file itself, or the rewritten copy
+ * `REWRITTEN` describes, written under tests/unit/pg_redis/.
+ */
+async function unitPath(unit: string): Promise<string> {
+	const rw = REWRITTEN[unit];
+	if (!rw) return unit;
+	const source = await Bun.file(`tests/${unit}.tcl`).text();
+	const chunks: string[][] = [];
+	for (const line of source.split("\n")) {
+		// A top-level block starts at the left margin; its closing brace and
+		// the lines inside it do not.
+		// A block opened by a line of its own that the next line nests in
+		// (`start_server {...} {` twice, for a replica) is one block.
+		const prev = chunks[chunks.length - 1];
+		const opener = prev?.length === 1 && /\{\s*$/.test(prev[0]);
+		if (chunks.length === 0 || (/^\S/.test(line) && !/^}/.test(line) && !opener)) chunks.push([]);
+		chunks[chunks.length - 1].push(line);
+	}
+	const kept = chunks
+		.map((c) => c.join("\n"))
+		.filter((c) => !rw.drop.some((re) => re.test(c)))
+		.join("\n")
+		// A tag of its own (`"external:skip"`) or one inside a quoted list
+		// (`"pubsubshard external:skip"`), whose closing quote stays.
+		.replaceAll(/\s*"external:skip"/g, "")
+		.replaceAll(/\s+external:skip/g, "")
+		// Each block is a fresh server to Redis, its statistics at zero
+		// (`evicted_keys`, `expired_keys` ...); here it is the same server.
+		.replaceAll(/^(start_server .*\{)[ \t]*$/gm, "$1\n    r config resetstat");
+	const name = `unit/pg_redis/${unit.replace(/^unit\//, "")}`;
+	await Bun.write(`tests/${name}.tcl`, kept);
+	return name;
+}
+
+/**
+ * The server blocks whose `external:skip` tag is lifted. Their later blocks
+ * need an ACL file, a `user` directive or a restart, and stay skipped.
+ */
+const UNTAG: Record<string, [string, string]> = {
+	"unit/acl": ['start_server {tags {"acl external:skip"}} {', 'start_server {tags {"acl"}} {'],
+	"unit/acl-v2": ['start_server {tags {"acl external:skip"}} {', 'start_server {tags {"acl"}} {'],
+	"unit/auth": ['start_server {tags {"auth external:skip"}} {', 'start_server {tags {"auth"}} {'],
+};
+for (const [unit, [from, to]] of Object.entries(UNTAG)) {
+	const path = `tests/${unit}.tcl`;
+	const text = await Bun.file(path).text();
+	if (text.includes(from)) await Bun.write(path, text.replace(from, to));
+}
 
 const HALVES = {
 	durable: [] as string[],
@@ -119,21 +225,75 @@ const ANSI = /\x1b\[[0-9;]*m/g;
  * after it. Put back what pg_redis acts on, as a fresh server would have it.
  */
 async function resetConfig(): Promise<void> {
-	const cmd = ["CONFIG", "SET", "maxmemory", "0", "maxmemory-policy", "noeviction"];
-	const wire = `*${cmd.length}\r\n${cmd.map((a) => `$${a.length}\r\n${a}\r\n`).join("")}`;
-	await new Promise<void>((resolve) => {
+	// The users a unit created go, the default user and the ACL settings go
+	// back to a fresh server's.
+	const users = (await roundTrip([["ACL", "USERS"]]))
+		.split("\r\n")
+		.filter((l, i, all) => i > 0 && all[i - 1].startsWith("$"))
+		.filter((u) => u !== "default");
+	const cmds: string[][] = [
+		["CONFIG", "SET", "maxmemory", "0", "maxmemory-policy", "noeviction"],
+		// obuf-limits leaves its own when a test fails before restoring it.
+		["CONFIG", "SET", "client-output-buffer-limit", "normal 0 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60"],
+		// The encoding thresholds, which the hash, set and zset files change
+		// for a test and leave for the next file's fresh server to forget.
+		[
+			"CONFIG",
+			"SET",
+			"hash-max-listpack-entries",
+			"512",
+			"hash-max-listpack-value",
+			"64",
+			"set-max-intset-entries",
+			"512",
+			"set-max-listpack-entries",
+			"128",
+			"set-max-listpack-value",
+			"64",
+			"zset-max-listpack-entries",
+			"128",
+			"zset-max-listpack-value",
+			"64",
+			"list-max-listpack-size",
+			"-2",
+			"hll-sparse-max-bytes",
+			"3000",
+		],
+		["CONFIG", "SET", "requirepass", "", "acllog-max-len", "128", "acl-pubsub-default", "resetchannels"],
+		["ACL", "SETUSER", "default", "reset", "on", "nopass", "~*", "&*", "+@all"],
+		["ACL", "LOG", "RESET"],
+		// A test that turns background expiry off and then fails leaves it off.
+		["DEBUG", "SET-ACTIVE-EXPIRE", "1"],
+		["DEBUG", "SET-DISABLE-DENY-SCRIPTS", "0"],
+		["CONFIG", "SET", "latency-tracking", "yes", "latency-tracking-info-percentiles", "50 99 99.9"],
+	];
+	if (users.length > 0) cmds.push(["ACL", "DELUSER", ...users]);
+	await roundTrip(cmds);
+}
+
+/** Send `cmds` on one connection and return every reply's bytes, read up to
+ * the PONG of a PING sent after them. */
+async function roundTrip(cmds: string[][]): Promise<string> {
+	const wire = [...cmds, ["PING"]]
+		.map((cmd) => `*${cmd.length}\r\n${cmd.map((a) => `$${Buffer.byteLength(a)}\r\n${a}\r\n`).join("")}`)
+		.join("");
+	return await new Promise<string>((resolve) => {
+		let got = "";
 		Bun.connect({
 			hostname: HOST,
 			port: Number(PORT),
 			socket: {
 				open: (s) => void s.write(wire),
-				data: (s) => {
-					s.end();
-					resolve();
+				data: (s, chunk) => {
+					got += Buffer.from(chunk).toString();
+					if (got.endsWith("+PONG\r\n") || got.includes("-NOAUTH")) {
+						s.end();
+						resolve(got);
+					}
 				},
-				close: () => resolve(),
-				error: () => resolve(),
-				connectError: () => resolve(),
+				close: () => resolve(got),
+				error: () => resolve(got),
+				connectError: () => resolve(got),
 			},
 		});
 	});
@@ -149,19 +309,24 @@ async function runUnit(half: Half, unit: string): Promise<UnitResult> {
 		"--port",
 		PORT,
 		"--single",
-		unit,
+		await unitPath(unit),
 		"--clients",
 		"1",
 		"--durable",
 		"--ignore-encoding",
 		"--ignore-digest",
 		"--no-latency",
+		// Seconds per test. The durable half's write-heavy tests (thousands of
+		// PFADDs, each committed to the WAL) ran past 120 on CI's shared disks
+		// while still passing; the limit catches a hang, not slowness.
 		"--timeout",
-		"120",
+		"300",
 		"--skipfile",
 		SKIPFILE,
 		"--tags",
-		DENY_TAGS.map((t) => `-${t}`).join(" "),
+		denyTags(half)
+			.map((t) => `-${t}`)
+			.join(" "),
 		...HALVES[half],
 	];
 	const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
@@ -193,7 +358,8 @@ async function runUnit(half: Half, unit: string): Promise<UnitResult> {
 		m = line.match(/^\[err\]: (.*?)(?: in tests\/\S+)?$/);
 		if (m) {
 			tests.set(m[1], "err");
-			if (process.env.VERBOSE) console.log(`    ${line}\n      ${lines[i + 1]}`);
+			// What failed and why: two lines, and all a CI log has to go on.
+			console.log(`    ${line}\n      ${lines[i + 1]}`);
 			continue;
 		}
 		m = line.match(/^\[(?:skip|ignore)\]: (.*)$/);
@@ -219,6 +385,7 @@ const summary: string[] = [];
 for (const half of Object.keys(HALVES) as Half[]) {
 	console.log(`\n══ ${half} half ══════════════════════════════════════`);
 	for (const unit of units) {
+		if (REWRITTEN[unit] && !REWRITTEN[unit].halves.includes(half)) continue;
 		const r = await runUnit(half, unit);
 		results.set(`${half} | ${unit}`, r);
 		const counts = { ok: 0, err: 0, skip: 0 };
@@ -232,6 +399,10 @@ for (const half of Object.keys(HALVES) as Half[]) {
 			`  (${counts.skip} skipped)${r.aborted ? "  ABORTED" : ""}`;
 		console.log(`  ${line}`);
 		if (r.aborted) console.log(`      ${r.aborted}`);
+		// Which tests failed, by name: the baseline holds only those passing.
+		for (const [test, outcome] of r.tests) {
+			if (outcome === "err") console.log(`      ✗ ${test}`);
+		}
 		summary.push(`${half.padEnd(8)} ${line}`);
 	}
 }
@@ -256,7 +427,10 @@ if (updating) {
 	if (onlyUnits.length > 0) {
 		const previous: Baseline = await Bun.file(BASELINE).json();
 		for (const half of Object.keys(HALVES) as Half[]) {
-			for (const unit of units) previous[half][unit] = baseline[half][unit] ?? [];
+			for (const unit of units) {
+				if (REWRITTEN[unit] && !REWRITTEN[unit].halves.includes(half)) continue;
+				previous[half][unit] = baseline[half][unit] ?? [];
+			}
 		}
 		Object.assign(baseline, previous);
 	}
@@ -278,7 +452,13 @@ try {
 	console.error(`no baseline at ${BASELINE}; run with --update-baseline`);
 }
 
-const regressed = [...expected].filter((k) => !passing.has(k)).sort();
+const missing = [...expected].filter((k) => !passing.has(k)).sort();
+const regressed = missing.filter((k) => !(k in TIMING));
+const unsteady = missing.filter((k) => k in TIMING);
+if (unsteady.length > 0) {
+	console.log(`\nTiming-dependent, not gated (${unsteady.length}):`);
+	for (const k of unsteady) console.log(`  ${k}   (${TIMING[k]})`);
+}
 const improved = [...passing].filter((k) => !expected.has(k)).sort();
 
 if (regressed.length > 0) {

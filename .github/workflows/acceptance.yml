@@ -25,7 +25,10 @@ jobs:
   acceptance:
     name: Redis acceptance suite
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Both halves of every unit, the needs:debug tests and the maxmemory,
+    # obuf-limits, info, pubsubshard, acl and auth units included: about 75
+    # minutes on a fast machine, more on a shared runner.
+    timeout-minutes: 180
     env:
       # dbs 0-7 on the shared-memory tables, 8-15 on SQL: the suite's default
       # SELECT 9 reaches the durable half and --singledb the memory half.

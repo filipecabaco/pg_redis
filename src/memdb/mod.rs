@@ -15,9 +15,12 @@
 mod db;
 pub mod deque;
 pub mod dict;
+pub mod encoding;
+pub mod keyspace;
+pub mod lru;
 pub mod zset;
 
-pub use db::{Db, take_reaped};
+pub use db::{Db, Score, pause_expiry, take_reaped};
 
 use allocator_api2::alloc::Allocator;
 use allocator_api2::vec::Vec;
@@ -77,14 +80,6 @@ pub fn parse_stored_int(bytes: &[u8]) -> Option<i64> {
     s.parse().ok()
 }
 
-pub fn parse_stored_float(bytes: &[u8]) -> Option<f64> {
-    std::str::from_utf8(bytes).ok()?.parse().ok()
-}
-
-pub fn format_float(f: f64) -> String {
-    format!("{f}")
-}
-
 /// The inclusive index range a range command selects, or `None` for none.
 /// Negative indexes count back from the end.
 pub fn range_bounds(start: i64, stop: i64, len: usize) -> Option<(usize, usize)> {
@@ -123,7 +118,7 @@ pub fn random_picks(n: usize, count: i64) -> std::vec::Vec<usize> {
         return vec![];
     }
     if count < 0 {
-        return (0..count.unsigned_abs())
+        return (0..crate::pubsub::cap_repeats(count.unsigned_abs()))
             .map(|_| (fast_random() % n as u64) as usize)
             .collect();
     }

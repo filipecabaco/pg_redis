@@ -1,8 +1,15 @@
 <div align="center">
   <img src="logo.svg" alt="pg_redis" width="600"/>
+
+  <p>
+    <a href="https://filipecabaco.github.io/pg_redis/"><strong>Website</strong></a> ·
+    <a href="https://filipecabaco.github.io/pg_redis/#try-it">Try it in your browser</a> ·
+    <a href="https://filipecabaco.github.io/pg_redis/installation/">Install</a> ·
+    <a href="https://filipecabaco.github.io/pg_redis/command-coverage/">Commands</a>
+  </p>
 </div>
 
-A PostgreSQL extension that lets you connect to Postgres using the **Redis protocol (RESP2 and RESP3)**. Drop-in Redis wire compatibility, with a storage policy per database to match your performance and durability needs.
+A PostgreSQL extension that lets you connect to Postgres using the **Redis protocol (RESP2 and RESP3)**. Existing Redis clients work unchanged, and each database has its own storage policy to match its performance and durability needs.
 
 Built with [pgrx](https://github.com/pgcentralfoundation/pgrx) in Rust.
 
@@ -10,17 +17,18 @@ Built with [pgrx](https://github.com/pgcentralfoundation/pgrx) in Rust.
 
 `pg_redis` starts a pool of TCP background workers inside PostgreSQL that listen for Redis clients on port 6379. Each of its 16 databases (0–15, Redis's own model) has a storage policy, changeable at runtime while clients keep using it ([Storage policies](./docs/STORAGE.md)):
 
-- **`memory`** (default for 0–7) — an in-memory engine in PostgreSQL shared memory, no transaction overhead, near-Redis throughput
-- **`memory+snapshot`** — memory, copied to a logged table on an interval and reloaded at startup, like Redis's RDB
-- **`logged`** (default for 8–15) — WAL-logged PostgreSQL tables, full crash durability, replication and SQL visibility
+- **`memory`** (default for 0–7): an in-memory engine in PostgreSQL shared memory, no transaction overhead, near-Redis throughput
+- **`memory+snapshot`**: memory, copied to a logged table on an interval and reloaded at startup, like Redis's RDB
+- **`logged`** (default for 8–15): WAL-logged PostgreSQL tables, full crash durability, replication and SQL visibility
 
 `SELECT` accepts `cache` (0) and `durable` (8) as names for the two default halves.
 
 Memory mode keeps its data in PostgreSQL shared memory, bounded by
-`redis.maxmemory` (256 MB by default) the way Redis is by `maxmemory`: the
-space is reserved at start but backed by RAM only as data fills it, and past
-the limit a write either evicts or is refused with `OOM`, depending on
-`redis.maxmemory_policy`. Keys and values are as long as Redis allows. See
+`redis.maxmemory` (256 MB by default) the same way Redis is bounded by
+`maxmemory`. The space is reserved at start but backed by RAM only as data
+fills it. Past the limit, a write either evicts or is refused with `OOM`,
+depending on `redis.maxmemory_policy`. Keys and values can be as long as Redis
+allows. See
 [Implementation](./docs/IMPLEMENTATION.md#3-the-shared-memory-backend).
 
 ## Performance
@@ -73,11 +81,11 @@ SELECT key, value, expires_at FROM redis.kv_8;
 
 ## Documentation
 
-Full docs at **[filipecabaco.github.io/pg_redis](https://filipecabaco.github.io/pg_redis/)**.
+The full documentation is at **[filipecabaco.github.io/pg_redis](https://filipecabaco.github.io/pg_redis/)**.
 
-- [Installation](./docs/installation.md) — requirements, building from source, enabling the extension
-- [Configuration](./docs/configuration.md) — GUC reference, database selection, worker management
-- [Commands](./docs/commands.md) — supported Redis commands
-- [Command coverage](./docs/command-coverage.md) — full compatibility matrix
-- [Implementation](./docs/IMPLEMENTATION.md) — architecture, storage backends, the shared-memory
+- [Installation](./docs/installation.md): requirements, building from source, enabling the extension
+- [Configuration](./docs/configuration.md): GUC reference, database selection, worker management
+- [Commands](./docs/commands.md): supported Redis commands
+- [Command coverage](./docs/command-coverage.md): full compatibility matrix
+- [Implementation](./docs/IMPLEMENTATION.md): architecture, storage backends, the shared-memory
   layout, pub/sub, WATCH, limits, performance, testing and CI

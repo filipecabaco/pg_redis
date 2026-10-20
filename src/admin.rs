@@ -47,6 +47,8 @@ const NAMES: &[&str] = &[
     "SHUTDOWN",
     "FAILOVER",
     "MEMORY",
+    "MIGRATE",
+    "MODULE",
 ];
 
 impl Admin {
@@ -72,6 +74,11 @@ pub struct Conn<'a> {
     pub db: u8,
     /// `CLIENT REPLY`: replies are written only while this is `On`.
     pub reply: ReplyMode,
+    /// The ACL user the command runs as.
+    pub session: crate::acl::Session,
+    /// On the connection's own thread, which may wait for the clients an
+    /// ACL change closes; the dispatcher may not.
+    pub may_wait: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -120,9 +127,19 @@ pub fn execute(a: &Admin, conn: &mut Conn, data: &mut Data) -> Response {
         "COMMAND" => command(a),
         "SLOWLOG" => slowlog(a),
         "LATENCY" => latency(a),
-        "ACL" => acl(a),
+        "ACL" => crate::acl::command(
+            &a.args,
+            &crate::acl::Caller {
+                session: conn.session,
+                client_id: conn.client.id,
+                may_wait: conn.may_wait,
+            },
+            data,
+        ),
         "DEBUG" => debug(a, conn, data),
         "MEMORY" => memory(a),
+        "MIGRATE" => migrate(a, conn, data),
+        "MODULE" => module(a),
         "LASTSAVE" => Response::Integer(
             server::ctl().map_or(0, |c| c.lastsave.load(std::sync::atomic::Ordering::Relaxed)),
         ),
@@ -134,6 +151,7 @@ pub fn execute(a: &Admin, conn: &mut Conn, data: &mut Data) -> Response {
         // (`Command::execute_inner`), where SPI is to hand; what is left is
         // LASTSAVE when there was nothing to snapshot.
         "SAVE" => {
+            server::mark_saved();
             if !a.saved
                 && let Some(c) = server::ctl()
             {
@@ -145,6 +163,7 @@ pub fn execute(a: &Admin, conn: &mut Conn, data: &mut Data) -> Response {
             Response::Ok
         }
         "BGSAVE" => {
+            server::mark_saved();
             if !crate::storage::request_snapshots()
                 && let Some(c) = server::ctl()
             {
@@ -247,7 +266,7 @@ fn client(a: &Admin, conn: &mut Conn) -> Response {
             Response::Ok
         }
         "INFO" => {
-            let me = server::clients()
+            let me = server::clients_with_output()
                 .into_iter()
                 .find(|c| c.id == conn.client.id);
             bulk(me.map(|c| format!("{}\n", c.line())).unwrap_or_default())
@@ -285,8 +304,13 @@ fn client(a: &Admin, conn: &mut Conn) -> Response {
             };
             if let Some(c) = server::ctl() {
                 use std::sync::atomic::Ordering::Relaxed;
+                // `pauseClients`: the new mode, and the later of the two ends.
                 c.pause_writes_only.store(writes as u32, Relaxed);
-                c.pause_until_ms.store(server::now_ms() + ms, Relaxed);
+                let until = server::now_ms() + ms;
+                let current = c.pause_until_ms.load(Relaxed);
+                if !server::paused() || current < until {
+                    c.pause_until_ms.store(until, Relaxed);
+                }
             }
             Response::Ok
         }
@@ -363,7 +387,7 @@ fn client(a: &Admin, conn: &mut Conn) -> Response {
 }
 
 fn client_list(opts: &[Vec<u8>]) -> Response {
-    let mut all = server::clients();
+    let mut all = server::clients_with_output();
     match opts {
         [] => {}
         [t, kind] if t.eq_ignore_ascii_case(b"TYPE") => {
@@ -425,11 +449,10 @@ fn client_kill(opts: &[Vec<u8>], conn: &Conn) -> Response {
             },
             "ADDR" => targets.retain(|c| c.addr == vs),
             "LADDR" => targets.retain(|c| c.laddr == vs),
-            "USER" => {
-                if vs != "default" {
-                    return err(format!("ERR No such user '{vs}'"));
-                }
-            }
+            "USER" => match crate::acl::serial_of(v) {
+                Some(serial) => targets.retain(|c| c.user_serial == serial),
+                None => return err(format!("ERR No such user '{vs}'")),
+            },
             "TYPE" => match vs.to_ascii_lowercase().as_str() {
                 "normal" => targets.retain(|c| c.flags & server::flag::PUBSUB == 0),
                 "pubsub" => targets.retain(|c| c.flags & server::flag::PUBSUB != 0),
@@ -558,6 +581,8 @@ pub fn info(args: &[Vec<u8>], conn: &Conn, data: &mut Data) -> Response {
                 DEFAULT_SECTIONS.iter().for_each(|s| add(s, &mut sections));
                 ALL_EXTRA.iter().for_each(|s| add(s, &mut sections));
             }
+            // Shown only when named, never by `all` or `everything`.
+            "debug" => add("debug", &mut sections),
             other => {
                 for s in DEFAULT_SECTIONS.iter().chain(ALL_EXTRA) {
                     if *s == other {
@@ -582,6 +607,7 @@ pub fn info(args: &[Vec<u8>], conn: &Conn, data: &mut Data) -> Response {
         "latencystats",
         "cluster",
         "keyspace",
+        "debug",
     ]
     .into_iter()
     .filter(|s| sections.contains(s))
@@ -619,6 +645,7 @@ fn info_section(section: &str, conn: &Conn, data: &mut Data) -> String {
         "errorstats" => "Errorstats",
         "latencystats" => "Latencystats",
         "cluster" => "Cluster",
+        "debug" => "Debug",
         _ => "Keyspace",
     };
     match section {
@@ -629,7 +656,7 @@ fn info_section(section: &str, conn: &Conn, data: &mut Data) -> String {
                 "redis_git_dirty:0".into(),
                 "redis_build_id:0".into(),
                 "redis_mode:standalone".into(),
-                "os:PostgreSQL".into(),
+                format!("os:{}", crate::sys::os_name()),
                 "arch_bits:64".into(),
                 "monotonic_clock:POSIX clock_gettime".into(),
                 "multiplexing_api:threads".into(),
@@ -637,7 +664,7 @@ fn info_section(section: &str, conn: &Conn, data: &mut Data) -> String {
                 "gcc_version:0.0.0".into(),
                 format!("process_id:{}", std::process::id()),
                 "process_supervised:no".into(),
-                "run_id:0000000000000000000000000000000000000000".into(),
+                format!("run_id:{}", server::run_id()),
                 format!("tcp_port:{}", crate::config::live_gucs().port),
                 format!("server_time_usec:{}", now * 1000),
                 format!("uptime_in_seconds:{uptime}"),
@@ -715,9 +742,11 @@ fn info_section(section: &str, conn: &Conn, data: &mut Data) -> String {
                     crate::config::get_str("maxmemory-policy")
                 ),
                 "mem_fragmentation_ratio:1.00".into(),
+                // No replication or AOF buffers are counted in the arena.
+                "mem_not_counted_for_evict:0".into(),
                 "mem_allocator:postgresql".into(),
                 "lazyfree_pending_objects:0".into(),
-                "lazyfreed_objects:0".into(),
+                format!("lazyfreed_objects:{}", stat(|c| &c.lazyfreed_objects)),
             ]);
         }
         "persistence" => {
@@ -725,7 +754,10 @@ fn info_section(section: &str, conn: &Conn, data: &mut Data) -> String {
             lines.extend([
                 "loading:0".into(),
                 "async_loading:0".into(),
-                "rdb_changes_since_last_save:0".into(),
+                format!(
+                    "rdb_changes_since_last_save:{}",
+                    server::changes_since_save()
+                ),
                 "rdb_bgsave_in_progress:0".into(),
                 format!("rdb_last_save_time:{lastsave}"),
                 "rdb_last_bgsave_status:ok".into(),
@@ -740,19 +772,33 @@ fn info_section(section: &str, conn: &Conn, data: &mut Data) -> String {
             ]);
         }
         "stats" => {
+            let denied = crate::acl::denied_counts();
             lines.extend([
                 format!(
                     "total_connections_received:{}",
                     stat(|c| &c.total_connections)
                 ),
                 format!("total_commands_processed:{}", stat(|c| &c.total_commands)),
-                "instantaneous_ops_per_sec:0".into(),
+                crate::eventloop::ops_line(),
                 format!("total_net_input_bytes:{}", stat(|c| &c.net_input)),
                 format!("total_net_output_bytes:{}", stat(|c| &c.net_output)),
+                "total_net_repl_input_bytes:0".into(),
+                "total_net_repl_output_bytes:0".into(),
+            ]);
+            lines.extend(crate::eventloop::kbps_lines());
+            lines.extend([
                 format!("rejected_connections:{}", stat(|c| &c.rejected_connections)),
                 format!("expired_keys:{}", stat(|c| &c.expired_keys)),
-                "evicted_keys:0".into(),
+                format!("evicted_keys:{}", stat(|c| &c.evicted_keys)),
                 "evicted_clients:0".into(),
+                format!(
+                    "total_eviction_exceeded_time:{}",
+                    server::eviction_exceeded_times().0
+                ),
+                format!(
+                    "current_eviction_exceeded_time:{}",
+                    server::eviction_exceeded_times().1
+                ),
                 format!("keyspace_hits:{}", stat(|c| &c.keyspace_hits)),
                 format!("keyspace_misses:{}", stat(|c| &c.keyspace_misses)),
                 "pubsub_channels:0".into(),
@@ -772,10 +818,22 @@ fn info_section(section: &str, conn: &Conn, data: &mut Data) -> String {
                 "dump_payload_sanitizations:0".into(),
                 format!("total_reads_processed:{}", stat(|c| &c.total_commands)),
                 format!("total_writes_processed:{}", stat(|c| &c.total_commands)),
-                "acl_access_denied_auth:0".into(),
-                "acl_access_denied_cmd:0".into(),
-                "acl_access_denied_key:0".into(),
-                "acl_access_denied_channel:0".into(),
+                "io_threaded_reads_processed:0".into(),
+                "io_threaded_writes_processed:0".into(),
+                "client_query_buffer_limit_disconnections:0".into(),
+                format!(
+                    "client_output_buffer_limit_disconnections:{}",
+                    stat(|c| &c.output_limit_disconnections)
+                ),
+                "reply_buffer_shrinks:0".into(),
+                "reply_buffer_expands:0".into(),
+            ]);
+            lines.extend(crate::eventloop::stats_lines());
+            lines.extend([
+                format!("acl_access_denied_auth:{}", denied[0]),
+                format!("acl_access_denied_cmd:{}", denied[1]),
+                format!("acl_access_denied_key:{}", denied[2]),
+                format!("acl_access_denied_channel:{}", denied[3]),
             ]);
         }
         "replication" => lines.extend([
@@ -830,6 +888,7 @@ fn info_section(section: &str, conn: &Conn, data: &mut Data) -> String {
                 lines.push(format!("errorstat_{code}:count={n}"));
             }
         }
+        "debug" => lines.extend(crate::eventloop::debug_lines()),
         "latencystats" => {
             let percentiles: Vec<f64> = crate::config::get_str("latency-tracking-info-percentiles")
                 .split_whitespace()
@@ -884,7 +943,7 @@ fn fmt_pct(p: f64) -> String {
 // ───────────────────────────────── COMMAND ──────────────────────────────────
 
 /// Commands pg_redis implements, as COMMAND LIST names them, subcommands too.
-fn implemented() -> impl Iterator<Item = &'static CommandSpec> {
+pub(crate) fn implemented() -> impl Iterator<Item = &'static CommandSpec> {
     crate::redis_tables::COMMANDS.iter().filter(|c| {
         let top = if c.container.is_empty() {
             c.name
@@ -895,9 +954,15 @@ fn implemented() -> impl Iterator<Item = &'static CommandSpec> {
     })
 }
 
+/// `implemented` by name, built once: `get_keys` runs after every command on
+/// a logged database (`access::after_command`), and the filter above walks
+/// the coverage page for each entry of the command table.
+static BY_NAME: std::sync::LazyLock<std::collections::HashMap<&'static str, &'static CommandSpec>> =
+    std::sync::LazyLock::new(|| implemented().map(|c| (c.name, c)).collect());
+
 fn find_spec(name: &[u8]) -> Option<&'static CommandSpec> {
     let lower = String::from_utf8_lossy(name).to_ascii_lowercase();
-    implemented().find(|c| c.name == lower)
+    BY_NAME.get(lower.as_str()).copied()
 }
 
 /// Redis's `populateCommandLegacyRangeSpec`: the single first/last/step
@@ -943,7 +1008,7 @@ fn legacy_range(c: &CommandSpec) -> (i64, i64, i64, bool) {
     (first as i64, last as i64, 1, movable)
 }
 
-const ACL_ORDER: &[&str] = &[
+pub(crate) const ACL_ORDER: &[&str] = &[
     "keyspace",
     "read",
     "write",
@@ -1378,7 +1443,7 @@ pub(crate) fn get_keys(argv: &[Vec<u8>]) -> Result<KeysWithFlags, String> {
             spec.name,
             String::from_utf8_lossy(&argv[1]).to_ascii_lowercase()
         );
-        if let Some(s) = implemented().find(|c| c.name == full) {
+        if let Some(s) = BY_NAME.get(full.as_str()) {
             spec = s;
         }
     }
@@ -1439,7 +1504,7 @@ fn key_flag_name(f: &str) -> &'static str {
 
 /// `getKeysUsingKeySpecs`: `None` when a spec cannot be followed — unknown,
 /// incomplete, a bad key count, positions past the arguments.
-fn keys_from_specs(
+pub(crate) fn keys_from_specs(
     spec: &CommandSpec,
     argv: &[Vec<u8>],
 ) -> Option<Vec<(usize, Vec<&'static str>)>> {
@@ -1649,16 +1714,10 @@ fn slowlog(a: &Admin) -> Response {
 /// per-command latency `INFO latencystats` keeps.
 fn latency(a: &Admin) -> Response {
     match a.sub().as_str() {
-        "LATEST" => Response::Value(Value::Array(vec![])),
-        "HISTORY" => Response::Value(Value::Array(vec![])),
-        "RESET" => Response::Integer(0),
-        "GRAPH" => err(format!(
-            "ERR No samples available for event '{}'",
-            a.args
-                .get(1)
-                .map(|v| String::from_utf8_lossy(v).into_owned())
-                .unwrap_or_default()
-        )),
+        "LATEST" => crate::latency::latest(),
+        "HISTORY" if a.args.len() == 2 => crate::latency::history(&a.args[1]),
+        "RESET" => crate::latency::reset(&a.args[1..]),
+        "GRAPH" if a.args.len() == 2 => crate::latency::graph(&a.args[1]),
         "DOCTOR" => bulk(
             "Dave, no latency spike was observed during the lifetime of this Redis instance, not in the slightest bit. I honestly think you ought to sleep tonight.\n",
         ),
@@ -1675,7 +1734,9 @@ fn latency(a: &Admin) -> Response {
             for (i, spec) in crate::redis_tables::COMMANDS.iter().enumerate() {
                 let Some(s) = ctl.cmdstats.get(i) else { break };
                 let calls = s.calls.load(Relaxed);
-                if calls == 0 || (!wanted.is_empty() && !wanted.iter().any(|w| w == spec.name)) {
+                // A container names its subcommands too.
+                let named = |w: &String| *w == spec.name || *w == spec.container;
+                if calls == 0 || (!wanted.is_empty() && !wanted.iter().any(named)) {
                     continue;
                 }
                 let buckets: Vec<(Value, Value)> = s
@@ -1728,97 +1789,270 @@ fn latency(a: &Admin) -> Response {
     }
 }
 
-// ─────────────────────────────────── ACL ────────────────────────────────────
+// ───────────────────────────────── DEBUG ────────────────────────────────────
 
-/// One user, `default`, with every permission — the only user pg_redis has.
-/// `redis.password` is its password.
-fn acl(a: &Admin) -> Response {
-    let user_line = "user default on nopass sanitize-payload ~* &* +@all";
+/// `DEBUG OBJECT key`, in Redis's words. The address is the key's own and
+/// stays put while its value is changed in place; `lru` is the 24-bit clock
+/// `lru_seconds_idle` is measured from. Nothing here touches the key.
+fn debug_object(key: &[u8], conn: &mut Conn, data: &mut Data) -> Response {
+    use crate::commands::ObjectField;
+    let db = conn.db;
+    let enc = match data(Command::ObjectEncoding { key: key.to_vec() }, db) {
+        Response::BulkString(e) => String::from_utf8_lossy(&e).into_owned(),
+        Response::Null => return err("ERR no such key"),
+        r => return r,
+    };
+    let field = |field, data: &mut Data| match data(
+        Command::ObjectAccess {
+            key: key.to_vec(),
+            field,
+        },
+        db,
+    ) {
+        Response::Integer(n) => Some(n),
+        _ => None,
+    };
+    let refcount = field(ObjectField::Refcount, data).unwrap_or(1);
+    let idle = field(ObjectField::Idletime, data).unwrap_or(0);
+    // DUMP looks the key up as a read; a no-touch client's does not touch it.
+    let was = conn.client.slot().is_some_and(|s| {
+        s.flags.load(std::sync::atomic::Ordering::Relaxed) & server::flag::NO_TOUCH != 0
+    });
+    conn.client.set_flag(server::flag::NO_TOUCH, true);
+    let dump = data(Command::Dump { key: key.to_vec() }, db);
+    conn.client.set_flag(server::flag::NO_TOUCH, was);
+    // The payload less its type byte and its RDB version and checksum.
+    let serialized = match dump {
+        Response::BulkString(p) => p.len().saturating_sub(11),
+        _ => 0,
+    };
+    let clock = (server::now_ms() / 1000 - idle).rem_euclid(1 << 24);
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ u64::from(db);
+    for &b in key {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let at = 0x7f00_0000_0000 | (h & 0xff_ffff_fff0);
+    Response::SimpleString(format!(
+        "Value at:{at:#x} refcount:{refcount} encoding:{enc} serializedlength:{serialized} lru:{clock} lru_seconds_idle:{idle}"
+    ))
+}
+
+/// `DEBUG POPULATE count [prefix] [size]`: keys `prefix:0` .. holding
+/// `value:N`, cut or zero-padded to `size`; a key already there is left.
+fn debug_populate(args: &[Vec<u8>], conn: &mut Conn, data: &mut Data) -> Response {
+    let positive = |v: &[u8]| int(v).filter(|n| *n >= 0);
+    let Some(count) = positive(&args[0]) else {
+        return err("ERR value is out of range, must be positive");
+    };
+    let size = match args.get(2) {
+        Some(v) => match positive(v) {
+            Some(n) => Some(n as usize),
+            None => return err("ERR value is out of range, must be positive"),
+        },
+        None => None,
+    };
+    let prefix = args.get(1).map_or(b"key".as_slice(), Vec::as_slice);
+    for j in 0..count {
+        let key = [prefix, format!(":{j}").as_bytes()].concat();
+        let mut value = format!("value:{j}").into_bytes();
+        if let Some(n) = size {
+            value.resize(n, 0);
+        }
+        let set = Command::parse(vec![b"SET".to_vec(), key, value, b"NX".to_vec()]);
+        match set.map(|c| data(c, conn.db)) {
+            Ok(Response::Error(e)) | Err(e) => return Response::Error(e),
+            Ok(_) => {}
+        }
+    }
+    Response::Ok
+}
+
+/// No key in any database and no function loaded.
+fn dataset_empty(conn: &mut Conn, data: &mut Data) -> bool {
+    let no_keys = (0..crate::commands::NUM_DBS as u8)
+        .all(|d| matches!(data(Command::DbSize, d), Response::Integer(0)));
+    let functions =
+        Command::parse(vec![b"FUNCTION".to_vec(), b"LIST".to_vec()]).map(|c| data(c, conn.db));
+    let no_functions = match functions {
+        Ok(Response::Value(Value::Array(v))) => v.is_empty(),
+        Ok(Response::Array(v)) => v.is_empty(),
+        _ => true,
+    };
+    no_keys && no_functions
+}
+
+/// `MODULE`, as a Redis with no modules loaded answers it: pg_redis loads
+/// none, so `LOAD` fails as a failed load does.
+fn module(a: &Admin) -> Response {
     match a.sub().as_str() {
-        "WHOAMI" => bulk("default"),
-        "USERS" => Response::Value(Value::Array(vec![Value::str("default")])),
-        "LIST" => Response::Value(Value::Array(vec![Value::str(user_line)])),
-        "CAT" => match a.args.get(1) {
-            None => Response::Value(Value::Array(
-                ACL_ORDER.iter().map(|c| Value::str(c)).collect(),
-            )),
-            Some(cat) => {
-                let cat = String::from_utf8_lossy(cat).to_ascii_lowercase();
-                if !ACL_ORDER.contains(&cat.as_str()) {
-                    return err(format!("ERR Unknown category '{cat}'"));
-                }
-                Response::Value(Value::Array(
-                    implemented()
-                        .filter(|c| acl_categories(c).contains(&cat.as_str()))
-                        .map(|c| Value::str(c.name))
-                        .collect(),
-                ))
-            }
-        },
-        "GETUSER" => {
-            if !a.args[1].eq_ignore_ascii_case(b"default") {
-                return Response::Null;
-            }
-            Response::Value(Value::Map(vec![
-                (
-                    Value::str("flags"),
-                    Value::Array(vec![
-                        Value::str("on"),
-                        Value::str("nopass"),
-                        Value::str("sanitize-payload"),
-                    ]),
-                ),
-                (Value::str("passwords"), Value::Array(vec![])),
-                (Value::str("commands"), Value::str("+@all")),
-                (Value::str("keys"), Value::str("~*")),
-                (Value::str("channels"), Value::str("&*")),
-                (Value::str("selectors"), Value::Array(vec![])),
-            ]))
-        }
-        "LOG" => match a.args.get(1) {
-            Some(r) if r.eq_ignore_ascii_case(b"RESET") => Response::Ok,
-            _ => Response::Value(Value::Array(vec![])),
-        },
-        "GENPASS" => {
-            let bits = a
-                .args
-                .get(1)
-                .and_then(|v| int(v))
-                .unwrap_or(256)
-                .clamp(1, 4096) as usize;
-            let hex: String = (0..bits.div_ceil(4))
-                .map(|_| format!("{:x}", crate::memdb::fast_random() & 0xf))
-                .collect();
-            bulk(hex)
-        }
-        "DRYRUN" => Response::Ok,
-        "SETUSER" | "DELUSER" | "LOAD" | "SAVE" => {
-            err("ERR pg_redis has a single user, default, configured with redis.password")
-        }
+        "LIST" => Response::Value(Value::Array(vec![])),
+        "LOAD" | "LOADEX" => err("ERR Error loading the extension. Please check the server logs."),
+        "UNLOAD" => err("ERR Error unloading module: no such module with that name"),
         "HELP" => help(&[
-            "ACL <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
-            "CAT [<category>]",
-            "    List all commands that belong to <category>, or all command categories",
-            "    when no category is specified.",
-            "GETUSER <username>",
-            "    Get the user's details.",
+            "MODULE <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
             "LIST",
-            "    Show users details in config file format.",
-            "USERS",
-            "    List all the registered usernames.",
-            "WHOAMI",
-            "    Return the current connection username.",
+            "    Return a list of loaded modules.",
+            "LOAD <path> [<arg> ...]",
+            "    Load a module library from <path>, passing to it any optional arguments.",
+            "LOADEX <path> [[CONFIG NAME VALUE] [CONFIG NAME VALUE]] [ARGS ...]",
+            "    Load a module library from <path>, while passing it module configurations and optional arguments.",
+            "UNLOAD <name>",
+            "    Unload a module.",
             "HELP",
             "    Print this help.",
         ]),
-        other => err(format!("ERR unknown subcommand '{other}'. Try ACL HELP.")),
+        other => err(format!(
+            "ERR unknown subcommand '{}'. Try MODULE HELP.",
+            other.to_ascii_lowercase()
+        )),
     }
 }
 
-// ───────────────────────────────── DEBUG ────────────────────────────────────
+/// `MIGRATE host port key|"" destination-db timeout [COPY] [REPLACE]
+/// [AUTH password | AUTH2 username password] [KEYS key ...]`, as Redis's
+/// `migrateCommand`: each key is dumped with its time to live and restored
+/// on the target, then, without COPY, deleted here.
+fn migrate(a: &Admin, conn: &mut Conn, data: &mut Data) -> Response {
+    use std::io::{BufRead, BufReader, Write};
+    let args = &a.args;
+    let (Some(port), Some(dest_db), Some(timeout)) = (
+        args.get(1).and_then(|p| int(p)),
+        args.get(3).and_then(|d| int(d)),
+        args.get(4).and_then(|t| int(t)),
+    ) else {
+        return err("ERR value is not an integer or out of range");
+    };
+    let (mut copy, mut replace) = (false, false);
+    let mut auth: Option<Vec<Vec<u8>>> = None;
+    let mut keys: Vec<Vec<u8>> = vec![args[2].clone()];
+    let mut j = 5;
+    while j < args.len() {
+        let opt = String::from_utf8_lossy(&args[j]).to_ascii_uppercase();
+        let more = args.len() - j - 1;
+        match opt.as_str() {
+            "COPY" => copy = true,
+            "REPLACE" => replace = true,
+            "AUTH" if more >= 1 => {
+                auth = Some(vec![b"AUTH".to_vec(), args[j + 1].clone()]);
+                j += 1;
+            }
+            "AUTH2" if more >= 2 => {
+                auth = Some(vec![
+                    b"AUTH".to_vec(),
+                    args[j + 1].clone(),
+                    args[j + 2].clone(),
+                ]);
+                j += 2;
+            }
+            "KEYS" => {
+                if !args[2].is_empty() {
+                    return err(
+                        "ERR When using MIGRATE KEYS option, the key argument must be set to the empty string",
+                    );
+                }
+                keys = args[j + 1..].to_vec();
+                break;
+            }
+            _ => return syntax(),
+        }
+        j += 1;
+    }
+    // The keys there are, each dumped with its time to live.
+    let mut found = Vec::new();
+    for key in &keys {
+        if let Response::BulkString(payload) = data(Command::Dump { key: key.clone() }, conn.db) {
+            let ttl = match data(Command::PTtl { key: key.clone() }, conn.db) {
+                Response::Integer(t) if t > 0 => t,
+                _ => 0,
+            };
+            found.push((key.clone(), payload, ttl));
+        }
+    }
+    if found.is_empty() {
+        return Response::SimpleString("NOKEY".into());
+    }
+    let host = String::from_utf8_lossy(&args[0]).into_owned();
+    let limit = std::time::Duration::from_millis(timeout.max(1) as u64);
+    let ioerr = || err("IOERR error or timeout connecting to the client");
+    let Ok(addr) = std::net::ToSocketAddrs::to_socket_addrs(&(host.as_str(), port as u16))
+        .map(|mut a| a.next())
+    else {
+        return ioerr();
+    };
+    let Some(Ok(stream)) = addr.map(|a| std::net::TcpStream::connect_timeout(&a, limit)) else {
+        return ioerr();
+    };
+    if stream.set_read_timeout(Some(limit)).is_err()
+        || stream.set_write_timeout(Some(limit)).is_err()
+    {
+        return ioerr();
+    }
+    let Ok(read_half) = stream.try_clone() else {
+        return ioerr();
+    };
+    let mut writer = std::io::BufWriter::new(stream);
+    let mut reader = BufReader::new(read_half);
+    let mut commands: Vec<Vec<Vec<u8>>> = Vec::new();
+    commands.extend(auth);
+    commands.push(vec![b"SELECT".to_vec(), dest_db.to_string().into_bytes()]);
+    for (key, payload, ttl) in &found {
+        let mut c = vec![
+            b"RESTORE".to_vec(),
+            key.clone(),
+            ttl.to_string().into_bytes(),
+            payload.clone(),
+        ];
+        if replace {
+            c.push(b"REPLACE".to_vec());
+        }
+        commands.push(c);
+    }
+    for c in &commands {
+        let mut frame = format!("*{}\r\n", c.len()).into_bytes();
+        for part in c {
+            frame.extend_from_slice(format!("${}\r\n", part.len()).as_bytes());
+            frame.extend_from_slice(part);
+            frame.extend_from_slice(b"\r\n");
+        }
+        if writer.write_all(&frame).is_err() {
+            return ioerr();
+        }
+    }
+    if writer.flush().is_err() {
+        return ioerr();
+    }
+    // One status reply each: AUTH, SELECT, then each RESTORE.
+    let restores_from = commands.len() - found.len();
+    let mut moved = Vec::new();
+    let mut failure = None;
+    for (i, _) in commands.iter().enumerate() {
+        let mut line = String::new();
+        if reader.read_line(&mut line).is_err() || line.is_empty() {
+            return ioerr();
+        }
+        let line = line.trim_end();
+        if let Some(e) = line.strip_prefix('-') {
+            failure.get_or_insert_with(|| e.to_string());
+        } else if i >= restores_from {
+            moved.push(found[i - restores_from].0.clone());
+        }
+    }
+    if !copy && !moved.is_empty() {
+        data(Command::Del { keys: moved }, conn.db);
+    }
+    match failure {
+        Some(e) => err(format!("ERR Target instance replied with error: {e}")),
+        None => Response::Ok,
+    }
+}
 
-fn debug(a: &Admin, _conn: &mut Conn, _data: &mut Data) -> Response {
+fn debug(a: &Admin, conn: &mut Conn, data: &mut Data) -> Response {
     match a.sub().as_str() {
+        "OBJECT" if a.args.len() == 2 => debug_object(&a.args[1], conn, data),
+        "POPULATE" if (2..=4).contains(&(a.args.len() - 1)) => {
+            debug_populate(&a.args[1..], conn, data)
+        }
+
         "SLEEP" => {
             let secs: f64 = a
                 .args
@@ -1826,6 +2060,14 @@ fn debug(a: &Admin, _conn: &mut Conn, _data: &mut Data) -> Response {
                 .and_then(|v| std::str::from_utf8(v).ok()?.parse().ok())
                 .unwrap_or(0.0);
             std::thread::sleep(std::time::Duration::from_secs_f64(secs.max(0.0)));
+            Response::Ok
+        }
+        "SET-DISABLE-DENY-SCRIPTS" => {
+            let on = a.args.get(1).and_then(|v| int(v)).unwrap_or(0) != 0;
+            if let Some(c) = server::ctl() {
+                c.deny_scripts_disabled
+                    .store(on as u32, std::sync::atomic::Ordering::Relaxed);
+            }
             Response::Ok
         }
         "SET-ACTIVE-EXPIRE" => {
@@ -1836,8 +2078,17 @@ fn debug(a: &Admin, _conn: &mut Conn, _data: &mut Data) -> Response {
             }
             Response::Ok
         }
-        // Reloading is a no-op: nothing here lives only in a dump.
-        "RELOAD"
+        // Reloading keeps the data as it is: nothing here lives only in a
+        // dump. But NOFLUSH without MERGE loads over what is there, which
+        // Redis refuses for any key or function already present.
+        "RELOAD" => {
+            let has = |o: &[u8]| a.args[1..].iter().any(|x| x.eq_ignore_ascii_case(o));
+            if has(b"NOFLUSH") && !has(b"MERGE") && !dataset_empty(conn, data) {
+                return err("ERR Error trying to load the RDB dump, check server logs.");
+            }
+            Response::Ok
+        }
+        "LOADAOF"
         | "JMAP"
         | "CHANGE-REPL-ID"
         | "LOG"
@@ -1857,19 +2108,43 @@ fn debug(a: &Admin, _conn: &mut Conn, _data: &mut Data) -> Response {
         {
             Some("string") => bulk("Hello World"),
             Some("integer") => Response::Integer(12345),
-            Some("double") => bulk("3.141"),
-            Some("bignum") => bulk("1234567999999999999999999999999999999"),
+            // Redis's own test value, 3.141: not an approximation of pi.
+            Some("double") => Response::Value(Value::Double(f64::from(3141) / 1000.0)),
+            Some("bignum") => Response::Value(Value::BigNum(
+                "1234567999999999999999999999999999999".into(),
+            )),
             Some("null") => Response::Null,
             Some("array") => Response::Value(Value::Array((0..3).map(Value::Int).collect())),
-            Some("set") => Response::Value(Value::Array((0..3).map(Value::Int).collect())),
-            Some("map") => Response::Value(Value::Array(
+            Some("set") => Response::Value(Value::Set((0..3).map(Value::Int).collect())),
+            Some("map") => Response::Value(Value::Map(
                 (0..3)
-                    .flat_map(|i| [Value::Int(i), Value::Int(i % 2)])
+                    .map(|i| (Value::Int(i), Value::Bool(i == 1)))
                     .collect(),
             )),
-            Some("true") => Response::Integer(1),
-            Some("false") => Response::Integer(0),
-            Some("verbatim") => bulk("This is a verbatim\nstring"),
+            Some("attrib") => Response::Value(Value::Attributed(
+                vec![(
+                    Value::Bulk(b"key-popularity".to_vec()),
+                    Value::Array(vec![Value::Bulk(b"key:123".to_vec()), Value::Int(90)]),
+                )],
+                Box::new(Value::Bulk(
+                    b"Some real reply following the attribute".to_vec(),
+                )),
+            )),
+            Some("push") if conn.client.proto() < 3 => {
+                err("ERR RESP2 is not supported by this command")
+            }
+            Some("push") => Response::Value(Value::Pushed(
+                vec![Value::Bulk(b"server-cpu-usage".to_vec()), Value::Int(42)],
+                Box::new(Value::Bulk(
+                    b"Some real reply following the push reply".to_vec(),
+                )),
+            )),
+            Some("true") => Response::Value(Value::Bool(true)),
+            Some("false") => Response::Value(Value::Bool(false)),
+            Some("verbatim") => {
+                Response::Value(Value::Verbatim("This is a verbatim\nstring".into()))
+            }
+
             _ => err(
                 "ERR Wrong protocol type name. Please use one of the following: string|integer|double|bignum|null|array|set|map|attrib|push|verbatim|true|false",
             ),
@@ -1882,6 +2157,13 @@ fn debug(a: &Admin, _conn: &mut Conn, _data: &mut Data) -> Response {
             "    Setting it to 0 disables expiring keys in background.",
             "RELOAD",
             "    Accepted; pg_redis keeps no dump to reload from.",
+            "OBJECT <key>",
+            "    Show low level info about the key and associated value.",
+            "POPULATE <count> [<prefix>] [<size>]",
+            "    Create <count> string keys named key:<num>. If <prefix> is specified then",
+            "    it is used instead of the 'key' prefix. These are not propagated to",
+            "    replicas. Cluster slots are not respected so keys not belonging to the",
+            "    current node can be created in cluster mode.",
             "PROTOCOL <type>",
             "    Reply with a test value of the specified type.",
             "HELP",

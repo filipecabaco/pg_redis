@@ -24,21 +24,22 @@ type Case = { name: string; cmds: Cmd[] };
 
 /**
  * Replies Redis leaves unordered: comparing them verbatim measures two
- * hash-table iteration orders, not two behaviours.
+ * hash-table iteration orders, or two draws, not two behaviours.
+ *
+ * A hash's or set's elements are compared in order: pg_redis keeps the
+ * encoding Redis would have given each one, and with it Redis's order — a
+ * listpack's insertion order, an intset's sorted one. Only a collection
+ * Redis keeps as a hash table has an order of its own, and the cases that
+ * read one mark the command with `anyOrder`.
  */
-const UNORDERED = new Set([
-	"SMEMBERS",
-	"SUNION",
-	"SINTER",
-	"SDIFF",
-	"HGETALL",
-	"HKEYS",
-	"HVALS",
-	"KEYS",
-	"ZRANDMEMBER",
-	"SRANDMEMBER",
-	"SPOP",
-]);
+const UNORDERED = new Set(["KEYS", "ZRANDMEMBER", "SRANDMEMBER", "SPOP"]);
+
+/** Commands whose array reply compares in any order: see `UNORDERED`. */
+const anyOrdered = new WeakSet<Cmd>();
+const anyOrder = (cmd: Cmd): Cmd => {
+	anyOrdered.add(cmd);
+	return cmd;
+};
 
 /** Draws, clocks and builds: only the reply shape is comparable. `TIME` is
  * two clocks, and `DUMP` two valid spellings of one value — a hashtable's
@@ -50,15 +51,40 @@ const SHAPE_ONLY = new Set([
 	"COMMAND",
 	"CONFIG",
 	"CLIENT",
-	"SCAN",
-	"HSCAN",
-	"SSCAN",
-	"ZSCAN",
 	"DEBUG",
 	"MEMORY",
 	"TIME",
 	"DUMP",
 ]);
+
+/**
+ * The SCAN family's cursors name a position in each server's own structure,
+ * so neither the cursor nor the split into pages can match. A reply that ends
+ * the iteration in one call (cursor 0, as both servers give for a small
+ * collection) is compared by the elements it returns, in any order and with
+ * field-value or member-score pairs kept together; a page that does not end
+ * it, by its shape alone.
+ */
+const SCAN_FAMILY = new Map([
+	["SCAN", 1],
+	["SSCAN", 1],
+	["HSCAN", 2],
+	["ZSCAN", 2],
+]);
+
+function scanForm(reply: Buffer, stride: number): string {
+	const [node] = readNode(reply, 0);
+	if (!Array.isArray(node) || node.length !== 2 || !Array.isArray(node[1])) {
+		return shape(reply);
+	}
+	if (node[0] !== "$0") return "*2 page";
+	const items = node[1].map(showNode);
+	const groups: string[] = [];
+	for (let i = 0; i < items.length; i += stride) {
+		groups.push(items.slice(i, i + stride).join(" "));
+	}
+	return `*2 end [${groups.sort().join("|")}]`;
+}
 
 /** RESP type name for a reply, used when only the shape is comparable. */
 function shape(reply: Buffer): string {
@@ -156,6 +182,8 @@ const CLOCK = new Set(["TTL", "PTTL", "EXPIRETIME", "PEXPIRETIME"]);
 function normalize(cmd: Cmd, reply: Buffer): string {
 	const name = cmd[0].toUpperCase();
 	if (SHAPE_ONLY.has(name)) return shape(reply);
+	const stride = SCAN_FAMILY.get(name);
+	if (stride !== undefined && reply[0] === 0x2a) return scanForm(reply, stride);
 	if (CLOCK.has(name) && reply[0] === 0x3a) {
 		const n = Number(reply.subarray(1, reply.indexOf("\r\n")).toString());
 		return n < 0 ? `:${n}` : ":positive";
@@ -164,7 +192,7 @@ function normalize(cmd: Cmd, reply: Buffer): string {
 	if ((name === "SPOP" || name === "SRANDMEMBER") && cmd.length > 2) {
 		return shape(reply);
 	}
-	if (UNORDERED.has(name) && reply[0] === 0x2a) {
+	if ((UNORDERED.has(name) || anyOrdered.has(cmd)) && reply[0] === 0x2a) {
 		return `*[${elements(reply).sort().join("|")}]`;
 	}
 	if (name === "FUNCTION" && cmd[1]?.toUpperCase() === "LIST" && reply[0] === 0x2a) {
@@ -506,6 +534,168 @@ c(
 	["SMEMBERS", "s2"],
 	["SMOVE", "s2", "s2", "c"],
 	["SMEMBERS", "s2"],
+);
+
+// ─────────────────────────── Order and encodings ────────────────────────────
+//
+// A small hash or set is a listpack (or an intset, for integers) until it
+// outgrows Redis's thresholds, and a hash table after, for good. Both the
+// order of the elements and OBJECT ENCODING show which.
+
+const many = (n: number, f: (i: number) => string[]) =>
+	Array.from({ length: n }, (_, i) => f(i)).flat();
+
+c(
+	"hash order across deletes and updates",
+	["HSET", "h", "c", "1", "a", "2", "b", "3"],
+	["HDEL", "h", "a"],
+	["HSET", "h", "d", "4"],
+	["HSET", "h", "c", "9"],
+	["HGETALL", "h"],
+	["HKEYS", "h"],
+	["HVALS", "h"],
+	["OBJECT", "ENCODING", "h"],
+	["HSCAN", "h", "0", "COUNT", "1"],
+	["HRANDFIELD", "h", "10", "WITHVALUES"],
+	["HSET", "n", "x", "1", "y", "2", "x", "3"],
+	["HGETALL", "n"],
+);
+c(
+	"a hash converted to a hashtable stays one",
+	["HSET", "h129", ...many(129, (i) => [`f${i}`, "v"])],
+	["OBJECT", "ENCODING", "h129"],
+	["HSET", "big", ...many(513, (i) => [`f${i}`, "v"])],
+	["OBJECT", "ENCODING", "big"],
+	["HDEL", "big", ...many(510, (i) => [`f${i}`])],
+	["OBJECT", "ENCODING", "big"],
+	anyOrder(["HGETALL", "big"]),
+	["HSET", "long", "a", "1", "b", "x".repeat(65)],
+	["HDEL", "long", "b"],
+	["OBJECT", "ENCODING", "long"],
+	["HINCRBY", "inc", "f".repeat(65), "1"],
+	["OBJECT", "ENCODING", "inc"],
+	["COPY", "big", "big2"],
+	["OBJECT", "ENCODING", "big2"],
+	["RENAME", "big2", "big3"],
+	["OBJECT", "ENCODING", "big3"],
+);
+c(
+	"set order through intset and listpack",
+	["SADD", "s", "5", "-3", "100", "2"],
+	["SMEMBERS", "s"],
+	["OBJECT", "ENCODING", "s"],
+	["SADD", "s", "x"],
+	["SADD", "s", "1"],
+	["SMEMBERS", "s"],
+	["OBJECT", "ENCODING", "s"],
+	["SREM", "s", "x"],
+	["SMEMBERS", "s"],
+	["OBJECT", "ENCODING", "s"],
+	["SSCAN", "s", "0", "COUNT", "1"],
+	["SADD", "l", "c", "a", "b", "d"],
+	["SREM", "l", "a"],
+	["SADD", "l", "e"],
+	["SMEMBERS", "l"],
+	["OBJECT", "ENCODING", "l"],
+	["SADD", "q", "a", "3", "1"],
+	["SREM", "q", "a"],
+	["SMEMBERS", "q"],
+	["SUNION", "q"],
+	["SDIFF", "q", "missing"],
+	["SADD", "odd", "007", "-0", "+1"],
+	["OBJECT", "ENCODING", "odd"],
+	["SADD", "edge", "9223372036854775807", "-9223372036854775808"],
+	["SMEMBERS", "edge"],
+	["SADD", "sm1", "a", "5"],
+	["SADD", "sm2", "9", "1"],
+	["SMOVE", "sm1", "sm2", "a"],
+	["SMEMBERS", "sm2"],
+	["OBJECT", "ENCODING", "sm2"],
+	["SORT", "sm2", "BY", "nosort"],
+);
+c(
+	"set operations build their results as Redis does",
+	["SADD", "A", "c", "a", "b", "3", "1"],
+	["SADD", "B", "b", "c", "z"],
+	["SADD", "I", "9", "3", "1"],
+	["SADD", "J", "1", "3", "7"],
+	["SINTER", "A", "B"],
+	["SINTER", "B", "A"],
+	["SUNION", "A", "B"],
+	["SUNION", "B", "A"],
+	["SDIFF", "A", "B"],
+	["SINTER", "I", "J"],
+	["SUNION", "I", "J"],
+	["SUNION", "I", "A"],
+	["SDIFF", "A", "I"],
+	["SINTERSTORE", "D1", "A", "B"],
+	["OBJECT", "ENCODING", "D1"],
+	["SMEMBERS", "D1"],
+	["SUNIONSTORE", "D2", "I", "J"],
+	["OBJECT", "ENCODING", "D2"],
+	["SMEMBERS", "D2"],
+	["SUNIONSTORE", "D3", "A", "B"],
+	["OBJECT", "ENCODING", "D3"],
+	["SMEMBERS", "D3"],
+	["SDIFFSTORE", "D4", "A", "B"],
+	["OBJECT", "ENCODING", "D4"],
+	["SMEMBERS", "D4"],
+	["SADD", "li", "a", "30", "10", "20"],
+	["SREM", "li", "a"],
+	["SINTERSTORE", "lo", "li", "li"],
+	["OBJECT", "ENCODING", "lo"],
+	["SMEMBERS", "lo"],
+);
+c(
+	"SORT makes a sorted set a skiplist, and it stays one",
+	["ZADD", "zs", "3", "c", "1", "a", "2", "b"],
+	["OBJECT", "ENCODING", "zs"],
+	["SORT", "zs", "ALPHA"],
+	["OBJECT", "ENCODING", "zs"],
+	["ZRANGE", "zs", "0", "-1", "WITHSCORES"],
+	["ZADD", "zr", "1", "x"],
+	["SORT_RO", "zr", "BY", "nosort"],
+	["OBJECT", "ENCODING", "zr"],
+	["ZREM", "zr", "x"],
+	["ZADD", "zr", "1", "y"],
+	["OBJECT", "ENCODING", "zr"],
+);
+c(
+	"a set converted to a hashtable stays one",
+	["SADD", "big", ...many(200, (i) => [`m${i}`])],
+	["OBJECT", "ENCODING", "big"],
+	["SREM", "big", ...many(197, (i) => [`m${i}`])],
+	["OBJECT", "ENCODING", "big"],
+	anyOrder(["SMEMBERS", "big"]),
+	["SADD", "ints", ...many(512, (i) => [String(i + 1)])],
+	["OBJECT", "ENCODING", "ints"],
+	["SADD", "ints", "513"],
+	["OBJECT", "ENCODING", "ints"],
+	["SADD", "dup", ...many(200, () => ["a"])],
+	["OBJECT", "ENCODING", "dup"],
+	["SADD", "long", "a", "x".repeat(65)],
+	["SREM", "long", "x".repeat(65)],
+	["OBJECT", "ENCODING", "long"],
+);
+c(
+	"sorted set and list encodings",
+	["ZADD", "z", ...many(129, (i) => [String(i), `m${i}`])],
+	["OBJECT", "ENCODING", "z"],
+	["ZREMRANGEBYRANK", "z", "0", "100"],
+	["OBJECT", "ENCODING", "z"],
+	["ZADD", "zl", "1", "a", "2", "x".repeat(65)],
+	["ZREM", "zl", "x".repeat(65)],
+	["OBJECT", "ENCODING", "zl"],
+	["ZADD", "up", ...many(100, (i) => [String(i), `m${i}`])],
+	["ZADD", "up", ...many(50, (i) => [String(i + 1000), `m${i}`])],
+	["OBJECT", "ENCODING", "up"],
+	["ZADD", "small", "2", "b", "1", "a", "3", "c"],
+	["ZSCAN", "small", "0", "COUNT", "1"],
+	["ZRANDMEMBER", "small", "5", "WITHSCORES"],
+	["RPUSH", "list", ...many(200, (i) => [`a${i}`])],
+	["OBJECT", "ENCODING", "list"],
+	["RPUSH", "list2", ...many(90, () => ["x".repeat(100)])],
+	["OBJECT", "ENCODING", "list2"],
 );
 
 // ─────────────────────────────── Sorted set ─────────────────────────────────
@@ -1099,6 +1289,65 @@ c(
 	["BITCOUNT", "b"],
 	["FLUSHDB"],
 );
+// The access clock: what OBJECT reports of a key under each kind of policy,
+// and the errors for the field the policy does not keep. maxmemory 0 first,
+// as the reference runs: Redis shares small integers then whatever the
+// policy, and pg_redis otherwise reports the arena's limit.
+c(
+	"OBJECT IDLETIME, FREQ and REFCOUNT",
+	["CONFIG", "SET", "maxmemory", "0"],
+	["SET", "k", "v"],
+	["OBJECT", "IDLETIME", "k"],
+	["OBJECT", "FREQ", "k"],
+	["OBJECT", "REFCOUNT", "k"],
+	["SET", "n", "100"],
+	["OBJECT", "REFCOUNT", "n"],
+	["SET", "big", "100000"],
+	["OBJECT", "REFCOUNT", "big"],
+	["RPUSH", "l", "a"],
+	["OBJECT", "REFCOUNT", "l"],
+	["OBJECT", "IDLETIME", "missing"],
+	["OBJECT", "FREQ", "missing"],
+	["OBJECT", "REFCOUNT", "missing"],
+	["OBJECT", "IDLETIME"],
+	["OBJECT", "IDLETIME", "k", "extra"],
+	["CONFIG", "SET", "maxmemory-policy", "allkeys-lfu"],
+	// Every access counts at factor 0, so the counter is the same on both.
+	["CONFIG", "SET", "lfu-log-factor", "0"],
+	["OBJECT", "IDLETIME", "k"],
+	["SET", "f", "v"],
+	["OBJECT", "FREQ", "f"],
+	["GET", "f"],
+	["OBJECT", "FREQ", "f"],
+	["OBJECT", "REFCOUNT", "n"],
+	["GET", "f"],
+	["GET", "f"],
+	["OBJECT", "FREQ", "f"],
+	["CONFIG", "SET", "lfu-log-factor", "10"],
+	["CONFIG", "SET", "maxmemory-policy", "allkeys-lru"],
+	["OBJECT", "FREQ", "f"],
+	["CLIENT", "NO-TOUCH", "ON"],
+	["GET", "f"],
+	["TOUCH", "f"],
+	["CLIENT", "NO-TOUCH", "OFF"],
+	["OBJECT", "IDLETIME", "f"],
+	["CONFIG", "SET", "maxmemory-policy", "noeviction"],
+	["CONFIG", "SET", "maxmemory-policy", "lru"],
+	["CONFIG", "GET", "maxmemory-policy"],
+	["CONFIG", "GET", "maxmemory-samples"],
+	["CONFIG", "GET", "lfu-log-factor"],
+	["CONFIG", "GET", "lfu-decay-time"],
+);
+c(
+	"RESTORE IDLETIME and FREQ options",
+	["RESTORE", "x", "0", "payload", "FREQ", "300"],
+	["RESTORE", "x", "0", "payload", "FREQ", "-1"],
+	["RESTORE", "x", "0", "payload", "IDLETIME", "-1"],
+	["RESTORE", "x", "0", "payload", "IDLETIME", "1", "FREQ", "1"],
+	["RESTORE", "x", "0", "payload", "FREQ", "1", "IDLETIME", "1"],
+	["RESTORE", "x", "0", "payload", "IDLETIME"],
+	["RESTORE", "x", "0", "payload", "IDLETIME", "abc"],
+);
 c(
 	"TOUCH counts like EXISTS",
 	["SET", "k", "v"],
@@ -1499,6 +1748,74 @@ type Difference = {
 	 */
 	note?: string;
 };
+
+// ACL: users, their descriptions, refusals and DRYRUN. Each case puts the
+// connection back on the default user and deletes what it made.
+c(
+	"ACL users described",
+	["ACL", "DELUSER", "par-a", "par-b"],
+	["ACL", "SETUSER", "par-a", "on", ">pw", "~app:*", "%R~ro:*", "%W~wo:*", "&ch:*", "+@all", "-@dangerous", "-client|kill", "+select|0"],
+	["ACL", "SETUSER", "par-a", "(+get ~sel:*)", "(-@all +set resetchannels &x)"],
+	["ACL", "GETUSER", "par-a"],
+	["ACL", "SETUSER", "par-b", "reset", "+@hash", "-hdel", "+@hash", "allkeys"],
+	["ACL", "LIST"],
+	["ACL", "USERS"],
+	["ACL", "GETUSER", "nobody"],
+	["ACL", "DELUSER", "par-a", "par-b", "nobody"],
+	["ACL", "DELUSER", "default"],
+);
+c(
+	"ACL SETUSER errors",
+	["ACL", "SETUSER", "par-e", "+nosuch"],
+	["ACL", "SETUSER", "par-e", "+config|get|x"],
+	["ACL", "SETUSER", "par-e", "+get|key1|key2"],
+	["ACL", "SETUSER", "par-e", "(+get", "~a"],
+	["ACL", "SETUSER", "par-e", "(nonsense)"],
+	["ACL", "SETUSER", "par-e", "<nopass"],
+	["ACL", "SETUSER", "par-e", "#abc"],
+	["ACL", "SETUSER", "par-e", "~*", "~a"],
+	["ACL", "SETUSER", "par e"],
+	["ACL", "GETUSER", "par-e"],
+	["ACL", "DELUSER", "par-e"],
+);
+c(
+	"ACL DRYRUN",
+	["ACL", "SETUSER", "par-d", "+@all", "%R~read*", "%W~write*", "%RW~rw*", "resetchannels", "&chan"],
+	["ACL", "DRYRUN", "par-d", "GET", "read"],
+	["ACL", "DRYRUN", "par-d", "GET", "write"],
+	["ACL", "DRYRUN", "par-d", "SET", "write", "v", "GET"],
+	["ACL", "DRYRUN", "par-d", "COPY", "read", "write"],
+	["ACL", "DRYRUN", "par-d", "EVAL", "", "1", "read"],
+	["ACL", "DRYRUN", "par-d", "SORT", "read", "STORE", "read"],
+	["ACL", "DRYRUN", "par-d", "PUBLISH", "chan", "m"],
+	["ACL", "DRYRUN", "par-d", "PUBLISH", "other", "m"],
+	["ACL", "DRYRUN", "par-d", "SET", "v"],
+	["ACL", "DRYRUN", "par-d", "NOSUCH"],
+	["ACL", "DRYRUN", "nobody", "GET", "k"],
+	["ACL", "DELUSER", "par-d"],
+);
+c(
+	"ACL refusals as another user",
+	["ACL", "SETUSER", "par-u", "on", ">pw", "~k:*", "+get", "+set", "+multi", "+exec", "+acl|whoami", "+auth"],
+	["AUTH", "par-u", "wrong"],
+	["AUTH", "par-u", "pw"],
+	["ACL", "WHOAMI"],
+	["SET", "k:1", "v"],
+	["GET", "other"],
+	["DEL", "k:1"],
+	["PUBLISH", "c", "m"],
+	["MULTI"],
+	["GET", "nope"],
+	["EXEC"],
+	["AUTH", "default", "testpass"],
+	["ACL", "DELUSER", "par-u"],
+	["AUTH", "a", "b", "c"],
+	["ACL", "WHOAMI", "extra"],
+	["ACL", "CAT", "nosuch"],
+	["ACL", "CAT", "a", "b"],
+	["ACL", "GENPASS", "0"],
+	["ACL", "LOG", "nope"],
+);
 
 const REPLY_TIMEOUT_MS = Number(process.env.PARITY_TIMEOUT_MS ?? 5000);
 

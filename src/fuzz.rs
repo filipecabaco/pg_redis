@@ -324,7 +324,9 @@ fn reply(v: Value) -> Reply {
         Value::Int(n) => Reply::Int(n),
         Value::Bulk(b) => Reply::Bulk(b),
         Value::Simple(s) => Reply::Simple(s),
-        Value::Error(e) => Reply::Error(e.split(' ').next().unwrap_or("").to_string()),
+        Value::Error(e) | Value::CountedError(e) => {
+            Reply::Error(e.split(' ').next().unwrap_or("").to_string())
+        }
         Value::Array(items) => Reply::Array(
             items
                 .into_iter()

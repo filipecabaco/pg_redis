@@ -13,39 +13,144 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-type PendingBatch = Option<(Vec<(Command, u8)>, u64, mpsc::SyncSender<Vec<Response>>)>;
+/// A batch's reply: `None` when an `EXEC` found a watched key changed.
+type BatchReply = mpsc::SyncSender<Option<Vec<Response>>>;
+type PendingBatch = Option<(Vec<(Command, u8)>, u64, BatchReply, BatchKind)>;
 
 const PUBSUB_NOT_LOADED: &str = "pub/sub requires shared_preload_libraries = 'pg_redis'";
 const WATCH_NOT_LOADED: &str = "WATCH requires shared_preload_libraries = 'pg_redis'";
 
-/// Channel names and payloads live in fixed-size shared-memory slots. Silently
-/// truncating either is worse than refusing: a truncated subscription never
-/// matches a publish to the same name, so the client waits forever on a channel
-/// it believes it is subscribed to.
-fn pubsub_len_error(items: &[Vec<u8>], limit: usize, what: &str) -> Option<String> {
-    items
-        .iter()
-        .find(|i| i.len() > limit)
-        .map(|_| format!("{what} exceeds the pub/sub limit of {limit} bytes"))
-}
+/// The pub/sub heap (`redis.pubsub_memory`) has no room for another
+/// subscription.
+const PUBSUB_FULL: &str = "OOM pub/sub memory is full; raise redis.pubsub_memory";
 
 /// Each message names the client it came from (0 for the server itself), so
 /// a write's invalidations can skip a NOLOOP client's own.
 enum DispatchMsg {
     Cmd(Command, u8, u64, mpsc::SyncSender<Response>),
-    Batch(Vec<(Command, u8)>, u64, mpsc::SyncSender<Vec<Response>>),
+    /// One connection's commands, run in order in one go.
+    Batch(Vec<(Command, u8)>, u64, BatchReply, BatchKind),
     FireAndForget(Command, u8),
     /// Ahead of a command on a migrating database: its keys to move, each
     /// with its database, and the databases to drain (`storage::plan`).
     Move(Vec<(u8, Vec<u8>)>, Vec<u8>, mpsc::SyncSender<()>),
+    /// A round of eviction ahead of a command the connection thread serves,
+    /// as Redis evicts before every command.
+    Evict(mpsc::SyncSender<()>),
 }
 
-/// Carry out a `Move`: drains first, then the keys left to move.
+/// What a `Batch` is.
+enum BatchKind {
+    /// A transaction (`EXEC`), with the keys its connection WATCHed. It holds
+    /// every database it touches, and every watched key's, exclusive until
+    /// it has committed, and checks the WATCHes once it holds them, so no
+    /// write lands between that check and the commands. The command lines,
+    /// one per command, go to the slow log as each runs.
+    Exec(Vec<((u8, Vec<u8>), Watched)>, Vec<Vec<Vec<u8>>>),
+    /// Probes that need no more than any command does.
+    Probe,
+}
+
+/// Carry out a `Move`: drains first, then the keys left to move. Each
+/// database involved is held shared, so no script or transaction on it sees a
+/// key half moved.
 fn run_move(keys: &[(u8, Vec<u8>)], drains: &[u8]) {
+    let dbs = keys
+        .iter()
+        .map(|(db, _)| *db)
+        .chain(drains.iter().copied())
+        .fold(0, |m, db| m | crate::dblock::bit(db));
+    let _held = crate::dblock::hold(crate::dblock::Plan::shared(dbs));
     for db in drains {
         crate::storage::drain(*db);
     }
     crate::storage::move_keys(keys);
+}
+
+/// Run commands with the database locks they need held around the whole run,
+/// commit included (`src/dblock.rs`): what each command needs on its own.
+/// Released before the replies go out.
+fn run_held(cmds: &[(Command, u8)], origins: &[u64], retry_conflicts: bool) -> Vec<Response> {
+    let plan = crate::dblock::plan_batch(cmds);
+    let run = || {
+        let _held = crate::dblock::hold(plan);
+        run_dispatch_batch(cmds, origins, retry_conflicts)
+    };
+    // What holds a database exclusive runs as one command does in Redis:
+    // evicted for once, before it starts.
+    if plan.exclusive != 0 {
+        crate::evict::before_run(run)
+    } else {
+        run()
+    }
+}
+
+thread_local! {
+    /// How long each command of the batch now running took, in order.
+    static STEP_USEC: std::cell::RefCell<Vec<i64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The slow log's entries for an `EXEC`: each command it ran that took
+/// `slowlog-log-slower-than` or more, as Redis logs them, never `EXEC`.
+fn slowlog_exec_steps(lines: &[Vec<Vec<u8>>], origin: u64) {
+    let threshold = crate::config::get_i64("slowlog-log-slower-than");
+    if threshold < 0 {
+        return;
+    }
+    let steps = STEP_USEC.with_borrow(Clone::clone);
+    let max_len = crate::config::get_i64("slowlog-max-len").max(0) as usize;
+    for (line, usec) in lines.iter().zip(steps) {
+        if usec < threshold {
+            continue;
+        }
+        let client = crate::server::clients()
+            .into_iter()
+            .find(|c| c.id == origin);
+        let (addr, name) = client.map_or_else(Default::default, |c| (c.addr, c.name));
+        let hide = redacted(line);
+        let args: Vec<Vec<u8>> = line
+            .iter()
+            .zip(hide)
+            .map(|(a, h)| if h { b"(redacted)".to_vec() } else { a.clone() })
+            .collect();
+        crate::server::slowlog_push(&args, usec, &addr, name.as_bytes(), max_len);
+    }
+}
+
+/// A `Batch` message. `None` when an `EXEC`'s WATCH broke.
+fn run_batch_msg(cmds: Vec<(Command, u8)>, origin: u64, kind: BatchKind) -> Option<Vec<Response>> {
+    let origins = vec![origin; cmds.len()];
+    match kind {
+        BatchKind::Probe => Some(run_held(&cmds, &origins, false)),
+        BatchKind::Exec(watched, lines) => {
+            let watched_dbs = watched
+                .iter()
+                .fold(0, |m, ((db, _), _)| m | crate::dblock::bit(*db));
+            let plan =
+                crate::dblock::plan_exec(&cmds).union(crate::dblock::Plan::exclusive(watched_dbs));
+            crate::evict::before_run(|| {
+                let _held = crate::dblock::hold(plan);
+                if watch_broken(&watched) {
+                    return None;
+                }
+                let responses = run_dispatch_batch(&cmds, &origins, false);
+                slowlog_exec_steps(&lines, origin);
+                Some(responses)
+            })
+        }
+    }
+}
+
+/// Whether any watched key was written, flushed or expired since its WATCH.
+fn watch_broken(watched: &[((u8, Vec<u8>), Watched)]) -> bool {
+    // Without shared memory WATCH refused, so nothing is watched.
+    let Some(ctl) = crate::watch_state() else {
+        return false;
+    };
+    watched.iter().any(|((db, key), w)| {
+        let now = crate::watch::version(ctl, *db, key);
+        w.broken(now, crate::server::flush_epoch(*db))
+    })
 }
 
 thread_local! {
@@ -64,9 +169,18 @@ const SUBSCRIBE_POLL: Duration = Duration::from_millis(5);
 /// wakes the sleeper — only how long a command from a quiet subscriber waits.
 const SUBSCRIBE_WAIT_MIN: Duration = Duration::from_millis(5);
 const SUBSCRIBE_WAIT_MAX: Duration = Duration::from_millis(250);
+/// How long a write to a subscriber waits for it to read before looking
+/// again at whether the connection is to close: its queue past
+/// `client-output-buffer-limit pubsub`, or a CLIENT KILL. Redis closes such a
+/// client at once, not when the socket next drains.
+const WRITE_SLICE: Duration = Duration::from_millis(100);
 
 pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
+    // A FATAL error exits without unwinding to the guards that release the
+    // database locks, and a worker that exits so is restarted with shared
+    // memory as it was: release them on the way out.
+    crate::pg::before_exit(crate::dblock::release_held);
     let db_oid = pgrx::pg_sys::Oid::from_u32(db_oid_datum.value() as u32);
     if db_oid == pgrx::pg_sys::InvalidOid {
         let db_name = crate::DATABASE
@@ -84,8 +198,18 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
     BackgroundWorker::transaction(|| Spi::connect_mut(crate::storage::load));
 
     crate::shm::attach();
+    crate::pubheap::attach();
+    // The users saved with ACL SAVE, and redis.password, before anyone is
+    // served. One worker loads them; the others wait for it.
+    crate::config::snapshot_gucs();
+    let guc_password = crate::config::live_gucs().password();
+    crate::acl::startup(
+        || BackgroundWorker::transaction(|| Spi::connect(load_acl_rows)),
+        guc_password.as_deref(),
+    );
     // memory+snapshot databases filled back in before anyone is served.
     crate::storage::restore_snapshots();
+    crate::storage::worker_started();
 
     // Load persisted routes into shared memory. Only the first BGW to win the CAS does the load;
     // others skip (routes are already in shared memory).
@@ -151,23 +275,22 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
     // Connection threads report these through CONFIG GET and INFO, and may
     // not read a GUC themselves.
     crate::config::snapshot_gucs();
+    // The address is bound once and needs a restart to change; the port
+    // follows CONFIG SET port.
+    // Everything else a connection uses is read from the snapshot as it is
+    // needed, so a reload reaches new connections and the next AUTH.
     let port = crate::PORT.get() as u16;
-    let default_db: u8 = crate::DEFAULT_DB.get().clamp(0, 15) as u8;
     let listen_addr = crate::LISTEN_ADDRESS
         .get()
         .as_deref()
         .and_then(|s| s.to_str().ok())
         .unwrap_or("0.0.0.0")
         .to_string();
-    let max_conn = crate::MAX_CONNECTIONS.get().max(1) as usize;
-    let password = configured_password();
-    let batch_size = crate::BATCH_SIZE.get().max(1) as usize;
+    let mut batch_size = crate::BATCH_SIZE.get().max(1) as usize;
 
     let (cmd_tx, cmd_rx) = mpsc::sync_channel::<DispatchMsg>(256);
 
-    std::thread::spawn(move || {
-        accept_loop(port, cmd_tx, default_db, listen_addr, max_conn, password)
-    });
+    std::thread::spawn(move || accept_loop(port, cmd_tx, listen_addr));
 
     let mut last_expiry_scan = Instant::now();
 
@@ -175,20 +298,51 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
         if BackgroundWorker::sigterm_received() {
             break;
         }
-        match cmd_rx.recv_timeout(Duration::from_millis(250)) {
+        // `pg_reload_conf()` or SIGHUP: read the configuration file again, as
+        // a backend does between queries, and hand the result to the
+        // connection threads.
+        if BackgroundWorker::sighup_received() {
+            crate::pg::reload_config();
+            crate::config::snapshot_gucs();
+            crate::acl::sync_password(crate::config::live_gucs().password().as_deref());
+            batch_size = crate::BATCH_SIZE.get().max(1) as usize;
+        }
+        // The loop that stands for Redis's event loop wakes at its cron's
+        // rate (`eventloop.rs`); the others only for work and the sweep.
+        let owner = crate::eventloop::claim();
+        let idle = if owner {
+            crate::eventloop::CRON
+        } else {
+            Duration::from_millis(250)
+        };
+        let received = cmd_rx.recv_timeout(idle);
+        let woke = Instant::now();
+        let mut served = match &received {
+            Ok(DispatchMsg::Cmd(..)) => 1,
+            Ok(DispatchMsg::Batch(cmds, ..)) => cmds.len() as u64,
+            Ok(DispatchMsg::FireAndForget(..)) => 1,
+            _ => 0,
+        };
+        match received {
             Ok(first) => match first {
                 DispatchMsg::Move(keys, drains, tx) => {
                     run_move(&keys, &drains);
                     tx.send(()).ok();
                 }
+                DispatchMsg::Evict(tx) => {
+                    crate::evict::perform();
+                    tx.send(()).ok();
+                }
                 DispatchMsg::FireAndForget(cmd, db) => {
-                    run_dispatch_batch(&[(cmd, db)], &[0], true);
+                    run_held(&[(cmd, db)], &[0], true);
                 }
-                DispatchMsg::Batch(cmds, origin, resp_tx) => {
-                    let origins = vec![origin; cmds.len()];
-                    let responses = run_dispatch_batch(&cmds, &origins, false);
-                    resp_tx.send(responses).ok();
+                DispatchMsg::Batch(cmds, origin, resp_tx, kind) => {
+                    resp_tx.send(run_batch_msg(cmds, origin, kind)).ok();
                 }
+                // A script or a multi-step command batches with the others:
+                // the batch then holds its databases exclusive (`plan_batch`).
+                // The commands run one after another on this thread, so each
+                // is still whole, and a table-backed batch shares one commit.
                 DispatchMsg::Cmd(first_cmd, first_db, first_origin, first_resp_tx) => {
                     let mut cmds: Vec<(Command, u8)> = Vec::with_capacity(batch_size);
                     let mut origins: Vec<u64> = Vec::with_capacity(batch_size);
@@ -207,8 +361,8 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                                 origins.push(o);
                                 txs.push(tx);
                             }
-                            Ok(DispatchMsg::Batch(batch_cmds, batch_origin, batch_tx)) => {
-                                pending_batch = Some((batch_cmds, batch_origin, batch_tx));
+                            Ok(DispatchMsg::Batch(batch_cmds, batch_origin, batch_tx, kind)) => {
+                                pending_batch = Some((batch_cmds, batch_origin, batch_tx, kind));
                                 break;
                             }
                             Ok(DispatchMsg::FireAndForget(c, d)) => {
@@ -219,24 +373,29 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                                 run_move(&keys, &drains);
                                 tx.send(()).ok();
                             }
+                            Ok(DispatchMsg::Evict(tx)) => {
+                                crate::evict::perform();
+                                tx.send(()).ok();
+                            }
                             Err(_) => break,
                         }
                     }
 
-                    let responses = run_dispatch_batch(&cmds, &origins, true);
+                    served = (cmds.len() + faf_cmds.len()) as u64;
+                    let responses = run_held(&cmds, &origins, true);
                     for (tx, resp) in txs.into_iter().zip(responses) {
                         tx.send(resp).ok();
                     }
 
                     if !faf_cmds.is_empty() {
                         let zeros = vec![0; faf_cmds.len()];
-                        run_dispatch_batch(&faf_cmds, &zeros, true);
+                        run_held(&faf_cmds, &zeros, true);
                     }
 
-                    if let Some((batch_cmds, batch_origin, batch_tx)) = pending_batch {
-                        let o = vec![batch_origin; batch_cmds.len()];
-                        let responses = run_dispatch_batch(&batch_cmds, &o, false);
-                        batch_tx.send(responses).ok();
+                    if let Some((batch_cmds, batch_origin, batch_tx, kind)) = pending_batch {
+                        batch_tx
+                            .send(run_batch_msg(batch_cmds, batch_origin, kind))
+                            .ok();
                     }
                 }
             },
@@ -245,10 +404,24 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                 break;
             }
         }
+        let cmd_usec = woke.elapsed().as_micros() as u64;
+        let cron = Instant::now();
 
         // Redis keeps the tracking table to `tracking-table-max-keys` from
-        // its cron, invalidating keys at random to get back under it.
-        crate::tracking::limit_used_slots(100);
+        // its cron as well as before each command, invalidating keys at
+        // random to get back under it.
+        crate::tracking::limit_used_slots();
+
+        // And closes a subscriber held past its soft output limit for its
+        // time, though no message has reached it since.
+        if let Some(slots) = crate::pubsub_state() {
+            crate::pubsub::enforce_limits(slots);
+        }
+
+        // Redis's `evictionTimeProc`: past the limit — a `CONFIG SET
+        // maxmemory` below what is held, or a round that ran out of time —
+        // eviction carries on with no command to start it.
+        crate::evict::perform();
 
         // memory+snapshot databases whose interval has passed.
         crate::storage::snapshots_round();
@@ -259,15 +432,22 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
             let until = Instant::now() + Duration::from_millis(50);
             for db in 0..crate::commands::NUM_DBS as u8 {
                 while crate::storage::migrating(db)
-                    && crate::storage::sweep(db, 256)
+                    && crate::dblock::try_hold_shared(db)
+                        .is_some_and(|_held| crate::storage::sweep(db, 256))
                     && Instant::now() < until
                 {}
             }
         }
         // Redis expires nothing while clients are paused: the keys wait for
         // the pause to end.
-        if last_expiry_scan.elapsed() >= Duration::from_secs(1) && !crate::server::paused() {
+        // `DEBUG SET-ACTIVE-EXPIRE 0` stops it, leaving keys to expire as
+        // they are read.
+        if last_expiry_scan.elapsed() >= Duration::from_secs(1)
+            && !crate::server::paused()
+            && crate::server::active_expire()
+        {
             last_expiry_scan = Instant::now();
+            let cycle = Instant::now();
             // redis.kv_* only exist where CREATE EXTENSION has run, and the
             // worker connects to redis.database, which commonly has not. A
             // missing relation raises, which killed the worker on a loop.
@@ -275,6 +455,13 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
             let notify = crate::notify::flags();
             let names = notify & crate::notify::EXPIRED != 0 || crate::server::tracking_active();
             for db in 0u8..16 {
+                // Shared, like a command: no script or transaction on the
+                // database sees a key expire in the middle of it. One that
+                // holds the database now is not waited for: its keys are
+                // swept next round.
+                let Some(held) = crate::dblock::try_hold_shared(db) else {
+                    continue;
+                };
                 let (count, keys) = if let Some(slot) = crate::storage::slot(db) {
                     crate::shm::with_db(slot, |m| m.sweep_expired(names)).unwrap_or_default()
                 } else if sql_tables_exist {
@@ -302,14 +489,58 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                 } else {
                     (0, Vec::new())
                 };
+                drop(held);
                 crate::server::count_expired(count as u64);
                 crate::tracking::invalidate(&keys, 0);
                 for key in keys {
                     crate::notify::emit(notify, crate::notify::EXPIRED, "expired", &key, db);
                 }
             }
+            crate::latency::record(
+                crate::latency::EXPIRE_CYCLE,
+                cycle.elapsed().as_millis() as u64,
+            );
         }
+        crate::eventloop::cycle(owner, served, cmd_usec, cron.elapsed().as_micros() as u64);
     }
+    // Left on SIGTERM: shutdown or `redis.remove_workers`.
+    crate::eventloop::release();
+    crate::storage::worker_exiting();
+}
+
+/// The rows of `redis.acl_users`, or `None` where the table does not exist
+/// (the extension is not installed in `redis.database`, or not yet).
+fn load_acl_rows(client: &pgrx::spi::SpiClient<'_>) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+    let present = client
+        .select(
+            "SELECT to_regclass('redis.acl_users') IS NOT NULL",
+            None,
+            &[],
+        )
+        .ok()?
+        .first()
+        .get::<bool>(1)
+        .ok()
+        .flatten()?;
+    if !present {
+        return None;
+    }
+    let rows = client
+        .select(
+            "SELECT name, rules FROM redis.acl_users ORDER BY name",
+            None,
+            &[],
+        )
+        .ok()?;
+    Some(
+        rows.filter_map(|r| {
+            Some((
+                r.get::<Vec<u8>>(1).ok().flatten()?,
+                r.get::<Vec<u8>>(2).ok().flatten()?,
+            ))
+        })
+        .collect(),
+    )
 }
 
 /// Whether this database has the `redis.kv_*` tables the SQL expiry sweep needs.
@@ -476,26 +707,36 @@ fn run_dispatch_batch(
     // fall through to SQL, where it would land in `kv_N`, a table the memory
     // half never reads.
     let on_mem = |cmd: &Command, db: u8| crate::storage::slot(db).is_some() && !cmd.needs_sql();
-    // Whether a key is there, on whichever backend serves its database — what
-    // keyspace notifications look up around a command.
-    let exists = |client: Option<&mut pgrx::spi::SpiClient<'_>>, d: u8, k: &[u8]| {
-        let probe = Command::Exists {
-            keys: vec![k.to_vec()],
-        };
-        let r = if on_mem(&probe, d) {
+    // A lookup on whichever backend serves its database: what keyspace
+    // notifications and the lazy-free count ask around a command.
+    let probe = |client: Option<&mut pgrx::spi::SpiClient<'_>>, d: u8, probe: Command| {
+        if on_mem(&probe, d) {
             probe.execute_mem(d)
         } else if let Some(client) = client {
             probe.execute(client, d)
         } else {
-            return false;
-        };
+            Response::Null
+        }
+    };
+    // Whether a key is there.
+    let exists = |client: Option<&mut pgrx::spi::SpiClient<'_>>, d: u8, k: &[u8]| {
+        let r = probe(
+            client,
+            d,
+            Command::Exists {
+                keys: vec![k.to_vec()],
+            },
+        );
         matches!(r, Response::Integer(n) if n > 0)
     };
     // With each reply, the keys the command named as written and left as
     // they were: no WATCH is broken on them and no tracking client told.
     // `guarded`: in a subtransaction of its own (`in_subtransaction`), or
     // as a plain statement of a batch that `run_flat` can roll back whole.
+    STEP_USEC.with_borrow_mut(Vec::clear);
     let run_as = |client: &mut pgrx::spi::SpiClient<'_>, cmd: &Command, db: u8, guarded: bool| {
+        let started = Instant::now();
+        let lazy = crate::lazyfree::before(cmd, db, &mut |d, c| probe(Some(&mut *client), d, c));
         let before = crate::notify::before(cmd, db, &mut |d, k| exists(Some(&mut *client), d, k));
         let r = if on_mem(cmd, db) {
             cmd.execute_mem(db)
@@ -507,6 +748,8 @@ fn run_dispatch_batch(
         crate::notify::after(before, cmd, db, &r, &mut |d, k| {
             exists(Some(&mut *client), d, k)
         });
+        crate::lazyfree::after(lazy, &r);
+        STEP_USEC.with_borrow_mut(|t| t.push(started.elapsed().as_micros() as i64));
         (r, crate::notify::take_untouched())
     };
     let run = |client: &mut pgrx::spi::SpiClient<'_>, cmd: &Command, db: u8| {
@@ -536,9 +779,13 @@ fn run_dispatch_batch(
             .zip(origins)
             .map(|((cmd, db), origin)| {
                 crate::tracking::set_origin(*origin);
+                let started = Instant::now();
+                let lazy = crate::lazyfree::before(cmd, *db, &mut |d, c| probe(None, d, c));
                 let before = crate::notify::before(cmd, *db, &mut |d, k| exists(None, d, k));
                 let r = cmd.execute_mem(*db);
+                STEP_USEC.with_borrow_mut(|t| t.push(started.elapsed().as_micros() as i64));
                 crate::notify::after(before, cmd, *db, &r, &mut |d, k| exists(None, d, k));
+                crate::lazyfree::after(lazy, &r);
                 (r, crate::notify::take_untouched())
             })
             .collect()
@@ -603,13 +850,13 @@ fn run_dispatch_batch(
                 continue;
             }
             match cmd {
-                Command::FlushDb => crate::server::bump_flush_epoch(*db),
-                Command::FlushAll => {
+                Command::FlushDb { .. } => crate::server::bump_flush_epoch(*db),
+                Command::FlushAll { .. } => {
                     (0..crate::commands::NUM_DBS as u8).for_each(crate::server::bump_flush_epoch)
                 }
                 _ => {}
             }
-            if matches!(cmd, Command::FlushDb | Command::FlushAll)
+            if matches!(cmd, Command::FlushDb { .. } | Command::FlushAll { .. })
                 && !matches!(resp, Response::Error(_))
             {
                 flushed = true;
@@ -642,10 +889,11 @@ fn run_dispatch_batch(
             }
         }
     }
+    // A flush empties the tracking table even with nobody tracking now.
+    if flushed {
+        crate::tracking::invalidate_all();
+    }
     if tracking {
-        if flushed {
-            crate::tracking::invalidate_all();
-        }
         for (origin, keys) in written {
             crate::tracking::invalidate(&keys, origin);
         }
@@ -671,7 +919,9 @@ pub(crate) fn watch_targets(cmd: &Command, db: u8) -> Option<Vec<(u8, Vec<u8>)>>
         Command::Block(op) | Command::BlockTry { op, .. } => Some(owned(op.write_targets(db))),
         // A flush breaks the WATCH on every key that existed, through the
         // flush epoch, not the per-key counters.
-        Command::FlushDb | Command::FlushAll => Some(Vec::new()),
+        Command::FlushDb { .. } | Command::FlushAll { .. } => Some(Vec::new()),
+        // SWAPDB breaks the WATCH on the keys it moved itself.
+        Command::Composite(crate::composite::Op::SwapDb { .. }) => Some(Vec::new()),
         // A composite names the database of each key it may write.
         Command::Composite(op) if op.touches_everything() => None,
         Command::Composite(op) => Some(owned(op.write_targets(db))),
@@ -695,62 +945,68 @@ pub(crate) fn watch_targets(cmd: &Command, db: u8) -> Option<Vec<(u8, Vec<u8>)>>
     }
 }
 
-fn accept_loop(
-    port: u16,
-    cmd_tx: mpsc::SyncSender<DispatchMsg>,
-    default_db: u8,
-    listen_addr: String,
-    max_conn: usize,
-    password: Option<Vec<u8>>,
-) {
-    let addr: SocketAddr = match format!("{}:{}", listen_addr, port).parse() {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!(
-                "pg_redis: invalid listen address '{}:{}': {}",
-                listen_addr, port, e
-            );
-            return;
-        }
-    };
-    // The Redis port bypasses PostgreSQL authentication entirely: whoever reaches
-    // it gets read/write access to every redis.* table through the worker's own
-    // privileges. Binding it off-host without a password is almost never intended.
-    if password.is_none() && !addr.ip().is_loopback() {
-        eprintln!(
-            "pg_redis: WARNING listening on {} with no redis.password set — \
-             any host that can reach this port has full access to redis.* data",
-            addr
-        );
-    }
-    let socket = match Socket::new(Domain::IPV4, Type::STREAM, None) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("pg_redis: failed to create socket: {}", e);
-            return;
-        }
-    };
+/// A listener on `addr:port`, shared with the other workers' through
+/// `SO_REUSEPORT`, which the kernel spreads connections across.
+pub(crate) fn bind_listener(listen_addr: &str, port: u16) -> std::io::Result<TcpListener> {
+    let addr: SocketAddr = format!("{listen_addr}:{port}")
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, None)?;
     if let Err(e) = socket.set_reuse_address(true) {
         eprintln!("pg_redis: SO_REUSEADDR failed: {}", e);
     }
-    if let Err(e) = socket.set_reuse_port(true) {
-        eprintln!("pg_redis: SO_REUSEPORT failed: {}", e);
-    }
-    if let Err(e) = socket.bind(&addr.into()) {
-        eprintln!("pg_redis: failed to bind port {}: {}", port, e);
-        return;
-    }
-    if let Err(e) = socket.listen(128) {
-        eprintln!("pg_redis: listen failed: {}", e);
-        return;
-    }
-    let listener: TcpListener = socket.into();
-    let conn_count = Arc::new(AtomicUsize::new(0));
+    socket.set_reuse_port(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(128)?;
+    Ok(socket.into())
+}
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(s) => {
-                if conn_count.load(Ordering::Relaxed) >= max_conn {
+/// Accept connections on the port `CONFIG GET port` names: bound at start,
+/// moved when `CONFIG SET port` changes it, closed at 0, as Redis does.
+fn accept_loop(port: u16, cmd_tx: mpsc::SyncSender<DispatchMsg>, listen_addr: String) {
+    let conn_count = Arc::new(AtomicUsize::new(0));
+    let mut bound: Option<(u16, TcpListener)> = None;
+    loop {
+        let want = u16::try_from(crate::config::get_i64("port")).unwrap_or(port);
+        if bound.as_ref().map(|(p, _)| *p) != Some(want) {
+            bound = None;
+            if want != 0 {
+                match bind_listener(&listen_addr, want) {
+                    Ok(l) => {
+                        // The Redis port bypasses PostgreSQL authentication
+                        // entirely: whoever reaches it gets read/write access
+                        // to every redis.* table through the worker's own
+                        // privileges. Binding it off-host without a password
+                        // is almost never intended.
+                        let loopback = l.local_addr().is_ok_and(|a| a.ip().is_loopback());
+                        if crate::acl::current().default_open() && !loopback {
+                            eprintln!(
+                                "pg_redis: WARNING listening on {listen_addr}:{want} with no redis.password set — \
+                                 any host that can reach this port has full access to redis.* data"
+                            );
+                        }
+                        bound = Some((want, l));
+                    }
+                    Err(e) => {
+                        eprintln!("pg_redis: failed to listen on {listen_addr}:{want}: {e}");
+                        std::thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
+                }
+            }
+        }
+        let Some((_, listener)) = &bound else {
+            std::thread::sleep(Duration::from_millis(250));
+            continue;
+        };
+        // In slices, so a changed port is noticed between connections.
+        if !crate::sys::wait_readable(listener, Duration::from_millis(250)) {
+            continue;
+        }
+        match listener.accept() {
+            Ok((s, _)) => {
+                let settings = crate::config::live_gucs();
+                if conn_count.load(Ordering::Relaxed) >= settings.maxclients.max(1) as usize {
                     if let Ok(mut w) = s.try_clone() {
                         write_error(&mut w, "max clients reached").ok();
                     }
@@ -764,10 +1020,10 @@ fn accept_loop(
                 }
                 let tx = cmd_tx.clone();
                 let counter = Arc::clone(&conn_count);
-                let pw = password.clone();
+                let default_db = settings.default_db;
                 counter.fetch_add(1, Ordering::Relaxed);
                 std::thread::spawn(move || {
-                    conn_loop(s, tx, default_db, pw);
+                    conn_loop(s, tx, default_db);
                     counter.fetch_sub(1, Ordering::Relaxed);
                 });
             }
@@ -778,34 +1034,7 @@ fn accept_loop(
     }
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    use subtle::ConstantTimeEq;
-    // Compare across max(len), reading past-the-end bytes as 0, so a length
-    // difference does not short-circuit the loop and leak via timing. Done
-    // without padding buffers: `a` is attacker-supplied and may be megabytes,
-    // and AUTH must not hand an unauthenticated client an allocation lever.
-    let mut equal = ((a.len() ^ b.len()) as u64).ct_eq(&0);
-    for i in 0..a.len().max(b.len()) {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        equal &= x.ct_eq(&y);
-    }
-    bool::from(equal)
-}
-
-fn configured_password() -> Option<Vec<u8>> {
-    crate::PASSWORD.get().as_deref().and_then(|s| {
-        let b = s.to_bytes();
-        if b.is_empty() { None } else { Some(b.to_vec()) }
-    })
-}
-
-fn conn_loop(
-    stream: TcpStream,
-    cmd_tx: mpsc::SyncSender<DispatchMsg>,
-    default_db: u8,
-    required_password: Option<Vec<u8>>,
-) {
+fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<DispatchMsg>, default_db: u8) {
     let write_stream = match stream.try_clone() {
         Ok(s) => s,
         Err(_) => return,
@@ -832,7 +1061,10 @@ fn conn_loop(
     let mut in_flight: Option<InFlight> = None;
     let mut db = default_db;
     let mut proto: u8 = 2;
-    let mut authenticated = required_password.is_none();
+    // The ACL user, and whether the connection has authenticated: at once
+    // when the default user is on and needs no password.
+    let mut session = crate::acl::Session::new();
+    client.set_user(session.serial);
     let mut multi = false;
     // Queued commands with the lines they came from, which MONITOR shows
     // when EXEC runs them.
@@ -850,6 +1082,9 @@ fn conn_loop(
     client.set_proto(2);
 
     'conn: loop {
+        // Replies wait for the rest of a pipeline only while its commands
+        // are being answered.
+        writer.more_input = false;
         if let Some(job) = in_flight.take() {
             // Normally done as the reply was flushed; here for one that
             // never was.
@@ -889,6 +1124,9 @@ fn conn_loop(
         if writer.broken || client.killed() {
             break;
         }
+        if !subscriptions_still_allowed(&client, &session, sub_slot) {
+            break;
+        }
         // Between commands, wait in short slices so a CLIENT KILL from any
         // worker, or the `timeout` setting, is noticed while the client idles.
         if let Some(idx) = sub_slot {
@@ -908,7 +1146,7 @@ fn conn_loop(
                 let ready = match (sub_slot, crate::pubsub_state()) {
                     // Sleep until a message is published or a slice passes,
                     // then look at the socket: whichever comes first is served.
-                    (Some(idx), Some((_, slots))) => {
+                    (Some(idx), Some(slots)) => {
                         let tail = crate::pubsub::current_tail(slots, idx);
                         parser.wait_readable(Duration::ZERO) || {
                             crate::pubsub::wait_for_message(slots, idx, tail, SUBSCRIBE_POLL);
@@ -924,6 +1162,9 @@ fn conn_loop(
                 if client.killed() || writer.broken {
                     break 'conn;
                 }
+                if !subscriptions_still_allowed(&client, &session, sub_slot) {
+                    break 'conn;
+                }
                 // Redis never times out a subscriber.
                 let timeout = crate::config::get_i64("timeout");
                 if sub_slot.is_none()
@@ -934,6 +1175,7 @@ fn conn_loop(
                 }
             }
         }
+        parser.set_authenticated(!crate::acl::current().auth_required(&session));
         let parts = match parser.read_command() {
             Ok(p) if p.is_empty() => continue,
             Ok(p) => p,
@@ -951,6 +1193,7 @@ fn conn_loop(
             .first()
             .map(|p| String::from_utf8_lossy(p).to_uppercase())
             .unwrap_or_default();
+        writer.more_input = parser.has_buffered();
 
         // What `CLIENT LIST` reports as this client's query buffer while the
         // command runs: the command as it came over the wire.
@@ -980,6 +1223,7 @@ fn conn_loop(
         }
         client.touch(&counted, db);
         crate::resp::REPLIED_ERROR.with(|e| e.set(false));
+        crate::resp::REPLIED_REJECTION.with(|e| e.set(false));
         // CLIENT REPLY: SKIP drops this one reply, OFF every reply until ON —
         // and ON itself answers, which the admin arm unmutes for.
         writer.muted = !matches!(reply_mode, crate::admin::ReplyMode::On);
@@ -992,13 +1236,57 @@ fn conn_loop(
             stat: known,
             rejected: false,
             args: parts.clone(),
+            db,
+            queued: queueing,
+            exec: Vec::new(),
         });
         writer.pending_read = Some(PendingRead {
             slot: client.slot(),
             id: client.id,
             args: parts.clone(),
             multi,
+            exec: Vec::new(),
         });
+
+        // The ACL, once the connection is past AUTH: Redis checks it after a
+        // command's name and arity and before anything runs or is queued,
+        // so a refused command inside MULTI flags the transaction.
+        if !crate::acl::current().auth_required(&session) {
+            match crate::acl::evaluate(session.serial, &parts) {
+                crate::acl::Verdict::Allowed => {}
+                crate::acl::Verdict::Gone => break 'conn,
+                crate::acl::Verdict::Denied(d) => {
+                    let ctx = if multi {
+                        crate::acl::Context::Multi
+                    } else {
+                        crate::acl::Context::Toplevel
+                    };
+                    crate::acl::record_denial(&d, ctx, client.id);
+                    if let Some(job) = in_flight.as_mut() {
+                        job.rejected = true;
+                    }
+                    let msg = format!("NOPERM {}", d.message(false));
+                    if cmd_name == "EXEC" {
+                        // `rejectCommand` on EXEC: `execCommandAbort`.
+                        multi = false;
+                        queue.clear();
+                        watched.clear();
+                        let abort = format!("EXECABORT Transaction discarded because of: {msg}");
+                        reply(&mut writer, |w| write_error(w, &abort));
+                        continue;
+                    }
+                    if multi {
+                        queue.push(Err(msg.clone()));
+                    }
+                    reply(&mut writer, |w| write_error(w, &msg));
+                    continue;
+                }
+            }
+            if !multi && let Some(e) = crate::acl::sort_denied(session.serial, &parts) {
+                reply(&mut writer, |w| write_error(w, e));
+                continue;
+            }
+        }
 
         // A script that has run past `busy-reply-threshold` holds a
         // dispatcher; until it ends, only the commands meant for that moment
@@ -1033,6 +1321,17 @@ fn conn_loop(
             continue;
         }
 
+        // `min-replicas-to-write` with no replicas to count: a write is
+        // refused as Redis's `processCommand` refuses it, queued or not.
+        if crate::server::too_few_replicas() && crate::scripting::flagged(&parts, "write") {
+            let msg = crate::scripting::NOREPLICAS;
+            if multi {
+                queue.push(Err(msg.to_string()));
+            }
+            reply(&mut writer, |w| write_error(w, msg));
+            continue;
+        }
+
         // RESET and QUIT act immediately even inside MULTI, as in Redis.
         if multi && !matches!(cmd_name.as_str(), "RESET" | "QUIT") {
             match cmd_name.as_str() {
@@ -1051,37 +1350,79 @@ fn conn_loop(
                         flush(&mut writer);
                         continue;
                     }
+                    // An EXEC carrying a command that may grow memory is
+                    // itself refused past the limit (`execCommandAbort`).
+                    let mut at = db;
+                    let oom = queue.iter().flatten().any(|(c, _)| {
+                        if let Command::Select { db: selected } = c {
+                            at = *selected;
+                        }
+                        refused_for_memory(c, at)
+                    });
+                    if oom {
+                        feed_monitors(&parts, db, &client);
+                        queue.clear();
+                        watched.clear();
+                        let e =
+                            format!("EXECABORT Transaction discarded because of: {}", oom_text());
+                        write_error(&mut writer, &e).ok();
+                        flush(&mut writer);
+                        continue;
+                    }
                     // Re-read the shared counters: any worker may have written
-                    // one of these keys since WATCH snapshotted it.
-                    let watch_dirty = match crate::watch_state() {
-                        Some(ctl) => watched.iter().any(|((w_db, key), w)| {
-                            let now = crate::watch::version(ctl, *w_db, key);
-                            w.broken(now, crate::server::flush_epoch(*w_db))
-                        }),
-                        // Without shared memory there is nothing to compare against.
-                        // WATCH already refused, so nothing can be watched here.
-                        None => false,
-                    };
+                    // one of these keys since WATCH snapshotted it. Checked
+                    // again by the dispatcher once it holds the databases.
+                    let watches: Vec<((u8, Vec<u8>), Watched)> = watched.drain().collect();
+                    let watch_dirty = watch_broken(&watches);
                     // A queued SELECT moves every command after it, and the
-                    // connection itself once the transaction has run.
+                    // connection itself once the transaction has run. Each
+                    // command is checked against the ACL again: the rules may
+                    // have changed since it was queued (`execCommand`).
                     let mut exec_db = db;
                     let mut lines: Vec<(Vec<Vec<u8>>, u8)> = Vec::new();
-                    let cmds: Vec<(Command, u8)> = queue
-                        .drain(..)
-                        .filter_map(|r| r.ok())
-                        .map(|(cmd, line)| {
-                            let at = exec_db;
-                            if let Command::Select { db: selected } = &cmd {
-                                exec_db = *selected;
+                    let mut refused: Vec<Option<String>> = Vec::new();
+                    let mut cmds: Vec<(Command, u8)> = Vec::new();
+                    for (cmd, line) in queue.drain(..).filter_map(|r| r.ok()) {
+                        let at = exec_db;
+                        let no = match crate::acl::evaluate(session.serial, &line) {
+                            crate::acl::Verdict::Denied(d) => {
+                                crate::acl::record_denial(
+                                    &d,
+                                    crate::acl::Context::Multi,
+                                    client.id,
+                                );
+                                Some(d.exec_message())
                             }
-                            lines.push((line, at));
-                            (cmd, at)
-                        })
-                        .collect();
-                    watched.clear();
+                            _ => crate::acl::sort_denied(session.serial, &line).map(str::to_string),
+                        };
+                        // A queued AUTH runs in its turn, as Redis runs it:
+                        // the commands after it are checked as its user.
+                        let no = match (&no, &cmd) {
+                            (None, Command::Auth { user, password }) => exec_auth(
+                                &mut session,
+                                &client,
+                                user.as_deref(),
+                                password,
+                                &line[0],
+                            ),
+                            _ => no,
+                        };
+                        if no.is_none()
+                            && let Command::Select { db: selected } = &cmd
+                        {
+                            exec_db = *selected;
+                        }
+                        lines.push((line, at));
+                        if no.is_none() {
+                            cmds.push((cmd, at));
+                        }
+                        refused.push(no);
+                    }
                     if !watch_dirty {
-                        for (line, at) in &lines {
-                            feed_monitors(line, *at, &client);
+                        for ((line, at), no) in lines.iter().zip(&refused) {
+                            if no.is_none() {
+                                feed_monitors(line, *at, &client);
+                            }
                         }
                     }
                     feed_monitors(&parts, db, &client);
@@ -1093,6 +1434,19 @@ fn conn_loop(
                         }
                         flush(&mut writer);
                         continue;
+                    }
+                    if let Some(job) = in_flight.as_mut() {
+                        job.exec = lines.clone();
+                    }
+                    // The reads the transaction runs are remembered for
+                    // tracking as each runs in Redis, before EXEC replies.
+                    if let Some(p) = writer.pending_read.as_mut() {
+                        p.exec = lines
+                            .iter()
+                            .zip(&refused)
+                            .filter(|(_, no)| no.is_none())
+                            .map(|((line, _), _)| line.clone())
+                            .collect();
                     }
                     let unblocks: Option<Vec<(u8, Vec<u8>)>> = crate::server::waiters_active()
                         .then(|| {
@@ -1106,7 +1460,7 @@ fn conn_loop(
                     // commands around them go to the dispatcher in segments,
                     // so each sees the subscriptions the ones before it left.
                     if proto == 3 && cmds.iter().any(|(c, _)| subscription_command(c)) {
-                        write_array_header(&mut writer, cmds.len()).ok();
+                        write_array_header(&mut writer, lines.len()).ok();
                         let mut segment: Vec<(Command, u8)> = Vec::new();
                         let mut segment_lines: Vec<Vec<Vec<u8>>> = Vec::new();
                         let mut ok = true;
@@ -1123,20 +1477,31 @@ fn conn_loop(
                                         std::mem::take(segment),
                                         client.id,
                                         tx,
+                                        // Checked above; the segments around
+                                        // a subscription each run atomically.
+                                        BatchKind::Exec(Vec::new(), lines.clone()),
                                     ))
                                     .is_err()
                                 {
                                     return false;
                                 }
-                                let Ok(responses) = rx.recv() else {
+                                let Ok(Some(responses)) = rx.recv() else {
                                     return false;
                                 };
                                 for (resp, line) in responses.into_iter().zip(lines.drain(..)) {
+                                    count_exec_step(&line, matches!(resp, Response::Error(_)));
                                     write_reply(writer, resp, &line, proto).ok();
                                 }
                                 true
                             };
-                        for ((cmd, d), (line, _)) in cmds.into_iter().zip(lines.iter()) {
+                        let mut queued = cmds.into_iter();
+                        for ((line, _), no) in lines.iter().zip(&refused) {
+                            if let Some(e) = no {
+                                ok &= run_segment(&mut segment, &mut segment_lines, &mut writer);
+                                exec_refusal(&mut writer, line, e);
+                                continue;
+                            }
+                            let Some((cmd, d)) = queued.next() else { break };
                             if !subscription_command(&cmd) {
                                 segment.push((cmd, d));
                                 segment_lines.push(line.clone());
@@ -1189,24 +1554,64 @@ fn conn_loop(
                         }
                         settle(unblocks, true);
                         db = exec_db;
+                        crate::resp::REPLIED_ERROR.with(|e| e.set(false));
+                        crate::resp::REPLIED_REJECTION.with(|e| e.set(false));
                         flush(&mut writer);
                         continue;
                     }
                     let (resp_tx, resp_rx) = mpsc::sync_channel(1);
                     if cmd_tx
-                        .send(DispatchMsg::Batch(cmds, client.id, resp_tx))
+                        .send(DispatchMsg::Batch(
+                            cmds,
+                            client.id,
+                            resp_tx,
+                            BatchKind::Exec(
+                                watches,
+                                lines
+                                    .iter()
+                                    .zip(&refused)
+                                    .filter(|(_, no)| no.is_none())
+                                    .map(|((line, _), _)| line.clone())
+                                    .collect(),
+                            ),
+                        ))
                         .is_err()
                     {
                         break;
                     }
                     match resp_rx.recv() {
-                        Ok(responses) => {
+                        // A watched key changed between the check above and
+                        // the dispatcher taking the databases.
+                        Ok(None) => {
+                            if proto == 3 {
+                                write!(&mut writer, "_\r\n").ok();
+                            } else {
+                                write_null_array(&mut writer).ok();
+                            }
+                            flush(&mut writer);
+                        }
+                        Ok(Some(responses)) => {
                             settle(unblocks, true);
                             db = exec_db;
-                            write_array_header(&mut writer, responses.len()).ok();
-                            for (resp, (line, _)) in responses.into_iter().zip(&lines) {
-                                write_reply(&mut writer, resp, line, proto).ok();
+                            write_array_header(&mut writer, lines.len()).ok();
+                            let mut responses = responses.into_iter();
+                            for ((line, _), no) in lines.iter().zip(&refused) {
+                                match no {
+                                    Some(e) => exec_refusal(&mut writer, line, e),
+                                    None => {
+                                        if let Some(resp) = responses.next() {
+                                            count_exec_step(
+                                                line,
+                                                matches!(resp, Response::Error(_)),
+                                            );
+                                            write_reply(&mut writer, resp, line, proto).ok();
+                                        }
+                                    }
+                                }
                             }
+                            // The errors inside are the steps', not EXEC's.
+                            crate::resp::REPLIED_ERROR.with(|e| e.set(false));
+                            crate::resp::REPLIED_REJECTION.with(|e| e.set(false));
                             flush(&mut writer);
                         }
                         Err(_) => break,
@@ -1243,6 +1648,15 @@ fn conn_loop(
                         flush(&mut writer);
                     } else {
                         match Command::parse(&parts) {
+                            // `processCommand`'s OOM check, which a queued
+                            // command meets too: refused, and the
+                            // transaction flagged.
+                            Ok(cmd) if refused_for_memory(&cmd, queued_db(&queue, db)) => {
+                                let e = oom_text();
+                                write_error(&mut writer, &e).ok();
+                                queue.push(Err(e));
+                                flush(&mut writer);
+                            }
                             Ok(cmd) => {
                                 queue.push(Ok((cmd, parts.clone())));
                                 reply(&mut writer, |w| write_simple_string(w, "QUEUED"));
@@ -1273,24 +1687,39 @@ fn conn_loop(
             Command::Hello {
                 proto: requested_proto,
                 auth: inline_auth,
-                ..
+                setname,
             } => {
-                if let Some(password) = inline_auth {
-                    let ok = match &required_password {
-                        None => true,
-                        Some(expected) => constant_time_eq(password.as_bytes(), expected),
-                    };
-                    if ok {
-                        authenticated = true;
-                    } else {
-                        reply(&mut writer, |w| {
-                            write_error(
-                                w,
-                                "WRONGPASS invalid username-password pair or user is disabled.",
-                            )
-                        });
-                        continue;
+                if let Some((user, password)) = inline_auth {
+                    match crate::acl::authenticate(user, password, &parts[0], multi, client.id) {
+                        Some(serial) => {
+                            session = crate::acl::Session {
+                                serial,
+                                authenticated: true,
+                            };
+                            client.set_user(serial);
+                        }
+                        None => {
+                            reply(&mut writer, |w| write_error(w, crate::acl::WRONGPASS));
+                            continue;
+                        }
                     }
+                }
+                // Redis's reply to a HELLO that neither comes authenticated
+                // nor carries AUTH; the protocol stays as it was.
+                if !session.authenticated {
+                    reply(&mut writer, |w| {
+                        write_error(
+                            w,
+                            "NOAUTH HELLO must be called with the client already authenticated, \
+                             otherwise the HELLO <proto> AUTH <user> <pass> option can be used to \
+                             authenticate the client and select the RESP protocol version at the \
+                             same time",
+                        )
+                    });
+                    continue;
+                }
+                if let Some(name) = setname {
+                    client.set_name(name);
                 }
                 if let Some(v) = requested_proto {
                     proto = *v;
@@ -1304,7 +1733,7 @@ fn conn_loop(
                     reply(&mut writer, |w| {
                         write_map_header(w, 7)?;
                         write_bulk_string(w, b"server")?;
-                        write_bulk_string(w, b"pg_redis")?;
+                        write_bulk_string(w, b"redis")?;
                         write_bulk_string(w, b"version")?;
                         write_bulk_string(w, crate::commands::REDIS_VERSION.as_bytes())?;
                         write_bulk_string(w, b"proto")?;
@@ -1322,7 +1751,7 @@ fn conn_loop(
                     reply(&mut writer, |w| {
                         write_array_header(w, 14)?;
                         write_bulk_string(w, b"server")?;
-                        write_bulk_string(w, b"pg_redis")?;
+                        write_bulk_string(w, b"redis")?;
                         write_bulk_string(w, b"version")?;
                         write_bulk_string(w, crate::commands::REDIS_VERSION.as_bytes())?;
                         write_bulk_string(w, b"proto")?;
@@ -1340,14 +1769,16 @@ fn conn_loop(
                 continue;
             }
             Command::Reset => {
-                if let (Some(idx), Some((ctl, slots))) = (sub_slot.take(), crate::pubsub_state()) {
-                    crate::pubsub::slot_free(ctl, slots, idx);
+                if let (Some(idx), Some(slots)) = (sub_slot.take(), crate::pubsub_state()) {
+                    crate::pubsub::slot_free(slots, idx);
                     client.set_flag(crate::server::flag::PUBSUB, false);
                 }
                 crate::tracking::disable(&client);
                 proto = 2;
                 client.set_proto(2);
-                authenticated = required_password.is_none();
+                session = crate::acl::Session::new();
+                client.set_user(session.serial);
+                client.set_name(b"");
                 db = default_db;
                 multi = false;
                 queue.clear();
@@ -1359,7 +1790,9 @@ fn conn_loop(
                 writer.quit_reply = true;
                 break;
             }
-            Command::Ping { msg } => {
+            // Behind the password like everything but AUTH, HELLO, QUIT and
+            // RESET, the commands Redis flags `no_auth`.
+            Command::Ping { msg } if !crate::acl::current().auth_required(&session) => {
                 match msg {
                     Some(m) => write_bulk_string(&mut writer, m).ok(),
                     None => write_simple_string(&mut writer, "PONG").ok(),
@@ -1367,29 +1800,38 @@ fn conn_loop(
                 flush(&mut writer);
                 continue;
             }
-            Command::Auth { password } => {
-                match &required_password {
-                    None => reply(&mut writer, |w| write_simple_string(w, "OK")),
-                    Some(expected) => {
-                        if constant_time_eq(password.as_bytes(), expected) {
-                            authenticated = true;
-                            reply(&mut writer, |w| write_simple_string(w, "OK"));
-                        } else {
-                            reply(&mut writer, |w| {
-                                write_error(
-                                    w,
-                                    "WRONGPASS invalid username-password pair or user is disabled.",
-                                )
-                            });
-                        }
+            Command::Auth { user, password } => {
+                let name = match user {
+                    Some(u) => u.clone(),
+                    None if crate::acl::current().default_user().nopass() => {
+                        reply(&mut writer, |w| {
+                            write_error(
+                                w,
+                                "ERR AUTH <password> called without any password configured for \
+                                 the default user. Are you sure your configuration is correct?",
+                            )
+                        });
+                        continue;
                     }
+                    None => b"default".to_vec(),
+                };
+                match crate::acl::authenticate(&name, password, &parts[0], multi, client.id) {
+                    Some(serial) => {
+                        session = crate::acl::Session {
+                            serial,
+                            authenticated: true,
+                        };
+                        client.set_user(serial);
+                        reply(&mut writer, |w| write_simple_string(w, "OK"));
+                    }
+                    None => reply(&mut writer, |w| write_error(w, crate::acl::WRONGPASS)),
                 }
                 continue;
             }
             _ => {}
         }
 
-        if !authenticated {
+        if crate::acl::current().auth_required(&session) {
             reply(&mut writer, |w| {
                 write_error(w, "NOAUTH Authentication required.")
             });
@@ -1438,8 +1880,13 @@ fn conn_loop(
                         .iter()
                         .map(|k| (Command::PTtl { key: k.clone() }, db))
                         .collect();
-                    let ttls = match cmd_tx.send(DispatchMsg::Batch(probes, client.id, resp_tx)) {
-                        Ok(()) => resp_rx.recv().unwrap_or_default(),
+                    let ttls = match cmd_tx.send(DispatchMsg::Batch(
+                        probes,
+                        client.id,
+                        resp_tx,
+                        BatchKind::Probe,
+                    )) {
+                        Ok(()) => resp_rx.recv().ok().flatten().unwrap_or_default(),
                         Err(_) => Vec::new(),
                     };
                     let now = crate::server::now_ms();
@@ -1503,6 +1950,7 @@ fn conn_loop(
                 };
                 let keys: Vec<Vec<u8>> = sc.keys().into_iter().map(|k| k.to_vec()).collect();
                 let group = sc.name == "XREADGROUP";
+                writer.send_now();
                 let outcome = wait_blocked(
                     &parser,
                     &client,
@@ -1559,6 +2007,10 @@ fn conn_loop(
                     flush(&mut writer);
                     continue;
                 }
+                // A blocked command is checked again each time it is retried,
+                // as Redis reprocesses it: the rules may have changed.
+                let refused = std::cell::Cell::new(false);
+                writer.send_now();
                 let outcome = wait_blocked(
                     &parser,
                     &client,
@@ -1571,10 +2023,22 @@ fn conn_loop(
                     },
                     written,
                     || {
+                        if let crate::acl::Verdict::Denied(d) =
+                            crate::acl::evaluate(session.serial, &parts)
+                        {
+                            crate::acl::record_denial(&d, crate::acl::Context::Toplevel, client.id);
+                            refused.set(true);
+                            return Some(Response::Error(format!("NOPERM {}", d.message(false))));
+                        }
                         let r = attempt(false);
                         (!matches!(r, Response::NullArray)).then_some(r)
                     },
                 );
+                if refused.get()
+                    && let Some(job) = in_flight.as_mut()
+                {
+                    job.rejected = true;
+                }
                 match outcome {
                     Some(r) => {
                         write_reply(&mut writer, r, &parts, proto).ok();
@@ -1596,10 +2060,21 @@ fn conn_loop(
                 flush(&mut writer);
             }
             Command::Admin(a) => {
+                // Redis evicts before every command, so what INFO reports
+                // after a CONFIG SET maxmemory below what is held already
+                // counts the keys that went. Eviction runs on the main thread.
+                if crate::shm::over_limit() {
+                    let (tx, rx) = mpsc::sync_channel(1);
+                    if cmd_tx.send(DispatchMsg::Evict(tx)).is_ok() {
+                        rx.recv().ok();
+                    }
+                }
                 let mut conn = crate::admin::Conn {
                     client: &client,
                     db,
                     reply: reply_mode,
+                    session,
+                    may_wait: true,
                 };
                 let response = crate::admin::execute(a, &mut conn, &mut |cmd, d| {
                     dispatch_one(&cmd_tx, cmd, d)
@@ -1611,27 +2086,10 @@ fn conn_loop(
                 write_reply(&mut writer, response, &parts, proto).ok();
                 flush(&mut writer);
             }
-            Command::Publish { channel, message }
-                if channel.len() > crate::pubsub::MAX_CHANNEL_LEN
-                    || message.len() > crate::pubsub::PUBSUB_MSG_LEN =>
-            {
-                let err = if channel.len() > crate::pubsub::MAX_CHANNEL_LEN {
-                    format!(
-                        "channel name exceeds the pub/sub limit of {} bytes",
-                        crate::pubsub::MAX_CHANNEL_LEN
-                    )
-                } else {
-                    format!(
-                        "message exceeds the pub/sub limit of {} bytes",
-                        crate::pubsub::PUBSUB_MSG_LEN
-                    )
-                };
-                reply(&mut writer, |w| write_error(w, &err));
-            }
             Command::Publish { channel, message } => match crate::pubsub_state() {
                 None => reply(&mut writer, |w| write_error(w, PUBSUB_NOT_LOADED)),
-                Some((ctl, slots)) => {
-                    let n = crate::pubsub::publish(ctl, slots, channel, message);
+                Some(slots) => {
+                    let n = crate::pubsub::publish(slots, channel, message);
                     if let Some(route_ctl) = crate::route_state()
                         && let Some((schema, table)) =
                             crate::pubsub::route_lookup(route_ctl, channel)
@@ -1651,9 +2109,9 @@ fn conn_loop(
             },
             Command::PubSubChannels { pattern, shard } => match crate::pubsub_state() {
                 None => reply(&mut writer, |w| write_error(w, PUBSUB_NOT_LOADED)),
-                Some((ctl, slots)) => {
+                Some(slots) => {
                     let channels =
-                        crate::pubsub::pubsub_channels(ctl, slots, pattern.as_deref(), *shard);
+                        crate::pubsub::pubsub_channels(slots, pattern.as_deref(), *shard);
                     reply(&mut writer, |w| {
                         write_array_header(w, channels.len())?;
                         for ch in &channels {
@@ -1665,7 +2123,7 @@ fn conn_loop(
             },
             Command::PubSubNumSub { channels, shard } => match crate::pubsub_state() {
                 None => reply(&mut writer, |w| write_error(w, PUBSUB_NOT_LOADED)),
-                Some((ctl, slots)) => {
+                Some(slots) => {
                     let stored: Vec<Vec<u8>> = if *shard {
                         channels
                             .iter()
@@ -1674,7 +2132,7 @@ fn conn_loop(
                     } else {
                         channels.clone()
                     };
-                    let counts = crate::pubsub::pubsub_numsub(ctl, slots, &stored);
+                    let counts = crate::pubsub::pubsub_numsub(slots, &stored);
                     reply(&mut writer, |w| {
                         write_array_header(w, channels.len() * 2)?;
                         for (ch, n) in channels.iter().zip(&counts) {
@@ -1687,8 +2145,8 @@ fn conn_loop(
             },
             Command::PubSubNumPat => match crate::pubsub_state() {
                 None => reply(&mut writer, |w| write_error(w, PUBSUB_NOT_LOADED)),
-                Some((ctl, slots)) => {
-                    let n = crate::pubsub::pubsub_numpat(ctl, slots);
+                Some(slots) => {
+                    let n = crate::pubsub::pubsub_numpat(slots);
                     reply(&mut writer, |w| write_integer(w, n));
                 }
             },
@@ -1697,7 +2155,7 @@ fn conn_loop(
                     write_array_header(w, 4)?;
                     write_bulk_string(
                         w,
-                        b"PUBSUB <subcommand> [<arg> [value] [opt] ...]. subcommands are:",
+                        b"PUBSUB <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
                     )?;
                     write_bulk_string(w, b"CHANNELS [<pattern>] -- Return the currently active channels matching a pattern (default: all).")?;
                     write_bulk_string(w, b"NUMSUB [<channel> ...] -- Return the number of subscribers for the specified channels.")?;
@@ -1708,12 +2166,6 @@ fn conn_loop(
                 });
             }
             Command::Subscribe { channels } => {
-                if let Some(err) =
-                    pubsub_len_error(channels, crate::pubsub::MAX_CHANNEL_LEN, "channel name")
-                {
-                    reply(&mut writer, |w| write_error(w, &err));
-                    continue;
-                }
                 if proto == 3 {
                     subscribe_in_place(
                         &mut writer,
@@ -1729,6 +2181,7 @@ fn conn_loop(
                 let cont = enter_subscribe_mode(
                     &mut writer,
                     &mut parser,
+                    (&client, &session),
                     proto,
                     channels,
                     SubKind::Channel,
@@ -1744,12 +2197,6 @@ fn conn_loop(
                     .iter()
                     .map(|c| crate::pubsub::shard_name(c))
                     .collect();
-                if let Some(err) =
-                    pubsub_len_error(&stored, crate::pubsub::MAX_CHANNEL_LEN, "channel name")
-                {
-                    reply(&mut writer, |w| write_error(w, &err));
-                    continue;
-                }
                 if proto == 3 {
                     subscribe_in_place(
                         &mut writer,
@@ -1765,6 +2212,7 @@ fn conn_loop(
                 let cont = enter_subscribe_mode(
                     &mut writer,
                     &mut parser,
+                    (&client, &session),
                     proto,
                     &stored,
                     SubKind::Shard,
@@ -1776,12 +2224,6 @@ fn conn_loop(
                 }
             }
             Command::PSubscribe { patterns } => {
-                if let Some(err) =
-                    pubsub_len_error(patterns, crate::pubsub::MAX_CHANNEL_LEN, "pattern")
-                {
-                    reply(&mut writer, |w| write_error(w, &err));
-                    continue;
-                }
                 if proto == 3 {
                     subscribe_in_place(
                         &mut writer,
@@ -1797,6 +2239,7 @@ fn conn_loop(
                 let cont = enter_subscribe_mode(
                     &mut writer,
                     &mut parser,
+                    (&client, &session),
                     proto,
                     patterns,
                     SubKind::Pattern,
@@ -1841,9 +2284,9 @@ fn conn_loop(
     }
     // A RESP3 subscriber's slot outlives no connection, and neither does one
     // handed to it and not yet taken.
-    if let Some((ctl, slots)) = crate::pubsub_state() {
+    if let Some(slots) = crate::pubsub_state() {
         if let Some(idx) = sub_slot {
-            crate::pubsub::slot_free(ctl, slots, idx);
+            crate::pubsub::slot_free(slots, idx);
         }
         let handed = client.slot().map_or(crate::server::HANDOFF_NONE, |s| {
             s.track_handoff.swap(
@@ -1852,7 +2295,7 @@ fn conn_loop(
             )
         });
         if handed >= 0 {
-            crate::pubsub::slot_free(ctl, slots, handed as usize);
+            crate::pubsub::slot_free(slots, handed as usize);
         }
     }
     crate::tracking::disable(&client);
@@ -1863,7 +2306,86 @@ fn conn_loop(
     drop(client);
     if writer.quit_reply {
         write_simple_string(&mut writer, "OK").ok();
-        writer.flush().ok();
+    }
+    writer.send_now();
+}
+
+/// When an ACL change took channel permissions from this client's user:
+/// whether its subscriptions are all still allowed. A subscriber that holds
+/// one no longer allowed is closed, as Redis closes it
+/// (`ACLKillPubsubClientsIfNeeded`).
+fn subscriptions_still_allowed(
+    client: &crate::server::ClientHandle,
+    session: &crate::acl::Session,
+    sub_slot: Option<usize>,
+) -> bool {
+    if !client.acl_recheck_asked() {
+        return true;
+    }
+    let ok = match (sub_slot, crate::pubsub_state()) {
+        (Some(idx), Some(slots)) => crate::acl::subscriptions_allowed(
+            session.serial,
+            &crate::pubsub::channel_names(slots, idx),
+            &crate::pubsub::pattern_names(slots, idx),
+        ),
+        _ => true,
+    };
+    if ok {
+        client.acl_recheck_done();
+    }
+    ok
+}
+
+/// The ACL check for a command a RESP2 subscriber sends: `None` when it may
+/// run, the error to answer otherwise.
+fn acl_refusal(
+    client: &crate::server::ClientHandle,
+    session: &crate::acl::Session,
+    parts: &[Vec<u8>],
+) -> Option<String> {
+    match crate::acl::evaluate(session.serial, parts) {
+        crate::acl::Verdict::Allowed => None,
+        crate::acl::Verdict::Gone => {
+            client.kill();
+            Some("NOPERM this connection's user was deleted".to_string())
+        }
+        crate::acl::Verdict::Denied(d) => {
+            crate::acl::record_denial(&d, crate::acl::Context::Toplevel, client.id);
+            Some(format!("NOPERM {}", d.message(false)))
+        }
+    }
+}
+
+/// A queued `AUTH`, checked as `EXEC` reaches it: the session the rest of the
+/// queue is checked as becomes the user's, or the error is its reply. The
+/// client's user changes when the dispatcher runs it, in its turn.
+fn exec_auth(
+    session: &mut crate::acl::Session,
+    client: &crate::server::ClientHandle,
+    user: Option<&[u8]>,
+    password: &[u8],
+    name: &[u8],
+) -> Option<String> {
+    let user = match user {
+        Some(u) => u.to_vec(),
+        None if crate::acl::current().default_user().nopass() => {
+            return Some(
+                "ERR AUTH <password> called without any password configured for the default \
+                 user. Are you sure your configuration is correct?"
+                    .to_string(),
+            );
+        }
+        None => b"default".to_vec(),
+    };
+    match crate::acl::authenticate(&user, password, name, true, client.id) {
+        Some(serial) => {
+            *session = crate::acl::Session {
+                serial,
+                authenticated: true,
+            };
+            None
+        }
+        None => Some(crate::acl::WRONGPASS.to_string()),
     }
 }
 
@@ -1881,6 +2403,7 @@ fn track_read(
     argv: &[Vec<u8>],
     multi: bool,
 ) {
+    crate::tracking::limit_used_slots();
     let tracking = slot.is_some_and(|s| {
         s.tracking.load(std::sync::atomic::Ordering::Relaxed) & crate::tracking::ON != 0
     });
@@ -1980,8 +2503,8 @@ fn adopt_handoff(
                 *track_sub = listen_for_invalidations(sub_slot, client);
             }
             deliver_messages(writer, idx, proto);
-            if let Some((ctl, slots)) = crate::pubsub_state() {
-                crate::pubsub::slot_free(ctl, slots, idx);
+            if let Some(slots) = crate::pubsub_state() {
+                crate::pubsub::slot_free(slots, idx);
             }
         }
     }
@@ -1996,16 +2519,16 @@ fn listen_for_invalidations(
     sub_slot: &mut Option<usize>,
     client: &crate::server::ClientHandle,
 ) -> bool {
-    let Some((ctl, slots)) = crate::pubsub_state() else {
+    let Some(slots) = crate::pubsub_state() else {
         return false;
     };
     let channel = vec![crate::tracking::channel(client.id)];
     match *sub_slot {
         Some(idx) => {
-            crate::pubsub::subscribe(ctl, slots, idx, &channel);
+            crate::pubsub::subscribe(slots, idx, &channel);
             true
         }
-        None => match crate::pubsub::slot_alloc_and_subscribe(ctl, slots, &channel) {
+        None => match crate::pubsub::slot_alloc_and_subscribe(slots, client.id, &channel) {
             Some((idx, _)) => {
                 *sub_slot = Some(idx);
                 true
@@ -2034,7 +2557,7 @@ fn unsubscribe_here(
     };
     // A pub/sub frame goes out even under CLIENT REPLY OFF.
     let muted = std::mem::replace(&mut writer.muted, false);
-    if let (Some(idx), Some((ctl, slots))) = (*sub_slot, crate::pubsub_state()) {
+    if let (Some(idx), Some(slots)) = (*sub_slot, crate::pubsub_state()) {
         let stored: Vec<Vec<u8>> = if kind == SubKind::Shard {
             names.iter().map(|c| crate::pubsub::shard_name(c)).collect()
         } else {
@@ -2043,22 +2566,22 @@ fn unsubscribe_here(
         let mut freed = false;
         let done = handle_unsub(
             writer,
-            SubSlot { ctl, slots, idx },
+            SubSlot { slots, idx },
             proto,
             &stored,
             kind,
-            |ctl, slots, idx, items| {
+            |slots, idx, items| {
                 if kind == SubKind::Pattern {
-                    crate::pubsub::punsubscribe(ctl, slots, idx, items)
+                    crate::pubsub::punsubscribe(slots, idx, items)
                 } else {
-                    crate::pubsub::unsubscribe(ctl, slots, idx, items)
+                    crate::pubsub::unsubscribe(slots, idx, items)
                 }
             },
             &mut freed,
         );
         if done {
             if !freed {
-                crate::pubsub::slot_free(ctl, slots, idx);
+                crate::pubsub::slot_free(slots, idx);
             }
             *sub_slot = None;
             client.set_flag(crate::server::flag::PUBSUB, false);
@@ -2101,9 +2624,10 @@ fn subscription_command(cmd: &Command) -> bool {
 /// Deliver what is waiting in a RESP3 subscriber's ring. A pub/sub frame is a
 /// push: it goes out even under CLIENT REPLY OFF, as in Redis.
 fn deliver_messages(writer: &mut ConnWriter, idx: usize, proto: u8) {
-    let Some((_, slots)) = crate::pubsub_state() else {
+    let Some(slots) = crate::pubsub_state() else {
         return;
     };
+    writer.limit_stalls(idx);
     let muted = std::mem::replace(&mut writer.muted, false);
     let mut any = false;
     while let Some((channel, pattern, payload)) = crate::pubsub::poll_message(slots, idx) {
@@ -2114,6 +2638,12 @@ fn deliver_messages(writer: &mut ConnWriter, idx: usize, proto: u8) {
         writer.flush().ok();
     }
     writer.muted = muted;
+    // Messages were dropped: close the connection, as Redis does at its
+    // pub/sub output buffer limit. The connection loop leaves on `broken`.
+    if crate::pubsub::overflowed(slots, idx) {
+        eprintln!("pg_redis: closing a subscriber that fell behind its message queue");
+        writer.broken = true;
+    }
 }
 
 /// One published message, as the subscriber receives it.
@@ -2168,34 +2698,32 @@ fn subscribe_in_place(
     proto: u8,
     client: &crate::server::ClientHandle,
 ) {
-    let Some((ctl, slots)) = crate::pubsub_state() else {
+    let Some(slots) = crate::pubsub_state() else {
         reply(writer, |w| write_error(w, PUBSUB_NOT_LOADED));
         return;
     };
     let muted = std::mem::replace(&mut writer.muted, false);
     match *sub_slot {
-        Some(idx) => confirm_subscriptions(writer, ctl, slots, idx, proto, items, kind),
+        Some(idx) => confirm_subscriptions(writer, slots, idx, proto, items, kind),
         None => {
             let alloc = if kind == SubKind::Pattern {
-                crate::pubsub::slot_alloc_and_psubscribe(ctl, slots, &items[..1])
+                crate::pubsub::slot_alloc_and_psubscribe(slots, client.id, &items[..1])
             } else {
-                crate::pubsub::slot_alloc_and_subscribe(ctl, slots, &items[..1])
+                crate::pubsub::slot_alloc_and_subscribe(slots, client.id, &items[..1])
             };
             match alloc {
-                None => reply(writer, |w| {
-                    write_error(w, "max pub/sub subscribers reached")
-                }),
+                None => reply(writer, |w| write_error(w, PUBSUB_FULL)),
                 Some((idx, _)) => {
                     *sub_slot = Some(idx);
                     client.set_flag(crate::server::flag::PUBSUB, true);
                     // A client in pub/sub mode is where a REDIRECT can point.
                     let own = vec![crate::tracking::channel(client.id)];
-                    crate::pubsub::subscribe(ctl, slots, idx, &own);
+                    crate::pubsub::subscribe(slots, idx, &own);
                     write_pubsub_header(writer, 3, proto).ok();
                     write_bulk_string(writer, kind.verb()).ok();
                     write_bulk_string(writer, crate::pubsub::shown_name(&items[0])).ok();
-                    write_integer(writer, sub_count(ctl, slots, idx, kind) as i64).ok();
-                    confirm_subscriptions(writer, ctl, slots, idx, proto, &items[1..], kind);
+                    write_integer(writer, sub_count(slots, idx, kind) as i64).ok();
+                    confirm_subscriptions(writer, slots, idx, proto, &items[1..], kind);
                 }
             }
         }
@@ -2206,16 +2734,13 @@ fn subscribe_in_place(
 fn enter_subscribe_mode(
     writer: &mut ConnWriter,
     parser: &mut crate::resp::RespParser,
+    who: (&crate::server::ClientHandle, &crate::acl::Session),
     proto: u8,
     items: &[Vec<u8>],
     kind: SubKind,
-    alloc_fn: impl Fn(
-        &'static crate::pubsub::PubsubCtl,
-        &'static crate::pubsub::Slots,
-        &[Vec<u8>],
-    ) -> Option<(usize, u32)>,
+    alloc_fn: impl Fn(&'static crate::pubsub::Slots, u64, &[Vec<u8>]) -> Option<(usize, u32)>,
 ) -> bool {
-    let Some((ctl, slots)) = crate::pubsub_state() else {
+    let Some(slots) = crate::pubsub_state() else {
         reply(writer, |w| write_error(w, PUBSUB_NOT_LOADED));
         return true;
     };
@@ -2223,24 +2748,22 @@ fn enter_subscribe_mode(
     writer.muted = false;
     let own_channel = vec![crate::tracking::channel(CONN_CLIENT.with(|c| c.get()))];
     // The slot is taken with the first name; the rest go through the same
-    // path as a SUBSCRIBE already in subscribe mode, so duplicates and names
-    // past the per-connection limit are answered the way Redis would.
-    match alloc_fn(ctl, slots, &items[..1]) {
+    // path as a SUBSCRIBE already in subscribe mode, so duplicates are
+    // answered the way Redis would.
+    match alloc_fn(slots, who.0.id, &items[..1]) {
         None => {
-            reply(writer, |w| {
-                write_error(w, "max pub/sub subscribers reached")
-            });
+            reply(writer, |w| write_error(w, PUBSUB_FULL));
             true
         }
         Some((idx, _)) => {
             // A client in pub/sub mode is where a REDIRECT can point.
-            crate::pubsub::subscribe(ctl, slots, idx, &own_channel);
+            crate::pubsub::subscribe(slots, idx, &own_channel);
             write_pubsub_header(writer, 3, proto).ok();
             write_bulk_string(writer, kind.verb()).ok();
             write_bulk_string(writer, crate::pubsub::shown_name(&items[0])).ok();
             write_integer(writer, 1).ok();
-            confirm_subscriptions(writer, ctl, slots, idx, proto, &items[1..], kind);
-            subscribe_loop(writer, parser, idx, proto)
+            confirm_subscriptions(writer, slots, idx, proto, &items[1..], kind);
+            subscribe_loop(writer, parser, idx, proto, who)
         }
     }
 }
@@ -2250,9 +2773,10 @@ fn subscribe_loop(
     parser: &mut crate::resp::RespParser,
     slot_idx: usize,
     proto: u8,
+    (client, session): (&crate::server::ClientHandle, &crate::acl::Session),
 ) -> bool {
     // Capture state once — these pointers are stable for the lifetime of the process.
-    let Some((ctl, slots)) = crate::pubsub_state() else {
+    let Some(slots) = crate::pubsub_state() else {
         return true;
     };
     // Short enough that a command sent by a subscribed client is noticed
@@ -2263,6 +2787,7 @@ fn subscribe_loop(
     let mut keep_conn = true;
     let mut slot_freed = false;
     let mut idle_wait = SUBSCRIBE_WAIT_MIN;
+    writer.limit_stalls(slot_idx);
 
     'outer: loop {
         // Snapshot before draining, so a publish that lands between the drain
@@ -2278,6 +2803,20 @@ fn subscribe_loop(
                     writer.flush().ok();
                 }
             }
+        }
+        // Messages were dropped: close the connection, as Redis does at its
+        // pub/sub output buffer limit.
+        if crate::pubsub::overflowed(slots, slot_idx) {
+            eprintln!("pg_redis: closing a subscriber that fell behind its message queue");
+            keep_conn = false;
+            break 'outer;
+        }
+        if client.killed()
+            || writer.broken
+            || !subscriptions_still_allowed(client, session, Some(slot_idx))
+        {
+            keep_conn = false;
+            break 'outer;
         }
 
         let parts = match parser.read_command() {
@@ -2303,6 +2842,11 @@ fn subscribe_loop(
         };
         // The client is talking; go back to acknowledging quickly.
         idle_wait = SUBSCRIBE_WAIT_MIN;
+        if let Some(e) = acl_refusal(client, session, &parts) {
+            write_error(writer, &e).ok();
+            writer.flush().ok();
+            continue;
+        }
 
         let cmd_name = parts
             .first()
@@ -2316,15 +2860,15 @@ fn subscribe_loop(
 
         match cmd_name.as_str() {
             "SUBSCRIBE" if !args.is_empty() => {
-                confirm_subscriptions(writer, ctl, slots, slot_idx, proto, args, SubKind::Channel);
+                confirm_subscriptions(writer, slots, slot_idx, proto, args, SubKind::Channel);
             }
             "PSUBSCRIBE" if !args.is_empty() => {
-                confirm_subscriptions(writer, ctl, slots, slot_idx, proto, args, SubKind::Pattern);
+                confirm_subscriptions(writer, slots, slot_idx, proto, args, SubKind::Pattern);
             }
             "SSUBSCRIBE" if !args.is_empty() => {
                 let stored: Vec<Vec<u8>> =
                     args.iter().map(|c| crate::pubsub::shard_name(c)).collect();
-                confirm_subscriptions(writer, ctl, slots, slot_idx, proto, &stored, SubKind::Shard);
+                confirm_subscriptions(writer, slots, slot_idx, proto, &stored, SubKind::Shard);
             }
             "SUNSUBSCRIBE" => {
                 let stored: Vec<Vec<u8>> =
@@ -2332,7 +2876,6 @@ fn subscribe_loop(
                 if handle_unsub(
                     writer,
                     SubSlot {
-                        ctl,
                         slots,
                         idx: slot_idx,
                     },
@@ -2349,7 +2892,6 @@ fn subscribe_loop(
                 if handle_unsub(
                     writer,
                     SubSlot {
-                        ctl,
                         slots,
                         idx: slot_idx,
                     },
@@ -2366,7 +2908,6 @@ fn subscribe_loop(
                 if handle_unsub(
                     writer,
                     SubSlot {
-                        ctl,
                         slots,
                         idx: slot_idx,
                     },
@@ -2387,14 +2928,14 @@ fn subscribe_loop(
                 writer.flush().ok();
             }
             "RESET" => {
-                crate::pubsub::slot_free(ctl, slots, slot_idx);
+                crate::pubsub::slot_free(slots, slot_idx);
                 slot_freed = true;
                 write_simple_string(writer, "RESET").ok();
                 writer.flush().ok();
                 break 'outer;
             }
             "QUIT" => {
-                crate::pubsub::slot_free(ctl, slots, slot_idx);
+                crate::pubsub::slot_free(slots, slot_idx);
                 slot_freed = true;
                 writer.quit_reply = true;
                 keep_conn = false;
@@ -2408,7 +2949,7 @@ fn subscribe_loop(
     }
 
     if !slot_freed {
-        crate::pubsub::slot_free(ctl, slots, slot_idx);
+        crate::pubsub::slot_free(slots, slot_idx);
     }
     parser.set_read_timeout(Some(Duration::from_secs(30))).ok();
     keep_conn
@@ -2442,19 +2983,14 @@ impl SubKind {
 }
 
 /// What a slot holds of one kind, as the registry stores the names.
-fn names_of(
-    ctl: &'static crate::pubsub::PubsubCtl,
-    slots: &'static crate::pubsub::Slots,
-    slot_idx: usize,
-    kind: SubKind,
-) -> Vec<Vec<u8>> {
+fn names_of(slots: &'static crate::pubsub::Slots, slot_idx: usize, kind: SubKind) -> Vec<Vec<u8>> {
     match kind {
-        SubKind::Pattern => crate::pubsub::pattern_names(ctl, slots, slot_idx),
-        SubKind::Channel => crate::pubsub::channel_names(ctl, slots, slot_idx)
+        SubKind::Pattern => crate::pubsub::pattern_names(slots, slot_idx),
+        SubKind::Channel => crate::pubsub::channel_names(slots, slot_idx)
             .into_iter()
             .filter(|n| !crate::pubsub::is_internal(n))
             .collect(),
-        SubKind::Shard => crate::pubsub::channel_names(ctl, slots, slot_idx)
+        SubKind::Shard => crate::pubsub::channel_names(slots, slot_idx)
             .into_iter()
             .filter(|n| n.starts_with(crate::pubsub::SHARD_PREFIX))
             .collect(),
@@ -2463,17 +2999,12 @@ fn names_of(
 
 /// The count a confirmation reports: Redis counts sharded subscriptions apart
 /// from channels and patterns, which it counts together.
-fn sub_count(
-    ctl: &'static crate::pubsub::PubsubCtl,
-    slots: &'static crate::pubsub::Slots,
-    slot_idx: usize,
-    kind: SubKind,
-) -> usize {
+fn sub_count(slots: &'static crate::pubsub::Slots, slot_idx: usize, kind: SubKind) -> usize {
     match kind {
-        SubKind::Shard => names_of(ctl, slots, slot_idx, SubKind::Shard).len(),
+        SubKind::Shard => names_of(slots, slot_idx, SubKind::Shard).len(),
         _ => {
-            names_of(ctl, slots, slot_idx, SubKind::Channel).len()
-                + names_of(ctl, slots, slot_idx, SubKind::Pattern).len()
+            names_of(slots, slot_idx, SubKind::Channel).len()
+                + names_of(slots, slot_idx, SubKind::Pattern).len()
         }
     }
 }
@@ -2483,7 +3014,6 @@ fn sub_count(
 /// confirmed: a confirmed subscription that receives nothing is worse than none.
 fn confirm_subscriptions(
     writer: &mut ConnWriter,
-    ctl: &'static crate::pubsub::PubsubCtl,
     slots: &'static crate::pubsub::Slots,
     slot_idx: usize,
     proto: u8,
@@ -2492,33 +3022,21 @@ fn confirm_subscriptions(
 ) {
     for name in names {
         let one = std::slice::from_ref(name);
-        let before = names_of(ctl, slots, slot_idx, kind);
+        let before = names_of(slots, slot_idx, kind);
         if kind == SubKind::Pattern {
-            crate::pubsub::psubscribe(ctl, slots, slot_idx, one);
+            crate::pubsub::psubscribe(slots, slot_idx, one);
         } else {
-            crate::pubsub::subscribe(ctl, slots, slot_idx, one);
+            crate::pubsub::subscribe(slots, slot_idx, one);
         }
-        let now = names_of(ctl, slots, slot_idx, kind);
+        let now = names_of(slots, slot_idx, kind);
         if now.len() == before.len() && !before.contains(name) {
-            write_error(
-                writer,
-                &format!(
-                    "pg_redis allows at most {} {} per connection",
-                    crate::pubsub::MAX_SUBS_PER_SLOT,
-                    if kind == SubKind::Pattern {
-                        "patterns"
-                    } else {
-                        "channels"
-                    }
-                ),
-            )
-            .ok();
+            write_error(writer, PUBSUB_FULL).ok();
             continue;
         }
         write_pubsub_header(writer, 3, proto).ok();
         write_bulk_string(writer, kind.verb()).ok();
         write_bulk_string(writer, crate::pubsub::shown_name(name)).ok();
-        write_integer(writer, sub_count(ctl, slots, slot_idx, kind) as i64).ok();
+        write_integer(writer, sub_count(slots, slot_idx, kind) as i64).ok();
     }
     writer.flush().ok();
 }
@@ -2528,7 +3046,6 @@ fn confirm_subscriptions(
 /// A connection's pub/sub slot: the shared state and its index in it.
 #[derive(Clone, Copy)]
 struct SubSlot {
-    ctl: &'static crate::pubsub::PubsubCtl,
     slots: &'static crate::pubsub::Slots,
     idx: usize,
 }
@@ -2539,26 +3056,19 @@ fn handle_unsub(
     proto: u8,
     args: &[Vec<u8>],
     kind: SubKind,
-    unsub_fn: impl Fn(
-        &'static crate::pubsub::PubsubCtl,
-        &'static crate::pubsub::Slots,
-        usize,
-        &[Vec<u8>],
-    ) -> (u32, u32),
+    unsub_fn: impl Fn(&'static crate::pubsub::Slots, usize, &[Vec<u8>]) -> (u32, u32),
     slot_freed: &mut bool,
 ) -> bool {
     let SubSlot {
-        ctl,
         slots,
         idx: slot_idx,
     } = slot;
     let total = || {
-        sub_count(ctl, slots, slot_idx, SubKind::Channel)
-            + sub_count(ctl, slots, slot_idx, SubKind::Shard)
+        sub_count(slots, slot_idx, SubKind::Channel) + sub_count(slots, slot_idx, SubKind::Shard)
     };
     // A bare unsubscribe drops every name of its own kind, and only those.
     let to_unsub: Vec<Vec<u8>> = if args.is_empty() {
-        names_of(ctl, slots, slot_idx, kind)
+        names_of(slots, slot_idx, kind)
     } else {
         args.to_vec()
     };
@@ -2568,17 +3078,17 @@ fn handle_unsub(
         write_pubsub_header(writer, 3, proto).ok();
         write_bulk_string(writer, kind.unverb()).ok();
         write_null_bulk(writer).ok();
-        write_integer(writer, sub_count(ctl, slots, slot_idx, kind) as i64).ok();
+        write_integer(writer, sub_count(slots, slot_idx, kind) as i64).ok();
         writer.flush().ok();
         // Do not mark slot_freed — let subscribe_loop's cleanup call slot_free.
         return total() == 0;
     }
     for item in &to_unsub {
-        unsub_fn(ctl, slots, slot_idx, std::slice::from_ref(item));
+        unsub_fn(slots, slot_idx, std::slice::from_ref(item));
         write_pubsub_header(writer, 3, proto).ok();
         write_bulk_string(writer, kind.unverb()).ok();
         write_bulk_string(writer, crate::pubsub::shown_name(item)).ok();
-        write_integer(writer, sub_count(ctl, slots, slot_idx, kind) as i64).ok();
+        write_integer(writer, sub_count(slots, slot_idx, kind) as i64).ok();
     }
     writer.flush().ok();
     // No subscription left — but the slot still holds the connection's
@@ -2597,6 +3107,7 @@ fn write_value(w: &mut impl std::io::Write, v: &crate::commands::Value) -> std::
         Value::Bulk(b) => write_bulk_string(w, b),
         Value::Simple(s) => write_simple_string(w, s),
         Value::Error(e) => write_error_verbatim(w, e),
+        Value::CountedError(e) => write_counted_error(w, e),
         Value::Array(items) => {
             write_array_header(w, items.len())?;
             items.iter().try_for_each(|i| write_value(w, i))
@@ -2615,6 +3126,8 @@ fn write_value(w: &mut impl std::io::Write, v: &crate::commands::Value) -> std::
         }
         Value::Bool(b) => write_integer(w, i64::from(*b)),
         Value::Verbatim(text) => write_bulk_string(w, text.as_bytes()),
+        Value::BigNum(n) => write_bulk_string(w, n.as_bytes()),
+        Value::Attributed(_, v) | Value::Pushed(_, v) => write_value(w, v),
     }
 }
 
@@ -2628,6 +3141,7 @@ fn write_value3(w: &mut impl std::io::Write, v: &crate::commands::Value) -> std:
         Value::Bulk(b) => write_bulk_string(w, b),
         Value::Simple(s) => write_simple_string(w, s),
         Value::Error(e) => write_error_verbatim(w, e),
+        Value::CountedError(e) => write_counted_error(w, e),
         Value::Array(items) => {
             write_array_header(w, items.len())?;
             items.iter().try_for_each(|i| write_value3(w, i))
@@ -2649,6 +3163,20 @@ fn write_value3(w: &mut impl std::io::Write, v: &crate::commands::Value) -> std:
             write!(w, "={}\r\ntxt:", text.len() + 4)?;
             w.write_all(text.as_bytes())?;
             write!(w, "\r\n")
+        }
+        Value::BigNum(n) => write!(w, "({n}\r\n"),
+        Value::Attributed(pairs, v) => {
+            write!(w, "|{}\r\n", pairs.len())?;
+            pairs.iter().try_for_each(|(k, v)| {
+                write_value3(w, k)?;
+                write_value3(w, v)
+            })?;
+            write_value3(w, v)
+        }
+        Value::Pushed(items, v) => {
+            write!(w, ">{}\r\n", items.len())?;
+            items.iter().try_for_each(|i| write_value3(w, i))?;
+            write_value3(w, v)
         }
     }
 }
@@ -2707,9 +3235,9 @@ fn write_response(w: &mut impl std::io::Write, response: Response) -> std::io::R
         Response::Value(v) => write_value(w, &v),
         // Consumed by the connection loop; never meant for a client.
         Response::StreamWait(_) => write_null_array(w),
-        Response::ScanResult { keys } => {
+        Response::ScanResult { cursor, keys } => {
             write_array_header(w, 2)?;
-            write_bulk_string(w, b"0")?;
+            write_bulk_string(w, cursor.to_string().as_bytes())?;
             write_array_header(w, keys.len())?;
             for item in keys {
                 match item {
@@ -2738,6 +3266,18 @@ struct ConnWriter {
     /// QUIT was asked for: its OK goes out after the connection is torn
     /// down.
     quit_reply: bool,
+    /// The client's pub/sub slot once it subscribes: its writes then wait
+    /// in `WRITE_SLICE`s, and stop when the slot overflows.
+    stall_limited: bool,
+    subscriber: Option<usize>,
+    /// Replies not yet sent, while a normal-class output limit is set: Redis
+    /// keeps a client's replies until the event they answer is done, and a
+    /// client whose replies pass the limit gets none of them and is closed.
+    held: Vec<u8>,
+    /// The command being answered has more of a pipeline behind it, already
+    /// read: under a normal-class limit its reply waits for theirs, as
+    /// Redis's waits for the whole read to be processed.
+    more_input: bool,
 }
 
 struct PendingRead {
@@ -2745,6 +3285,8 @@ struct PendingRead {
     id: u64,
     args: Vec<Vec<u8>>,
     multi: bool,
+    /// For an EXEC: the queued commands it ran, each a read to remember.
+    exec: Vec<Vec<Vec<u8>>>,
 }
 
 impl ConnWriter {
@@ -2755,6 +3297,57 @@ impl ConnWriter {
             muted: false,
             pending_read: None,
             quit_reply: false,
+            stall_limited: false,
+            subscriber: None,
+            held: Vec::new(),
+            more_input: false,
+        }
+    }
+
+    /// From a client's first subscription, its writes wait for it in
+    /// slices, so a client that stops reading is closed as soon as its queue
+    /// passes the pubsub output limit, as Redis closes it.
+    fn limit_stalls(&mut self, idx: usize) {
+        self.subscriber = Some(idx);
+        if !self.stall_limited {
+            self.stall_limited = true;
+            if let Err(e) = self.inner.get_ref().set_write_timeout(Some(WRITE_SLICE)) {
+                eprintln!("pg_redis: set_write_timeout failed: {e}");
+            }
+        }
+    }
+
+    /// A subscriber's write that waited a slice: whether to give up on the
+    /// connection rather than wait another.
+    fn must_close(&self) -> bool {
+        let overflowed = match (self.subscriber, crate::pubsub_state()) {
+            (Some(idx), Some(slots)) => crate::pubsub::overflowed(slots, idx),
+            _ => false,
+        };
+        let id = CONN_CLIENT.with(|c| c.get());
+        overflowed
+            || crate::server::slot_of(id)
+                .is_some_and(|s| s.kill.load(std::sync::atomic::Ordering::Relaxed) != 0)
+    }
+
+    /// Run a write, waiting out the slices a subscriber's write times out in.
+    /// What the socket took stays taken: a timed-out write is tried again
+    /// with the rest.
+    fn patiently<T>(
+        &mut self,
+        mut op: impl FnMut(&mut BufWriter<TcpStream>) -> io::Result<T>,
+    ) -> io::Result<T> {
+        loop {
+            match op(&mut self.inner) {
+                Err(e)
+                    if self.stall_limited
+                        && matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        )
+                        && !self.must_close() => {}
+                r => return r,
+            }
         }
     }
 
@@ -2764,25 +3357,76 @@ impl ConnWriter {
             && !crate::resp::REPLIED_ERROR.with(|e| e.get())
         {
             track_read(p.slot, p.id, &p.args, p.multi);
+            for line in &p.exec {
+                track_read(p.slot, p.id, line, false);
+            }
         }
     }
 }
 
 impl Write for ConnWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if self.muted {
+        if self.muted || self.broken {
             return Ok(buf.len());
         }
-        let r = self.inner.write(buf);
+        // A subscriber's limit is the pubsub class's, on its queue.
+        let hard = if self.stall_limited {
+            0
+        } else {
+            crate::pubsub::normal_limits().hard
+        };
+        if hard > 0 {
+            self.held.extend_from_slice(buf);
+            // Redis counts what is past its static buffer in the 16 KB blocks
+            // it allocates for it, and closes the client at the limit.
+            let chunk = crate::pubsub::REPLY_CHUNK;
+            let listed = self.held.len().saturating_sub(chunk).div_ceil(chunk) * chunk;
+            if listed >= hard {
+                self.held = Vec::new();
+                self.broken = true;
+                crate::server::count_output_limit_disconnection();
+            }
+            return Ok(buf.len());
+        }
+        let r = self
+            .send_held()
+            .and_then(|()| self.patiently(|w| w.write(buf)));
         self.broken |= r.is_err();
         r
     }
 
     fn flush(&mut self) -> io::Result<()> {
         self.remember_read();
-        let r = self.inner.flush();
+        if self.broken {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        if self.more_input && !self.held.is_empty() {
+            return Ok(());
+        }
+        let r = self
+            .send_held()
+            .and_then(|()| self.patiently(|w| w.flush()));
         self.broken |= r.is_err();
         r
+    }
+}
+
+impl ConnWriter {
+    /// Send what is held now, whatever follows in the pipeline: before the
+    /// client blocks, and as the connection ends. Redis writes a blocked or
+    /// departing client's replies then too.
+    fn send_now(&mut self) {
+        self.more_input = false;
+        self.flush().ok();
+    }
+
+    fn send_held(&mut self) -> io::Result<()> {
+        if self.held.is_empty() {
+            return Ok(());
+        }
+        let held = std::mem::take(&mut self.held);
+        // Held only for a normal client, whose writes never time out.
+        self.inner.write_all(&held)
     }
 }
 
@@ -2954,6 +3598,14 @@ fn redacted(parts: &[Vec<u8>]) -> Vec<bool> {
     let name = String::from_utf8_lossy(&parts[0]).to_ascii_uppercase();
     match name.as_str() {
         "AUTH" => r.iter_mut().skip(1).for_each(|x| *x = true),
+        // Every rule of an ACL SETUSER: it may carry a password.
+        "ACL"
+            if parts
+                .get(1)
+                .is_some_and(|s| s.eq_ignore_ascii_case(b"SETUSER")) =>
+        {
+            r.iter_mut().skip(2).for_each(|x| *x = true)
+        }
         "HELLO" | "MIGRATE" => {
             for i in 1..parts.len() {
                 if parts[i].eq_ignore_ascii_case(b"AUTH") {
@@ -3026,9 +3678,8 @@ fn feed_monitors_from(parts: &[Vec<u8>], db: u8, origin: impl FnOnce() -> String
         }
     }
     line.push_str("\r\n");
-    if let Some((pctl, slots)) = crate::pubsub_state() {
-        let msg = &line.as_bytes()[..line.len().min(crate::pubsub::PUBSUB_MSG_LEN)];
-        crate::pubsub::publish(pctl, slots, MONITOR_CHANNEL, msg);
+    if let Some(pslots) = crate::pubsub_state() {
+        crate::pubsub::publish(pslots, MONITOR_CHANNEL, line.as_bytes());
     }
 }
 
@@ -3039,16 +3690,14 @@ fn monitor_loop(
     parser: &mut RespParser,
     client: &crate::server::ClientHandle,
 ) -> bool {
-    let (Some(ctl), Some((pctl, slots))) = (crate::server::ctl(), crate::pubsub_state()) else {
+    let (Some(ctl), Some(pslots)) = (crate::server::ctl(), crate::pubsub_state()) else {
         reply(writer, |w| write_error(w, PUBSUB_NOT_LOADED));
         return true;
     };
     let Some((idx, _)) =
-        crate::pubsub::slot_alloc_and_subscribe(pctl, slots, &[MONITOR_CHANNEL.to_vec()])
+        crate::pubsub::slot_alloc_and_subscribe(pslots, client.id, &[MONITOR_CHANNEL.to_vec()])
     else {
-        reply(writer, |w| {
-            write_error(w, "max pub/sub subscribers reached")
-        });
+        reply(writer, |w| write_error(w, PUBSUB_FULL));
         return true;
     };
     ctl.monitors
@@ -3056,7 +3705,7 @@ fn monitor_loop(
     client.set_flag(crate::server::flag::MONITOR, true);
     reply(writer, |w| write_simple_string(w, "OK"));
     let keep = loop {
-        while let Some((_, _, payload)) = crate::pubsub::poll_message(slots, idx) {
+        while let Some((_, _, payload)) = crate::pubsub::poll_message(pslots, idx) {
             writer.write_all(&payload).ok();
         }
         writer.flush().ok();
@@ -3084,7 +3733,7 @@ fn monitor_loop(
     ctl.monitors
         .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     client.set_flag(crate::server::flag::MONITOR, false);
-    crate::pubsub::slot_free(pctl, slots, idx);
+    crate::pubsub::slot_free(pslots, idx);
     keep
 }
 
@@ -3109,11 +3758,37 @@ struct InFlight {
     stat: Option<usize>,
     rejected: bool,
     args: Vec<Vec<u8>>,
+    /// The database it ran on, for the access fields of a logged one.
+    db: u8,
+    /// Queued inside MULTI: it has not run.
+    queued: bool,
+    /// For an EXEC that ran: each queued command and its database.
+    exec: Vec<(Vec<Vec<u8>>, u8)>,
+}
+
+/// One command an `EXEC` ran, counted as Redis's `call()` counts it: a call,
+/// failed when its own reply is an error.
+fn count_exec_step(line: &[Vec<u8>], failed: bool) {
+    if let Some(i) = stat_index(&stat_name(line)) {
+        crate::server::count_command(i, 0, failed, false);
+    }
+}
+
+/// Write an `EXEC` step's error: a queued `AUTH` that failed is a call that
+/// failed; a command the ACL refused at `EXEC` never ran.
+fn exec_refusal(writer: &mut ConnWriter, line: &[Vec<u8>], e: &str) {
+    if line
+        .first()
+        .is_some_and(|c| c.eq_ignore_ascii_case(b"AUTH"))
+    {
+        count_exec_step(line, true);
+    }
+    write_error(writer, e).ok();
 }
 
 /// Index of a command in the generated table, which is also its
 /// `INFO commandstats` slot.
-fn stat_index(name: &str) -> Option<usize> {
+pub(crate) fn stat_index(name: &str) -> Option<usize> {
     static INDEX: std::sync::LazyLock<HashMap<&'static str, usize>> =
         std::sync::LazyLock::new(|| {
             crate::redis_tables::COMMANDS
@@ -3127,7 +3802,7 @@ fn stat_index(name: &str) -> Option<usize> {
 
 /// The name a command line is counted under: `config|get` for a container's
 /// subcommand, the command itself otherwise.
-fn stat_name(parts: &[Vec<u8>]) -> String {
+pub(crate) fn stat_name(parts: &[Vec<u8>]) -> String {
     let top = String::from_utf8_lossy(&parts[0]).to_ascii_lowercase();
     if let Some(sub) = parts.get(1) {
         let full = format!(
@@ -3142,22 +3817,88 @@ fn stat_name(parts: &[Vec<u8>]) -> String {
 }
 
 /// Close out a command: commandstats, latency, and the slow log.
+/// Whether a command queued in MULTI, or an EXEC holding it, is refused for
+/// memory: one that may grow a memory database while the arena is past the
+/// limit under `noeviction`. Under an evicting policy the worker evicts
+/// before running it, which a connection thread cannot do, so it is let
+/// through and meets the limit there.
+fn refused_for_memory(cmd: &Command, _db: u8) -> bool {
+    cmd.may_grow()
+        && crate::shm::over_limit()
+        && crate::access::settings().policy == crate::access::Policy::NoEviction
+}
+
+fn oom_text() -> String {
+    match crate::commands::mem_out_of_memory() {
+        Response::Error(e) => e,
+        _ => String::new(),
+    }
+}
+
+/// The database a command queued now will run on: the connection's, or
+/// what a SELECT queued before it chose.
+fn queued_db(queue: &Queue, db: u8) -> u8 {
+    queue
+        .iter()
+        .flatten()
+        .filter_map(|(c, _)| match c {
+            Command::Select { db } => Some(*db),
+            _ => None,
+        })
+        .next_back()
+        .unwrap_or(db)
+}
+
 fn finish(job: InFlight, client: &crate::server::ClientHandle) {
     let usec = job.started.elapsed().as_micros() as u64;
+    crate::eventloop::command(usec);
+    // A logged database's keys are touched here, after the command, from
+    // the keys its arguments name (`access::after_command`).
+    if !job.queued && !job.rejected {
+        let no_touch = client.slot().is_some_and(|s| {
+            s.flags.load(std::sync::atomic::Ordering::Relaxed) & crate::server::flag::NO_TOUCH != 0
+        });
+        crate::access::after_command(job.db, &job.args, no_touch);
+        for (line, at) in &job.exec {
+            crate::access::after_command(*at, line, no_touch);
+        }
+    }
     let failed = crate::resp::REPLIED_ERROR.with(|e| e.replace(false));
-    if let Some(i) = job.stat {
-        crate::server::count_command(i, usec, failed && !job.rejected, job.rejected);
+    let rejected = job.rejected || crate::resp::REPLIED_REJECTION.with(|e| e.replace(false));
+    // A command queued in MULTI is counted when EXEC runs it
+    // (`count_exec_step`); one refused as it was queued, now.
+    if let Some(i) = job.stat
+        && (!job.queued || rejected)
+    {
+        crate::server::count_command(i, usec, failed && !rejected, rejected);
+        // The latency monitor's `command` or `fast-command` event.
+        if !rejected {
+            let fast = crate::redis_tables::COMMANDS[i].flags.contains(&"fast");
+            let event = if fast {
+                crate::latency::FAST_COMMAND
+            } else {
+                crate::latency::COMMAND
+            };
+            crate::latency::record(event, usec / 1000);
+        }
     }
     let threshold = crate::config::get_i64("slowlog-log-slower-than");
-    if threshold >= 0 && usec as i64 >= threshold && !job.rejected {
+    // An EXEC's commands are logged as they run (`slowlog_exec_steps`).
+    let exec = job
+        .args
+        .first()
+        .is_some_and(|c| c.eq_ignore_ascii_case(b"EXEC"));
+    if threshold >= 0 && usec as i64 >= threshold && !job.rejected && !exec {
         let max_len = crate::config::get_i64("slowlog-max-len").max(0) as usize;
-        crate::server::slowlog_push(
-            &job.args,
-            usec as i64,
-            &client.addr(),
-            &client.name(),
-            max_len,
-        );
+        // The slow log hides passwords where MONITOR does.
+        let hide = redacted(&job.args);
+        let args: Vec<Vec<u8>> = job
+            .args
+            .iter()
+            .zip(hide)
+            .map(|(a, h)| if h { b"(redacted)".to_vec() } else { a.clone() })
+            .collect();
+        crate::server::slowlog_push(&args, usec as i64, &client.addr(), &client.name(), max_len);
     }
 }
 
@@ -3260,13 +4001,13 @@ mod tests {
                         db_tx.send(db).ok();
                         resp_tx.send(Response::Ok).ok();
                     }
-                    DispatchMsg::Batch(cmds, _, resp_tx) => {
+                    DispatchMsg::Batch(cmds, _, resp_tx, _) => {
                         resp_tx
-                            .send(cmds.iter().map(|_| Response::Ok).collect())
+                            .send(Some(cmds.iter().map(|_| Response::Ok).collect()))
                             .ok();
                     }
                     DispatchMsg::FireAndForget(..) => {}
-                    DispatchMsg::Move(_, _, tx) => {
+                    DispatchMsg::Move(_, _, tx) | DispatchMsg::Evict(tx) => {
                         tx.send(()).ok();
                     }
                 }
@@ -3288,7 +4029,7 @@ mod tests {
             let dispatched = fake_dispatcher(cmd_rx);
             std::thread::spawn(move || {
                 let (stream, _) = listener.accept().unwrap();
-                conn_loop(stream, cmd_tx, default_db, None);
+                conn_loop(stream, cmd_tx, default_db);
             });
             let client = TcpStream::connect(addr).unwrap();
             client
@@ -3404,8 +4145,11 @@ mod tests {
             (&["PING"], "+PONG"),
             (&["MULTI"], "+OK"),
             (&["UNWATCH"], "+OK"),
-            // Both are allowed before AUTH when no password is configured.
-            (&["AUTH", "anything"], "+OK"),
+            // Redis's reply when the default user has no password.
+            (
+                &["AUTH", "anything"],
+                "-ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?",
+            ),
         ];
         for (cmd, expected) in cases {
             let mut c = Conn::open(1);
@@ -3465,29 +4209,5 @@ mod tests {
             c.dispatched_nothing(),
             "discarded commands must not be executed"
         );
-    }
-
-    // ───────────────────────────────  AUTH  ──────────────────────────────────
-
-    #[test]
-    fn constant_time_eq_compares_by_value() {
-        let cases: &[(&[u8], &[u8], bool)] = &[
-            (b"secret", b"secret", true),
-            (b"secret", b"wroong", false),
-            (b"short", b"longer", false),
-            (b"", b"", true),
-            (b"", b"x", false),
-            // Differs only in the final byte — must not be reported equal.
-            (b"secreta", b"secretb", false),
-        ];
-        for &(a, b, expected) in cases {
-            assert_eq!(
-                constant_time_eq(a, b),
-                expected,
-                "{:?} vs {:?}",
-                String::from_utf8_lossy(a),
-                String::from_utf8_lossy(b)
-            );
-        }
     }
 }

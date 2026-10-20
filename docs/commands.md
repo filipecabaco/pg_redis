@@ -6,11 +6,11 @@
 |---------|-----------|
 | `PING [msg]` | Returns `PONG` or echoes `msg` |
 | `ECHO msg` | Returns `msg` |
-| `SELECT db` | 0–15, or the names `cache` (0) and `durable` (8). Databases 0–7 are ephemeral, 8–15 WAL-logged — see [Storage modes](IMPLEMENTATION.md) |
+| `SELECT db` | 0–15, or the names `cache` (0) and `durable` (8). By default databases 0–7 are `memory` and 8–15 `logged`, and any database's policy can be changed. See [Storage policies](STORAGE.md) |
 | `AUTH [password]` | Validates against `redis.password` GUC; no-op when unset |
-| `INFO` | Returns server info string |
-| `COMMAND` | Returns empty array (client compatibility); `COMMAND COUNT` reports the number of accepted commands |
-| `CLIENT ...` | No-op, returns OK |
+| `INFO [section ...]` | Every section, plus `default`, `all` and `everything`; `commandstats`, `errorstats` and `latencystats` are counted across workers |
+| `COMMAND [subcommand]` | With no subcommand, Redis 7.2's command-table entry for every accepted command. `INFO`, `DOCS`, `LIST`, `GETKEYS` and `GETKEYSANDFLAGS` answer from the same table; `COUNT` reports the number of accepted commands |
+| `CLIENT subcommand ...` | `ID`, `INFO`, `LIST`, `KILL`, `SETNAME`, `REPLY`, `PAUSE`, `UNBLOCK`, `TRACKING` and the rest act as in Redis; see [command coverage](command-coverage.md#connection) for the full list |
 | `TIME` | Unix seconds and leftover microseconds, from one clock reading |
 
 ## Key–value
@@ -18,7 +18,7 @@
 | Command | Behaviour |
 |---------|-----------|
 | `GET key` | Returns value or nil if missing/expired |
-| `SET key value [NX\|XX] [GET] [EX sec\|PX ms\|EXAT ts\|PXAT ts-ms\|KEEPTTL]` | Upsert with conditional flags and optional TTL |
+| <code>SET key value [NX&#124;XX] [GET] [EX sec&#124;PX ms&#124;EXAT ts&#124;PXAT ts-ms&#124;KEEPTTL]</code> | Upsert with conditional flags and optional TTL |
 | `SETEX key seconds value` | SET with seconds TTL |
 | `PSETEX key ms value` | SET with milliseconds TTL |
 | `MGET key [key ...]` | Bulk get, preserves nil for missing keys |
@@ -28,32 +28,33 @@
 | `TOUCH key [key ...]` | Counts as `EXISTS` does; there is no LRU clock to refresh |
 | `SETRANGE key offset value` | Overwrite from `offset`, padding the gap with NUL bytes; returns the new length |
 | `GETRANGE key start end` | Substring; negative indices count from the end, and both clamp |
-| `SETBIT key offset 0\|1` | Set a bit, growing the value to reach it; returns the bit as it was |
+| <code>SETBIT key offset 0&#124;1</code> | Set a bit, growing the value to reach it; returns the bit as it was |
 | `GETBIT key offset` | The bit, or `0` past the end |
-| `BITCOUNT key [start end [BYTE\|BIT]]` | Bits set, over the whole value or a range |
+| <code>BITCOUNT key [start end [BYTE&#124;BIT]]</code> | Bits set, over the whole value or a range |
 | `RENAME key newkey` | Rename, replacing `newkey`; errors if `key` is missing |
-| `RENAMENX key newkey` | The same, but `0` rather than replacing an occupied `newkey` |
-| `COPY src dst [DB n] [REPLACE]` | Duplicate a key of any type — see below |
-| `DUMP key` / `RESTORE key ttl payload [REPLACE\|ABSTTL]` | Redis's serialisation format, interchangeable with a real 7.2 — see below |
-| `OBJECT ENCODING key` | Redis's name for the representation — see below |
-| `FLUSHDB [ASYNC\|SYNC]` | Empty the current database |
-| `FLUSHALL [ASYNC\|SYNC]` | Empty **all sixteen**, the durable half included — see below |
+| `RENAMENX key newkey` | The same, but returns `0` and leaves an occupied `newkey` in place |
+| `COPY src dst [DB n] [REPLACE]` | Duplicate a key of any type; see below |
+| `DUMP key` / <code>RESTORE key ttl payload [REPLACE&#124;ABSTTL]</code> | Redis's serialisation format, interchangeable with a real 7.2; see below |
+| `OBJECT ENCODING key` | Redis's name for the representation; `FREQ`, `IDLETIME`, `REFCOUNT` and `HELP` as in Redis. See below |
+| <code>FLUSHDB [ASYNC&#124;SYNC]</code> | Empty the current database |
+| <code>FLUSHALL [ASYNC&#124;SYNC]</code> | Empty **all sixteen**, the durable half included; see below |
 
-Bits are numbered from the most significant of byte 0, as in Redis. `ASYNC` and
-`SYNC` are accepted and ignored: nothing here defers the work, so both spellings
-describe what already happens.
+Bits are numbered from the most significant of byte 0, as in Redis. A flush always
+runs immediately; `ASYNC` (or `lazyfree-lazy-user-flush`) only decides whether its
+keys are counted in `INFO memory`'s `lazyfreed_objects`, as Redis counts what it
+frees in the background.
 
-> **`FLUSHALL` destroys the durable half.** Databases 8–15 are WAL-backed and
-> survive a restart, and the Redis port bypasses PostgreSQL authentication — so
-> any client that can reach it can erase them, with no confirmation and nothing
-> to roll back to but your own backups. This matches Redis, deliberately. If
-> that reach is wider than you want, bind `redis.listen_address` to loopback
-> (the default) and set `redis.password`.
+> **`FLUSHALL` destroys the durable half.** Databases with the `logged` policy
+> (8–15 by default) are WAL-backed and survive a restart. The Redis port bypasses PostgreSQL authentication, so any
+> client that can reach it can erase them with no confirmation. Only your own
+> backups can bring them back. This matches Redis and is deliberate. If the
+> port is reachable more widely than you want, bind `redis.listen_address` to
+> loopback (the default) and set `redis.password`.
 
 ### `COPY` across the two halves
 
-`COPY src dst DB n` may name a database on the other storage half, which is how
-a shared-memory cache entry becomes a durable row, or the reverse:
+`COPY src dst DB n` may name a database on the other storage half. That turns a
+shared-memory cache entry into a durable row, or the reverse:
 
 ```
 SELECT cache
@@ -61,38 +62,52 @@ SET session:42 '{"user":7}'
 COPY session:42 session:42 DB 8    -- now WAL-backed
 ```
 
-It copies every type, not just strings. Redis has no such split, so this is the
-one place `COPY` does more here than there. The read and the write land in one
-transaction, but they are two different storage engines: a crash between them
-cannot leave the destination half-written, though the value must also pass every
-limit of the half it is going to.
+It copies keys of every type. Redis has no such split, so copying across halves
+is the one thing `COPY` does here that it cannot do in Redis. The read and the
+write run in one transaction, across two different storage engines. A crash
+between them cannot leave the destination half-written. The value must still
+pass every limit of the destination half.
 
 ### `DUMP` and `RESTORE`
 
-`DUMP` emits Redis's own payload format — an RDB-serialised value, a two-byte
-version stamped 11, and a CRC-64 — so what it produces restores into a real
-Redis 7.2 (the version this server reports) and vice versa. Streams included:
-they are written as Redis lays them out, node listpacks, consumer groups,
-pending entries and consumer times, and a Redis stream payload of any format
-since 5.0 restores here. The bytes are not always identical to what Redis
-itself would emit, because valid encodings are not unique (a set's member
-order, say); `RESTORE` accepts everything a 7.2 produces, listpacks and
-compressed strings included. Two deliberate refusals, both loud: payloads
-stamped newer than version 11 (what a 7.4 would hand you — Redis 7.2 refuses
-them too), and the compact encodings no server since 6.x has written
-(ziplists, zipmaps).
-`REPLACE` and `ABSTTL` behave as in Redis; `IDLETIME` and `FREQ` are accepted
-and unused, there being no LRU or LFU clock to hand them to.
+`DUMP` emits Redis's own payload format: an RDB-serialised value, a two-byte
+version stamped 11, and a CRC-64. Its output restores into a real Redis 7.2
+(the version this server reports), and a 7.2 payload restores here. This
+includes streams, which are written in Redis's layout of node listpacks,
+consumer groups, pending entries and consumer times. A Redis stream payload of
+any format since 5.0 restores here. The bytes are not always identical to what
+Redis itself would emit, because valid encodings are not unique (a set's
+member order, for example). A hash, set or sorted set is written in the payload
+type its encoding calls for, as Redis writes it, so a listpack or intset
+restores as one with its order. `RESTORE` accepts everything a 7.2 produces,
+listpacks and compressed strings included. It deliberately refuses two kinds of
+payload, with an error: payloads stamped newer than version 11, which is what a
+7.4 produces and Redis 7.2 also refuses, and the compact encodings (ziplists,
+zipmaps) that no server since 6.x has written.
+`REPLACE`, `ABSTTL`, `IDLETIME` and `FREQ` behave as in Redis: `IDLETIME`
+sets the key's access clock under an LRU-kept policy, `FREQ` its counter under
+an LFU one, and the two exclude each other.
 
 ### `OBJECT ENCODING`
 
-Reports the encoding **Redis** would use — `int`, `embstr`, `raw`, `listpack`,
-`quicklist`, `intset`, `hashtable`, `skiplist` — derived from the value's shape
-against Redis's default thresholds. pg_redis stores none of those
-representations; it has its own collections, or a `bytea` column.
-The name is reported for the benefit of clients that branch on it, and says
-nothing about how this server stores anything. A missing key answers nil, which
-is Redis's own reply here and not the error most commands give.
+Reports the encoding **Redis** would use (`int`, `embstr`, `raw`, `listpack`,
+`quicklist`, `intset`, `hashtable` or `skiplist`). A hash, set or sorted set
+carries the encoding Redis would have given it, kept as Redis keeps it: it
+converts once it passes Redis's thresholds and never converts back, and the
+thresholds follow `CONFIG SET` of the `*-max-listpack-*` and
+`set-max-intset-entries` parameters. The same state decides the order the
+elements come back in: insertion order for a listpack, sorted for an intset.
+A string's and a list's encoding are worked out from the value. pg_redis
+stores none of those representations; it uses its own collections, or a
+`bytea` column. A missing key answers nil. That is Redis's own reply for this
+command, though most commands give an error instead.
+
+`OBJECT IDLETIME` and `OBJECT FREQ` read the key's access field, kept as
+Redis 7.2 keeps it ([The access clock](IMPLEMENTATION.md#the-access-clock)),
+and give Redis's errors under the policy that does not keep what they ask
+for. `OBJECT REFCOUNT` answers `2147483647` for a string holding an integer
+from 0 to 9999, which Redis shares, unless an LRU or LFU policy is set with a
+limit, and 1 for anything else. A missing key answers nil.
 
 ## Expiry
 
@@ -107,11 +122,11 @@ is Redis's own reply here and not the error most commands give.
 | `PERSIST key` | Remove TTL |
 | `EXPIRETIME key` | Absolute expiry as unix timestamp (seconds) |
 | `PEXPIRETIME key` | Absolute expiry as unix timestamp (milliseconds) |
-| `GETEX key [EX s\|PX ms\|EXAT ts\|PXAT ts\|PERSIST]` | Read the value and, optionally, change what happens to it next |
+| <code>GETEX key [EX s&#124;PX ms&#124;EXAT ts&#124;PXAT ts&#124;PERSIST]</code> | Read the value and, optionally, change what happens to it next |
 
-Every type carries an expiry, not just strings: a list, set, hash or sorted set
-takes a TTL and is deleted whole when it passes. Replacing a key's value clears
-its TTL, as in Redis — `SET` over a string, and `SUNIONSTORE` over a set alike.
+Every type carries an expiry. A list, set, hash or sorted set takes a TTL and
+is deleted whole when it passes. Replacing a key's value clears its TTL, as in
+Redis. That holds for `SET` over a string and for `SUNIONSTORE` over a set.
 
 ## Hashes
 
@@ -135,15 +150,15 @@ its TTL, as in Redis — `SET` over a string, and `SUNIONSTORE` over a set alike
 | `LPUSH`/`RPUSH key value [value ...]` | Prepend/append, returns the new length |
 | `LPOP`/`RPOP key [count]` | Pop from either end |
 | `LRANGE key start stop` | Inclusive range, negative indices count from the tail |
-| `LINSERT key BEFORE\|AFTER pivot value` | Returns the new length, `-1` if the pivot is absent, `0` if the key is |
+| <code>LINSERT key BEFORE&#124;AFTER pivot value</code> | Returns the new length, `-1` if the pivot is absent, `0` if the key is |
 | `LREM key count value` | `count > 0` from the head, `< 0` from the tail, `0` removes every match |
-| `LPOS key element [RANK r] [COUNT n]` | Negative `RANK` searches from the tail; `COUNT 0` returns every match |
-| `LMOVE src dst LEFT\|RIGHT LEFT\|RIGHT` | Pop from one end of `src` and push onto one end of `dst` |
+| `LPOS key element [RANK r] [COUNT n] [MAXLEN len]` | Negative `RANK` searches from the tail; `COUNT 0` returns every match |
+| <code>LMOVE src dst LEFT&#124;RIGHT LEFT&#124;RIGHT</code> | Pop from one end of `src` and push onto one end of `dst` |
 | `RPOPLPUSH src dst` | `LMOVE src dst RIGHT LEFT`, under its older name |
 
 `LINSERT` and `LREM` rewrite the list so its positions stay contiguous, which
-makes them O(n). Removing in place would leave a gap, and every reader walks
-positions in order — the list would silently end at the first gap.
+makes them O(n). Removing in place would leave a gap. Every reader walks
+positions in order, so the list would end at the first gap with no error.
 
 ## Sets
 
@@ -167,7 +182,7 @@ works unchanged:
 | Reply | Meaning |
 |---|---|
 | `-ERR ...` | The general case |
-| `-WRONGTYPE Operation against a key holding the wrong kind of value` | The key holds another type. A key holds exactly one — see [one database, one dictionary](IMPLEMENTATION.md#one-database-one-dictionary) |
+| `-WRONGTYPE Operation against a key holding the wrong kind of value` | The key holds another type. A key holds exactly one type; see [one database, one dictionary](IMPLEMENTATION.md#one-database-one-dictionary) |
 | `-OOM command not allowed when used memory > 'maxmemory'` | Memory mode is past `redis.maxmemory` and `redis.maxmemory_policy` could not evict enough. See [the limit and eviction](IMPLEMENTATION.md#the-limit-and-eviction) |
 
 `WRONGTYPE` applies to every policy; `OOM` is specific to databases in memory,
@@ -179,14 +194,23 @@ limit is checked before the command runs, so a refused write changes nothing.
 | Command | Behaviour |
 |---------|-----------|
 | `MULTI` | Begin a transaction block; subsequent commands are queued |
-| `EXEC` | Execute all queued commands atomically; returns nil if a `WATCH`ed key changed |
+| `EXEC` | Run the queued commands with no other client's command on their databases between them; returns nil if a `WATCH`ed key changed |
 | `DISCARD` | Discard the queued commands and exit the transaction block |
 | `WATCH key [key ...]` | Mark keys to watch; if any are modified before `EXEC`, the transaction aborts |
 | `UNWATCH` | Clear all watched keys |
 
-Commands queued inside `MULTI` receive `QUEUED` responses. Runtime errors inside `EXEC` (e.g. `INCR` on a non-integer) are returned as per-command errors without aborting the remaining commands: each command runs in its own subtransaction, so a failure rolls back that command only.
+The server runs a pool of workers (`redis.workers`), and each database has a
+lock in shared memory that all of them share. Ordinary commands hold it
+shared and run in parallel. `EXEC` holds every database its queue touches
+exclusive until the transaction has committed, so no other client's command
+on those databases runs in between, on any worker, as in Redis. Other
+databases are not affected. `EVAL` and `FCALL` scripts, and commands built
+from several steps such as `ZUNIONSTORE`, hold their database the same way.
+See [Atomicity across workers](IMPLEMENTATION.md#atomicity-across-workers).
+
+Commands queued inside `MULTI` receive `QUEUED` responses. Runtime errors inside `EXEC` (e.g. `INCR` on a non-integer) are returned as per-command errors without aborting the remaining commands: on a table-backed database each command runs in its own subtransaction, so a failure rolls back that command only.
 
 `WATCH` tracks writes through counters in shared memory, so it detects a conflicting write no matter which worker served it. Two consequences:
 
-- It requires the extension in `shared_preload_libraries`; otherwise `WATCH` returns an error rather than silently failing to detect anything.
+- It requires the extension in `shared_preload_libraries`; without it, `WATCH` returns an error, so it never silently fails to detect a conflict.
 - Keys are hashed into a fixed table of counters, so unrelated keys can occasionally share one. That can abort an `EXEC` that did not strictly conflict; it can never let a conflicting one through. Retry on a nil `EXEC`, as with Redis.

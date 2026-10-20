@@ -1,4 +1,8 @@
+# Used by the mise test tasks (e2e, parity, acceptance). The suites reach the
+# servers over the compose network, so nothing is published on the host, and
+# several stacks (worktrees, parallel runs) can run side by side.
 services:
   postgres:
-    ports: !override
-      - "6379:6379"
+    ports: !reset []
+  redis:
+    ports: !reset []

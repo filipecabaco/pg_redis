@@ -27,6 +27,25 @@ pub fn is_superuser() -> bool {
     unsafe { pg_sys::superuser() }
 }
 
+/// Read the configuration files again after a SIGHUP, as a backend does
+/// between queries, so `SHOW` and every GUC read see the new values.
+pub fn reload_config() {
+    assert!(!in_transaction(), "a reload is taken between transactions");
+    // SAFETY: called on the main thread (the FFI guard enforces it) and
+    // outside a transaction (asserted), where PostgreSQL's own backends call
+    // it. An invalid setting in the file is logged and skipped, not raised.
+    unsafe { pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP) }
+}
+
+/// Whether the library is being loaded from `shared_preload_libraries`, at
+/// postmaster start: the one time shared memory can be requested, static
+/// background workers registered and restart-only settings defined.
+pub fn preloading() -> bool {
+    // SAFETY: a plain read of a backend-global flag PostgreSQL sets while it
+    // processes shared_preload_libraries; no preconditions.
+    unsafe { pg_sys::process_shared_preload_libraries_in_progress }
+}
+
 /// The database this backend is connected to.
 pub fn database_oid() -> pg_sys::Oid {
     // SAFETY: a plain read of a backend-local global, set once at connection
@@ -178,4 +197,25 @@ pub fn transaction_or_abort<T>(body: impl FnOnce() -> Option<T>) -> Option<T> {
         }
     }
     value
+}
+
+static ON_EXIT: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Run `f` as this process exits through `proc_exit`, a FATAL error's exit
+/// included: what releases the database locks (`src/dblock.rs`) when nothing
+/// unwound to their guards. One callback per process; a second call is
+/// ignored.
+pub fn before_exit(f: fn()) {
+    if ON_EXIT.set(f).is_err() {
+        return;
+    }
+    extern "C-unwind" fn run(_code: std::ffi::c_int, _arg: pg_sys::Datum) {
+        if let Some(f) = ON_EXIT.get() {
+            f();
+        }
+    }
+    // SAFETY: registers a callback with no argument to free; `run` touches
+    // nothing but a Rust static and the atomics `f` reads. PostgreSQL calls it
+    // once, on the main thread, while shared memory is still attached.
+    unsafe { pg_sys::before_shmem_exit(Some(run), pg_sys::Datum::from(0usize)) };
 }

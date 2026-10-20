@@ -198,11 +198,20 @@ pub struct Usage {
 
 pub fn usage() -> Option<Usage> {
     let a = arena()?;
+    let used = used_bytes(a);
     Some(Usage {
-        used: a.used.load(Ordering::Relaxed),
-        peak: a.peak.load(Ordering::Relaxed),
+        used,
+        peak: a.peak.fetch_max(used, Ordering::Relaxed).max(used),
         limit: a.limit.load(Ordering::Relaxed),
     })
+}
+
+/// What the server has allocated, as Redis's `used_memory` counts it: the
+/// data, and the shared heap's subscriptions, queued messages, tracking table
+/// and ACL users (`pubheap.rs`). Redis counts its clients' output buffers
+/// against `maxmemory` too.
+fn used_bytes(a: &Arena) -> usize {
+    a.used.load(Ordering::Relaxed) + crate::pubheap::counted()
 }
 
 /// `CONFIG SET maxmemory`: a new limit, no higher than the arena was sized
@@ -252,59 +261,21 @@ pub fn with_db<R>(slot: usize, f: impl FnOnce(&mut Db<Shm>) -> R) -> Result<R, F
     })
 }
 
-/// `redis.maxmemory_policy`, named after Redis's setting.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Policy {
-    NoEviction,
-    AllKeysRandom,
-    VolatileTtl,
+/// Bytes left under the limit, when there is an arena: what the keyspace
+/// may grow by in one step (`Dict::grow_within`).
+pub fn room() -> Option<usize> {
+    let a = arena()?;
+    Some(
+        a.limit
+            .load(Ordering::Relaxed)
+            .saturating_sub(a.used.load(Ordering::Relaxed)),
+    )
 }
 
-impl Policy {
-    pub fn parse(setting: Option<&str>) -> Policy {
-        match setting {
-            Some("allkeys-random") => Policy::AllKeysRandom,
-            Some("volatile-ttl") => Policy::VolatileTtl,
-            _ => Policy::NoEviction,
-        }
-    }
-
-    /// The GUC, or what `CONFIG SET maxmemory-policy` replaced it with.
-    fn current() -> Policy {
-        Policy::parse(Some(&crate::config::get_str("maxmemory-policy")))
-    }
-}
-
-/// Before a write that may grow memory, as Redis does before a `denyoom`
-/// command: over the limit, evict under the policy until back under it.
-/// False when still over — the policy allows nothing more — and the write
-/// must be refused.
-pub fn make_room() -> bool {
-    let Some(a) = arena() else { return true };
-    let over = || a.used.load(Ordering::Relaxed) > a.limit.load(Ordering::Relaxed);
-    if !over() {
-        return true;
-    }
-    let volatile_only = match Policy::current() {
-        Policy::NoEviction => return false,
-        Policy::AllKeysRandom => false,
-        Policy::VolatileTtl => true,
-    };
-    while over() {
-        let mut freed = false;
-        for slot in 0..NUM_SLOTS {
-            if with_db(slot, |db| db.evict(volatile_only)) == Ok(true) {
-                freed = true;
-                if !over() {
-                    break;
-                }
-            }
-        }
-        if !freed {
-            return false;
-        }
-    }
-    true
+/// Whether the arena holds more than the limit: Redis's
+/// `getMaxmemoryState` failing. What is done about it is `crate::evict`'s.
+pub fn over_limit() -> bool {
+    arena().is_some_and(|a| used_bytes(a) > a.limit.load(Ordering::Relaxed))
 }
 
 /// The arena's allocator, as a handle that costs nothing to store: every
@@ -356,5 +327,79 @@ unsafe impl Allocator for Shm {
             (*a.talc.get()).deallocate(ptr.as_ptr(), layout);
         }
         a.used.fetch_sub(layout.size(), Ordering::Relaxed);
+    }
+}
+
+/// `maxmemory-policy`, and the `redis.maxmemory_policy` GUC. Here rather
+/// than in `access.rs` because the GUC derive implements an `unsafe` trait,
+/// and this module is the one in the engine allowed `unsafe`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, pgrx::PostgresGucEnum)]
+pub enum Policy {
+    #[name = c"noeviction"]
+    NoEviction,
+    #[name = c"allkeys-lru"]
+    AllKeysLru,
+    #[name = c"allkeys-lfu"]
+    AllKeysLfu,
+    #[name = c"allkeys-random"]
+    AllKeysRandom,
+    #[name = c"volatile-lru"]
+    VolatileLru,
+    #[name = c"volatile-lfu"]
+    VolatileLfu,
+    #[name = c"volatile-random"]
+    VolatileRandom,
+    #[name = c"volatile-ttl"]
+    VolatileTtl,
+}
+
+impl Policy {
+    pub const ALL: [Policy; 8] = [
+        Policy::NoEviction,
+        Policy::AllKeysLru,
+        Policy::AllKeysLfu,
+        Policy::AllKeysRandom,
+        Policy::VolatileLru,
+        Policy::VolatileLfu,
+        Policy::VolatileRandom,
+        Policy::VolatileTtl,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Policy::NoEviction => "noeviction",
+            Policy::AllKeysLru => "allkeys-lru",
+            Policy::AllKeysLfu => "allkeys-lfu",
+            Policy::AllKeysRandom => "allkeys-random",
+            Policy::VolatileLru => "volatile-lru",
+            Policy::VolatileLfu => "volatile-lfu",
+            Policy::VolatileRandom => "volatile-random",
+            Policy::VolatileTtl => "volatile-ttl",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Policy> {
+        Policy::ALL.into_iter().find(|p| p.name() == s)
+    }
+
+    /// `MAXMEMORY_FLAG_LFU`.
+    pub fn lfu(self) -> bool {
+        matches!(self, Policy::AllKeysLfu | Policy::VolatileLfu)
+    }
+
+    /// `MAXMEMORY_FLAG_LRU`.
+    pub fn lru(self) -> bool {
+        matches!(self, Policy::AllKeysLru | Policy::VolatileLru)
+    }
+
+    /// Whether only keys with a deadline may be evicted.
+    pub fn volatile(self) -> bool {
+        matches!(
+            self,
+            Policy::VolatileLru
+                | Policy::VolatileLfu
+                | Policy::VolatileRandom
+                | Policy::VolatileTtl
+        )
     }
 }

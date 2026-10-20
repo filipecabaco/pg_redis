@@ -24,6 +24,12 @@ export class RawRedis {
 	 * sent in one `write` was cut short, and the server waited for the
 	 * remainder forever. */
 	private pending: Buffer[] = [];
+	/** Set once the server closed the connection; replies still awaited
+	 * then resolve empty. */
+	closed = false;
+	/** Set once the server closed the connection; replies still awaited
+	 * then resolve empty. */
+	closed = false;
 
 	async connect(opts: RawRedisOptions = {}) {
 		const host = opts.host ?? process.env.REDIS_HOST ?? "localhost";
@@ -39,7 +45,10 @@ export class RawRedis {
 				},
 				drain: () => this.flush(),
 				error: () => {},
-				close: () => {},
+				close: () => {
+					this.closed = true;
+					for (const w of this.waiters.splice(0)) w(Buffer.alloc(0));
+				},
 			},
 		});
 		if (password) await this.send("AUTH", password);
@@ -57,12 +66,21 @@ export class RawRedis {
 		}
 	}
 
+	/** The next reply the server sends unasked: a pub/sub message. */
+	next(): Promise<Buffer> {
+		const done = new Promise<Buffer>((resolve) => this.waiters.push(resolve));
+		this.drain();
+		return done;
+	}
+
 	send(...args: Array<string | Buffer>): Promise<Buffer> {
 		const parts: Buffer[] = [Buffer.from(`*${args.length}\r\n`)];
 		for (const a of args) {
 			const b = Buffer.isBuffer(a) ? a : Buffer.from(a, "utf8");
 			parts.push(Buffer.from(`$${b.length}\r\n`), b, Buffer.from("\r\n"));
 		}
+		if (this.closed) return Promise.resolve(Buffer.alloc(0));
+		if (this.closed) return Promise.resolve(Buffer.alloc(0));
 		const done = new Promise<Buffer>((resolve) => this.waiters.push(resolve));
 		this.pending.push(Buffer.concat(parts));
 		if (this.pending.length === 1) this.flush();
@@ -153,8 +171,117 @@ export function integerReply(reply: Buffer): number {
 	return Number(text.slice(1, text.indexOf("\r\n")));
 }
 
+/**
+ * A `SCAN`-family reply: the cursor as the server spelled it, and the
+ * elements. Throws on anything else, an error reply included.
+ */
+export function scanReply(reply: Buffer): { cursor: string; items: Buffer[] } {
+	if (!reply.toString("latin1", 0, 4).startsWith("*2\r\n")) {
+		throw new Error(`expected a scan reply, got ${reply.subarray(0, 64)}`);
+	}
+	const bulk = (at: number): [Buffer, number] => {
+		const head = reply.indexOf("\r\n", at);
+		const len = Number(reply.subarray(at + 1, head).toString());
+		return [reply.subarray(head + 2, head + 2 + len), head + 2 + len + 2];
+	};
+	const [cursor, rest] = bulk(4);
+	const head = reply.indexOf("\r\n", rest);
+	const count = Number(reply.subarray(rest + 1, head).toString());
+	const items: Buffer[] = [];
+	let cur = head + 2;
+	for (let i = 0; i < count; i++) {
+		const [item, next] = bulk(cur);
+		items.push(item);
+		cur = next;
+	}
+	return { cursor: cursor.toString(), items };
+}
+
 /** The message of an error reply, or null when the reply is not an error. */
 export function errorReply(reply: Buffer): string | null {
 	const text = reply.toString();
 	return text.startsWith("-") ? text.slice(1, text.indexOf("\r\n")) : null;
+}
+
+/** A RESP2 value, decoded: bulk and simple strings as strings, integers as
+ * numbers, nil as null, arrays as arrays, errors as `{ error }`. */
+export type Resp = string | number | null | Resp[] | { error: string };
+
+export function decode(buf: Buffer): Resp {
+	const [v] = decodeAt(buf, 0);
+	return v;
+}
+
+function decodeAt(buf: Buffer, at: number): [Resp, number] {
+	const head = buf.indexOf("\r\n", at);
+	const line = buf.toString("utf8", at + 1, head);
+	const next = head + 2;
+	switch (buf[at]) {
+		case 0x2b: // +
+			return [line, next];
+		case 0x2d: // -
+			return [{ error: line }, next];
+		case 0x3a: // :
+			return [Number(line), next];
+		case 0x24: {
+			const len = Number(line);
+			if (len < 0) return [null, next];
+			return [buf.toString("utf8", next, next + len), next + len + 2];
+		}
+		case 0x2a: {
+			const n = Number(line);
+			if (n < 0) return [null, next];
+			const out: Resp[] = [];
+			let cur = next;
+			for (let i = 0; i < n; i++) {
+				const [v, c] = decodeAt(buf, cur);
+				out.push(v);
+				cur = c;
+			}
+			return [out, cur];
+		}
+		default:
+			throw new Error(`cannot decode ${buf.subarray(at, at + 32)}`);
+	}
+}
+
+/** A RESP2 value, decoded: bulk and simple strings as strings, integers as
+ * numbers, nil as null, arrays as arrays, errors as `{ error }`. */
+export type Resp = string | number | null | Resp[] | { error: string };
+
+export function decode(buf: Buffer): Resp {
+	return decodeAt(buf, 0)[0];
+}
+
+function decodeAt(buf: Buffer, at: number): [Resp, number] {
+	const head = buf.indexOf("\r\n", at);
+	const line = buf.toString("utf8", at + 1, head);
+	const next = head + 2;
+	switch (buf[at]) {
+		case 0x2b: // +
+			return [line, next];
+		case 0x2d: // -
+			return [{ error: line }, next];
+		case 0x3a: // :
+			return [Number(line), next];
+		case 0x24: {
+			const len = Number(line);
+			if (len < 0) return [null, next];
+			return [buf.toString("utf8", next, next + len), next + len + 2];
+		}
+		case 0x2a: {
+			const n = Number(line);
+			if (n < 0) return [null, next];
+			const out: Resp[] = [];
+			let cur = next;
+			for (let i = 0; i < n; i++) {
+				const [v, c] = decodeAt(buf, cur);
+				out.push(v);
+				cur = c;
+			}
+			return [out, cur];
+		}
+		default:
+			throw new Error(`cannot decode ${buf.subarray(at, at + 32)}`);
+	}
 }

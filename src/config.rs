@@ -19,9 +19,12 @@ pub fn spec(name: &str) -> Option<&'static ConfigSpec> {
         .find(|c| c.name == n || (!c.alias.is_empty() && c.alias == n))
 }
 
-/// The GUC values `CONFIG GET` reports in place of Redis's defaults. Read once
-/// on the worker's main thread by [`snapshot_gucs`]: pgrx refuses a GUC read
-/// from any other thread, and these are answered on connection threads.
+/// The GUC values connection threads need: what `CONFIG GET` reports in place
+/// of Redis's defaults, and the password, connection limit and default
+/// database the listener applies. Taken on the worker's main thread by
+/// [`snapshot_gucs`], at start and again after every reload: pgrx refuses a
+/// GUC read from any other thread, and these are answered on connection
+/// threads.
 #[derive(Default, Clone)]
 pub struct LiveGucs {
     pub port: i32,
@@ -29,26 +32,55 @@ pub struct LiveGucs {
     pub requirepass: Option<String>,
     pub maxclients: i32,
     pub maxmemory_policy: Option<String>,
+    pub default_db: u8,
 }
 
-static LIVE: std::sync::OnceLock<LiveGucs> = std::sync::OnceLock::new();
+impl LiveGucs {
+    /// `redis.password` as the bytes a client must send, or `None` when no
+    /// password is set.
+    pub fn password(&self) -> Option<Vec<u8>> {
+        self.requirepass
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .map(|p| p.as_bytes().to_vec())
+    }
+}
 
-/// Take the snapshot. Call on the background worker's main thread.
+static LIVE: std::sync::RwLock<Option<LiveGucs>> = std::sync::RwLock::new(None);
+
+/// Take the snapshot, replacing the last one. Call on the background
+/// worker's main thread.
 pub fn snapshot_gucs() {
     let s = |g: &pgrx::guc::GucSetting<Option<std::ffi::CString>>| {
         g.get().and_then(|c| c.to_str().ok().map(str::to_string))
     };
-    let _ = LIVE.set(LiveGucs {
+    let next = LiveGucs {
         port: crate::PORT.get(),
         bind: s(&crate::LISTEN_ADDRESS),
         requirepass: s(&crate::PASSWORD),
         maxclients: crate::MAX_CONNECTIONS.get(),
-        maxmemory_policy: s(&crate::MAXMEMORY_POLICY),
-    });
+        maxmemory_policy: Some(crate::MAXMEMORY_POLICY.get().name().to_string()),
+        default_db: crate::DEFAULT_DB.get().clamp(0, 15) as u8,
+    };
+    // A poisoned lock only means a reader panicked holding it; the value is
+    // a plain copy and still whole.
+    *LIVE.write().unwrap_or_else(|e| e.into_inner()) = Some(next);
+    GUC_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// Bumped by every snapshot, so a cache of settings read through it knows
+/// to read them again (`access::settings`).
+static GUC_GENERATION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn guc_generation() -> u32 {
+    GUC_GENERATION.load(std::sync::atomic::Ordering::Acquire)
 }
 
 pub fn live_gucs() -> LiveGucs {
-    LIVE.get().cloned().unwrap_or_default()
+    LIVE.read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default()
 }
 
 /// What pg_redis itself fixes for a parameter, where Redis's default would
@@ -160,6 +192,14 @@ fn normalise(spec: &ConfigSpec, arg: &str, v: &str) -> Result<String, String> {
                 if n < 0 {
                     return Err(failed(arg, "argument must be a memory or percent value"));
                 }
+                // Redis keeps a percentage as its negative, bounded below by
+                // the config's lower bound.
+                if -n < *min {
+                    return Err(failed(
+                        arg,
+                        &format!("percentage argument must be less or equal to {}", -*min),
+                    ));
+                }
                 return Ok(format!("{n}%"));
             }
             let n = if *mem {
@@ -234,22 +274,65 @@ fn special(name: &str, arg: &str, v: &str) -> Result<String, String> {
             }
             Ok(keyspace_events_canonical(v))
         }
+        // Only the classes named change; all three are reported, in bytes,
+        // in Redis's order.
         "client-output-buffer-limit" => {
             let parts: Vec<&str> = v.split_whitespace().collect();
-            if !parts.len().is_multiple_of(4)
-                || parts.chunks(4).any(|c| {
-                    !matches!(c[0], "normal" | "replica" | "slave" | "pubsub")
-                        || memory(c[1]).is_none()
-                        || memory(c[2]).is_none()
-                        || c[3].parse::<u64>().is_err()
-                })
-            {
+            if !parts.len().is_multiple_of(4) {
                 return Err(failed(
                     arg,
                     "Wrong number of arguments in buffer limit configuration.",
                 ));
             }
-            Ok(v.to_string())
+            let mut classes = output_limit_classes(&get_str("client-output-buffer-limit"));
+            for c in parts.chunks(4) {
+                let class = match c[0].to_ascii_lowercase().as_str() {
+                    "normal" => 0,
+                    "replica" | "slave" => 1,
+                    "pubsub" => 2,
+                    _ => {
+                        return Err(failed(
+                            arg,
+                            "Invalid client class specified in buffer limit configuration.",
+                        ));
+                    }
+                };
+                match (bytes(c[1]), bytes(c[2]), c[3].parse::<u64>()) {
+                    (Some(hard), Some(soft), Ok(secs)) => classes[class] = [hard, soft, secs],
+                    _ => {
+                        return Err(failed(
+                            arg,
+                            "Error in hard, soft or soft_seconds setting in buffer limit configuration.",
+                        ));
+                    }
+                }
+            }
+            Ok(["normal", "slave", "pubsub"]
+                .iter()
+                .zip(classes)
+                .map(|(name, [h, s, t])| format!("{name} {h} {s} {t}"))
+                .collect::<Vec<_>>()
+                .join(" "))
+        }
+        // Each between 0 and 100, printed back as Redis prints a double.
+        "latency-tracking-info-percentiles" => {
+            let mut out = Vec::new();
+            for p in v.split_whitespace() {
+                let Ok(n) = p.parse::<f64>() else {
+                    return Err(failed(
+                        arg,
+                        "Invalid latency-tracking-info-percentiles parameters",
+                    ));
+                };
+                if !(0.0..=100.0).contains(&n) {
+                    return Err(failed(
+                        arg,
+                        "latency-tracking-info-percentiles parameters should be between 0.0 and 100.0",
+                    ));
+                }
+                out.push(crate::commands::format_score(n));
+            }
+            Ok(out.join(" "))
         }
         "oom-score-adj-values" => {
             let parts: Vec<&str> = v.split_whitespace().collect();
@@ -264,6 +347,35 @@ fn special(name: &str, arg: &str, v: &str) -> Result<String, String> {
         }
         _ => Ok(v.to_string()),
     }
+}
+
+/// A size as Redis writes one, in bytes, for the buffer limits.
+fn bytes(v: &str) -> Option<u64> {
+    memory(v).and_then(|n| u64::try_from(n).ok())
+}
+
+/// The three classes of a `client-output-buffer-limit` value, normal, replica
+/// and pubsub, each hard, soft and soft seconds; Redis's defaults for any it
+/// does not name.
+fn output_limit_classes(value: &str) -> [[u64; 3]; 3] {
+    let mut classes = [
+        [0, 0, 0],
+        [256 << 20, 64 << 20, 60],
+        [32 << 20, 8 << 20, 60],
+    ];
+    let words: Vec<&str> = value.split_whitespace().collect();
+    for c in words.chunks(4).filter(|c| c.len() == 4) {
+        let i = match c[0] {
+            "normal" => 0,
+            "replica" | "slave" => 1,
+            "pubsub" => 2,
+            _ => continue,
+        };
+        if let (Some(h), Some(s), Ok(t)) = (bytes(c[1]), bytes(c[2]), c[3].parse()) {
+            classes[i] = [h, s, t];
+        }
+    }
+    classes
 }
 
 /// Redis normalises the flags it was given: `A` expands to its classes and
@@ -318,14 +430,35 @@ pub fn set(args: &[Vec<u8>]) -> Result<(), String> {
         if spec.name == "hz" {
             value = value.parse::<i64>().unwrap_or(10).clamp(1, 500).to_string();
         }
+        // Applied by moving the listener, which Redis tries as it sets it:
+        // a port nothing can listen on fails the whole CONFIG SET.
+        if spec.name == "port"
+            && let Ok(port) = value.parse::<u16>()
+            && port != 0
+            && i64::from(port) != get_i64("port")
+        {
+            // A plain bind, without the reuse flags the listeners take: it
+            // fails while anything listens on the port, on any address.
+            let at = live_gucs().bind.unwrap_or_else(|| "0.0.0.0".into());
+            std::net::TcpListener::bind((at.as_str(), port))
+                .map_err(|e| failed(&arg, &format!("Unable to listen on this port: {e}")))?;
+        }
         staged.push((spec.name, value));
     }
     crate::server::config_set(&staged)?;
     if let Some((_, v)) = staged.iter().find(|(n, _)| *n == "notify-keyspace-events") {
         crate::server::set_notify_flags(crate::notify::parse_flags(v));
     }
+    // `updateRequirePass`: the default user's password, or none.
+    if let Some((_, v)) = staged.iter().find(|(n, _)| *n == "requirepass") {
+        crate::acl::set_default_password(Some(v.as_bytes()));
+    }
     if let Some((_, v)) = staged.iter().find(|(n, _)| *n == "maxmemory") {
         crate::shm::set_limit(v.parse().unwrap_or(0));
+    }
+    use crate::memdb::encoding::LIMIT_NAMES;
+    if staged.iter().any(|(n, _)| LIMIT_NAMES.contains(n)) {
+        crate::server::set_enc_limits(LIMIT_NAMES.map(get_i64));
     }
     Ok(())
 }
@@ -344,7 +477,39 @@ mod tests {
                 .unwrap_err()
                 .contains("memory value")
         );
+        let o = spec("client-output-buffer-limit").unwrap();
+        let set = |v: &str| normalise(o, "client-output-buffer-limit", v);
+        assert_eq!(
+            set("normal 1mb 2mb 60 replica 3mb 4mb 70 pubsub 5mb 6mb 80").unwrap(),
+            "normal 1048576 2097152 60 slave 3145728 4194304 70 pubsub 5242880 6291456 80"
+        );
+        // A class not named keeps its value.
+        assert_eq!(
+            set("normal 100000 0 0").unwrap(),
+            "normal 100000 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60"
+        );
+        assert!(
+            set("wrong number")
+                .unwrap_err()
+                .contains("Wrong number of arguments")
+        );
+        assert!(
+            set("master 10mb 10mb 60")
+                .unwrap_err()
+                .contains("Invalid client class")
+        );
+        assert!(
+            set("normal 10mbs 10mb 60")
+                .unwrap_err()
+                .contains("Error in hard")
+        );
+        assert!(
+            set("pubsub 10mb 10mb 60s")
+                .unwrap_err()
+                .contains("soft_seconds")
+        );
         let b = spec("appendonly").unwrap();
+
         assert_eq!(normalise(b, "appendonly", "YES").unwrap(), "yes");
         assert!(
             normalise(b, "appendonly", "maybe")

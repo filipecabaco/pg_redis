@@ -27,7 +27,7 @@ pub fn peer_closed(stream: &TcpStream) -> bool {
 /// Wait up to `timeout` for `stream` to become readable. True once it is, or
 /// has hung up or failed (the next read reports which); false when the time
 /// ran out.
-pub fn wait_readable(stream: &TcpStream, timeout: Duration) -> bool {
+pub fn wait_readable(stream: &impl std::os::fd::AsFd, timeout: Duration) -> bool {
     let mut fds = [rustix::event::PollFd::new(
         stream,
         rustix::event::PollFlags::IN,
@@ -86,3 +86,33 @@ pub fn futex_wait(_word: &AtomicU32, _expected: u32, timeout: Duration) {
 
 #[cfg(not(target_os = "linux"))]
 pub fn futex_wake(_word: &AtomicU32) {}
+
+/// Random bytes from the kernel, for identifiers rather than keys: a failed
+/// read leaves `out` zeroed.
+pub fn random_bytes(out: &mut [u8]) {
+    use std::io::Read;
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(out);
+    }
+}
+
+/// `INFO`'s `os` line as Redis writes it: kernel name, release and machine,
+/// from uname(2).
+pub fn os_name() -> String {
+    let u = rustix::system::uname();
+    format!(
+        "{} {} {}",
+        u.sysname().to_string_lossy(),
+        u.release().to_string_lossy(),
+        u.machine().to_string_lossy()
+    )
+}
+
+/// Wake every process sleeping in [`futex_wait`] on `word`.
+#[cfg(target_os = "linux")]
+pub fn futex_wake_all(word: &AtomicU32) {
+    let _ = rustix::thread::futex::wake(word, rustix::thread::futex::Flags::empty(), u32::MAX);
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn futex_wake_all(_word: &AtomicU32) {}

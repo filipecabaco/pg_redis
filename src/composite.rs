@@ -8,9 +8,10 @@
 //! So a command added here works on both halves, and against any database a
 //! `MOVE` or `COPY` names, without knowing which is which.
 //!
-//! The price is atomicity on the memory half: each sub-command takes its own
-//! locks, so another worker can interleave between two of them. On the durable
-//! half the whole command runs in one subtransaction and its rows stay locked.
+//! Each sub-command takes its backend's own locks and releases them. What
+//! keeps the whole command atomic is the database lock its dispatcher holds
+//! exclusive around it (`src/dblock.rs`), unless [`Op::single_step`] says it
+//! makes only one call, which holds it shared like any command.
 #![forbid(unsafe_code)]
 
 use crate::commands::{Command, Response, Value};
@@ -58,11 +59,6 @@ pub enum Op {
         db: u8,
     },
     Sort(Box<SortSpec>),
-    CollectionScan {
-        kind: ScanKind,
-        key: Vec<u8>,
-        pattern: Option<Vec<u8>>,
-    },
     BitField {
         key: Vec<u8>,
         ops: Vec<BitFieldOp>,
@@ -170,13 +166,6 @@ pub enum BitOpKind {
     Not,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ScanKind {
-    Hash,
-    Set,
-    Zset,
-}
-
 #[derive(Debug, Clone)]
 pub struct SortSpec {
     key: Vec<u8>,
@@ -249,7 +238,6 @@ impl Op {
             | "ZINTERCARD" => parse_zaggregate(name, args),
             "MOVE" => parse_move(args),
             "SORT" | "SORT_RO" => parse_sort(name == "SORT_RO", args),
-            "HSCAN" | "SSCAN" | "ZSCAN" => parse_collection_scan(name, args),
             "BITFIELD" | "BITFIELD_RO" => parse_bitfield(name == "BITFIELD_RO", args),
             "SWAPDB" => parse_swapdb(args),
             "PFADD" if !args.is_empty() => Ok(Op::PfAdd {
@@ -350,13 +338,33 @@ impl Op {
         }
     }
 
+    /// Whether the command makes a single storage call, and so is atomic
+    /// without holding its database exclusive. Every other composite reads
+    /// and writes, or reads twice, through separate calls.
+    pub fn single_step(&self) -> bool {
+        match self {
+            Op::BitPos { .. } | Op::GeoAdd { .. } | Op::PfSelfTest => true,
+            // Only GETs: one read of the string.
+            Op::BitField { ops, .. } => ops.iter().all(|o| o.kind == BitFieldKind::Get),
+            _ => false,
+        }
+    }
+
     /// Whether this command rewrites keys it cannot name, so every WATCH must
     /// be invalidated — `SWAPDB` changes what every key in two databases is.
     pub fn touches_everything(&self) -> bool {
         matches!(self, Op::SwapDb { .. })
     }
 
+    /// Run the command, its steps not counted as changes: it counts as
+    /// Redis counts it (`dirty::of_op`).
     pub fn run(&self, db: u8, exec: &mut Runner) -> Response {
+        let reply = crate::dirty::quietly(|| self.run_steps(db, exec));
+        crate::dirty::force(crate::dirty::of_op(self, &reply));
+        reply
+    }
+
+    fn run_steps(&self, db: u8, exec: &mut Runner) -> Response {
         let result = match self {
             Op::Lcs {
                 a,
@@ -394,9 +402,6 @@ impl Op {
             } => run_mpop(exec, db, *zset, keys, *front, *count),
             Op::Move { key, db: to } => run_move(exec, db, key, *to),
             Op::Sort(spec) => run_sort(exec, db, spec),
-            Op::CollectionScan { kind, key, pattern } => {
-                run_collection_scan(exec, db, *kind, key, pattern.as_deref())
-            }
             Op::BitField { key, ops } => run_bitfield(exec, db, key, ops),
             Op::SwapDb { a, b } => run_swapdb(exec, *a, *b),
             Op::PfAdd { key, elements } => run_pfadd(exec, db, key, elements),
@@ -1303,7 +1308,16 @@ fn run_sort(exec: &mut Runner, db: u8, spec: &SortSpec) -> Result<Response, Resp
     let mut elems: Vec<Vec<u8>> = match kind.as_str() {
         "list" => items(ok(call(exec, db, &[b"LRANGE", &spec.key, b"0", b"-1"]))?),
         "set" => items(ok(call(exec, db, &[b"SMEMBERS", &spec.key]))?),
-        "zset" => items(ok(call(exec, db, &[b"ZRANGE", &spec.key, b"0", b"-1"]))?),
+        // "Destructively convert encoded sorted sets for SORT."
+        "zset" => {
+            ok(exec(
+                db,
+                Command::ZsetToSkiplist {
+                    key: spec.key.clone(),
+                },
+            ))?;
+            items(ok(call(exec, db, &[b"ZRANGE", &spec.key, b"0", b"-1"]))?)
+        }
         "none" => vec![],
         _ => {
             return Err(Response::Error(
@@ -1420,77 +1434,6 @@ fn run_sort(exec: &mut Runner, db: u8, spec: &SortSpec) -> Result<Response, Resp
             Ok(Response::Integer(out.len() as i64))
         }
     }
-}
-
-// ───────────────────────────── HSCAN/SSCAN/ZSCAN ─────────────────────────────
-
-fn parse_collection_scan(name: &str, args: &[Vec<u8>]) -> Result<Op, String> {
-    if args.len() < 2 {
-        return Err(arity(name));
-    }
-    std::str::from_utf8(&args[1])
-        .ok()
-        .and_then(|c| c.parse::<u64>().ok())
-        .ok_or_else(|| "ERR invalid cursor".to_string())?;
-    let mut pattern = None;
-    let mut i = 2;
-    while i < args.len() {
-        if i + 1 >= args.len() {
-            return Err(SYNTAX.to_string());
-        }
-        if is(&args[i], "MATCH") {
-            pattern = Some(args[i + 1].clone());
-        } else if is(&args[i], "COUNT") {
-            if int(&args[i + 1])? < 1 {
-                return Err(SYNTAX.to_string());
-            }
-        } else {
-            return Err(SYNTAX.to_string());
-        }
-        i += 2;
-    }
-    Ok(Op::CollectionScan {
-        kind: match name {
-            "HSCAN" => ScanKind::Hash,
-            "SSCAN" => ScanKind::Set,
-            _ => ScanKind::Zset,
-        },
-        key: args[0].clone(),
-        pattern,
-    })
-}
-
-/// One pass over the whole collection, cursor 0 — the same guarantee `SCAN`
-/// gives here: every element present for the whole scan is returned.
-fn run_collection_scan(
-    exec: &mut Runner,
-    db: u8,
-    kind: ScanKind,
-    key: &[u8],
-    pattern: Option<&[u8]>,
-) -> Result<Response, Response> {
-    let (flat, stride) = match kind {
-        ScanKind::Hash => (items(ok(call(exec, db, &[b"HGETALL", key]))?), 2),
-        ScanKind::Set => (items(ok(call(exec, db, &[b"SMEMBERS", key]))?), 1),
-        ScanKind::Zset => (
-            items(ok(call(
-                exec,
-                db,
-                &[b"ZRANGE", key, b"0", b"-1", b"WITHSCORES"],
-            ))?),
-            2,
-        ),
-    };
-    let mut out = Vec::new();
-    for chunk in flat.chunks(stride) {
-        if pattern.is_none_or(|p| crate::pubsub::glob_match(p, &chunk[0])) {
-            out.extend(chunk.iter().cloned().map(Value::Bulk));
-        }
-    }
-    Ok(Response::Value(Value::Array(vec![
-        Value::str("0"),
-        Value::Array(out),
-    ])))
 }
 
 // ──────────────────────────────── BITFIELD ───────────────────────────────────
@@ -1690,11 +1633,16 @@ fn run_bitfield(
         .map(|o| o.offset + o.bits as u64 - 1)
         .max();
     let mut changed = false;
+    // Redis counts each write that changes a value, or that runs on a
+    // string it created or grew.
+    let mut grew = false;
+    let mut changes = 0;
     if let Some(h) = highest {
         let need = (h >> 3) as usize + 1;
         if buf.len() < need {
             buf.resize(need, 0);
             changed = true;
+            grew = true;
         }
     }
     let mut out = Vec::with_capacity(ops.len());
@@ -1722,6 +1670,7 @@ fn run_bitfield(
                     out.push(Value::Int(ret));
                     set_unsigned(&mut buf, op.offset, op.bits, new as u64);
                     changed |= old != new;
+                    changes += u64::from(grew || old != new);
                 }
             }
             (kind, false) => {
@@ -1745,6 +1694,7 @@ fn run_bitfield(
                     out.push(Value::Int(ret as i64));
                     set_unsigned(&mut buf, op.offset, op.bits, new);
                     changed |= old != new;
+                    changes += u64::from(grew || old != new);
                 }
             }
         }
@@ -1752,6 +1702,7 @@ fn run_bitfield(
     if changed {
         ok(call(exec, db, &[b"SET", key, &buf, b"KEEPTTL"]))?;
     }
+    crate::dirty::force(changes);
     Ok(Response::Value(Value::Array(out)))
 }
 
@@ -1821,6 +1772,15 @@ fn run_swapdb(exec: &mut Runner, a: u8, b: u8) -> Result<Response, Response> {
         restore_db(exec, b, &in_b)?;
         return Err(refusal);
     }
+    // `touchAllWatchedKeysInDb`: a WATCH breaks on a key that was live on
+    // either side, and on no other. One missing or expired on both did not
+    // change.
+    if let Some(ctl) = crate::watch_state() {
+        for (key, _, _) in in_a.iter().chain(&in_b) {
+            crate::watch::bump(ctl, a, key);
+            crate::watch::bump(ctl, b, key);
+        }
+    }
     Ok(Response::Ok)
 }
 
@@ -1846,8 +1806,10 @@ fn corrupt(_: crate::hll::Corrupt) -> Response {
     Response::Error(crate::hll::INVALID.to_string())
 }
 
+/// `hll-sparse-max-bytes`: past it a sparse HyperLogLog turns dense.
 fn sparse_max() -> usize {
-    crate::hll::DEFAULT_SPARSE_MAX_BYTES
+    usize::try_from(crate::config::get_i64("hll-sparse-max-bytes"))
+        .unwrap_or(crate::hll::DEFAULT_SPARSE_MAX_BYTES)
 }
 
 fn run_pfadd(

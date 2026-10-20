@@ -34,11 +34,6 @@ const CMD_LEN: usize = 48;
 const CONFIG_NAME_LEN: usize = 64;
 const CONFIG_VALUE_LEN: usize = 512;
 const TRACK_PREFIXES_LEN: usize = 512;
-/// Tracked (key, client) pairs across all clients.
-pub const TRACK_CAP: usize = 16384;
-/// The longest key name the tracking table keeps; a longer key is still
-/// tracked and invalidated by its writes, but never chosen for eviction.
-pub const TRACK_NAME_LEN: usize = 128;
 
 /// A string field with its length, written only under its owner's seqlock.
 #[repr(C)]
@@ -131,6 +126,12 @@ pub struct ClientSlot {
     /// A pub/sub slot another connection subscribed to this one's tracking
     /// channel for it to take over, or `HANDOFF_NONE` / `HANDOFF_CLOSED`.
     pub track_handoff: AtomicI32,
+    /// The serial of the ACL user the client is authenticated as.
+    pub user_serial: AtomicU64,
+    /// Set when the client's user lost channel permissions: a subscriber
+    /// checks its subscriptions and closes if one is no longer allowed, then
+    /// clears it.
+    pub acl_recheck: AtomicU32,
     /// `BCAST` prefixes, NUL-separated, behind `seq`.
     track_prefixes: Field<TRACK_PREFIXES_LEN>,
     name: Field<NAME_LEN>,
@@ -213,6 +214,8 @@ pub struct SlowEntry {
 #[repr(C)]
 pub struct ServerCtl {
     initialised: AtomicU32,
+    /// `INFO`'s `run_id`: random, new at every server start, as in Redis.
+    run_id: [AtomicU64; 3],
     pub next_client_id: AtomicU64,
     pub started_ms: AtomicI64,
     pub stat_reset_ms: AtomicI64,
@@ -223,6 +226,20 @@ pub struct ServerCtl {
     pub keyspace_hits: AtomicU64,
     pub keyspace_misses: AtomicU64,
     pub expired_keys: AtomicU64,
+    /// INFO's `lazyfreed_objects` (`lazyfree.rs`).
+    pub lazyfreed_objects: AtomicU64,
+    /// INFO's `client_output_buffer_limit_disconnections`.
+    pub output_limit_disconnections: AtomicU64,
+    /// INFO's `evicted_keys`.
+    pub evicted_keys: AtomicU64,
+    /// When the arena went over the limit and stayed there (unix ms, 0 when
+    /// under), and the milliseconds spent over it before: Redis's
+    /// `current_eviction_exceeded_time` and `total_eviction_exceeded_time`.
+    pub eviction_exceeded_since: AtomicI64,
+    pub eviction_exceeded_total: AtomicU64,
+    /// Clients in `CLIENT NO-TOUCH` mode: while 0, no command looks its
+    /// client up to ask.
+    pub no_touch_clients: AtomicU32,
     pub net_input: AtomicU64,
     pub net_output: AtomicU64,
     pub cmdstats: [CmdStat; CMD_SLOTS],
@@ -241,6 +258,8 @@ pub struct ServerCtl {
     pub pause_writes_only: AtomicU32,
     pub monitors: AtomicU32,
     pub active_expire: AtomicU32,
+    /// `DEBUG SET-DISABLE-DENY-SCRIPTS`: scripts may run `noscript` commands.
+    pub deny_scripts_disabled: AtomicU32,
     pub lastsave: AtomicI64,
     next_ticket: AtomicU64,
     waiters: [Waiter; MAX_CLIENTS],
@@ -265,16 +284,25 @@ pub struct ServerCtl {
     flush_epochs: [AtomicU64; 16],
     /// `notify-keyspace-events`, parsed: read before every command.
     notify_flags: AtomicU32,
+    /// The `*-max-listpack-*` and `set-max-intset-entries` thresholds, read
+    /// on every collection write (`memdb::encoding::Limits`). Written
+    /// together under the config lock, and `enc_limits_set` is 0 until
+    /// a `CONFIG SET` names one, which means Redis's defaults.
+    enc_limits: [AtomicI64; crate::memdb::encoding::LIMIT_COUNT],
+    enc_limits_set: AtomicU32,
     /// Clients with tracking on: when 0, no write looks at the table.
     pub tracking_clients: AtomicU32,
-    pub track_lock: AtomicU32,
-    /// (key hash, client id) pairs, 0 key when free, under `track_lock`.
-    pub track_keys: [AtomicU64; TRACK_CAP],
-    pub track_owners: [AtomicU64; TRACK_CAP],
-    /// The key each pair is for, so eviction can name what it invalidates.
-    track_names: [Field<TRACK_NAME_LEN>; TRACK_CAP],
+    /// Redis's `server.dirty` (`dirty.rs`), in shards so that workers
+    /// counting their writes do not share a cache line, and what the shards
+    /// summed to at the last save.
+    dirty: [DirtyShard; DIRTY_SHARDS],
+    dirty_at_save: AtomicU64,
     /// Each database's storage policy and memory slot (`storage.rs`).
     pub storage: crate::storage::PolicyTable,
+    /// The latency monitor's samples (`latency.rs`).
+    pub latency: crate::latency::LatencyCtl,
+    /// The event loop metrics (`eventloop.rs`).
+    pub eventloop: crate::eventloop::EventLoopCtl,
 }
 
 /// Keys one blocked client is recorded under; past this its later keys still
@@ -301,11 +329,41 @@ pub fn server_ctl_size() -> usize {
     std::mem::size_of::<ServerCtl>()
 }
 
-pub fn now_ms() -> i64 {
+thread_local! {
+    /// The time a running script sees, fixed when it started.
+    static FROZEN_US: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+fn clock_us() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
+        .map(|d| d.as_micros() as i64)
         .unwrap_or(0)
+}
+
+/// Unix microseconds: Redis's `commandTimeSnapshot`, which a script's
+/// commands all read as the moment the script started.
+pub fn now_us() -> i64 {
+    FROZEN_US.get().unwrap_or_else(clock_us)
+}
+
+pub fn now_ms() -> i64 {
+    now_us() / 1000
+}
+
+/// Holds the time still on this thread until dropped: a script's commands
+/// set and test deadlines, and TIME answers, as of its start, as Redis's do.
+pub struct FrozenTime(Option<i64>);
+
+pub fn freeze_time() -> FrozenTime {
+    let at = FROZEN_US.get().unwrap_or_else(clock_us);
+    FrozenTime(FROZEN_US.replace(Some(at)))
+}
+
+impl Drop for FrozenTime {
+    fn drop(&mut self) {
+        FROZEN_US.set(self.0);
+    }
 }
 
 /// The shared block, once the postmaster has set it up.
@@ -323,7 +381,25 @@ pub fn init(ctl: &ServerCtl) {
         ctl.stat_reset_ms.store(now, Ordering::Relaxed);
         ctl.active_expire.store(1, Ordering::Relaxed);
         ctl.lastsave.store(now / 1000, Ordering::Relaxed);
+        let mut bytes = [0u8; 24];
+        crate::sys::random_bytes(&mut bytes);
+        for (word, chunk) in ctl.run_id.iter().zip(bytes.as_chunks::<8>().0) {
+            word.store(u64::from_le_bytes(*chunk), Ordering::Relaxed);
+        }
     }
+}
+
+/// The 40 hex digits `INFO` reports as `run_id`.
+pub fn run_id() -> String {
+    let Some(ctl) = ctl() else {
+        return "0".repeat(40);
+    };
+    let hex: String = ctl
+        .run_id
+        .iter()
+        .map(|w| format!("{:016x}", w.load(Ordering::Relaxed)))
+        .collect();
+    hex[..40].to_string()
 }
 
 fn spin_lock(l: &AtomicU32) {
@@ -389,6 +465,9 @@ impl ClientHandle {
             s.unblock.store(0, Ordering::Relaxed);
             s.track_listening.store(0, Ordering::Relaxed);
             s.track_handoff.store(HANDOFF_NONE, Ordering::Relaxed);
+            s.user_serial
+                .store(crate::acl::DEFAULT_SERIAL, Ordering::Relaxed);
+            s.acl_recheck.store(0, Ordering::Relaxed);
             s.id.store(id, Ordering::Release);
         }
         ClientHandle { id, slot }
@@ -397,6 +476,32 @@ impl ClientHandle {
     pub fn killed(&self) -> bool {
         self.slot
             .is_some_and(|s| s.kill.load(Ordering::Relaxed) != 0)
+    }
+
+    /// Close this connection once the command now running has replied.
+    pub fn kill(&self) {
+        if let Some(s) = self.slot {
+            s.kill.store(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The ACL user the client now runs as.
+    pub fn set_user(&self, serial: u64) {
+        if let Some(s) = self.slot {
+            s.user_serial.store(serial, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether a channel-permission check was asked for.
+    pub fn acl_recheck_asked(&self) -> bool {
+        self.slot
+            .is_some_and(|s| s.acl_recheck.load(Ordering::Acquire) != 0)
+    }
+
+    pub fn acl_recheck_done(&self) {
+        if let Some(s) = self.slot {
+            s.acl_recheck.store(0, Ordering::Release);
+        }
     }
 
     /// The size of the command now being run; 0 between commands.
@@ -443,10 +548,20 @@ impl ClientHandle {
 
     pub fn set_flag(&self, f: u32, on: bool) {
         if let Some(s) = self.slot {
-            if on {
-                s.flags.fetch_or(f, Ordering::Relaxed);
+            let was = if on {
+                s.flags.fetch_or(f, Ordering::Relaxed)
             } else {
-                s.flags.fetch_and(!f, Ordering::Relaxed);
+                s.flags.fetch_and(!f, Ordering::Relaxed)
+            };
+            if f & flag::NO_TOUCH != 0
+                && (was & flag::NO_TOUCH != 0) != on
+                && let Some(ctl) = ctl()
+            {
+                if on {
+                    ctl.no_touch_clients.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    ctl.no_touch_clients.fetch_sub(1, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -486,6 +601,7 @@ impl ClientHandle {
 impl Drop for ClientHandle {
     fn drop(&mut self) {
         if let Some(s) = self.slot {
+            self.set_flag(flag::NO_TOUCH, false);
             s.id.store(0, Ordering::Relaxed);
             s.state.store(0, Ordering::Release);
         }
@@ -511,12 +627,33 @@ pub struct ClientInfo {
     pub lib_name: String,
     pub lib_ver: String,
     pub qbuf: u32,
+    /// Undelivered pub/sub bytes, filled by [`clients_with_output`].
+    pub omem: usize,
+    pub user_serial: u64,
+    pub user: String,
     slot: &'static ClientSlot,
 }
 
 impl ClientInfo {
     pub fn kill(&self) {
         self.slot.kill.store(1, Ordering::Relaxed);
+    }
+
+    /// Whether this client was told to close and is still there.
+    pub fn killed(&self) -> bool {
+        self.slot.id.load(Ordering::Acquire) == self.id
+            && self.slot.kill.load(Ordering::Relaxed) != 0
+    }
+
+    /// Have a subscriber check its subscriptions against its user's
+    /// channel permissions.
+    pub fn request_acl_recheck(&self) {
+        self.slot.acl_recheck.store(1, Ordering::Release);
+    }
+
+    pub fn acl_recheck_pending(&self) -> bool {
+        self.slot.id.load(Ordering::Acquire) == self.id
+            && self.slot.acl_recheck.load(Ordering::Acquire) != 0
     }
 
     /// `CLIENT UNBLOCK`: end this client's wait, if it is waiting.
@@ -561,7 +698,7 @@ impl ClientInfo {
             f.push('N');
         }
         format!(
-            "id={} addr={} laddr={} fd={} name={} age={} idle={} flags={} db={} sub={} psub={} ssub=0 multi={} qbuf={} qbuf-free=0 argv-mem=0 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd={} user=default redir=-1 resp={} lib-name={} lib-ver={}",
+            "id={} addr={} laddr={} fd={} name={} age={} idle={} flags={} db={} sub={} psub={} ssub=0 multi={} qbuf={} qbuf-free=0 argv-mem=0 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} tot-mem={} events=r cmd={} user={} redir=-1 resp={} lib-name={} lib-ver={}",
             self.id,
             self.addr,
             self.laddr,
@@ -575,12 +712,31 @@ impl ClientInfo {
             self.psub,
             self.multi,
             self.qbuf,
+            self.omem,
+            self.omem,
             self.cmd,
+            self.user,
             self.resp,
             self.lib_name,
             self.lib_ver,
         )
     }
+}
+
+/// [`clients`], each with its output memory, for `CLIENT LIST` and `CLIENT
+/// INFO`: what waits in its pub/sub queue. A subscriber past its output
+/// limit is being closed and is left out, as Redis has freed it by the next
+/// command.
+pub fn clients_with_output() -> Vec<ClientInfo> {
+    let mut all = clients();
+    if let Some(slots) = crate::pubsub_state() {
+        let out = crate::pubsub::output_bytes(slots);
+        all.retain(|c| !out.get(&c.id).is_some_and(|(_, closing)| *closing));
+        for c in &mut all {
+            c.omem = out.get(&c.id).map_or(0, |(bytes, _)| *bytes);
+        }
+    }
+    all
 }
 
 /// Every registered client, ordered by id as Redis lists them.
@@ -621,6 +777,9 @@ pub fn clients() -> Vec<ClientInfo> {
                 lib_name: text(lib_name),
                 lib_ver: text(lib_ver),
                 qbuf: s.qbuf.load(Ordering::Relaxed),
+                omem: 0,
+                user_serial: s.user_serial.load(Ordering::Relaxed),
+                user: crate::acl::name_of(s.user_serial.load(Ordering::Relaxed)),
                 slot: s,
             }
         })
@@ -709,6 +868,10 @@ pub fn reset_stats() {
         &ctl.keyspace_hits,
         &ctl.keyspace_misses,
         &ctl.expired_keys,
+        &ctl.lazyfreed_objects,
+        &ctl.output_limit_disconnections,
+        &ctl.evicted_keys,
+        &ctl.eviction_exceeded_total,
         &ctl.net_input,
         &ctl.net_output,
     ] {
@@ -725,6 +888,7 @@ pub fn reset_stats() {
     for e in &ctl.errstats {
         e.count.store(0, Ordering::Relaxed);
     }
+    crate::eventloop::reset();
     ctl.stat_reset_ms.store(now_ms(), Ordering::Relaxed);
 }
 
@@ -739,6 +903,11 @@ pub fn config_get(name: &str) -> Option<String> {
             .find(|c| c.used.load(Ordering::Relaxed) == 1 && c.name.load() == name.as_bytes())
             .map(|c| String::from_utf8_lossy(&c.value.load()).into_owned())
     })
+}
+
+/// Changes with every `CONFIG SET`; odd while one is being written.
+pub fn config_generation() -> u32 {
+    ctl().map_or(0, |c| c.config_seq.load(Ordering::Acquire))
 }
 
 /// Store several values at once, all visible together.
@@ -1251,6 +1420,29 @@ pub fn flush_epoch(db: u8) -> u64 {
         .map_or(0, |e| e.load(Ordering::Acquire))
 }
 
+/// Publish the encoding thresholds a `CONFIG SET` changed.
+pub fn set_enc_limits(values: [i64; crate::memdb::encoding::LIMIT_COUNT]) {
+    if let Some(ctl) = ctl() {
+        spin_lock(&ctl.config_lock);
+        for (slot, v) in ctl.enc_limits.iter().zip(values) {
+            slot.store(v, Ordering::Relaxed);
+        }
+        ctl.enc_limits_set.store(1, Ordering::Release);
+        spin_unlock(&ctl.config_lock);
+    }
+}
+
+/// The encoding thresholds, or `None` while they are Redis's defaults.
+pub fn enc_limits() -> Option<[i64; crate::memdb::encoding::LIMIT_COUNT]> {
+    let ctl = ctl()?;
+    if ctl.enc_limits_set.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    Some(std::array::from_fn(|i| {
+        ctl.enc_limits[i].load(Ordering::Relaxed)
+    }))
+}
+
 pub fn set_notify_flags(flags: u32) {
     if let Some(ctl) = ctl() {
         ctl.notify_flags.store(flags, Ordering::Relaxed);
@@ -1268,6 +1460,69 @@ pub fn count_expired(n: u64) {
     {
         ctl.expired_keys.fetch_add(n, Ordering::Relaxed);
     }
+}
+
+/// A client closed past its output buffer limit.
+pub fn count_output_limit_disconnection() {
+    if let Some(ctl) = ctl() {
+        ctl.output_limit_disconnections
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Values Redis would have freed in the background (`lazyfree.rs`).
+pub fn count_lazyfreed(n: u64) {
+    if let Some(ctl) = ctl() {
+        ctl.lazyfreed_objects.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// Keys evicted under `maxmemory-policy`, for INFO's `evicted_keys`.
+pub fn count_evicted(n: u64) {
+    if let Some(ctl) = ctl() {
+        ctl.evicted_keys.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// After an eviction round: whether the arena is still over the limit.
+pub fn eviction_exceeded(over: bool) {
+    let Some(ctl) = ctl() else { return };
+    let since = ctl.eviction_exceeded_since.load(Ordering::Relaxed);
+    if over {
+        if since == 0 {
+            ctl.eviction_exceeded_since
+                .store(now_ms(), Ordering::Relaxed);
+        }
+    } else if since != 0
+        && ctl
+            .eviction_exceeded_since
+            .compare_exchange(since, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        ctl.eviction_exceeded_total
+            .fetch_add((now_ms() - since).max(0) as u64, Ordering::Relaxed);
+    }
+}
+
+/// INFO's `total_eviction_exceeded_time` and `current_eviction_exceeded_time`,
+/// in milliseconds.
+pub fn eviction_exceeded_times() -> (u64, u64) {
+    let Some(ctl) = ctl() else { return (0, 0) };
+    let since = ctl.eviction_exceeded_since.load(Ordering::Relaxed);
+    let current = if since == 0 {
+        0
+    } else {
+        (now_ms() - since).max(0) as u64
+    };
+    (
+        ctl.eviction_exceeded_total.load(Ordering::Relaxed) + current,
+        current,
+    )
+}
+
+/// Whether any client is in `CLIENT NO-TOUCH` mode.
+pub fn any_no_touch() -> bool {
+    ctl().is_some_and(|c| c.no_touch_clients.load(Ordering::Relaxed) > 0)
 }
 
 /// Whether a `CLIENT PAUSE` is in force.
@@ -1346,32 +1601,71 @@ impl ClientHandle {
             s.proto.store(proto as u32, Ordering::Relaxed);
         }
     }
+
+    /// The protocol the connection speaks: 2 or 3.
+    pub fn proto(&self) -> u8 {
+        self.slot
+            .map_or(2, |s| s.proto.load(Ordering::Relaxed) as u8)
+    }
 }
 
-/// Run `f` holding the tracking table's lock.
-pub fn with_track_table<R>(f: impl FnOnce(&ServerCtl) -> R) -> Option<R> {
-    let ctl = ctl()?;
-    spin_lock(&ctl.track_lock);
-    let r = f(ctl);
-    spin_unlock(&ctl.track_lock);
-    Some(r)
+const DIRTY_SHARDS: usize = 64;
+
+#[repr(C, align(64))]
+pub struct DirtyShard(AtomicU64);
+
+/// Each worker's commands run on its main thread, one per process: the
+/// process picks the shard.
+fn dirty_shard() -> usize {
+    std::process::id() as usize % DIRTY_SHARDS
+}
+
+pub fn add_dirty(n: u64) {
+    if let Some(c) = ctl() {
+        c.dirty[dirty_shard()].0.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+fn dirty_total(c: &ServerCtl) -> u64 {
+    c.dirty
+        .iter()
+        .map(|s| s.0.load(Ordering::Relaxed))
+        .fold(0, u64::wrapping_add)
+}
+
+/// INFO's `rdb_changes_since_last_save`.
+pub fn changes_since_save() -> u64 {
+    ctl().map_or(0, |c| {
+        dirty_total(c).wrapping_sub(c.dirty_at_save.load(Ordering::Relaxed))
+    })
+}
+
+/// A save happened: the count starts again.
+pub fn mark_saved() {
+    if let Some(c) = ctl() {
+        c.dirty_at_save.store(dirty_total(c), Ordering::Relaxed);
+    }
+}
+
+pub fn deny_scripts_disabled() -> bool {
+    ctl().is_some_and(|c| c.deny_scripts_disabled.load(Ordering::Relaxed) != 0)
+}
+
+/// `min-replicas-to-write` set with a lag limit: this server has no
+/// replicas, so too few to write, as Redis's `checkGoodReplicasStatus` finds.
+pub fn too_few_replicas() -> bool {
+    crate::config::get_i64("min-replicas-to-write") > 0
+        && crate::config::get_i64("min-replicas-max-lag") > 0
+}
+
+/// Whether keys are expired in the background, which `DEBUG
+/// SET-ACTIVE-EXPIRE 0` turns off.
+pub fn active_expire() -> bool {
+    ctl().is_none_or(|c| c.active_expire.load(Ordering::Relaxed) != 0)
 }
 
 pub fn tracking_active() -> bool {
     ctl().is_some_and(|c| c.tracking_clients.load(Ordering::Relaxed) > 0)
-}
-
-/// The name stored with tracking pair `i`, under the table's lock.
-pub fn track_name(ctl: &ServerCtl, i: usize) -> Vec<u8> {
-    ctl.track_names[i].load()
-}
-
-pub fn set_track_name(ctl: &ServerCtl, i: usize, key: &[u8]) {
-    ctl.track_names[i].store(if key.len() <= TRACK_NAME_LEN {
-        key
-    } else {
-        b""
-    });
 }
 
 /// INFO's `total_blocking_keys` and `total_blocking_keys_on_nokey`: the

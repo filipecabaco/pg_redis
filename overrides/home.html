@@ -9,13 +9,13 @@
 <section class="pr-hero">
   <div class="pr-wrap pr-hero__grid">
     <div class="pr-hero__copy">
-      <p class="pr-eyebrow">PostgreSQL extension · Rust + pgrx · PG 15–18</p>
+      <p class="pr-eyebrow">PostgreSQL extension · Rust + pgrx · <span class="pr-nowrap">PG 15–18</span></p>
       <h1 class="pr-hero__title">Redis, spoken&nbsp;by&nbsp;Postgres.</h1>
       <p class="pr-hero__lede">
         pg_redis runs a Redis server inside PostgreSQL. Point any Redis client
         at port 6379, and choose per database where the data lives: shared
-        memory, memory with snapshots, or tables you can query, join and back
-        up. Change it while clients keep writing.
+        memory, memory with snapshots, or WAL-logged tables you can query and
+        join. Change it while clients keep writing.
       </p>
       <div class="pr-hero__actions">
         <a class="pr-btn pr-btn--primary" href="#try-it">Try it in your browser</a>
@@ -24,12 +24,18 @@
           {% include ".icons/fontawesome/brands/github.svg" %} View on GitHub
         </a>
       </div>
+      <p class="pr-hero__note">
+        Pre-release: no published build yet, build from source. It runs on a Postgres server you
+        control, on a host or in a container, and needs <code>shared_preload_libraries</code>.
+        <a href="{{ 'installation/' | url }}">How to install</a>
+      </p>
     </div>
 
     <div class="pr-term" aria-label="redis-cli and psql against the same server">
       <div class="pr-term__bar"><span></span><span></span><span></span><em>one server, two protocols</em></div>
       <pre class="pr-term__body"><code><span class="c"># any Redis client, port 6379</span>
 <span class="p">$</span> redis-cli
+<span class="c"># durable is pg_redis's name for database 8</span>
 <span class="p">&gt;</span> SELECT durable
 <span class="o">OK</span>
 <span class="p">&gt;</span> HSET user:42 name Ada plan pro
@@ -49,8 +55,9 @@
 
   <div class="pr-wrap">
     <dl class="pr-stats">
-      <div><dt>235<small>/242</small></dt><dd>Redis 7.2 commands accepted</dd></div>
-      <div><dt>2<small>/2,010</small></dt><dd>replies that differ from Redis</dd></div>
+      <div><dt>237<small>/242</small></dt><dd>Redis 7.2 commands accepted</dd></div>
+      <div><dt>0<small>/2,464</small></dt><dd>replies that differ from Redis 7.2 on x86-64</dd></div>
+      <div><dt>4,092</dt><dd>of Redis's own acceptance tests pass</dd></div>
       <div><dt>3</dt><dd>storage policies, set per database</dd></div>
       <div><dt>RESP2 + 3</dt><dd>works with stock clients</dd></div>
     </dl>
@@ -63,7 +70,7 @@
   <h2 class="pr-h2">Try it, in this tab</h2>
   <p class="pr-sub">
     A real PostgreSQL 17 with pg_redis loaded, on an emulated Linux machine running in your
-    browser. No server behind it. Write a key to memory, snapshot it, move the database into
+    browser, with no server behind it. Write a key to memory, snapshot it, move the database into
     tables while it is in use, then change the key from SQL.
   </p>
 
@@ -88,8 +95,8 @@
         <p class="pr-phase__name"><code>logged</code> move it into tables</p>
         <ol class="pr-steps">
         <li><button type="button" class="pr-step" data-pane="sql" data-cmd="SELECT redis.set_policy(0, 'logged');"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>SELECT redis.set_policy(0, 'logged');</code><em>move db 0 into tables, live</em></button></li>
-        <li><button type="button" class="pr-step" data-pane="redis" data-cmd="GET greeting"><span class="pr-step__pane">redis</span><code>GET greeting</code><em>still there, moved on touch</em></button></li>
-        <li><button type="button" class="pr-step" data-pane="sql" data-cmd="SELECT convert_from(key, 'UTF8') AS key, convert_from(value, 'UTF8') AS value FROM redis.kv_0;"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>SELECT … FROM redis.kv_0;</code><em>now it is a row</em></button></li>
+        <li><button type="button" class="pr-step" data-pane="redis" data-cmd="GET greeting"><span class="pr-step__pane">redis</span><code>GET greeting</code><em>still there, moved into a table</em></button></li>
+        <li><button type="button" class="pr-step" data-pane="sql" data-cmd="SELECT convert_from(key, 'UTF8') AS key, convert_from(value, 'UTF8') AS value FROM redis.kv_0 WHERE key = 'greeting';"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>SELECT … FROM redis.kv_0 WHERE key = 'greeting';</code><em>now it is a row</em></button></li>
         <li><button type="button" class="pr-step" data-pane="sql" data-cmd="UPDATE redis.kv_0 SET value = convert_to('hello from SQL', 'UTF8') WHERE key = 'greeting';"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>UPDATE redis.kv_0 SET value = …</code><em>change it from SQL</em></button></li>
         <li><button type="button" class="pr-step" data-pane="redis" data-cmd="GET greeting"><span class="pr-step__pane">redis</span><code>GET greeting</code><em>Redis sees the update</em></button></li>
         </ol>
@@ -110,7 +117,7 @@
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11l9-5.5z"/></svg>
           Boot Postgres here
         </button>
-        <p class="pr-demo__note">About 40 MB, once. Then it runs offline, sandboxed in the tab.</p>
+        <p class="pr-demo__note">It downloads about 40 MB once, then runs offline, sandboxed in the tab.</p>
       </div>
     </div>
   </div>
@@ -124,23 +131,23 @@
   <h2 class="pr-h2">Storage, chosen per database</h2>
   <p class="pr-sub">
     Each of the 16 databases has its own policy. By default 0–7 are ephemeral and 8–15 durable,
-    and <code>SELECT cache</code> and <code>SELECT durable</code> still pick one of each. Any of
-    them can change at runtime.
+    and <code>SELECT cache</code> and <code>SELECT durable</code> still pick one of each. Any
+    database's policy can change at runtime.
   </p>
   <div class="pr-policies">
     <article class="pr-policy">
       <header><code>memory</code><span class="pr-tag">default 0–7</span></header>
-      <p>Shared memory, no transaction on the hot path. Built for sessions, rate limits and memoised queries.</p>
+      <p>Shared memory, with no transaction on the hot path. Suited to sessions, rate limits and memoised queries.</p>
       <dl><div><dt>Survives a crash</dt><dd class="no">no</dd></div><div><dt>Replicated</dt><dd class="no">no</dd></div><div><dt>Visible to SQL</dt><dd class="no">no</dd></div></dl>
     </article>
     <article class="pr-policy">
       <header><code>memory+snapshot</code></header>
-      <p>Memory, copied to a logged table every <code>redis.snapshot_interval</code> seconds and reloaded at startup. Redis's RDB, inside Postgres.</p>
+      <p>Memory, copied to a logged table every <code>redis.snapshot_interval</code> seconds and reloaded at startup. It works like Redis's RDB, stored in Postgres.</p>
       <dl><div><dt>Survives a crash</dt><dd class="part">to the last snapshot</dd></div><div><dt>Replicated</dt><dd class="part">the snapshot</dd></div><div><dt>Visible to SQL</dt><dd class="part">the snapshot</dd></div></dl>
     </article>
     <article class="pr-policy pr-policy--accent">
       <header><code>logged</code><span class="pr-tag">default 8–15</span></header>
-      <p>WAL-logged tables. Every write is a row, streamed to your replicas and covered by the backups you already take.</p>
+      <p>WAL-logged tables. Every write is a row, streamed to your replicas and included in your backups.</p>
       <dl><div><dt>Survives a crash</dt><dd class="yes">yes</dd></div><div><dt>Replicated</dt><dd class="yes">yes</dd></div><div><dt>Visible to SQL</dt><dd class="yes">yes</dd></div></dl>
     </article>
   </div>
@@ -150,8 +157,8 @@
       <h3>Moves while you use it</h3>
       <p>Changing a policy between memory and tables moves the data online. Each key moves the
         moment a command touches it, and a background sweep moves the rest. Clients keep reading
-        and writing throughout, and no key is lost on the way. Between <code>memory</code> and
-        <code>memory+snapshot</code> nothing moves at all.</p>
+        and writing throughout, and no key is lost on the way. Switching between <code>memory</code> and
+        <code>memory+snapshot</code> moves no data.</p>
       <a href="{{ 'STORAGE/' | url }}">How migration works</a>
     </div>
 <pre class="pr-code"><code><span class="c">-- every database, its policy, and any move in progress</span>
@@ -174,9 +181,9 @@ SELECT redis.set_policy(0, 'memory+snapshot');</code></pre>
     </p>
     <ul>
       <li>Keys and values up to 512 MB, as in Redis, and all 16 databases can be in memory at once.</li>
-      <li>Past the limit, a write gets <code>OOM</code>, or keys are evicted per <code>maxmemory-policy</code>: <code>noeviction</code>, <code>allkeys-random</code> or <code>volatile-ttl</code>.</li>
-      <li>Every memory command runs under one lock, so each is fully atomic. Sorted sets keep an ordered index, so <code>ZRANGE</code>, <code>ZRANK</code> and <code>ZPOPMIN</code> don't scan.</li>
-      <li>Written in safe Rust. The only <code>unsafe</code> code is one small module, and running out of memory returns <code>OOM</code> instead of crashing.</li>
+      <li>Past the limit, a write gets <code>OOM</code>, or keys are evicted per <code>maxmemory-policy</code>, with all eight of Redis's policies: <code>noeviction</code>, <code>allkeys-lru</code>, <code>allkeys-lfu</code>, <code>allkeys-random</code>, <code>volatile-lru</code>, <code>volatile-lfu</code>, <code>volatile-random</code> and <code>volatile-ttl</code>. LRU and LFU use Redis's sampled approximation and its 24-bit access clock, so <code>OBJECT IDLETIME</code> and <code>OBJECT FREQ</code> answer as in Redis. An evicted key raises the <code>evicted</code> event and a <code>CLIENT TRACKING</code> invalidation.</li>
+      <li>A memory command holds its database's lock from start to finish, so a single command such as <code>INCR</code> is atomic. Scripts, <code>MULTI</code> and commands built from others, such as <code>ZUNIONSTORE</code>, hold the database for their whole run on every worker, as in Redis, while other databases keep running. Sorted sets keep an ordered index, so <code>ZRANGE</code>, <code>ZRANK</code> and <code>ZPOPMIN</code> don't scan.</li>
+      <li>The memory engine's <code>unsafe</code> code is confined to one small module, <code>shm.rs</code>. Running out of memory returns <code>OOM</code> instead of crashing.</li>
     </ul>
   </div>
 <pre class="pr-code"><code><span class="p">&gt;</span> CONFIG SET maxmemory 16mb
@@ -197,7 +204,10 @@ maxmemory_policy:allkeys-random</span></code></pre>
     Requests per second, higher is better: <strong>230k/s</strong> is 230,000 commands answered
     every second. <code>redis-benchmark</code>, 50 clients, 64-byte values over 100,000 random
     keys, median of 5 runs. Each server pinned to the same 4 CPUs, Docker on Apple Silicon.
-    <code>memory+snapshot</code> runs within 2% of <code>memory</code>.
+    Each client sends one command at a time, with no pipelining.
+    <code>memory+snapshot</code> runs within 2% of <code>memory</code>. <code>logged</code> writes
+    commit to PostgreSQL's write-ahead log and wait for it to reach disk, so the disk sets their
+    rate; reads stay fast.
     <a href="{{ 'IMPLEMENTATION/#8-performance' | url }}">Full table and tuning</a>
   </p>
   <div class="pr-bench" role="table" aria-label="Requests per second by command, in thousands">
@@ -240,9 +250,9 @@ maxmemory_policy:allkeys-random</span></code></pre>
     <div><h3>The long tail</h3><p>HyperLogLog, GEO, client-side caching with <code>CLIENT TRACKING</code>, <code>OBJECT</code>, <code>SCAN</code>, <code>SLOWLOG</code>.</p></div>
   </div>
   <p class="pr-proof">
-    At parity with Redis on Redis's own Tcl acceptance suite and on a reply-by-reply diff
-    against Redis 7.2, both run in CI, apart from a few minor deviations
-    <a href="#differences">listed below</a>.
+    Redis's own Tcl acceptance suite and a reply-by-reply diff against Redis 7.2 both run in
+    CI, on both storage halves, and a test that passes is not allowed to stop passing. The
+    deviations that remain are <a href="#differences">listed below</a>.
     <a href="{{ 'command-coverage/' | url }}">See every command</a>
   </p>
 </section>
@@ -257,6 +267,7 @@ maxmemory_policy:allkeys-random</span></code></pre>
     <a class="pr-btn pr-btn--primary" href="{{ 'installation/' | url }}">Installation guide</a>
   </div>
 <pre class="pr-code"><code><span class="c"># build and install into the active Postgres</span>
+git clone https://github.com/filipecabaco/pg_redis && cd pg_redis
 cargo pgrx install --release --features pg17
 
 <span class="c"># postgresql.conf</span>
@@ -273,27 +284,29 @@ redis-cli PING   <span class="o"># PONG</span></code></pre>
     <li>The Redis port does not go through <code>pg_hba.conf</code>. It binds to <code>127.0.0.1</code> by default; <a href="{{ 'configuration/#exposing-the-listener' | url }}">set a password before widening it</a>.</li>
     <li>Memory databases share one arena of <code>redis.maxmemory</code>, reserved at server start. Raising it needs a restart; <code>CONFIG SET maxmemory</code> can only lower it.</li>
     <li>A command's first touch of a key that hasn't moved yet pays for the move, and a command that needs the whole database (<code>KEYS</code>, <code>SCAN</code>, <code>FLUSHDB</code>) finishes the migration first.</li>
-    <li>It needs <code>shared_preload_libraries</code> and a superuser, so it runs where you control the server, not on managed Postgres that doesn't offer it.</li>
+    <li><code>pg_dump</code> and physical backups both include the <code>logged</code> databases, the snapshots of <code>memory+snapshot</code> ones and the policies. <code>memory</code> databases are in no backup, as in Redis without persistence.</li>
+    <li>It needs <code>shared_preload_libraries</code> and a superuser, so it runs on servers you control, and on managed Postgres only where the provider offers both.</li>
   </ul>
 </section>
 
 <section class="pr-section pr-diff" id="differences">
   <h2 class="pr-h2">Where it differs from Redis</h2>
   <p class="pr-sub">
-    pg_redis passes the same tests as Redis: Redis's own Tcl acceptance suite, and a diff of
-    every reply against Redis 7.2. These are the deviations that remain.
+    Measured against Redis's own Tcl acceptance suite and a diff of every reply against
+    Redis 7.2. These are the deviations that remain.
     <a href="{{ 'IMPLEMENTATION/#known-differences-from-redis' | url }}">Full detail</a>
   </p>
   <div class="pr-diff__grid">
     <div>
       <h3>Behaviour</h3>
       <ul>
-        <li><strong>Atomicity is per worker.</strong> Each command is atomic, but the commands inside a script or <code>MULTI</code> can interleave with other workers' commands. Redis runs on one thread, so nothing interleaves.</li>
+        <li><strong><code>SCAN</code> cursors on tables are kept by the server.</strong> On a <code>logged</code> database a cursor names the last key returned, and the server keeps up to 4,096 iterations in progress. The cursor from the latest call, or from the one before it, resumes where it left off, which covers a client retrying a lost reply. An older cursor, or one pushed out by newer iterations, starts the iteration over, so keys come back again. None is skipped.</li>
         <li><strong>Blocked clients are served just after the write.</strong> A write that unblocks <code>BLPOP</code> clients waits up to 500 ms for them to be served, where Redis serves them inside the write.</li>
-        <li><strong>Small hashes and sets keep insertion order only until a removal.</strong> Redis documents both as unordered, but a client can see the difference.</li>
-        <li><strong>No access clock.</strong> <code>OBJECT IDLETIME</code> and <code>OBJECT FREQ</code> return nil, since tracking reads would turn every read on a table into a write.</li>
-        <li><strong>A stand-alone server, with one user.</strong> <code>REPLICAOF</code>, <code>WAIT</code>, <code>CLUSTER</code> and <code>ACL</code> answer as Redis would with no replicas, no cluster and only the <code>default</code> user. Replication is PostgreSQL's.</li>
-        <li><strong>GEO distances can differ in the last digit</strong> of a stored float. It is the only difference the reply diff still finds.</li>
+        <li><strong>Logged keys' access times are kept in a fixed table.</strong> <code>OBJECT IDLETIME</code> and <code>OBJECT FREQ</code> answer for a <code>logged</code> database from a 65,536-slot table in shared memory, so a read never writes a row. Two keys that share a slot share a clock, and the table starts empty after a restart.</li>
+        <li><strong>Memory data does not fail over.</strong> On a promoted standby, <code>memory</code> databases start empty, as a Redis primary without replicas would. A <code>memory+snapshot</code> database is snapshotted at shutdown, so a planned switchover keeps every write; after an unplanned one it loads its last snapshot.</li>
+        <li><strong>A stand-alone server, without modules.</strong> Redis replication, cluster mode and modules are out of scope: <code>REPLICAOF</code>, <code>WAIT</code> and <code>CLUSTER</code> answer as Redis would with no replicas and no cluster, and <code>MODULE</code> answers that no modules are loaded. Replication is PostgreSQL's.</li>
+        <li><strong>ACL users are saved to a table.</strong> Users, their rules and the checks follow Redis 7.2. <code>ACL SAVE</code> and <code>ACL LOAD</code> write and read <code>redis.acl_users</code> where Redis uses an ACL file; <code>ACL SETUSER</code> alone does not survive a restart, as in Redis.</li>
+        <li><strong>Floats follow Redis on x86-64.</strong> <code>INCRBYFLOAT</code> and <code>HINCRBYFLOAT</code> add in 80-bit <code>long double</code> and print the digits Redis prints on x86-64. Redis builds on arm64 use a 128-bit <code>long double</code> and round GEO distances differently, so against them these can differ in the last digit. These are the only differences the reply-by-reply diff finds, and only against arm64 Redis.</li>
       </ul>
     </div>
     <div>
@@ -302,9 +315,8 @@ redis-cli PING   <span class="o"># PONG</span></code></pre>
         <div><dt>Memory databases</dt><dd><code>redis.maxmemory</code>, shared</dd></div>
         <div><dt>Keys and values</dt><dd>512 MB, as in Redis</dd></div>
         <div><dt>Values in tables</dt><dd>~1 GB per field, PostgreSQL's TOAST limit</dd></div>
-        <div><dt>Pub/sub channel or pattern</dt><dd>255 bytes</dd></div>
-        <div><dt>Pub/sub message</dt><dd>512 bytes</dd></div>
-        <div><dt>Client-side caching</dt><dd>16,384 tracked key–client pairs</dd></div>
+        <div><dt>Pub/sub and client-side caching</dt><dd><code>redis.pubsub_memory</code>, 128 MB by default</dd></div>
+        <div><dt>A slow subscriber</dt><dd><code>client-output-buffer-limit pubsub</code>, as in Redis</dd></div>
       </dl>
     </div>
   </div>

@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { errorReply, integerReply, RawRedis } from "./resp";
+import { decode, errorReply, integerReply, RawRedis, type Resp, scanReply } from "./resp";
 
 const REDIS_HOST = process.env.REDIS_HOST ?? "localhost";
 const REDIS_PORT = process.env.REDIS_PORT ?? "6379";
@@ -26,14 +26,51 @@ afterAll(async () => {
 });
 
 describe("Authentication", () => {
-	test("PING before AUTH returns PONG (allowed)", async () => {
+	// As in Redis: only AUTH, HELLO, QUIT and RESET answer before AUTH.
+	test("PING before AUTH returns NOAUTH", async () => {
 		const noAuthClient = new Bun.RedisClient(
 			`redis://${REDIS_HOST}:${REDIS_PORT}`,
 		);
 		try {
-			expect(await noAuthClient.ping()).toBe("PONG");
+			await expect(noAuthClient.ping()).rejects.toThrow(/NOAUTH/);
 		} finally {
 			noAuthClient.close();
+		}
+	});
+
+	// Redis refuses a HELLO that neither comes authenticated nor carries AUTH,
+	// and leaves the protocol where it was. It used to switch the connection
+	// to RESP3 and describe the server to anyone.
+	test("HELLO before AUTH returns Redis's NOAUTH and keeps RESP2", async () => {
+		const conn = await new RawRedis().connect({ password: "" });
+		try {
+			for (const args of [["HELLO"], ["HELLO", "3"]]) {
+				const reply = (await conn.send(...args)).toString();
+				expect(reply).toStartWith("-NOAUTH HELLO must be called with the client already authenticated");
+			}
+			expect((await conn.send("HELLO", "3", "AUTH", "default", "nope")).toString()).toStartWith(
+				"-WRONGPASS",
+			);
+			// Still RESP2: a RESP3 null would be `_`.
+			expect((await conn.send("PING")).toString()).toStartWith("-NOAUTH");
+		} finally {
+			conn.close();
+		}
+	});
+
+	// The server says what Redis says: client libraries branch on HELLO's
+	// `server` field, and tools watch INFO's run_id to notice a restart.
+	test("HELLO and INFO identify the server as Redis does", async () => {
+		const conn = await new RawRedis().connect();
+		try {
+			const hello = (await conn.send("HELLO", "2")).toString();
+			expect(hello).toContain("$6\r\nserver\r\n$5\r\nredis\r\n");
+			const info = (await conn.bulk("INFO", "server"))?.toString() ?? "";
+			expect(info).toMatch(/run_id:[0-9a-f]{40}\r\n/);
+			expect(info).not.toContain(`run_id:${"0".repeat(40)}`);
+			expect(info).not.toContain("os:PostgreSQL");
+		} finally {
+			conn.close();
 		}
 	});
 
@@ -466,7 +503,7 @@ describe("Server", () => {
 	// to the parser in both directions. A change here means a command was
 	// added or removed: update the page and this number together.
 	test("COMMAND COUNT reports the number of accepted commands", async () => {
-		expect(await client.send("COMMAND", ["COUNT"])).toBe(235);
+		expect(await client.send("COMMAND", ["COUNT"])).toBe(237);
 	});
 });
 
@@ -1716,7 +1753,79 @@ describe("Transactions", () => {
 	});
 });
 
+// MIGRATE to this same server, a database over: the network path end to end.
+describe("MIGRATE", () => {
+	test("moves keys with their TTL, COPY keeps them, NOKEY when none exist", async () => {
+		const host = process.env.REDIS_HOST ?? "localhost";
+		const port = process.env.REDIS_PORT ?? "6379";
+		const pw = process.env.REDIS_PASSWORD ?? "testpass";
+		const auth = pw ? ["AUTH", pw] : [];
+		await raw.send("SELECT", "0");
+		await raw.send("DEL", "mig:a", "mig:b");
+		await raw.send("SET", "mig:a", "1", "EX", "100");
+		await raw.send("SET", "mig:b", "2");
+		expect((await raw.send("MIGRATE", host, port, "mig:a", "1", "5000", ...auth)).toString()).toBe("+OK\r\n");
+		expect(integerReply(await raw.send("EXISTS", "mig:a"))).toBe(0);
+		await raw.send("SELECT", "1");
+		expect((await raw.bulk("GET", "mig:a"))?.toString()).toBe("1");
+		expect(integerReply(await raw.send("TTL", "mig:a"))).toBeGreaterThan(90);
+		await raw.send("DEL", "mig:a");
+		await raw.send("SELECT", "0");
+		const copy = await raw.send("MIGRATE", host, port, "", "1", "5000", "COPY", ...auth, "KEYS", "mig:b", "mig:none");
+		expect(copy.toString()).toBe("+OK\r\n");
+		expect(integerReply(await raw.send("EXISTS", "mig:b"))).toBe(1);
+		expect((await raw.send("MIGRATE", host, port, "mig:none", "1", "5000", ...auth)).toString()).toBe("+NOKEY\r\n");
+		// Already there without REPLACE: the target's error, the key kept.
+		const busy = errorReply(await raw.send("MIGRATE", host, port, "mig:b", "1", "5000", ...auth));
+		expect(busy).toStartWith("ERR Target instance replied with error: BUSYKEY");
+		expect(integerReply(await raw.send("EXISTS", "mig:b"))).toBe(1);
+		await raw.send("DEL", "mig:b");
+		await raw.send("SELECT", "1");
+		await raw.send("DEL", "mig:b");
+		await raw.send("SELECT", "durable");
+	});
+});
+
+// INFO's rdb_changes_since_last_save counts as Redis's server.dirty does.
+describe("The dirty counter", () => {
+	const changes = async () => {
+		const info = (await raw.bulk("INFO", "persistence"))?.toString() ?? "";
+		return Number(/rdb_changes_since_last_save:(\d+)/.exec(info)?.[1]);
+	};
+	for (const db of ["0", "8"]) {
+		test(`writes count their changes (db ${db})`, async () => {
+			await raw.send("SELECT", db);
+			await raw.send("DEL", "dc:s", "dc:b", "dc:f", "dc:h");
+			let before = await changes();
+			await raw.send("SADD", "dc:s", "a", "b", "c");
+			await raw.send("SADD", "dc:s", "a");
+			await raw.send("HSET", "dc:h", "f1", "v", "f2", "v");
+			expect((await changes()) - before).toBe(5);
+			// SETBIT counts a created or grown string, or a changed bit.
+			before = await changes();
+			await raw.send("SETBIT", "dc:b", "0", "0");
+			await raw.send("SETBIT", "dc:b", "0", "0");
+			await raw.send("SETBIT", "dc:b", "0", "1");
+			await raw.send("SETBIT", "dc:b", "90", "0");
+			expect((await changes()) - before).toBe(3);
+			// BITFIELD counts each write that changed something.
+			before = await changes();
+			await raw.send("BITFIELD", "dc:f", "SET", "i5", "0", "0");
+			await raw.send("BITFIELD", "dc:f", "SET", "i5", "0", "0");
+			await raw.send("BITFIELD", "dc:f", "INCRBY", "i5", "0", "1", "INCRBY", "i5", "0", "1");
+			expect((await changes()) - before).toBe(3);
+			before = await changes();
+			await raw.send("DEL", "dc:s", "dc:b", "dc:f", "dc:h", "dc:none");
+			expect((await changes()) - before).toBe(4);
+			await raw.send("SAVE");
+			expect(await changes()).toBe(0);
+			await raw.send("SELECT", "durable");
+		});
+	}
+});
+
 describe("Binary safety", () => {
+
 	// Redis keys and values are arbitrary byte strings. These bytes are exactly
 	// what the previous TEXT columns could not store: a NUL, and sequences that
 	// are not valid UTF-8.
@@ -1789,9 +1898,15 @@ describe("Binary safety", () => {
 
 		const pattern = Buffer.concat([prefix, star]);
 		expect(hexes(await raw.array("KEYS", pattern))).toEqual(hexes(keys));
-		// SCAN's second element is the key array; cursor is always 0 here.
-		const scanned = await raw.array("SCAN", "0", "MATCH", pattern);
-		expect(scanned[1]).not.toBeNull();
+		// SCAN returns a page per call; the whole iteration names every key.
+		const scanned: Buffer[] = [];
+		let cursor = "0";
+		do {
+			const page = scanReply(await raw.send("SCAN", cursor, "MATCH", pattern));
+			scanned.push(...page.items);
+			cursor = page.cursor;
+		} while (cursor !== "0");
+		expect([...new Set(hexes(scanned))]).toEqual(hexes(keys));
 
 		// RANDOMKEY reads a key out of an entry through the same call. Whatever
 		// it names has to be a whole key: a truncating read would hand back a
@@ -2072,56 +2187,142 @@ describe("Sharded Pub/Sub", () => {
 	});
 });
 
-describe("Pub/Sub size limits", () => {
-	// Names and payloads live in fixed-size shared-memory slots. Truncating them
-	// would leave a client subscribed to a channel it can never receive on, so
-	// the server rejects them instead.
-	const MAX_CHANNEL = 255;
-	const MAX_PAYLOAD = 512;
+describe("Pub/Sub and client tracking without fixed limits", () => {
+	// Redis bounds none of these except by memory and the pubsub output
+	// buffer limit; neither does pg_redis.
 
-	test("a channel name at the limit works end to end", async () => {
-		const channel = "c".repeat(MAX_CHANNEL);
-		const subscriber = new Bun.RedisClient(redisUrl);
+	test("a 10,000-byte channel carries a 1 MB message", async () => {
+		const channel = "c".repeat(10_000);
+		const payload = "p".repeat(1 << 20);
+		const sub = await new RawRedis().connect();
 		try {
-			await subscriber.send("SUBSCRIBE", [channel]);
-			await Bun.sleep(100);
-			expect(await client.send("PUBLISH", [channel, "hi"])).toBe(1);
+			await sub.send("SUBSCRIBE", channel);
+			expect(await client.send("PUBSUB", ["NUMSUB", channel])).toEqual([channel, 1]);
+			// At least this subscriber; a pattern another test left may match too.
+			expect(await client.send("PUBLISH", [channel, payload])).toBeGreaterThanOrEqual(1);
+			const message = (await sub.next()).toString();
+			expect(message).toContain(`$${channel.length}\r\n${channel}\r\n`);
+			expect(message).toContain(`$${payload.length}\r\n${payload}\r\n`);
 		} finally {
-			subscriber.close();
+			sub.close();
 		}
 	});
 
-	test("a payload at the limit is delivered", async () => {
-		const subscriber = new Bun.RedisClient(redisUrl);
+	test("a connection holds a thousand channels", async () => {
+		const sub = await new RawRedis().connect();
 		try {
-			await subscriber.send("SUBSCRIBE", ["limit-chan"]);
-			await Bun.sleep(100);
-			const payload = "p".repeat(MAX_PAYLOAD);
-			expect(await client.send("PUBLISH", ["limit-chan", payload])).toBe(1);
+			const names = Array.from({ length: 1000 }, (_, i) => `many-${i}`);
+			await sub.send("SUBSCRIBE", ...names);
+			// One confirmation per channel; the last counts all of them.
+			for (let i = 1; i < names.length; i++) await sub.next();
+			const numsub = await client.send("PUBSUB", ["NUMSUB", "many-0", "many-999"]);
+			expect(numsub).toEqual(["many-0", 1, "many-999", 1]);
+			expect(await client.send("PUBLISH", ["many-999", "x"])).toBe(1);
 		} finally {
-			subscriber.close();
+			sub.close();
 		}
 	});
 
-	test("an over-long channel name is rejected, not truncated", async () => {
-		const tooLong = "c".repeat(MAX_CHANNEL + 1);
-		await expect(client.send("PUBLISH", [tooLong, "hi"])).rejects.toThrow(
-			/limit/,
+	test("more than 256 connections subscribe at once", async () => {
+		const subs = await Promise.all(
+			Array.from({ length: 300 }, () => new RawRedis().connect()),
 		);
-		const subscriber = new Bun.RedisClient(redisUrl);
 		try {
-			await expect(subscriber.send("SUBSCRIBE", [tooLong])).rejects.toThrow(
-				/limit/,
-			);
+			await Promise.all(subs.map((s) => s.send("SUBSCRIBE", "crowd")));
+			expect(await client.send("PUBLISH", ["crowd", "hello"])).toBe(300);
 		} finally {
-			subscriber.close();
+			for (const s of subs) s.close();
 		}
 	});
 
-	test("an over-long payload is rejected, not truncated", async () => {
-		await expect(
-			client.send("PUBLISH", ["limit-chan", "p".repeat(MAX_PAYLOAD + 1)]),
-		).rejects.toThrow(/limit/);
+	// Redis's `obuf-limits`: a normal client whose replies pass the hard
+	// limit gets none of them and is closed; HRANDFIELD with a huge negative
+	// count stops part way instead of building the whole reply.
+	test("a normal client past its output limit is closed with no reply", async () => {
+		const name = `obuf-${Date.now()}`;
+		// Filled on a fresh connection, on the default database the test's
+		// own socket reads; the shared client may have selected another.
+		const filler = await new RawRedis().connect();
+		await filler.send("DEL", "obuf:list");
+		for (let i = 0; i < 150; i++) await filler.send("LPUSH", "obuf:list", "x".repeat(1000));
+		await client.send("CONFIG", ["SET", "client-output-buffer-limit", "normal 100000 0 0"]);
+		try {
+			let got = 0;
+			let closed = false;
+			await new Promise<void>((resolve) => {
+				Bun.connect({
+					hostname: process.env.REDIS_HOST ?? "localhost",
+					port: Number(process.env.REDIS_PORT ?? 6379),
+					socket: {
+						open: (s) => {
+							const pw = process.env.REDIS_PASSWORD ?? "testpass";
+							const auth = pw ? `*2\r\n$4\r\nAUTH\r\n$${pw.length}\r\n${pw}\r\n` : "";
+							s.write(
+								`${auth}*3\r\n$6\r\nCLIENT\r\n$7\r\nSETNAME\r\n$${name.length}\r\n${name}\r\n` +
+									"*4\r\n$6\r\nLRANGE\r\n$9\r\nobuf:list\r\n$1\r\n0\r\n$2\r\n-1\r\n",
+							);
+						},
+						data: (_s, chunk) => {
+							got += chunk.length;
+						},
+						close: () => {
+							closed = true;
+							resolve();
+						},
+						error: () => resolve(),
+					},
+				});
+				setTimeout(resolve, 3000);
+			});
+			expect(closed).toBe(true);
+			// AUTH's +OK and SETNAME's +OK, nothing of the list.
+			expect(got).toBeLessThan(100);
+			expect((await client.send("CLIENT", ["LIST"])) as string).not.toContain(`name=${name}`);
+
+			const raw2 = await new RawRedis().connect();
+			await raw2.send("HSET", "obuf:h", "a", "b");
+			raw2.close();
+			// Bounded by the limit, so it ends quickly rather than building
+			// 999,999,999 entries.
+			const started = performance.now();
+			const r = new Bun.RedisClient(redisUrl);
+			await expect(r.send("HRANDFIELD", ["obuf:h", "-999999999"])).rejects.toThrow();
+			r.close();
+			expect(performance.now() - started).toBeLessThan(5000);
+		} finally {
+			await client.send("CONFIG", ["SET", "client-output-buffer-limit", "normal 0 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60"]);
+			await filler.send("DEL", "obuf:list", "obuf:h");
+			filler.close();
+		}
+	});
+
+	test("tracking remembers more than 16,384 keys, long ones included", async () => {
+
+		const tracker = await new RawRedis().connect();
+		const inval = await new RawRedis().connect();
+		try {
+			const invalId = integerReply(await inval.send("CLIENT", "ID"));
+			await inval.send("SUBSCRIBE", "__redis__:invalidate");
+			await tracker.send("CLIENT", "TRACKING", "ON", "REDIRECT", String(invalId));
+			const long = `track-long-${"k".repeat(5000)}`;
+			await tracker.send("GET", long);
+			const keys = Array.from({ length: 20_000 }, (_, i) => `track-many-${i}`);
+			for (let i = 0; i < keys.length; i += 1000) {
+				await tracker.send("MGET", ...keys.slice(i, i + 1000));
+			}
+			const info = (await client.send("INFO", ["stats"])) as string;
+			const total = Number(/tracking_total_keys:(\d+)/.exec(info)?.[1]);
+			expect(total).toBeGreaterThanOrEqual(20_001);
+			// A write to the long key names it in the invalidation.
+			const message = inval.next();
+			await client.send("SET", [long, "v"]);
+			const got = (await message).toString();
+			expect(got).toContain("__redis__:invalidate");
+			expect(got).toContain(long);
+		} finally {
+			tracker.close();
+			inval.close();
+		}
 	});
 });
 
@@ -2501,10 +2702,13 @@ for (const half of ["cache", "durable"]) {
 			await raw.send("SADD", "p5:i", "1", "2");
 			await raw.send("RPUSH", "p5:l", "a");
 			await raw.send("ZADD", "p5:z", "1", "m");
-			const enc = async (k: string) =>
-				(await raw.send("OBJECT", "ENCODING", k))
-					.toString()
-					.replace(/^\+|\r\n$/g, "");
+			// A bulk string, as Redis sends it. `+embstr` was a simple string,
+			// which a client that checks reply types refuses.
+			const enc = async (k: string) => {
+				const reply = (await raw.send("OBJECT", "ENCODING", k)).toString();
+				expect(reply.startsWith("$")).toBe(true);
+				return reply.split("\r\n")[1];
+			};
 			expect(await enc("p5:k")).toBe("embstr");
 			expect(await enc("p5:n")).toBe("int");
 			expect(await enc("p5:big")).toBe("raw");
@@ -3592,6 +3796,59 @@ async function fanOut<T>(
 /** Both storage halves, by the name `SELECT` takes. */
 const HALVES = ["cache", "durable"] as const;
 
+// Redis adds floats in C `long double`, the x87 80-bit format on x86-64, and
+// prints 17 decimal places: digits a 64-bit double drops. Both halves compute
+// it the same way, on memory db 0 and on logged db 8.
+describe("Float increments in long double", () => {
+	afterAll(async () => {
+		await raw.send("SELECT", "durable");
+	});
+
+	for (const db of ["0", "8"]) {
+		test(`db ${db}: INCRBYFLOAT keeps the digits x86-64 Redis keeps`, async () => {
+			await raw.send("SELECT", db);
+			await raw.send("SET", "ld:n2", "3");
+			expect(
+				(await raw.bulk("INCRBYFLOAT", "ld:n2", "1.000000000000000005"))?.toString(),
+			).toBe("4.00000000000000001");
+			expect((await raw.bulk("GET", "ld:n2"))?.toString()).toBe("4.00000000000000001");
+			expect((await raw.bulk("INCRBYFLOAT", "ld:n2", "0x1p-2"))?.toString()).toBe(
+				"4.25000000000000001",
+			);
+			await raw.send("DEL", "ld:n2");
+		});
+
+		test(`db ${db}: HINCRBYFLOAT keeps them too`, async () => {
+			await raw.send("SELECT", db);
+			await raw.send("HSET", "ld:h", "n2", "3");
+			expect(
+				(await raw.bulk("HINCRBYFLOAT", "ld:h", "n2", "1.000000000000000005"))?.toString(),
+			).toBe("4.00000000000000001");
+			expect((await raw.bulk("HGET", "ld:h", "n2"))?.toString()).toBe(
+				"4.00000000000000001",
+			);
+			await raw.send("DEL", "ld:h");
+		});
+
+		test(`db ${db}: a bad increment is refused after the type check`, async () => {
+			await raw.send("SELECT", db);
+			await raw.send("DEL", "ld:list", "ld:none");
+			await raw.send("RPUSH", "ld:list", "a");
+			expect((await raw.send("INCRBYFLOAT", "ld:list", "abc")).toString()).toMatch(
+				/^-WRONGTYPE/,
+			);
+			expect((await raw.send("INCRBYFLOAT", "ld:none", "abc")).toString()).toBe(
+				"-ERR value is not a valid float\r\n",
+			);
+			expect((await raw.send("INCRBYFLOAT", "ld:none", "inf")).toString()).toBe(
+				"-ERR increment would produce NaN or Infinity\r\n",
+			);
+			expect(integerReply(await raw.send("EXISTS", "ld:none"))).toBe(0);
+			await raw.send("DEL", "ld:list");
+		});
+	}
+});
+
 describe("Concurrent clients", () => {
 	const WRITERS = 8;
 	const PER_WRITER = 25;
@@ -4054,6 +4311,482 @@ for (const half of HALVES) {
 			// still be in the tables, and the draw must not see them.
 			await Bun.sleep(80);
 			expect(await raw.bulk("RANDOMKEY")).toBeNull();
+		});
+	});
+}
+
+// ───────────────────────────── SCAN cursors ─────────────────────────────────
+//
+// SCAN, HSCAN, SSCAN and ZSCAN return a page per call and a cursor to resume
+// from. Redis's guarantee is what these pin: a full iteration returns every
+// element present from its start to its end at least once, however the keys
+// change in between, and it ends. The memory half's cursor is a position in
+// the dictionary; the durable half's names the last key returned, kept in
+// shared memory so another connection, on another worker, can resume it.
+
+for (const half of HALVES) {
+	describe(`Incremental cursors (${half})`, () => {
+		let other: RawRedis;
+		beforeAll(async () => {
+			await raw.send("SELECT", half);
+			await raw.send("FLUSHDB");
+			other = await new RawRedis().connect();
+			await other.send("SELECT", half);
+		});
+		afterAll(async () => {
+			other.close();
+			await raw.send("FLUSHDB");
+			await raw.send("SELECT", "durable");
+		});
+
+		/**
+		 * A whole iteration of `cmd`, the cursor going in at `at`: every
+		 * element (repeats included) and the number of calls. `between` runs
+		 * after each call that is not the last; `conn` picks the connection
+		 * for each call.
+		 */
+		async function iterate(
+			cmd: string[],
+			at: number,
+			between: (call: number) => Promise<void> = async () => {},
+			conn: (call: number) => RawRedis = () => raw,
+		): Promise<{ items: Buffer[]; calls: number }> {
+			const items: Buffer[] = [];
+			let cursor = "0";
+			for (let call = 1; call < 20_000; call++) {
+				const line = [...cmd];
+				line.splice(at, 0, cursor);
+				const page = scanReply(await conn(call).send(...line));
+				// An unsigned 64-bit integer in decimal, as clients parse it.
+				expect(page.cursor).toMatch(/^\d+$/);
+				expect(BigInt(page.cursor) < 2n ** 64n).toBe(true);
+				items.push(...page.items);
+				if (page.cursor === "0") return { items, calls: call };
+				cursor = page.cursor;
+				await between(call);
+			}
+			throw new Error(`${cmd.join(" ")} did not end`);
+		}
+
+		const strings = (items: Buffer[]) => new Set(items.map((b) => b.toString()));
+		const name = (i: number) => `cur:${String(i).padStart(4, "0")}`;
+
+		async function thousandKeys() {
+			await raw.send("FLUSHDB");
+			const args: string[] = [];
+			for (let i = 0; i < 1000; i++) args.push(name(i), "v");
+			expect((await raw.send("MSET", ...args)).toString()).toBe("+OK\r\n");
+		}
+
+		test("SCAN pages through 1,000 keys and returns every one", async () => {
+			await thousandKeys();
+			const { items, calls } = await iterate(["SCAN", "COUNT", "10"], 1);
+			expect(calls).toBeGreaterThan(1);
+			const seen = strings(items);
+			expect(seen.size).toBe(1000);
+			for (let i = 0; i < 1000; i++) expect(seen.has(name(i))).toBe(true);
+			// The default COUNT is 10 too, so the default takes more than one call.
+			expect((await iterate(["SCAN"], 1)).calls).toBeGreaterThan(1);
+		});
+
+		test("a cursor resumes on another connection", async () => {
+			await thousandKeys();
+			const { items, calls } = await iterate(
+				["SCAN", "COUNT", "10"],
+				1,
+				undefined,
+				(call) => (call % 2 === 0 ? other : raw),
+			);
+			expect(calls).toBeGreaterThan(1);
+			expect(strings(items).size).toBe(1000);
+		});
+
+		test("deleting and adding keys mid-iteration hides no untouched key", async () => {
+			await thousandKeys();
+			const deleted = new Set<string>();
+			const { items } = await iterate(["SCAN", "COUNT", "10"], 1, async (call) => {
+				// Behind the cursor and ahead of it, wherever it is.
+				for (const j of [0, 1, 2]) {
+					const k = name((call * 37 + j * 331) % 1000);
+					await raw.send("DEL", k);
+					deleted.add(k);
+				}
+				await raw.send("SET", `cur:new:${call}`, "v");
+			});
+			const seen = strings(items);
+			for (let i = 0; i < 1000; i++) {
+				const k = name(i);
+				if (!deleted.has(k)) expect(seen.has(k)).toBe(true);
+			}
+		});
+
+		test("MATCH and TYPE filter each page and the iteration still ends", async () => {
+			await thousandKeys();
+			for (let i = 0; i < 20; i++) {
+				await raw.send("RPUSH", `other:list:${i}`, "a");
+				await raw.send("HSET", `other:hash:${i}`, "f", "v");
+			}
+			const listed = await iterate(["SCAN", "COUNT", "10", "MATCH", "other:*"], 1);
+			// Most pages of strings match nothing, and still are not the end.
+			expect(listed.calls).toBeGreaterThan(10);
+			expect(strings(listed.items).size).toBe(40);
+			const hashes = strings((await iterate(["SCAN", "TYPE", "hash", "COUNT", "25"], 1)).items);
+			expect([...hashes].sort()).toEqual(
+				Array.from({ length: 20 }, (_, i) => `other:hash:${i}`).sort(),
+			);
+			const lists = await iterate(["SCAN", "MATCH", "other:list:1*", "TYPE", "list"], 1);
+			expect([...strings(lists.items)].sort()).toEqual(
+				["1", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19"].map(
+					(n) => `other:list:${n}`,
+				).sort(),
+			);
+		});
+
+		// A client that lost a reply sends the same cursor again. Redis gives
+		// it the same page; so does pg_redis for the latest two cursors.
+		test("resending the previous cursor gives the same page again", async () => {
+			await thousandKeys();
+			const names = (p: { items: Buffer[] }) => p.items.map((b) => b.toString()).sort();
+			const first = scanReply(await raw.send("SCAN", "0", "COUNT", "10"));
+			const second = scanReply(await raw.send("SCAN", first.cursor, "COUNT", "10"));
+			expect(second.cursor).not.toBe("0");
+			const latest = scanReply(await raw.send("SCAN", first.cursor, "COUNT", "10"));
+			expect(names(latest)).toEqual(names(second));
+			// And the iteration carries on from the newer cursor.
+			const third = scanReply(await raw.send("SCAN", second.cursor, "COUNT", "10"));
+			expect(third.items.length).toBeGreaterThan(0);
+		});
+
+		test("a cursor the server never issued restarts or resumes, and ends", async () => {
+			await thousandKeys();
+			for (const made_up of ["12345", "9223372036854775807", "18446744073709551615"]) {
+				const page = scanReply(await raw.send("SCAN", made_up, "COUNT", "10"));
+				expect(page.cursor).toMatch(/^\d+$/);
+				let cursor = page.cursor;
+				for (let n = 0; cursor !== "0"; n++) {
+					expect(n).toBeLessThan(5000);
+					cursor = scanReply(await raw.send("SCAN", cursor, "COUNT", "50")).cursor;
+				}
+			}
+			// Not an integer at all is the error it always was.
+			expect((await raw.send("SCAN", "notanumber")).toString()).toMatch(/^-ERR/);
+			expect((await raw.send("SSCAN", "s", "-1")).toString()).toBe(
+				"-ERR invalid cursor\r\n",
+			);
+		});
+
+		const member = (i: number) => `m${String(i).padStart(3, "0")}`;
+
+		async function collections(n: number) {
+			await raw.send("FLUSHDB");
+			const h: string[] = [];
+			const s: string[] = [];
+			const z: string[] = [];
+			for (let i = 0; i < n; i++) {
+				h.push(member(i), `v${i}`);
+				s.push(member(i));
+				z.push(String(i + 0.5), member(i));
+			}
+			await raw.send("HSET", "c:h", ...h);
+			await raw.send("SADD", "c:s", ...s);
+			await raw.send("ZADD", "c:z", ...z);
+		}
+
+		// 600: a hash of 512 fields or fewer is a listpack, which HSCAN
+		// returns whole in one call, as Redis does; past that it pages.
+		test("HSCAN, SSCAN and ZSCAN page through a few hundred elements", async () => {
+			await collections(600);
+			const hscan = await iterate(["HSCAN", "c:h", "COUNT", "10"], 2);
+			expect(hscan.calls).toBeGreaterThan(1);
+			const fields = new Map<string, string>();
+			for (let i = 0; i < hscan.items.length; i += 2) {
+				fields.set(hscan.items[i].toString(), hscan.items[i + 1].toString());
+			}
+			expect(fields.size).toBe(600);
+			for (let i = 0; i < 600; i++) expect(fields.get(member(i))).toBe(`v${i}`);
+
+			const sscan = await iterate(["SSCAN", "c:s", "COUNT", "10"], 2);
+			expect(sscan.calls).toBeGreaterThan(1);
+			expect(strings(sscan.items).size).toBe(600);
+
+			const zscan = await iterate(["ZSCAN", "c:z", "COUNT", "10"], 2);
+			expect(zscan.calls).toBeGreaterThan(1);
+			const scores = new Map<string, string>();
+			for (let i = 0; i < zscan.items.length; i += 2) {
+				scores.set(zscan.items[i].toString(), zscan.items[i + 1].toString());
+			}
+			expect(scores.size).toBe(600);
+			for (let i = 0; i < 600; i++) expect(scores.get(member(i))).toBe(`${i}.5`);
+
+			// MATCH applies to fields and members; a missing key is empty.
+			const matched = await iterate(["ZSCAN", "c:z", "MATCH", "m00*"], 2);
+			expect(matched.items.map((b) => b.toString()).filter((_, i) => i % 2 === 0).sort()).toEqual(
+				Array.from({ length: 10 }, (_, i) => member(i)),
+			);
+			expect(await iterate(["SSCAN", "c:none"], 2)).toEqual({ items: [], calls: 1 });
+			expect((await raw.send("HSCAN", "c:s", "0")).toString()).toMatch(/^-WRONGTYPE/);
+		});
+
+		test("removing elements mid-HSCAN, SSCAN and ZSCAN hides none that stayed", async () => {
+			await collections(600);
+			for (const [cmd, key, del] of [
+				["HSCAN", "c:h", "HDEL"],
+				["SSCAN", "c:s", "SREM"],
+				["ZSCAN", "c:z", "ZREM"],
+			]) {
+				const removed = new Set<string>();
+				const { items } = await iterate([cmd, key, "COUNT", "10"], 2, async (call) => {
+					for (const j of [0, 1]) {
+						const m = member((call * 41 + j * 149) % 600);
+						await raw.send(del, key, m);
+						removed.add(m);
+					}
+				});
+				const step = cmd === "SSCAN" ? 1 : 2;
+				const seen = new Set(items.filter((_, i) => i % step === 0).map((b) => b.toString()));
+				for (let i = 0; i < 600; i++) {
+					const m = member(i);
+					if (!removed.has(m)) expect(seen.has(m)).toBe(true);
+				}
+			}
+		});
+	});
+}
+
+// ───────────────────── Collection order and encodings ───────────────────────
+//
+// Redis keeps a small hash or set packed — a listpack, or an intset for a
+// set of integers — and converts it to a hash table once it outgrows a
+// threshold, for good. The encoding shows twice: in OBJECT ENCODING, and in
+// the order elements come back, since a listpack keeps insertion order and
+// deletes in place and an intset is sorted. Every expected value here is
+// what redis:7.2-alpine answered for the same commands.
+
+for (const half of HALVES) {
+	describe(`Collection order and encodings (${half})`, () => {
+		beforeAll(async () => {
+			await raw.send("SELECT", half);
+			await raw.send("FLUSHDB");
+		});
+		afterAll(async () => {
+			await raw.send("FLUSHDB");
+			await raw.send("SELECT", "durable");
+		});
+
+		const list = async (...args: string[]) =>
+			(await raw.array(...args)).map((b) => b?.toString());
+		const enc = async (key: string) =>
+			(await raw.bulk("OBJECT", "ENCODING", key))?.toString();
+		const many = (n: number, f: (i: number) => string[]) =>
+			Array.from({ length: n }, (_, i) => f(i)).flat();
+
+		test("a hash keeps insertion order across HDEL and updates", async () => {
+			await raw.send("HSET", "o:h", "c", "1", "a", "2", "b", "3");
+			await raw.send("HDEL", "o:h", "a");
+			await raw.send("HSET", "o:h", "d", "4");
+			await raw.send("HSET", "o:h", "c", "9");
+			expect(await list("HGETALL", "o:h")).toEqual(["c", "9", "b", "3", "d", "4"]);
+			expect(await list("HKEYS", "o:h")).toEqual(["c", "b", "d"]);
+			expect(await list("HVALS", "o:h")).toEqual(["9", "3", "4"]);
+			expect(await enc("o:h")).toBe("listpack");
+			// A listpack is scanned whole in one call, whatever COUNT says.
+			const page = scanReply(await raw.send("HSCAN", "o:h", "0", "COUNT", "1"));
+			expect(page.cursor).toBe("0");
+			expect(page.items.map((b) => b.toString())).toEqual(["c", "9", "b", "3", "d", "4"]);
+			// HRANDFIELD with a count covering the hash returns it in order.
+			expect(await list("HRANDFIELD", "o:h", "10", "WITHVALUES")).toEqual([
+				"c", "9", "b", "3", "d", "4",
+			]);
+		});
+
+		test("a hash grown past the listpack limit and shrunk stays a hashtable", async () => {
+			// 512 fields is Redis 7.2's compiled-in hash-max-listpack-entries.
+			await raw.send("HSET", "o:h129", ...many(129, (i) => [`f${i}`, "v"]));
+			expect(await enc("o:h129")).toBe("listpack");
+			await raw.send("HSET", "o:big", ...many(513, (i) => [`f${i}`, "v"]));
+			expect(await enc("o:big")).toBe("hashtable");
+			await raw.send("HDEL", "o:big", ...many(510, (i) => [`f${i}`]));
+			expect(integerReply(await raw.send("HLEN", "o:big"))).toBe(3);
+			expect(await enc("o:big")).toBe("hashtable");
+			// A value past 64 bytes converts it too, and its removal does not
+			// convert it back.
+			await raw.send("HSET", "o:long", "a", "1", "b", "x".repeat(65));
+			await raw.send("HDEL", "o:long", "b");
+			expect(await enc("o:long")).toBe("hashtable");
+		});
+
+		test("a set of integers is an intset and comes back sorted", async () => {
+			await raw.send("SADD", "o:i", "5", "-3", "100", "2");
+			expect(await list("SMEMBERS", "o:i")).toEqual(["-3", "2", "5", "100"]);
+			expect(await enc("o:i")).toBe("intset");
+			// A string converts it: the integers keep their sorted order and
+			// later members are appended.
+			await raw.send("SADD", "o:i", "x");
+			await raw.send("SADD", "o:i", "1");
+			expect(await list("SMEMBERS", "o:i")).toEqual(["-3", "2", "5", "100", "x", "1"]);
+			expect(await enc("o:i")).toBe("listpack");
+			// Losing the string does not make it an intset again.
+			await raw.send("SREM", "o:i", "x");
+			expect(await enc("o:i")).toBe("listpack");
+			expect(await list("SMEMBERS", "o:i")).toEqual(["-3", "2", "5", "100", "1"]);
+			// Not what Redis reads as integers: a listpack from the start.
+			for (const m of ["007", "-0", "+1", "1.0", "9223372036854775808"]) {
+				await raw.send("DEL", "o:n");
+				await raw.send("SADD", "o:n", m);
+				expect(await enc("o:n")).toBe("listpack");
+			}
+			await raw.send("SADD", "o:edge", "9223372036854775807", "-9223372036854775808");
+			expect(await list("SMEMBERS", "o:edge")).toEqual([
+				"-9223372036854775808",
+				"9223372036854775807",
+			]);
+			expect(await enc("o:edge")).toBe("intset");
+		});
+
+		test("a listpack set removes in place and SSCAN returns it whole", async () => {
+			await raw.send("SADD", "o:l", "c", "a", "b", "d");
+			await raw.send("SREM", "o:l", "a");
+			await raw.send("SADD", "o:l", "e");
+			expect(await list("SMEMBERS", "o:l")).toEqual(["c", "b", "d", "e"]);
+			expect(await enc("o:l")).toBe("listpack");
+			const page = scanReply(await raw.send("SSCAN", "o:l", "0", "COUNT", "1"));
+			expect(page.cursor).toBe("0");
+			expect(page.items.map((b) => b.toString())).toEqual(["c", "b", "d", "e"]);
+			expect(await list("SRANDMEMBER", "o:l", "10")).toEqual(["c", "b", "d", "e"]);
+		});
+
+		test("a set that gained and lost a non-integer reports listpack", async () => {
+			await raw.send("SADD", "o:g", "1", "2");
+			expect(await enc("o:g")).toBe("intset");
+			await raw.send("SADD", "o:g", "x");
+			await raw.send("SREM", "o:g", "x");
+			expect(await enc("o:g")).toBe("listpack");
+			expect(await list("SMEMBERS", "o:g")).toEqual(["1", "2"]);
+		});
+
+		test("sets convert to hashtable for good", async () => {
+			await raw.send("SADD", "o:s200", ...many(200, (i) => [`m${i}`]));
+			expect(await enc("o:s200")).toBe("hashtable");
+			await raw.send("SREM", "o:s200", ...many(197, (i) => [`m${i}`]));
+			expect(await enc("o:s200")).toBe("hashtable");
+			await raw.send("SADD", "o:i512", ...many(512, (i) => [String(i + 1)]));
+			expect(await enc("o:i512")).toBe("intset");
+			await raw.send("SADD", "o:i512", "513");
+			expect(await enc("o:i512")).toBe("hashtable");
+			await raw.send("SADD", "o:long", "a", "x".repeat(65));
+			await raw.send("SREM", "o:long", "x".repeat(65));
+			expect(await enc("o:long")).toBe("hashtable");
+			// SADD sizes a set by the members named, repeats included.
+			await raw.send("SADD", "o:dup", ...many(200, () => ["a"]));
+			expect(await enc("o:dup")).toBe("hashtable");
+		});
+
+		test("set operations come back in the order their result set keeps", async () => {
+			await raw.send("SADD", "o:A", "c", "a", "b", "3", "1");
+			await raw.send("SADD", "o:B", "b", "c", "z");
+			await raw.send("SADD", "o:I", "9", "3", "1");
+			await raw.send("SADD", "o:J", "1", "3", "7");
+			expect(await list("SINTER", "o:A", "o:B")).toEqual(["b", "c"]);
+			expect(await list("SUNION", "o:A", "o:B")).toEqual(["c", "a", "b", "3", "1", "z"]);
+			expect(await list("SDIFF", "o:A", "o:B")).toEqual(["a", "3", "1"]);
+			expect(await list("SINTER", "o:I", "o:J")).toEqual(["1", "3"]);
+			expect(await list("SUNION", "o:I", "o:J")).toEqual(["1", "3", "7", "9"]);
+			expect(await list("SUNION", "o:I", "o:A")).toEqual(["1", "3", "9", "c", "a", "b"]);
+			expect(await list("SDIFF", "o:A", "o:I")).toEqual(["c", "a", "b"]);
+			expect(integerReply(await raw.send("SINTERSTORE", "o:D1", "o:A", "o:B"))).toBe(2);
+			expect(await enc("o:D1")).toBe("listpack");
+			expect(await list("SMEMBERS", "o:D1")).toEqual(["b", "c"]);
+			expect(integerReply(await raw.send("SUNIONSTORE", "o:D2", "o:I", "o:J"))).toBe(4);
+			expect(await enc("o:D2")).toBe("intset");
+			expect(integerReply(await raw.send("SUNIONSTORE", "o:D3", "o:A", "o:B"))).toBe(6);
+			expect(await list("SMEMBERS", "o:D3")).toEqual(["c", "a", "b", "3", "1", "z"]);
+			// A listpack holding only integers, stored by SINTERSTORE or
+			// rebuilt by SUNION, becomes an intset and sorts.
+			await raw.send("SADD", "o:li", "a", "30", "10", "20");
+			await raw.send("SREM", "o:li", "a");
+			expect(await list("SMEMBERS", "o:li")).toEqual(["30", "10", "20"]);
+			expect(await list("SUNION", "o:li")).toEqual(["10", "20", "30"]);
+			expect(integerReply(await raw.send("SINTERSTORE", "o:lo", "o:li", "o:li"))).toBe(3);
+			expect(await enc("o:lo")).toBe("intset");
+			// SPOP of the whole set answers as SUNION would.
+			await raw.send("SADD", "o:q", "a", "3", "1");
+			await raw.send("SREM", "o:q", "a");
+			expect(await list("SPOP", "o:q", "5")).toEqual(["1", "3"]);
+			// SMOVE into an intset converts it the same way SADD does.
+			await raw.send("SADD", "o:sm1", "a", "5");
+			await raw.send("SADD", "o:sm2", "9", "1");
+			await raw.send("SMOVE", "o:sm1", "o:sm2", "a");
+			expect(await list("SMEMBERS", "o:sm2")).toEqual(["1", "9", "a"]);
+			expect(await enc("o:sm2")).toBe("listpack");
+		});
+
+		test("a sorted set converted to skiplist stays one", async () => {
+			await raw.send("ZADD", "o:z", ...many(129, (i) => [String(i), `m${i}`]));
+			expect(await enc("o:z")).toBe("skiplist");
+			await raw.send("ZREMRANGEBYRANK", "o:z", "0", "100");
+			expect(integerReply(await raw.send("ZCARD", "o:z"))).toBe(28);
+			expect(await enc("o:z")).toBe("skiplist");
+			await raw.send("ZADD", "o:zl", "1", "a", "2", "x".repeat(65));
+			await raw.send("ZREM", "o:zl", "x".repeat(65));
+			expect(await enc("o:zl")).toBe("skiplist");
+			await raw.send("ZADD", "o:small", "2", "b", "1", "a", "3", "c");
+			expect(await enc("o:small")).toBe("listpack");
+			const page = scanReply(await raw.send("ZSCAN", "o:small", "0", "COUNT", "1"));
+			expect(page.cursor).toBe("0");
+			expect(page.items.map((b) => b.toString())).toEqual(["a", "1", "b", "2", "c", "3"]);
+			// The whole sorted set from ZRANDMEMBER comes highest first.
+			expect(await list("ZRANDMEMBER", "o:small", "5", "WITHSCORES")).toEqual([
+				"c", "3", "b", "2", "a", "1",
+			]);
+		});
+
+		test("a list is a listpack until it outgrows 8 KB", async () => {
+			await raw.send("RPUSH", "o:list", ...many(200, (i) => [`a${i}`]));
+			expect(await enc("o:list")).toBe("listpack");
+			await raw.send("RPUSH", "o:list2", ...many(90, () => ["x".repeat(100)]));
+			expect(await enc("o:list2")).toBe("quicklist");
+		});
+
+		test("COPY and RENAME keep the encoding, DUMP and RESTORE load it as Redis does", async () => {
+			await raw.send("HSET", "o:hb", ...many(600, (i) => [`f${i}`, "v"]));
+			await raw.send("HDEL", "o:hb", ...many(597, (i) => [`f${i + 3}`]));
+			expect(await enc("o:hb")).toBe("hashtable");
+			await raw.send("COPY", "o:hb", "o:hc");
+			expect(await enc("o:hc")).toBe("hashtable");
+			await raw.send("RENAME", "o:hc", "o:hd");
+			expect(await enc("o:hd")).toBe("hashtable");
+			// A payload loads as Redis's rdbLoadObject would: three fields
+			// fit a listpack.
+			const payload = await raw.bulk("DUMP", "o:hb");
+			expect((await raw.send("RESTORE", "o:he", "0", payload as Buffer)).toString()).toBe(
+				"+OK\r\n",
+			);
+			expect(await enc("o:he")).toBe("listpack");
+			// A listpack's payload keeps its order and its encoding.
+			await raw.send("SADD", "o:sp", "a", "30", "10");
+			await raw.send("SREM", "o:sp", "a");
+			const sp = await raw.bulk("DUMP", "o:sp");
+			await raw.send("RESTORE", "o:sq", "0", sp as Buffer);
+			expect(await list("SMEMBERS", "o:sq")).toEqual(["30", "10"]);
+			expect(await enc("o:sq")).toBe("listpack");
+		});
+
+		test("CONFIG SET moves the thresholds", async () => {
+			try {
+				await raw.send("CONFIG", "SET", "hash-max-listpack-entries", "2");
+				await raw.send("HSET", "o:cs", "a", "1", "b", "2");
+				expect(await enc("o:cs")).toBe("listpack");
+				await raw.send("HSET", "o:cs", "c", "3");
+				expect(await enc("o:cs")).toBe("hashtable");
+				await raw.send("CONFIG", "SET", "set-max-intset-entries", "3");
+				await raw.send("SADD", "o:ci", "1", "2", "3");
+				expect(await enc("o:ci")).toBe("intset");
+				await raw.send("SADD", "o:ci", "4");
+				expect(await enc("o:ci")).toBe("hashtable");
+			} finally {
+				await raw.send("CONFIG", "SET", "hash-max-listpack-entries", "512");
+				await raw.send("CONFIG", "SET", "set-max-intset-entries", "512");
+			}
 		});
 	});
 }
@@ -4580,5 +5313,794 @@ describe("memory+snapshot", () => {
 		expect(await rows(6)).toBe(0);
 		expect((await raw.bulk("GET", "snap:new"))?.toString()).toBe("v");
 		await raw.send("FLUSHDB");
+	});
+});
+
+// A script, an EXEC and a multi-step command hold their database for their
+// whole run, on every worker: the listener spreads connections over the
+// workers, so these clients run on all of them at once.
+describe("Atomicity across workers", () => {
+	const CLIENTS = 16;
+	const ROUNDS = 40;
+	const connect = (n = CLIENTS) =>
+		Promise.all(Array.from({ length: n }, () => new RawRedis().connect()));
+	const closeAll = (conns: RawRedis[]) => {
+		for (const c of conns) c.close();
+	};
+	/** An EXEC's raw reply with no nil and no error in it. */
+	const execOk = (r: Buffer) => {
+		const s = r.toString();
+		return s.startsWith("*") && !s.startsWith("*-1") && !s.includes("\r\n-");
+	};
+
+	afterAll(async () => {
+		await raw.send("SELECT", "durable");
+	});
+
+	const RMW =
+		"local v = tonumber(redis.call('GET', KEYS[1]) or '0') " +
+		"redis.call('SET', KEYS[1], tostring(v + 1)) return v + 1";
+
+	for (const db of ["0", "8"]) {
+		test(`db ${db}: a read-modify-write script loses no increment`, async () => {
+			const key = `atomic:${db}:script`;
+			await raw.send("SELECT", db);
+			await raw.send("DEL", key);
+			const conns = await connect();
+			const errors: string[] = [];
+			try {
+				await Promise.all(
+					conns.map(async (c) => {
+						await c.send("SELECT", db);
+						for (let i = 0; i < ROUNDS; i++) {
+							const e = errorReply(await c.send("EVAL", RMW, "1", key));
+							if (e) errors.push(e);
+						}
+					}),
+				);
+			} finally {
+				closeAll(conns);
+			}
+			expect(errors).toEqual([]);
+			expect((await raw.bulk("GET", key))?.toString()).toBe(String(CLIENTS * ROUNDS));
+			await raw.send("DEL", key);
+		}, 60_000);
+
+		// No WATCH: the GET and the SET are separate commands, and only the
+		// transaction holding the database keeps another one out between them.
+		// Each EXEC reads the token the one before it wrote, so if they run one
+		// at a time every token is read exactly once.
+		test(`db ${db}: MULTI GET/SET transactions run one at a time`, async () => {
+			const key = `atomic:${db}:multi`;
+			await raw.send("SELECT", db);
+			await raw.send("SET", key, "start");
+			const conns = await connect();
+			const read: string[] = [];
+			const interleaved: string[] = [];
+			try {
+				await Promise.all(
+					conns.map(async (c, n) => {
+						await c.send("SELECT", db);
+						for (let i = 0; i < ROUNDS; i++) {
+							await c.send("MULTI");
+							await c.send("GET", key);
+							await c.send("SET", key, `t${n}:${i}`);
+							await c.send("GET", key);
+							const [before, , after] = await c.array("EXEC");
+							// Nothing ran between the SET and the GET after it.
+							if (after?.toString() !== `t${n}:${i}`) interleaved.push(`t${n}:${i}`);
+							read.push(before?.toString() ?? "");
+						}
+					}),
+				);
+			} finally {
+				closeAll(conns);
+			}
+			expect(interleaved).toEqual([]);
+			const last = (await raw.bulk("GET", key))?.toString() ?? "";
+			const written = new Set<string>(["start"]);
+			for (let n = 0; n < CLIENTS; n++)
+				for (let i = 0; i < ROUNDS; i++) written.add(`t${n}:${i}`);
+			// Two transactions that read the same token both ran their GET
+			// before either SET: a lost update.
+			expect(new Set(read).size).toBe(read.length);
+			expect(new Set([...read, last])).toEqual(written);
+			await raw.send("DEL", key);
+		}, 60_000);
+	}
+
+	test("a script on db 0 holds db 0 on every worker and leaves db 1 alone", async () => {
+		const LONG_MS = 1500;
+		const script = await new RawRedis().connect();
+		const db1 = await connect(8);
+		const db0 = await connect(8);
+		try {
+			await script.send("SELECT", "0");
+			await script.send("DEL", "atomic:busy");
+			for (const c of db1) await c.send("SELECT", "1");
+			for (const c of db0) await c.send("SELECT", "0");
+			// Time stands still inside a script, as in Redis, so the script
+			// holds its database by sleeping rather than watching TIME.
+			await script.send("DEBUG", "SET-DISABLE-DENY-SCRIPTS", "1");
+			const busy =
+				"redis.call('DEBUG', 'SLEEP', tonumber(ARGV[1]) / 1000) " +
+				"redis.call('SET', KEYS[1], 'done') return 1";
+			const started = performance.now();
+			const running = script.send("EVAL", busy, "1", "atomic:busy", String(LONG_MS));
+			await Bun.sleep(200);
+			// Commands on db 1 go ahead on the workers not running the script.
+			// The one running it serves nobody until it ends, as before.
+			const fast = await Promise.all(
+				db1.map(async (c, i) => {
+					const t = performance.now();
+					await c.send("SET", `atomic:free:${i}`, "x");
+					await c.send("GET", `atomic:free:${i}`);
+					return performance.now() - t;
+				}),
+			);
+			// Commands on db 0 wait for the script on every worker, and see
+			// what it wrote.
+			const seen = await Promise.all(
+				db0.map(async (c) => {
+					const r = await c.bulk("GET", "atomic:busy");
+					return { at: performance.now() - started, value: r?.toString() };
+				}),
+			);
+			expect(errorReply(await running)).toBeNull();
+			expect(Math.min(...fast)).toBeLessThan(500);
+			for (const s of seen) {
+				expect(s.value).toBe("done");
+				expect(s.at).toBeGreaterThan(LONG_MS - 100);
+			}
+			await script.send("DEL", "atomic:busy");
+			for (const [i, c] of db1.entries()) await c.send("DEL", `atomic:free:${i}`);
+		} finally {
+			await script.send("DEBUG", "SET-DISABLE-DENY-SCRIPTS", "0");
+			script.close();
+			closeAll(db1);
+			closeAll(db0);
+		}
+	}, 30_000);
+
+	test("SWAPDB, MOVE, and SELECT in MULTI and in scripts under load", async () => {
+		const [A, B, L] = ["3", "4", "11"];
+		const KEYS = 60;
+		const ROUND = 25;
+		for (const db of [A, B, L]) {
+			await raw.send("SELECT", db);
+			await raw.send("FLUSHDB");
+		}
+		await raw.send("SELECT", A);
+		for (let i = 0; i < KEYS; i++) await raw.send("SET", `mv:${i}`, "v");
+
+		// Starts on the higher database and selects the lower one.
+		const crossScript =
+			`redis.call('SELECT', '${L}') redis.call('INCR', 'xs') ` +
+			`redis.call('SELECT', '${A}') redis.call('INCR', 'xs') return 1`;
+		const errors: string[] = [];
+		const check = (r: Buffer) => {
+			const e = errorReply(r);
+			if (e) errors.push(e);
+		};
+		const conns = await connect();
+		try {
+			await Promise.all(
+				conns.map(async (c, n) => {
+					for (let i = 0; i < ROUND; i++) {
+						switch (n % 4) {
+							case 0:
+								await c.send("SELECT", A);
+								check(await c.send("SWAPDB", A, B));
+								break;
+							case 1: {
+								// In A or B, wherever SWAPDB left it, or already
+								// moved by another client: MOVE answers 0 then.
+								const k = `mv:${(n * ROUND + i) % KEYS}`;
+								await c.send("SELECT", (n + i) % 2 ? A : B);
+								check(await c.send("MOVE", k, L));
+								await c.send("SELECT", L);
+								check(await c.send("MOVE", k, A));
+								break;
+							}
+							case 2: {
+								await c.send("SELECT", A);
+								await c.send("MULTI");
+								await c.send("SELECT", L);
+								await c.send("INCR", "ym");
+								await c.send("SELECT", A);
+								await c.send("INCR", "ym");
+								const r = await c.send("EXEC");
+								if (!execOk(r)) errors.push(r.toString());
+								break;
+							}
+							case 3:
+								await c.send("SELECT", L);
+								check(await c.send("EVAL", crossScript, "0"));
+								break;
+						}
+					}
+				}),
+			);
+		} finally {
+			closeAll(conns);
+		}
+		expect(errors).toEqual([]);
+
+		const count = async (db: string, key: string) => {
+			await raw.send("SELECT", db);
+			const v = await raw.bulk("GET", key);
+			return v ? Number(v.toString()) : 0;
+		};
+		const per = (CLIENTS / 4) * ROUND;
+		// Every increment landed once: in L, and in A or B as SWAPDB left them.
+		for (const key of ["xs", "ym"]) {
+			expect(await count(L, key)).toBe(per);
+			expect((await count(A, key)) + (await count(B, key))).toBe(per);
+		}
+		// MOVE and SWAPDB move keys; none is lost or doubled.
+		let total = 0;
+		for (const db of [A, B, L]) {
+			await raw.send("SELECT", db);
+			total += (await raw.array("KEYS", "mv:*")).length;
+		}
+		expect(total).toBe(KEYS);
+		for (const db of [A, B, L]) {
+			await raw.send("SELECT", db);
+			await raw.send("FLUSHDB");
+		}
+	}, 120_000);
+});
+
+// Redis 7.2's eviction policies and access clock (src/evict.rs, src/access.rs,
+// src/memdb/lru.rs). Memory database 0 for eviction; logged database 8 for
+// OBJECT, which must answer there too. Every test puts the limit and the
+// policy back, and the memory databases are emptied first, since an allkeys
+// policy may take a key from any of them.
+describe("Eviction and access tracking", () => {
+	const usedMemory = async (): Promise<number> => {
+		const info = (await raw.bulk("INFO", "memory"))?.toString() ?? "";
+		return Number(info.match(/used_memory:(\d+)/)?.[1] ?? 0);
+	};
+	const stat = async (name: string): Promise<number> => {
+		const info = (await raw.bulk("INFO", "stats"))?.toString() ?? "";
+		return Number(info.match(new RegExp(`${name}:(\\d+)`))?.[1] ?? -1);
+	};
+	const reset = async () => {
+		await raw.send("CONFIG", "SET", "maxmemory", "0", "maxmemory-policy", "noeviction");
+		await raw.send("CONFIG", "SET", "notify-keyspace-events", "", "lfu-decay-time", "1");
+	};
+	const within = <T>(p: Promise<T>, ms: number) =>
+		Promise.race([p, Bun.sleep(ms).then(() => null)]);
+	const exists = async (key: string) => integerReply(await raw.send("EXISTS", key)) === 1;
+	const value = "x".repeat(200);
+
+	beforeAll(async () => {
+		for (let db = 0; db < 8; db++) {
+			await raw.send("SELECT", String(db));
+			await raw.send("FLUSHDB");
+		}
+		await raw.send("SELECT", "0");
+	});
+
+	afterAll(async () => {
+		await reset();
+		await raw.send("SELECT", "0");
+		await raw.send("FLUSHDB");
+		await raw.send("SELECT", "durable");
+	});
+
+	test("every policy is accepted, reported, and refused when misspelt", async () => {
+		try {
+			for (const p of [
+				"noeviction",
+				"allkeys-lru",
+				"allkeys-lfu",
+				"allkeys-random",
+				"volatile-lru",
+				"volatile-lfu",
+				"volatile-random",
+				"volatile-ttl",
+			]) {
+				expect((await raw.send("CONFIG", "SET", "maxmemory-policy", p)).toString()).toBe("+OK\r\n");
+				expect((await raw.array("CONFIG", "GET", "maxmemory-policy"))[1]?.toString()).toBe(p);
+				expect((await raw.bulk("INFO", "memory"))?.toString()).toContain(`maxmemory_policy:${p}`);
+			}
+			expect(errorReply(await raw.send("CONFIG", "SET", "maxmemory-policy", "lru"))).toStartWith(
+				"ERR CONFIG SET failed (possibly related to argument 'maxmemory-policy') - argument(s) must be one of the following: volatile-lru,",
+			);
+			expect(errorReply(await raw.send("CONFIG", "SET", "maxmemory-samples", "0"))).toContain(
+				"argument must be between 1 and 2147483647 inclusive",
+			);
+		} finally {
+			await reset();
+		}
+	});
+
+	for (const policy of ["volatile-lru", "volatile-lfu", "volatile-random", "volatile-ttl"]) {
+		test(`${policy} evicts only keys with an expiry, then refuses writes`, async () => {
+			await raw.send("FLUSHDB");
+			try {
+				for (let i = 0; i < 200; i++) {
+					await raw.send("SET", `p:${i}`, value);
+					await raw.send("SET", `v:${i}`, value, "EX", String(1000 + i));
+				}
+				const before = await stat("evicted_keys");
+				const used = await usedMemory();
+				await raw.send("CONFIG", "SET", "maxmemory-policy", policy);
+				await raw.send("CONFIG", "SET", "maxmemory", String(used - 20_000));
+				expect((await raw.send("SET", "trigger", "1")).toString()).toBe("+OK\r\n");
+				const evicted = (await stat("evicted_keys")) - before;
+				expect(evicted).toBeGreaterThan(10);
+				for (let i = 0; i < 200; i++) expect(await exists(`p:${i}`)).toBe(true);
+				const gone: number[] = [];
+				for (let i = 0; i < 200; i++) if (!(await exists(`v:${i}`))) gone.push(i);
+				expect(gone.length).toBe(evicted);
+				if (policy === "volatile-ttl") {
+					// The soonest deadlines go first: what went is from the low end.
+					const mean = gone.reduce((a, b) => a + b, 0) / gone.length;
+					expect(mean).toBeLessThan(60);
+				}
+				// With every volatile key gone, nothing may be evicted: OOM.
+				await raw.send("CONFIG", "SET", "maxmemory", "1");
+				expect(errorReply(await raw.send("SET", "more", value))).toStartWith("OOM ");
+				expect(await exists("p:0")).toBe(true);
+				for (let i = 0; i < 200; i++) expect(await exists(`v:${i}`)).toBe(false);
+			} finally {
+				await reset();
+				await raw.send("FLUSHDB");
+			}
+		});
+	}
+
+	// Redis's own LRU test, in outline: keys touched after a pause outlive
+	// keys left alone, because an idle key scores higher in the pool.
+	test("allkeys-lru keeps the keys used recently", async () => {
+		await raw.send("FLUSHDB");
+		try {
+			await raw.send("CONFIG", "SET", "maxmemory-policy", "allkeys-lru");
+			const empty = await usedMemory();
+			for (let i = 0; i < 1000; i++) await raw.send("SET", `k:${i}`, value);
+			const full = await usedMemory();
+			await Bun.sleep(2100);
+			for (let i = 0; i < 500; i++) await raw.send("GET", `k:${i}`);
+			await raw.send("CONFIG", "SET", "maxmemory", String(full - Math.floor((full - empty) * 0.25)));
+			await raw.send("PING");
+			let touched = 0;
+			let idle = 0;
+			for (let i = 0; i < 1000; i++) {
+				const here = await exists(`k:${i}`);
+				if (here && i < 500) touched++;
+				if (here && i >= 500) idle++;
+			}
+			expect(idle).toBeLessThan(450);
+			expect(touched).toBeGreaterThan(475);
+		} finally {
+			await reset();
+			await raw.send("FLUSHDB");
+		}
+	});
+
+	test("allkeys-lfu keeps the keys used often", async () => {
+		await raw.send("FLUSHDB");
+		try {
+			// The counter decays a step for each minute boundary its clock
+			// crosses, as Redis's does, which took k:999 to 4 whenever one
+			// fell during the test. Without decay the counts are only the reads.
+			await raw.send("CONFIG", "SET", "maxmemory-policy", "allkeys-lfu", "lfu-decay-time", "0");
+			const empty = await usedMemory();
+			for (let i = 0; i < 1000; i++) await raw.send("SET", `k:${i}`, value);
+			const full = await usedMemory();
+			// The counter climbs by chance: past 6 it takes one in eleven reads
+			// at the default lfu-log-factor, so 20 rounds left it at 6 one run
+			// in six. A hundred leave it there one run in ten thousand.
+			for (let round = 0; round < 100; round++) {
+				await Promise.all(Array.from({ length: 200 }, (_, i) => raw.send("GET", `k:${i}`)));
+			}
+			expect(integerReply(await raw.send("OBJECT", "FREQ", "k:0"))).toBeGreaterThan(6);
+			expect(integerReply(await raw.send("OBJECT", "FREQ", "k:999"))).toBe(5);
+			await raw.send("CONFIG", "SET", "maxmemory", String(full - Math.floor((full - empty) * 0.25)));
+			await raw.send("PING");
+			let hot = 0;
+			for (let i = 0; i < 200; i++) if (await exists(`k:${i}`)) hot++;
+			expect(hot).toBeGreaterThan(190);
+			expect(integerReply(await raw.send("DBSIZE"))).toBeLessThan(950);
+		} finally {
+			await reset();
+			await raw.send("FLUSHDB");
+		}
+	});
+
+	test("an evicted key raises `evicted` and invalidates a tracking client", async () => {
+		await raw.send("FLUSHDB");
+		const sub = await new RawRedis().connect();
+		const inval = await new RawRedis().connect();
+		const tracker = await new RawRedis().connect();
+		try {
+			await raw.send("CONFIG", "SET", "notify-keyspace-events", "Ee");
+			await sub.send("PSUBSCRIBE", "__keyevent@0__:evicted");
+			const invalId = integerReply(await inval.send("CLIENT", "ID"));
+			await inval.send("SUBSCRIBE", "__redis__:invalidate");
+			await tracker.send("SELECT", "0");
+			await tracker.send("CLIENT", "TRACKING", "on", "REDIRECT", String(invalId));
+			await raw.send("SET", "ev:k", value, "EX", "1000");
+			await tracker.send("GET", "ev:k");
+			const before = await stat("evicted_keys");
+			const event = sub.next();
+			const invalidation = inval.next();
+			// The only key with an expiry: volatile-ttl takes it and nothing
+			// else, and with no command to start it, the worker's next round.
+			await raw.send("CONFIG", "SET", "maxmemory-policy", "volatile-ttl");
+			await raw.send("CONFIG", "SET", "maxmemory", String((await usedMemory()) - 1));
+			const got = (await within(event, 3000))?.toString() ?? "";
+			expect(got).toContain("__keyevent@0__:evicted");
+			expect(got).toContain("ev:k");
+			const inv = (await within(invalidation, 3000))?.toString() ?? "";
+			expect(inv).toContain("__redis__:invalidate");
+			expect(inv).toContain("ev:k");
+			expect(await stat("evicted_keys")).toBe(before + 1);
+			expect(await stat("evicted_clients")).toBe(0);
+		} finally {
+			await reset();
+			sub.close();
+			inval.close();
+			tracker.close();
+		}
+	});
+
+	for (const half of ["0", "8"]) {
+		test(`OBJECT IDLETIME grows and resets on access (db ${half})`, async () => {
+			await raw.send("SELECT", half);
+			try {
+				await raw.send("DEL", "at:k");
+				await raw.send("SET", "at:k", "v");
+				expect(integerReply(await raw.send("OBJECT", "IDLETIME", "at:k"))).toBeLessThanOrEqual(1);
+				await Bun.sleep(2100);
+				// TTL, TYPE and EXISTS look without touching.
+				await raw.send("TTL", "at:k");
+				await raw.send("TYPE", "at:k");
+				await raw.send("EXISTS", "at:k");
+				expect(integerReply(await raw.send("OBJECT", "IDLETIME", "at:k"))).toBeGreaterThanOrEqual(2);
+				await raw.send("GET", "at:k");
+				expect(integerReply(await raw.send("OBJECT", "IDLETIME", "at:k"))).toBeLessThanOrEqual(1);
+				expect(await raw.bulk("OBJECT", "IDLETIME", "at:absent")).toBeNull();
+				expect(errorReply(await raw.send("OBJECT", "FREQ", "at:k"))).toBe(
+					"ERR An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.",
+				);
+			} finally {
+				await raw.send("DEL", "at:k");
+				await raw.send("SELECT", "0");
+			}
+		});
+
+		test(`OBJECT FREQ counts under LFU (db ${half})`, async () => {
+			await raw.send("SELECT", half);
+			try {
+				await raw.send("CONFIG", "SET", "maxmemory-policy", "allkeys-lfu");
+				await raw.send("DEL", "af:k");
+				await raw.send("SET", "af:k", "v");
+				expect(integerReply(await raw.send("OBJECT", "FREQ", "af:k"))).toBe(5);
+				for (let i = 0; i < 30; i++) await raw.send("GET", "af:k");
+				expect(integerReply(await raw.send("OBJECT", "FREQ", "af:k"))).toBeGreaterThan(5);
+				expect(errorReply(await raw.send("OBJECT", "IDLETIME", "af:k"))).toBe(
+					"ERR An LFU maxmemory policy is selected, idle time not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.",
+				);
+				expect(await raw.bulk("OBJECT", "FREQ", "af:absent")).toBeNull();
+			} finally {
+				await reset();
+				await raw.send("DEL", "af:k");
+				await raw.send("SELECT", "0");
+			}
+		});
+
+		test(`CLIENT NO-TOUCH leaves the clock alone but TOUCH still touches (db ${half})`, async () => {
+			await raw.send("SELECT", half);
+			try {
+				await raw.send("SET", "nt:k", "v");
+				await Bun.sleep(2100);
+				await raw.send("CLIENT", "NO-TOUCH", "ON");
+				await raw.send("GET", "nt:k");
+				expect(integerReply(await raw.send("OBJECT", "IDLETIME", "nt:k"))).toBeGreaterThanOrEqual(2);
+				await raw.send("TOUCH", "nt:k");
+				expect(integerReply(await raw.send("OBJECT", "IDLETIME", "nt:k"))).toBeLessThanOrEqual(1);
+			} finally {
+				await raw.send("CLIENT", "NO-TOUCH", "OFF");
+				await raw.send("DEL", "nt:k");
+				await raw.send("SELECT", "0");
+			}
+		});
+
+		test(`RESTORE sets IDLETIME and FREQ, and REFCOUNT follows sharing (db ${half})`, async () => {
+			await raw.send("SELECT", half);
+			try {
+				await raw.send("SET", "rs:k", "bar");
+				const dump = (await raw.bulk("DUMP", "rs:k")) as Buffer;
+				await raw.send("DEL", "rs:k");
+				await raw.send("CONFIG", "SET", "maxmemory-policy", "allkeys-lru");
+				expect((await raw.send("RESTORE", "rs:k", "0", dump, "IDLETIME", "1000")).toString()).toBe("+OK\r\n");
+				const idle = integerReply(await raw.send("OBJECT", "IDLETIME", "rs:k"));
+				expect(idle).toBeGreaterThanOrEqual(1000);
+				expect(idle).toBeLessThanOrEqual(1010);
+				await raw.send("DEL", "rs:k");
+				await raw.send("CONFIG", "SET", "maxmemory-policy", "allkeys-lfu");
+				await raw.send("RESTORE", "rs:k", "0", dump, "FREQ", "100");
+				expect(integerReply(await raw.send("OBJECT", "FREQ", "rs:k"))).toBe(100);
+				expect(errorReply(await raw.send("RESTORE", "rs:k", "0", dump, "REPLACE", "FREQ", "256"))).toBe(
+					"ERR Invalid FREQ value, must be >= 0 and <= 255",
+				);
+				expect(errorReply(await raw.send("RESTORE", "rs:k", "0", dump, "REPLACE", "IDLETIME", "1", "FREQ", "1"))).toBe(
+					"ERR syntax error",
+				);
+				// Small integers are shared objects unless an LRU or LFU policy
+				// has a limit to keep per key.
+				await raw.send("CONFIG", "SET", "maxmemory", "1gb");
+				await raw.send("SET", "rs:n", "100");
+				expect(integerReply(await raw.send("OBJECT", "REFCOUNT", "rs:n"))).toBe(1);
+				await raw.send("CONFIG", "SET", "maxmemory-policy", "noeviction");
+				expect(integerReply(await raw.send("OBJECT", "REFCOUNT", "rs:n"))).toBe(2147483647);
+				expect(integerReply(await raw.send("OBJECT", "REFCOUNT", "rs:k"))).toBe(1);
+				expect(await raw.bulk("OBJECT", "REFCOUNT", "rs:absent")).toBeNull();
+			} finally {
+				await reset();
+				await raw.send("DEL", "rs:k", "rs:n");
+				await raw.send("SELECT", "0");
+			}
+		});
+	}
+});
+
+describe("ACL", () => {
+	/** A RESP2 map reply as an object. */
+	const asMap = (v: Resp): Record<string, Resp> => {
+		const a = v as Resp[];
+		const out: Record<string, Resp> = {};
+		for (let i = 0; i < a.length; i += 2) out[a[i] as string] = a[i + 1];
+		return out;
+	};
+	const cmd = async (c: RawRedis, ...args: string[]) => decode(await c.send(...args));
+	/** A connection authenticated as `user`. */
+	const as = async (user: string, password: string) => {
+		const c = await new RawRedis().connect({ password: "" });
+		expect(await cmd(c, "AUTH", user, password)).toBe("OK");
+		return c;
+	};
+	let admin: RawRedis;
+	const users = ["acl-app", "acl-ro", "acl-ps", "acl-gone", "acl-saved", "acl-multi", "acl-blk", "acl-sql"];
+
+	beforeAll(async () => {
+		admin = await new RawRedis().connect();
+		await admin.send("ACL", "DELUSER", ...users);
+		await admin.send("ACL", "LOG", "RESET");
+	});
+
+	afterAll(async () => {
+		await admin.send("ACL", "DELUSER", ...users);
+		await sql`DELETE FROM redis.acl_users`;
+		admin.close();
+	});
+
+	test("the default user carries redis.password", async () => {
+		const d = asMap(await cmd(admin, "ACL", "GETUSER", "default"));
+		expect(d.flags).toEqual(["on", "sanitize-payload"]);
+		const hash = new Bun.CryptoHasher("sha256").update(REDIS_PASSWORD).digest("hex");
+		expect(d.passwords).toEqual([hash]);
+		expect(await cmd(admin, "ACL", "WHOAMI")).toBe("default");
+		const c = await new RawRedis().connect({ password: "" });
+		expect(await cmd(c, "AUTH", "default", "wrong")).toEqual({
+			error: "WRONGPASS invalid username-password pair or user is disabled.",
+		});
+		expect(await cmd(c, "AUTH", "default", REDIS_PASSWORD)).toBe("OK");
+		c.close();
+		const log = asMap(((await cmd(admin, "ACL", "LOG", "1")) as Resp[])[0]);
+		expect(log).toMatchObject({ reason: "auth", object: "AUTH", username: "default" });
+	});
+
+	test("SETUSER, GETUSER and LIST describe a user as Redis does", async () => {
+		expect(
+			await cmd(
+				admin,
+				"ACL",
+				"SETUSER",
+				"acl-app",
+				"on",
+				">pw",
+				"~app:*",
+				"%R~shared:*",
+				"&news:*",
+				"+@all",
+				"-@dangerous",
+				"(+get ~sel:*)",
+			),
+		).toBe("OK");
+		const list = (await cmd(admin, "ACL", "LIST")) as string[];
+		expect(list).toContain(
+			"user acl-app on sanitize-payload #30c952fab122c3f9759f02a6d95c3758b246b4fee239957b2d4fee46e26170c4 ~app:* %R~shared:* resetchannels &news:* +@all -@dangerous (~sel:* resetchannels -@all +get)",
+		);
+		const u = asMap(await cmd(admin, "ACL", "GETUSER", "acl-app"));
+		expect(u.commands).toBe("+@all -@dangerous");
+		expect(u.keys).toBe("~app:* %R~shared:*");
+		expect(u.channels).toBe("&news:*");
+		expect((u.selectors as Resp[]).map(asMap)[0].keys).toBe("~sel:*");
+		expect(await cmd(admin, "ACL", "SETUSER", "acl-app", "+nosuch")).toEqual({
+			error: "ERR Error in ACL SETUSER modifier '+nosuch': Unknown command or category name in ACL",
+		});
+	});
+
+	test("commands, keys and channels are refused with Redis's NOPERM texts", async () => {
+		await admin.send("ACL", "LOG", "RESET");
+		const c = await as("acl-app", "pw");
+		expect(await cmd(c, "ACL", "WHOAMI")).toBe("acl-app");
+		expect(await cmd(c, "SET", "app:1", "v")).toBe("OK");
+		expect(await cmd(c, "GET", "shared:1")).toBeNull();
+		expect(await cmd(c, "SET", "shared:1", "v")).toEqual({ error: "NOPERM No permissions to access a key" });
+		expect(await cmd(c, "GET", "other")).toEqual({ error: "NOPERM No permissions to access a key" });
+		expect(await cmd(c, "GET", "sel:1")).toBeNull();
+		expect(await cmd(c, "FLUSHALL")).toEqual({
+			error: "NOPERM User acl-app has no permissions to run the 'flushall' command",
+		});
+		expect(await cmd(c, "PUBLISH", "news:1", "m")).toBe(0);
+		expect(await cmd(c, "PUBLISH", "sport", "m")).toEqual({ error: "NOPERM No permissions to access a channel" });
+		c.close();
+		await admin.send("DEL", "app:1");
+		const log = ((await cmd(admin, "ACL", "LOG")) as Resp[]).map(asMap);
+		expect(log[0]).toMatchObject({ reason: "channel", context: "toplevel", object: "sport", username: "acl-app" });
+		expect(log[1]).toMatchObject({ reason: "command", object: "flushall" });
+		expect(log[2]).toMatchObject({ reason: "key", object: "other" });
+		expect(log[3]).toMatchObject({ reason: "key", object: "shared:1" });
+		expect(log[0]["client-info"]).toContain("user=acl-app");
+		const stats = (await cmd(admin, "INFO", "stats")) as string;
+		expect(stats).toMatch(/acl_access_denied_channel:[1-9]/);
+	});
+
+	test("DRYRUN answers for another user without running anything", async () => {
+		await cmd(admin, "ACL", "SETUSER", "acl-ro", "on", "nopass", "+@read", "%R~r*", "resetchannels");
+		expect(await cmd(admin, "ACL", "DRYRUN", "acl-ro", "GET", "r1")).toBe("OK");
+		expect(await cmd(admin, "ACL", "DRYRUN", "acl-ro", "SET", "r1", "v")).toBe(
+			"User acl-ro has no permissions to run the 'set' command",
+		);
+		expect(await cmd(admin, "ACL", "DRYRUN", "acl-ro", "GET", "x")).toBe(
+			"User acl-ro has no permissions to access the 'x' key",
+		);
+		expect(await cmd(admin, "ACL", "DRYRUN", "nobody", "GET", "x")).toEqual({ error: "ERR User 'nobody' not found" });
+	});
+
+	test("MULTI refuses at queue time and EXEC checks again", async () => {
+		await cmd(admin, "ACL", "SETUSER", "acl-multi", "on", ">pw", "~*", "+multi", "+exec", "+incr", "+get");
+		const c = await as("acl-multi", "pw");
+		expect(await cmd(c, "MULTI")).toBe("OK");
+		expect(await cmd(c, "SET", "k", "v")).toEqual({
+			error: "NOPERM User acl-multi has no permissions to run the 'set' command",
+		});
+		expect(await cmd(c, "EXEC")).toEqual({ error: "EXECABORT Transaction discarded because of previous errors." });
+		expect(await cmd(c, "MULTI")).toBe("OK");
+		expect(await cmd(c, "INCR", "acl:ctr")).toBe("QUEUED");
+		expect(await cmd(c, "GET", "acl:ctr")).toBe("QUEUED");
+		await cmd(admin, "ACL", "SETUSER", "acl-multi", "-incr");
+		const r = (await cmd(c, "EXEC")) as Resp[];
+		expect((r[0] as { error: string }).error).toStartWith(
+			"NOPERM ACLs rules changed between the moment the transaction was accumulated and the EXEC call.",
+		);
+		expect(r[1]).toBeNull();
+		const log = asMap(((await cmd(admin, "ACL", "LOG", "1")) as Resp[])[0]);
+		expect(log).toMatchObject({ context: "multi", object: "incr" });
+		c.close();
+		await admin.send("DEL", "acl:ctr");
+	});
+
+	test("a queued AUTH switches the user in its turn at EXEC", async () => {
+		await cmd(admin, "ACL", "SETUSER", "acl-later", "on", ">pw2", "~*", "+@all", "-set");
+		await cmd(admin, "ACL", "SETUSER", "acl-multi", "+acl|whoami", "+auth");
+		const c = await as("acl-multi", "pw");
+		expect(await cmd(c, "MULTI")).toBe("OK");
+		expect(await cmd(c, "ACL", "WHOAMI")).toBe("QUEUED");
+		expect(await cmd(c, "AUTH", "acl-later", "wrong")).toBe("QUEUED");
+		expect(await cmd(c, "AUTH", "acl-later", "pw2")).toBe("QUEUED");
+		expect(await cmd(c, "ACL", "WHOAMI")).toBe("QUEUED");
+		const r = (await cmd(c, "EXEC")) as Resp[];
+		expect(r[0]).toBe("acl-multi");
+		expect((r[1] as { error: string }).error).toStartWith("WRONGPASS");
+		expect(r[2]).toBe("OK");
+		expect(r[3]).toBe("acl-later");
+		expect(await cmd(c, "ACL", "WHOAMI")).toBe("acl-later");
+		c.close();
+		await cmd(admin, "ACL", "DELUSER", "acl-later");
+	});
+
+	test("redis.call checks the script caller's permissions", async () => {
+
+		await cmd(admin, "ACL", "SETUSER", "acl-multi", "+eval", "resetkeys", "~ok:*");
+		const c = await as("acl-multi", "pw");
+		expect(await cmd(c, "EVAL", "return redis.call('get', KEYS[1])", "1", "ok:1")).toBeNull();
+		const r = (await cmd(c, "EVAL", "return redis.call('get', 'secret')", "0")) as { error: string };
+		expect(r.error).toStartWith("ERR ACL failure in script: No permissions to access a key");
+		// false, which Lua returns to the client as nil.
+		expect(await cmd(c, "EVAL", "return redis.acl_check_cmd('get', 'secret')", "0")).toBeNull();
+		expect(await cmd(c, "EVAL", "return redis.acl_check_cmd('get', 'ok:2')", "0")).toBe(1);
+		c.close();
+		const log = asMap(((await cmd(admin, "ACL", "LOG", "1")) as Resp[])[0]);
+		expect(log).toMatchObject({ context: "lua", reason: "key", object: "secret" });
+	});
+
+	test("DELUSER closes the user's connections; off does not", async () => {
+		await cmd(admin, "ACL", "SETUSER", "acl-gone", "on", ">pw", "+@all", "~*");
+		const c = await as("acl-gone", "pw");
+		expect(await cmd(c, "CLIENT", "SETNAME", "acl-gone-conn")).toBe("OK");
+		expect(await cmd(admin, "CLIENT", "LIST")).toMatch(/name=acl-gone-conn .* user=acl-gone /);
+		expect(await cmd(admin, "ACL", "SETUSER", "acl-gone", "off")).toBe("OK");
+		expect(await cmd(c, "PING")).toBe("PONG");
+		expect(await cmd(admin, "ACL", "DELUSER", "acl-gone")).toBe(1);
+		expect(await cmd(admin, "CLIENT", "LIST")).not.toContain("name=acl-gone-conn");
+		expect((await c.send("PING")).length).toBe(0);
+		expect(await cmd(admin, "CLIENT", "KILL", "USER", "acl-gone")).toEqual({ error: "ERR No such user 'acl-gone'" });
+	});
+
+	test("CLIENT KILL USER closes that user's clients", async () => {
+		await cmd(admin, "ACL", "SETUSER", "acl-gone", "on", ">pw", "+@all", "~*");
+		const c = await as("acl-gone", "pw");
+		expect(await cmd(admin, "CLIENT", "KILL", "USER", "acl-gone")).toBe(1);
+		expect((await c.send("PING")).length).toBe(0);
+	});
+
+	test("a subscriber that loses its channel is closed", async () => {
+		await cmd(admin, "ACL", "SETUSER", "acl-ps", "on", ">pw", "+@all", "resetchannels", "&foo:*");
+		const c = await as("acl-ps", "pw");
+		await cmd(c, "CLIENT", "SETNAME", "acl-ps-sub");
+		expect(await cmd(c, "SUBSCRIBE", "foo:1")).toEqual(["subscribe", "foo:1", 1]);
+		// Still allowed: the subscriber stays.
+		await cmd(admin, "ACL", "SETUSER", "acl-ps", "&bar");
+		expect(await cmd(admin, "CLIENT", "LIST")).toContain("name=acl-ps-sub");
+		await cmd(admin, "ACL", "SETUSER", "acl-ps", "resetchannels", "&bar");
+		expect(await cmd(admin, "CLIENT", "LIST")).not.toContain("name=acl-ps-sub");
+		c.close();
+	});
+
+	test("a blocked command is refused when the rules change before it is served", async () => {
+		await cmd(admin, "ACL", "SETUSER", "acl-blk", "on", ">pw", "+@all", "~*");
+		const c = await as("acl-blk", "pw");
+		await admin.send("DEL", "acl:list");
+		const blocked = c.send("BLPOP", "acl:list", "0");
+		await Bun.sleep(100);
+		await cmd(admin, "ACL", "SETUSER", "acl-blk", "resetkeys");
+		await admin.send("LPUSH", "acl:list", "x");
+		expect(decode(await blocked)).toEqual({ error: "NOPERM No permissions to access a key" });
+		c.close();
+		await admin.send("DEL", "acl:list");
+	});
+
+	test("ACL SAVE writes redis.acl_users and ACL LOAD reads it back", async () => {
+		await cmd(admin, "ACL", "SETUSER", "acl-saved", "on", ">pw", "~s:*", "+get");
+		const c = await as("acl-saved", "pw");
+		expect(await cmd(admin, "ACL", "SAVE")).toBe("OK");
+		const rows =
+			await sql`SELECT convert_from(rules, 'UTF8') AS rules FROM redis.acl_users WHERE name = 'acl-saved'::bytea`;
+		expect(rows[0].rules).toContain("#30c952fab122c3f9759f02a6d95c3758b246b4fee239957b2d4fee46e26170c4 ~s:*");
+		expect(await cmd(admin, "ACL", "DELUSER", "acl-saved")).toBe(1);
+		expect(await cmd(admin, "ACL", "GETUSER", "acl-saved")).toBeNull();
+		expect(await cmd(admin, "ACL", "LOAD")).toBe("OK");
+		expect(asMap(await cmd(admin, "ACL", "GETUSER", "acl-saved")).keys).toBe("~s:*");
+		const again = await as("acl-saved", "pw");
+		expect(await cmd(again, "GET", "s:1")).toBeNull();
+		// LOAD replaces every user but default: their clients are closed.
+		expect(await cmd(admin, "ACL", "LOAD")).toBe("OK");
+		expect((await again.send("PING")).length).toBe(0);
+		c.close();
+		// An operator's own row, with a cleartext password, loads too.
+		await sql`INSERT INTO redis.acl_users (name, rules) VALUES ('acl-sql'::bytea, convert_to('on >sqlpw ~* +ping', 'UTF8'))`;
+		expect(await cmd(admin, "ACL", "LOAD")).toBe("OK");
+		const viaSql = await as("acl-sql", "sqlpw");
+		expect(await cmd(viaSql, "PING")).toBe("PONG");
+		viaSql.close();
+		expect(await cmd(admin, "ACL", "WHOAMI")).toBe("default");
+		expect(await cmd(admin, "PING")).toBe("PONG");
+	});
+
+	test("CONFIG SET requirepass sets the default user's password", async () => {
+		expect(await cmd(admin, "CONFIG", "SET", "requirepass", "other")).toBe("OK");
+		const c = await new RawRedis().connect({ password: "" });
+		expect(await cmd(c, "AUTH", REDIS_PASSWORD)).toEqual({
+			error: "WRONGPASS invalid username-password pair or user is disabled.",
+		});
+		expect(await cmd(c, "AUTH", "other")).toBe("OK");
+		expect(await cmd(admin, "CONFIG", "SET", "requirepass", REDIS_PASSWORD)).toBe("OK");
+		c.close();
 	});
 });

@@ -30,6 +30,7 @@ theme:
   features:
     - navigation.sections
     - navigation.top
+    - navigation.footer
     - content.code.copy
     - content.action.edit
 
@@ -58,6 +59,7 @@ nav:
   - Getting started:
       - Installation: installation.md
       - Configuration: configuration.md
+      - Operating in production: operations.md
       - Storage policies: STORAGE.md
   - Reference:
       - Commands: commands.md

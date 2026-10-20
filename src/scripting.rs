@@ -132,6 +132,31 @@ pub fn flags_write(flags: i64) -> bool {
     flags < 0 || flags as u32 & FLAG_EVAL_COMPAT != 0 || flags as u32 & FLAG_NO_WRITES == 0
 }
 
+pub const NOREPLICAS: &str = "NOREPLICAS Not enough good replicas to write.";
+
+/// `scriptPrepareForRun`'s refusals, for a script declared with flags (the
+/// flagless pre-7.0 form is checked command by command instead): one that
+/// may write, with too few replicas, or past `maxmemory` without
+/// `allow-oom`.
+fn refused_before_run(flags: u32, compat: bool, host: &mut dyn Host) -> Option<Response> {
+    if compat || flags & FLAG_NO_WRITES != 0 {
+        return None;
+    }
+    if crate::server::too_few_replicas() {
+        return Some(Response::Error(NOREPLICAS.into()));
+    }
+    if flags & FLAG_ALLOW_OOM == 0 && !host.room_to_write() {
+        return Some(crate::commands::mem_out_of_memory());
+    }
+    None
+}
+
+/// Whether the commands a script runs may grow memory past `maxmemory`:
+/// `allow-oom`, which `no-writes` implies.
+fn allows_oom(flags: u32, compat: bool) -> bool {
+    !compat && flags & (FLAG_ALLOW_OOM | FLAG_NO_WRITES) != 0
+}
+
 /// The flags an `EVAL` body declares, read straight from its shebang.
 pub fn body_flags(body: &[u8]) -> i64 {
     shebang_flags(body).map_or(-1, |(f, _)| f as i64)
@@ -445,6 +470,11 @@ pub trait Host {
     fn delete_library(&mut self, name: &str);
     fn flush_libraries(&mut self);
     fn on_commit(&mut self, f: fn());
+    /// Whether a write may grow memory now: false past `maxmemory` with
+    /// nothing the policy may evict.
+    fn room_to_write(&mut self) -> bool {
+        true
+    }
     fn on_abort(&mut self, f: fn());
 }
 
@@ -468,6 +498,9 @@ thread_local! {
     /// Set while a script's `redis.call` runs its command — Redis's
     /// `CLIENT_SCRIPT`, which a few commands answer differently under.
     static IN_CALL: Cell<bool> = const { Cell::new(false) };
+    /// The ACL user of the client running the script, 0 for none: what
+    /// `redis.call` checks a command against (`scriptVerifyACL`).
+    static CALLER: Cell<u64> = const { Cell::new(0) };
     /// The `rand48` state behind `math.random`.
     static RAND48: Cell<u64> = const { Cell::new(0) };
     /// The functions a library's top level registers during `FUNCTION LOAD`.
@@ -782,7 +815,7 @@ impl Sandbox {
             "as_error",
             lua.create_function(|lua, v: Lv| match &v {
                 Lv::Error(e) => match redis_error(e) {
-                    Some(msg) => Ok(err_table(lua, &msg)),
+                    Some(r) => Ok(r.table(lua)),
                     None => Ok(v),
                 },
                 _ => Ok(v),
@@ -837,7 +870,15 @@ impl Sandbox {
                     Err(e) => return Ok((None, Some(format!("ERR {e}")))),
                 };
                 match command_spec(&argv) {
-                    Some(_) => Ok((Some(true), None)),
+                    Some(_) => {
+                        let caller = CALLER.get();
+                        let ok = caller == 0
+                            || !matches!(
+                                crate::acl::evaluate(caller, &argv),
+                                crate::acl::Verdict::Denied(_)
+                            );
+                        Ok((Some(ok), None))
+                    }
                     None => Ok((
                         None,
                         Some("ERR Invalid command passed to redis.acl_check_cmd()".into()),
@@ -894,9 +935,10 @@ impl Sandbox {
             let call =
                 scope.create_function(|lua, args: MultiValue| {
                     match dispatch_from_script(lua, args, &mut ctx.borrow_mut()) {
-                        (true, Lv::Table(t)) => Err(mlua::Error::external(RedisError(
-                            t.raw_get::<Option<String>>("err")?.unwrap_or_default(),
-                        ))),
+                        (true, Lv::Table(t)) => Err(mlua::Error::external(RedisError {
+                            msg: t.raw_get::<Option<String>>("err")?.unwrap_or_default(),
+                            counted: counted(&t),
+                        })),
                         (_, v) => Ok(v),
                     }
                 })?;
@@ -912,6 +954,9 @@ impl Sandbox {
         });
         match outcome {
             Ok((true, v)) => Response::Value(lua_to_value(v, 0)),
+            Ok((false, Lv::Table(t))) if counted(&t) => {
+                Response::Value(Value::CountedError(script_error(&t, funcname)))
+            }
             Ok((false, Lv::Table(t))) => Response::Value(Value::Error(script_error(&t, funcname))),
             Ok((false, other)) => Response::Error(format!(
                 "ERR Error running script {funcname}, {:.100}",
@@ -924,23 +969,48 @@ impl Sandbox {
 
 /// A failed `redis.call`, carried through Lua as an mlua error and turned
 /// back into Redis's `{err=...}` table by the error handler and `pcall`.
-#[derive(Debug)]
-struct RedisError(String);
+#[derive(Debug, Clone)]
+struct RedisError {
+    msg: String,
+    /// Already counted in `errorstats` where the command failed.
+    counted: bool,
+}
+
+impl RedisError {
+    fn table(&self, lua: &Lua) -> Lv {
+        let t = err_table(lua, &self.msg);
+        if self.counted
+            && let Lv::Table(t) = &t
+        {
+            let _ = t.raw_set(COUNTED, true);
+        }
+        t
+    }
+}
 
 impl std::fmt::Display for RedisError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.msg)
     }
 }
 
 impl std::error::Error for RedisError {}
 
-fn redis_error(e: &mlua::Error) -> Option<String> {
+fn redis_error(e: &mlua::Error) -> Option<RedisError> {
     match e {
         mlua::Error::CallbackError { cause, .. } => redis_error(cause),
-        mlua::Error::ExternalError(x) => x.downcast_ref::<RedisError>().map(|r| r.0.clone()),
+        mlua::Error::ExternalError(x) => x.downcast_ref::<RedisError>().cloned(),
         _ => None,
     }
+}
+
+/// The field Redis sets on the error table of a command a script called,
+/// whose error `call()` has already counted: a script reply carrying it is
+/// not counted again.
+const COUNTED: &str = "ignore_error_stats_update";
+
+fn counted(t: &Table) -> bool {
+    matches!(t.raw_get::<Lv>(COUNTED), Ok(Lv::Boolean(true)))
 }
 
 /// `luaCallFunction`'s error reply: the message, then where it was raised.
@@ -984,11 +1054,10 @@ fn error_handler(lua: &Lua, err: Lv) -> mlua::Result<Table> {
             t
         }
         (None, Lv::Table(t)) => t,
-        (None, Lv::Error(e)) if redis_error(&e).is_some() => {
-            let t = lua.create_table()?;
-            t.raw_set("err", redis_error(&e))?;
-            t
-        }
+        (None, Lv::Error(e)) if let Some(r) = redis_error(&e) => match r.table(lua) {
+            Lv::Table(t) => t,
+            _ => lua.create_table()?,
+        },
         (None, other) => {
             let t = lua.create_table()?;
             t.raw_set("err", format!("ERR {}", describe(&other)))?;
@@ -1232,6 +1301,11 @@ fn value_to_lua(lua: &Lua, v: Value) -> mlua::Result<Lv> {
             t.raw_set("err", command_error_text(&e))?;
             Lv::Table(t)
         }
+        Value::CountedError(e) => RedisError {
+            msg: command_error_text(&e),
+            counted: true,
+        }
+        .table(lua),
         Value::Array(items) => {
             let t = lua.create_table_with_capacity(items.len(), 0)?;
             for (i, item) in items.into_iter().enumerate() {
@@ -1285,6 +1359,14 @@ fn value_to_lua(lua: &Lua, v: Value) -> mlua::Result<Lv> {
             Lv::Table(t)
         }
         Value::Verbatim(text) => Lv::String(lua.create_string(text)?),
+        Value::BigNum(n) if resp3 => {
+            let t = lua.create_table()?;
+            t.raw_set("big_number", n)?;
+            Lv::Table(t)
+        }
+        Value::BigNum(n) => Lv::String(lua.create_string(n)?),
+        // `redisProtocolToLuaType_Attribute`: read and dropped.
+        Value::Attributed(_, v) | Value::Pushed(_, v) => value_to_lua(lua, *v)?,
     })
 }
 
@@ -1304,7 +1386,11 @@ fn lua_to_value(v: Lv, depth: usize) -> Value {
         Lv::Number(n) => Value::Int(n as i64),
         Lv::Table(t) => {
             if let Ok(Lv::String(e)) = t.raw_get::<Lv>("err") {
-                return Value::Error(e.to_string_lossy());
+                return if counted(&t) {
+                    Value::CountedError(e.to_string_lossy())
+                } else {
+                    Value::Error(e.to_string_lossy())
+                };
             }
             if let Ok(Lv::String(ok)) = t.raw_get::<Lv>("ok") {
                 return Value::Simple(ok.to_string_lossy().replace(['\r', '\n'], " "));
@@ -1316,18 +1402,14 @@ fn lua_to_value(v: Lv, depth: usize) -> Value {
                 return Value::Double(d as f64);
             }
             if let Ok(Lv::String(b)) = t.raw_get::<Lv>("big_number") {
-                return Value::Bulk(
-                    b.as_bytes()
-                        .iter()
-                        .map(|&c| if c == b'\r' || c == b'\n' { b' ' } else { c })
-                        .collect(),
-                );
+                // `addReplyBigNum`: a line break would end the frame.
+                return Value::BigNum(b.to_string_lossy().replace(['\r', '\n'], " "));
             }
             if let Ok(Lv::Table(v)) = t.raw_get::<Lv>("verbatim_string")
                 && let (Ok(Lv::String(_)), Ok(Lv::String(s))) =
                     (v.raw_get::<Lv>("format"), v.raw_get::<Lv>("string"))
             {
-                return Value::Bulk(s.as_bytes().to_vec());
+                return Value::Verbatim(s.to_string_lossy());
             }
             if let Ok(Lv::Table(map)) = t.raw_get::<Lv>("map") {
                 return Value::Map(
@@ -1415,8 +1497,30 @@ fn dispatch_from_script(lua: &Lua, args: MultiValue, ctx: &mut &mut CallCtx<'_>)
         Ok(a) => a,
         Err(e) => return (true, err_table(lua, &format!("ERR {e}"))),
     };
-    match run_from_script(&argv, ctx) {
-        Ok(Response::Error(e)) => (true, err_table(lua, &command_error_text(&e))),
+    let started = std::time::Instant::now();
+    // Counted as Redis's `scriptCall` and `call()` count a script's
+    // commands: a refusal (`scriptCall`'s checks, OOM, ACL) as a rejected
+    // call, a command's error as a failed one, and either in `errorstats`
+    // here, once, whether `pcall` catches it or the script returns it.
+    let ran = match run_from_script(&argv, ctx) {
+        Err(e) => Err((format!("ERR {e}"), true)),
+        Ok(Response::Error(e)) => {
+            let e = command_error_text(&e);
+            let rejected = crate::resp::is_rejection(&e);
+            Err((e, rejected))
+        }
+        Ok(r) => Ok(r),
+    };
+    if let Some(i) = crate::worker::stat_index(&crate::worker::stat_name(&argv)) {
+        let usec = started.elapsed().as_micros() as u64;
+        let rejected = ran.as_ref().is_err_and(|e| e.1);
+        crate::server::count_command(i, usec, ran.is_err(), rejected);
+    }
+    match ran {
+        Err((msg, _)) => {
+            crate::server::count_error(crate::resp::error_code(&msg));
+            (true, RedisError { msg, counted: true }.table(lua))
+        }
         Ok(r) => match value_to_lua(lua, {
             // After `redis.setresp(3)` a script sees replies as a RESP3
             // client would.
@@ -1430,15 +1534,34 @@ fn dispatch_from_script(lua: &Lua, args: MultiValue, ctx: &mut &mut CallCtx<'_>)
             Ok(v) => (false, v),
             Err(e) => (true, err_table(lua, &format!("ERR {e}"))),
         },
-        Err(e) => (true, err_table(lua, &format!("ERR {e}"))),
     }
 }
 
-/// `scriptCall`: the checks a command passes before a script may run it,
-/// then the command. `Err` is a scripting error, `Ok` the command's reply.
 /// Whether the command running now was called from a script.
 pub(crate) fn in_script_call() -> bool {
     IN_CALL.get()
+}
+
+/// Sets [`CALLER`] for one run, from the client that sent it.
+struct CallerGuard;
+
+impl CallerGuard {
+    fn set() -> CallerGuard {
+        let origin = crate::tracking::origin();
+        let serial = if origin == 0 {
+            0
+        } else {
+            crate::acl::session_of(origin).serial
+        };
+        CALLER.set(serial);
+        CallerGuard
+    }
+}
+
+impl Drop for CallerGuard {
+    fn drop(&mut self) {
+        CALLER.set(0);
+    }
 }
 
 struct InCall(bool);
@@ -1449,21 +1572,41 @@ impl Drop for InCall {
     }
 }
 
-fn run_from_script(argv: &[Vec<u8>], ctx: &mut CallCtx<'_>) -> Result<Response, &'static str> {
+/// `scriptCall`: the checks a command passes before a script may run it,
+/// then the command. `Err` is a scripting error, `Ok` the command's reply.
+fn run_from_script(argv: &[Vec<u8>], ctx: &mut CallCtx<'_>) -> Result<Response, String> {
     let _in_call = InCall(IN_CALL.replace(true));
     // Redis's own table, not just what pg_redis serves: a command Redis has
     // and forbids in scripts (CLUSTER) is "not allowed", not "unknown". One it
     // allows but pg_redis lacks fails below, as the unknown command it is.
     let spec = redis_command_spec(argv).ok_or("Unknown Redis command called from script")?;
     if !crate::commands::arity_ok(spec.arity, argv.len()) {
-        return Err("Wrong number of args calling Redis command from script");
+        return Err("Wrong number of args calling Redis command from script".into());
     }
     let has = |f: &str| spec.flags.contains(&f);
-    if has("noscript") {
-        return Err("This Redis command is not allowed from script");
+    // `DEBUG SET-DISABLE-DENY-SCRIPTS 1` lets a script run them.
+    if has("noscript") && !crate::server::deny_scripts_disabled() {
+        return Err("This Redis command is not allowed from script".into());
+    }
+    // `scriptCall`'s refusal of a write with too few replicas: the command's
+    // error, raised in the script.
+    // (A command that may grow memory meets `maxmemory` where it runs, as
+    // every command does.)
+    if has("write") && crate::server::too_few_replicas() {
+        return Ok(Response::Error(NOREPLICAS.into()));
+    }
+    let caller = CALLER.get();
+    if caller != 0 {
+        if let crate::acl::Verdict::Denied(d) = crate::acl::evaluate(caller, argv) {
+            crate::acl::record_denial(&d, crate::acl::Context::Lua, crate::tracking::origin());
+            return Err(format!("ACL failure in script: {}", d.message(false)));
+        }
+        if let Some(e) = crate::acl::sort_denied(caller, argv) {
+            return Ok(Response::Error(e.to_string()));
+        }
     }
     if ctx.read_only && (has("write") || has("may_replicate")) {
-        return Err("Write commands are not allowed from read-only scripts.");
+        return Err("Write commands are not allowed from read-only scripts.".into());
     }
     if has("write") {
         ctx.run.mark_dirty();
@@ -1494,6 +1637,16 @@ fn run_from_script(argv: &[Vec<u8>], ctx: &mut CallCtx<'_>) -> Result<Response, 
     };
     let db = ctx.db;
     crate::worker::feed_monitors_from_script(argv, db);
+    // Every database the command touches must be held, exclusive, by the
+    // run (`src/dblock.rs`). A database the script was not started with is
+    // only tried: waiting here, inside the transaction, could deadlock.
+    let reached = match &cmd {
+        Command::Select { db } => crate::dblock::bit(*db),
+        cmd => crate::dblock::dbs_of(cmd, db),
+    };
+    if let Err(d) = crate::dblock::reach(reached) {
+        return Ok(Response::Error(reach_error(d)));
+    }
     Ok(match cmd {
         Command::Select { db } => {
             ctx.db = db;
@@ -1515,14 +1668,16 @@ fn run_from_script(argv: &[Vec<u8>], ctx: &mut CallCtx<'_>) -> Result<Response, 
                 client: &client,
                 db,
                 reply: crate::admin::ReplyMode::On,
+                session: crate::acl::session_of(crate::tracking::origin()),
+                may_wait: false,
             };
             let host = &mut *ctx.host;
             crate::admin::execute(&a, &mut conn, &mut |c, d| host.exec(d, c))
         }
         cmd => {
             match cmd {
-                Command::FlushDb => crate::server::bump_flush_epoch(db),
-                Command::FlushAll => {
+                Command::FlushDb { .. } => crate::server::bump_flush_epoch(db),
+                Command::FlushAll { .. } => {
                     (0..crate::commands::NUM_DBS as u8).for_each(crate::server::bump_flush_epoch)
                 }
                 _ => {}
@@ -1545,7 +1700,14 @@ fn run_from_script(argv: &[Vec<u8>], ctx: &mut CallCtx<'_>) -> Result<Response, 
             let before = notified
                 .as_ref()
                 .and_then(|c| crate::notify::before(c, db, &mut exists));
+            let lazy = crate::lazyfree::before(&cmd, db, &mut |d, c| host.exec(d, c));
             let r = host.exec(db, cmd);
+            crate::lazyfree::after(lazy, &r);
+            crate::access::after_command(
+                db,
+                argv,
+                crate::access::client_no_touch(crate::tracking::origin()),
+            );
             if let Some(c) = &notified {
                 let mut exists = |d: u8, k: &[u8]| {
                     matches!(
@@ -1583,6 +1745,9 @@ struct EvalEngine {
     sb: Sandbox,
     /// Compiled scripts by SHA1, with their shebang flags.
     scripts: HashMap<String, (Function, u32)>,
+    /// Whether each compiled script names a command that reaches another
+    /// database ([`names_other_db`]).
+    reach: HashMap<String, bool>,
     generation: u64,
 }
 
@@ -1597,6 +1762,9 @@ struct Library {
     name: String,
     code: Vec<u8>,
     functions: Vec<FuncInfo>,
+    /// Whether the code names a command that reaches another database
+    /// ([`names_other_db`]).
+    reaches: bool,
 }
 
 struct FuncEngine {
@@ -1623,6 +1791,7 @@ impl Engine {
             self.eval = Some(EvalEngine {
                 sb: Sandbox::new(false).map_err(sandbox_failed)?,
                 scripts: HashMap::new(),
+                reach: HashMap::new(),
                 generation,
             });
         }
@@ -1831,6 +2000,7 @@ fn compile_library(sb: &Sandbox, code: &[u8]) -> Result<Library, String> {
         name,
         code: code.to_vec(),
         functions,
+        reaches: names_other_db(code),
     })
 }
 
@@ -1986,8 +2156,159 @@ fn lua_array(lua: &Lua, items: &[Vec<u8>]) -> mlua::Result<Table> {
     Ok(t)
 }
 
+/// Whether the command runs Lua against the data: `EVAL`, `EVALSHA`, `FCALL`
+/// and their `_RO` forms. The rest manage the cache and the libraries.
+pub fn runs_code(cmd: &ScriptCmd) -> bool {
+    matches!(
+        cmd,
+        ScriptCmd::Eval { .. } | ScriptCmd::EvalSha { .. } | ScriptCmd::Fcall { .. }
+    )
+}
+
+/// Whether a script may reach a database other than the one it starts on, so
+/// its dispatcher locks every database before it runs (`src/dblock.rs`). True
+/// when its source names `SELECT`, `MOVE`, `COPY`, `SWAPDB` or `FLUSHALL`, and
+/// when this worker has not compiled it yet and cannot tell.
+pub fn reaches_other_dbs(cmd: &ScriptCmd) -> bool {
+    match cmd {
+        ScriptCmd::Eval { body, .. } => names_other_db(body),
+        // A SHA names one body, so what any compile of it found holds.
+        ScriptCmd::EvalSha { sha, .. } => ENGINE.with(|e| {
+            e.try_borrow()
+                .ok()
+                .and_then(|e| e.eval.as_ref().and_then(|ev| ev.reach.get(sha).copied()))
+                .unwrap_or(true)
+        }),
+        // A library can be replaced from another worker: only an engine at
+        // the current generation knows what the function runs.
+        ScriptCmd::Fcall { name, .. } => ENGINE.with(|e| {
+            let name = String::from_utf8_lossy(name);
+            e.try_borrow()
+                .ok()
+                .and_then(|e| {
+                    let func = e.func.as_ref()?;
+                    if func.generation != crate::server::functions_gen() {
+                        return None;
+                    }
+                    func.libs
+                        .iter()
+                        .find(|l| {
+                            l.functions
+                                .iter()
+                                .any(|f| f.name.eq_ignore_ascii_case(&name))
+                        })
+                        .map(|l| l.reaches)
+                })
+                .unwrap_or(true)
+        }),
+        _ => false,
+    }
+}
+
+/// Whether Lua source may reach a database other than the one it starts on:
+/// it names, as a whole word in any case, a command that does, or it runs a
+/// command whose name it does not spell out. Comments and strings count too:
+/// a false match only locks more than needed.
+fn names_other_db(src: &[u8]) -> bool {
+    const WORDS: [&[u8]; 5] = [b"select", b"move", b"copy", b"swapdb", b"flushall"];
+    let word = |b: &u8| b.is_ascii_alphanumeric() || *b == b'_';
+    src.split(|b| !word(b))
+        .any(|w| WORDS.iter().any(|x| w.eq_ignore_ascii_case(x)))
+        || names_commands_at_run_time(src)
+}
+
+/// Whether some `redis.call` or `redis.pcall` (or `server.…`) takes a
+/// command name that is not a plain string literal: one built at run time,
+/// read from `ARGV`, or called through another name. Such a script can run
+/// any command, so it holds every database, as every script does in Redis.
+fn names_commands_at_run_time(src: &[u8]) -> bool {
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let skip_ws = |mut j: usize| {
+        while src.get(j).is_some_and(u8::is_ascii_whitespace) {
+            j += 1;
+        }
+        j
+    };
+    let mut i = 0;
+    while i < src.len() {
+        let len = [b"pcall".as_slice(), b"call"]
+            .iter()
+            .find(|w| src[i..].starts_with(w))
+            .map_or(0, |w| w.len());
+        let whole = len > 0
+            && (i == 0 || !word(src[i - 1]))
+            && !src.get(i + len).copied().is_some_and(word);
+        let after_dot = src[..i].iter().rev().find(|b| !b.is_ascii_whitespace()) == Some(&b'.');
+        if !whole || !after_dot {
+            i += 1;
+            continue;
+        }
+        let mut j = skip_ws(i + len);
+        let paren = src.get(j) == Some(&b'(');
+        if paren {
+            j = skip_ws(j + 1);
+        }
+        let Some(end) = lua_string_end(src, j) else {
+            return true;
+        };
+        // In parentheses the name is the first argument, alone: `'sel' ..
+        // 'ect'` builds one.
+        if paren && !matches!(src.get(skip_ws(end)), Some(b',' | b')')) {
+            return true;
+        }
+        i = end;
+    }
+    false
+}
+
+/// Where the Lua string literal starting at `j` ends: quoted, or a long
+/// bracket `[[ … ]]` / `[==[ … ]==]`. `None` when no literal starts there.
+fn lua_string_end(src: &[u8], j: usize) -> Option<usize> {
+    match *src.get(j)? {
+        q @ (b'\'' | b'"') => {
+            let mut k = j + 1;
+            while k < src.len() {
+                match src[k] {
+                    b'\\' => k += 2,
+                    c if c == q => return Some(k + 1),
+                    _ => k += 1,
+                }
+            }
+            None
+        }
+        b'[' => {
+            let eqs = src[j + 1..].iter().take_while(|&&b| b == b'=').count();
+            if src.get(j + 1 + eqs) != Some(&b'[') {
+                return None;
+            }
+            let close: Vec<u8> = std::iter::once(b']')
+                .chain(std::iter::repeat_n(b'=', eqs))
+                .chain(std::iter::once(b']'))
+                .collect();
+            let body = j + 2 + eqs;
+            src[body..]
+                .windows(close.len())
+                .position(|w| w == close.as_slice())
+                .map(|p| body + p + close.len())
+        }
+        _ => None,
+    }
+}
+
+/// The error a script gets when it reaches a database another client holds.
+fn reach_error(db: u8) -> String {
+    format!(
+        "ERR this script reached database {db}, which another client is using. \
+         A script that names SELECT, MOVE, COPY, SWAPDB or FLUSHALL in its source, \
+         or runs a command it does not name with a string literal, locks every \
+         database before it starts; this one reached it in a way that could not \
+         be seen ahead"
+    )
+}
+
 /// Run one scripting command on the dispatcher.
 pub fn execute(cmd: &ScriptCmd, db: u8, host: &mut dyn Host) -> Response {
+    let _frozen = crate::server::freeze_time();
     ENGINE.with(|e| {
         let mut engine = e.borrow_mut();
         engine.execute(cmd, db, host).unwrap_or_else(|r| r)
@@ -2009,6 +2330,7 @@ impl Engine {
                 let engine = self.eval_engine()?;
                 if !engine.scripts.contains_key(&sha) {
                     let compiled = compile_script(&engine.sb, body).map_err(err)?;
+                    engine.reach.insert(sha.clone(), names_other_db(body));
                     engine.scripts.insert(sha.clone(), compiled);
                     host.save_script(&sha, body);
                 }
@@ -2023,6 +2345,7 @@ impl Engine {
                         .flatten()
                         .ok_or_else(|| err(NOSCRIPT.into()))?;
                     let compiled = compile_script(&engine.sb, &body).map_err(err)?;
+                    engine.reach.insert(sha.clone(), names_other_db(&body));
                     engine.scripts.insert(sha.clone(), compiled);
                 }
                 Ok(run_eval(engine, sha, keys, args, inv, db, host))
@@ -2032,6 +2355,7 @@ impl Engine {
                 let engine = self.eval_engine()?;
                 if !engine.scripts.contains_key(&sha) {
                     let compiled = compile_script(&engine.sb, body).map_err(err)?;
+                    engine.reach.insert(sha.clone(), names_other_db(body));
                     engine.scripts.insert(sha.clone(), compiled);
                 }
                 host.save_script(&sha, body);
@@ -2067,12 +2391,16 @@ impl Engine {
                 if f.flags & FLAG_NO_WRITES == 0 && inv.ro {
                     return Err(err(RO_WITH_WRITE_FLAG.into()));
                 }
+                if let Some(refused) = refused_before_run(f.flags, false, host) {
+                    return Err(refused);
+                }
                 let read_only = inv.ro || f.flags & FLAG_NO_WRITES != 0;
                 let lua = &engine.sb.lua;
                 let (k, a) = (
                     lua_array(lua, keys).map_err(|e| err(e.to_string()))?,
                     lua_array(lua, args).map_err(|e| err(e.to_string()))?,
                 );
+                let _caller = CallerGuard::set();
                 let run =
                     crate::server::ScriptRunHandle::start(false, f.name.as_bytes(), &inv.argv);
                 let _interrupt = InterruptGuard::set(Interrupt::Run(run.probe()));
@@ -2082,7 +2410,10 @@ impl Engine {
                     read_only,
                     run: &run,
                 };
-                Ok(engine.sb.call(&f.func, Some(k), Some(a), &f.name, &mut ctx))
+                let allow = allows_oom(f.flags, false);
+                Ok(crate::evict::allowing_oom(allow, || {
+                    engine.sb.call(&f.func, Some(k), Some(a), &f.name, &mut ctx)
+                }))
             }
             ScriptCmd::FunctionLoad { replace, code } => {
                 let engine = self.func_engine(host)?;
@@ -2298,6 +2629,9 @@ fn run_eval(
     if !compat && flags & FLAG_NO_WRITES == 0 && inv.ro {
         return Response::Error(RO_WITH_WRITE_FLAG.into());
     }
+    if let Some(refused) = refused_before_run(flags, compat, host) {
+        return refused;
+    }
     let read_only = inv.ro || (!compat && flags & FLAG_NO_WRITES != 0);
     let lua = &engine.sb.lua;
     let set = (|| {
@@ -2307,6 +2641,7 @@ fn run_eval(
     if let Err(e) = set {
         return Response::Error(format!("ERR {e}"));
     }
+    let _caller = CallerGuard::set();
     let run = crate::server::ScriptRunHandle::start(true, sha.as_bytes(), &inv.argv);
     let _interrupt = InterruptGuard::set(Interrupt::Run(run.probe()));
     let mut ctx = CallCtx {
@@ -2315,7 +2650,9 @@ fn run_eval(
         read_only,
         run: &run,
     };
-    engine.sb.call(&f, None, None, sha, &mut ctx)
+    crate::evict::allowing_oom(allows_oom(flags, compat), || {
+        engine.sb.call(&f, None, None, sha, &mut ctx)
+    })
 }
 
 // ───────────────────────────────── SHA-1 ────────────────────────────────────
@@ -2469,8 +2806,46 @@ mod tests {
 
     fn error_of(r: Response) -> String {
         match r {
-            Response::Error(e) | Response::Value(Value::Error(e)) => e,
+            Response::Error(e)
+            | Response::Value(Value::Error(e))
+            | Response::Value(Value::CountedError(e)) => e,
             other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_source_that_names_another_database_is_found() {
+        for src in [
+            "redis.call('SELECT', 1)",
+            "redis.call(\"select\",ARGV[1])",
+            "return redis.call('move', KEYS[1], 2)",
+            "redis.pcall('COPY', 'a', 'b', 'DB', '3')",
+            "redis.call('swapdb', 0, 1)",
+            "redis.call('FlushAll')",
+            "-- select\nreturn 1",
+            "return redis.call(ARGV[1], KEYS[1])",
+            "local c = redis.call return c('get', 'k')",
+            "redis.pcall('sel' .. 'ect', 1)",
+            "redis.call(unpack(ARGV))",
+            "server.call(cmd)",
+            "redis.call('get', 'k') redis.call(name)",
+        ] {
+            assert!(names_other_db(src.as_bytes()), "{src}");
+        }
+        for src in [
+            "return redis.call('get', KEYS[1])",
+            "redis.call('LMOVE', 'a', 'b', 'LEFT', 'LEFT')",
+            "redis.call('SMOVE', 'a', 'b', 'm')",
+            "local remove = 1 local selected = 2 return remove + selected",
+            "redis.call('FLUSHDB')",
+            "redis.call( \"incr\" , KEYS[1])",
+            "redis.call([[get]], 'k')",
+            "redis.call([==[get]==], 'k')",
+            "redis.call 'ping'",
+            "local ok = pcall(function() return 1 end) return redis.pcall('get', 'x')",
+            "redis.call('set', 'k', 'it\\'s')",
+        ] {
+            assert!(!names_other_db(src.as_bytes()), "{src}");
         }
     }
 

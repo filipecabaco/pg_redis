@@ -1,14 +1,22 @@
-# The in-browser demo: pg_redis inside Postgres, with redis-cli and psql stacked in tmux.
-# Built into a static site by snowglobe (https://github.com/filipecabaco/snowglobe), which boots
-# this image on an emulated arm64 machine in the visitor's tab. `mise run demo` builds it.
+# The in-browser demo: pg_redis inside Postgres, with redis-cli and psql stacked in tmux, and a
+# shell with Node for the showcases in examples/. Built into a static site by snowglobe
+# (https://github.com/filipecabaco/snowglobe), which boots this image on an emulated arm64 machine
+# in the visitor's tab. `mise run demo` builds it.
 #
 # The base is the repo's own Dockerfile built for arm64 (pg_redis:alpine-arm64), so the demo runs
-# exactly the extension the e2e suite tests.
+# exactly the extension the e2e suite tests; the showcases come from examples/'s own image built
+# for arm64 (pg_redis:examples-arm64), dependencies installed, as CI runs them.
 ARG BASE=pg_redis:alpine-arm64
+ARG EXAMPLES=pg_redis:examples-arm64
+FROM ${EXAMPLES} AS examples
 FROM ${BASE}
 
 # redis-cli comes with Alpine's redis package; the server it also installs is never started
-RUN apk add --no-cache redis tmux
+RUN apk add --no-cache redis tmux nodejs
+
+# The showcases. Node and these files are fetched only when a visitor runs one: snowglobe loads
+# the filesystem as it is read.
+COPY --from=examples /app /examples
 
 # A cluster made at build time and sized for a browser tab: one worker, small shared-memory
 # tables, no durability work (the disk is the visitor's memory and goes away with the tab)
@@ -46,6 +54,11 @@ COPY redisclirc /root/.redisclirc
 COPY start.sh /usr/local/bin/start-demo
 
 ENV LANG=C.UTF-8 HOME=/root TERM=xterm-256color
+# Where the showcases find pg_redis and Postgres here, and how much slower than native the
+# emulated CPU is: their waits and locks stretch by it.
+ENV REDIS_HOST=127.0.0.1 \
+    DATABASE_URL="postgresql://postgres@localhost/postgres?host=/run/postgresql" \
+    SHOWCASE_SLOW=5
 WORKDIR /root
 CMD ["/usr/local/bin/start-demo"]
 

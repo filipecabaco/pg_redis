@@ -453,8 +453,28 @@ try {
 }
 
 const missing = [...expected].filter((k) => !passing.has(k)).sort();
-const regressed = missing.filter((k) => !(k in TIMING));
+const firstFailures = missing.filter((k) => !(k in TIMING));
 const unsteady = missing.filter((k) => k in TIMING);
+
+// Each unit with a test that stopped passing runs once more. A test that
+// passes the second time failed on timing, and is reported as flaky; one that
+// fails twice is a regression and fails the gate.
+const flaky: string[] = [];
+const rerun = [...new Set(firstFailures.map((k) => k.split(" | ").slice(0, 2).join(" | ")))];
+for (const key of rerun) {
+	const [half, unit] = key.split(" | ") as [Half, string];
+	console.log(`\nRunning ${key} again: a test in it stopped passing`);
+	const again = await runUnit(half, unit);
+	for (const k of firstFailures) {
+		if (!k.startsWith(`${key} | `)) continue;
+		if (again.tests.get(k.split(" | ")[2]) === "ok") flaky.push(k);
+	}
+}
+const regressed = firstFailures.filter((k) => !flaky.includes(k));
+if (flaky.length > 0) {
+	console.log(`\nFlaky — failed once, passed when run again (${flaky.length}):`);
+	for (const k of flaky) console.log(`  ${k}`);
+}
 if (unsteady.length > 0) {
 	console.log(`\nTiming-dependent, not gated (${unsteady.length}):`);
 	for (const k of unsteady) console.log(`  ${k}   (${TIMING[k]})`);

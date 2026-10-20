@@ -70,12 +70,19 @@
   <h2 class="pr-h2">Try it, in this tab</h2>
   <p class="pr-sub">
     A real PostgreSQL 17 with pg_redis loaded, on an emulated Linux machine running in your
-    browser, with no server behind it. Write a key to memory, snapshot it, move the database into
-    tables while it is in use, then change the key from SQL.
+    browser, with no server behind it. Take the tour of its storage, run four apps built on
+    BullMQ, connect-redis, Socket.IO and streams, or try the recipes, then read
+    <a href="{{ 'examples/' | url }}">how each one works</a>.
   </p>
 
   <div class="pr-demo__grid">
-    <div class="pr-demo__rail" role="group" aria-label="Guided steps">
+    <div class="pr-demo__rail">
+      <div class="pr-tabs" role="tablist" aria-label="What to run">
+        <button type="button" role="tab" class="pr-tab" id="pr-tab-tour" aria-controls="pr-rail-tour" aria-selected="true">Tour</button>
+        <button type="button" role="tab" class="pr-tab" id="pr-tab-apps" aria-controls="pr-rail-apps" aria-selected="false" tabindex="-1">Apps</button>
+        <button type="button" role="tab" class="pr-tab" id="pr-tab-recipes" aria-controls="pr-rail-recipes" aria-selected="false" tabindex="-1">Recipes</button>
+      </div>
+      <div class="pr-panel" role="tabpanel" id="pr-rail-tour" aria-labelledby="pr-tab-tour">
       <div class="pr-phase">
         <p class="pr-phase__name"><code>memory</code> write a key</p>
         <ol class="pr-steps">
@@ -101,9 +108,60 @@
         <li><button type="button" class="pr-step" data-pane="redis" data-cmd="GET greeting"><span class="pr-step__pane">redis</span><code>GET greeting</code><em>Redis sees the update</em></button></li>
         </ol>
       </div>
+      </div>
+
+      <div class="pr-panel" role="tabpanel" id="pr-rail-apps" aria-labelledby="pr-tab-apps" data-warm="system/warm-examples.pack" hidden>
+      <p class="pr-panel__note">Real apps on the libraries teams run, unchanged, each checking what happened. The first one starts Node in the machine.</p>
+      <div class="pr-phase">
+        <p class="pr-phase__name"><code>BullMQ</code> a job queue</p>
+        <ol class="pr-steps">
+        <li><button type="button" class="pr-step" data-pane="app" data-cmd="node run.mjs job-queue"><span class="pr-step__pane pr-step__pane--app">node</span><code>node run.mjs job-queue</code><em>retries with backoff, a delayed job, a crashed worker's job recovered</em></button></li>
+        </ol>
+      </div>
+      <div class="pr-phase">
+        <p class="pr-phase__name"><code>connect-redis</code> sessions and a cache</p>
+        <ol class="pr-steps">
+        <li><button type="button" class="pr-step" data-pane="app" data-cmd="node run.mjs web-sessions"><span class="pr-step__pane pr-step__pane--app">node</span><code>node run.mjs web-sessions</code><em>sessions outlive a redeploy; who is signed in, from SQL</em></button></li>
+        </ol>
+      </div>
+      <div class="pr-phase">
+        <p class="pr-phase__name"><code>Socket.IO</code> two instances, one rate limit</p>
+        <ol class="pr-steps">
+        <li><button type="button" class="pr-step" data-pane="app" data-cmd="node run.mjs rate-limit-realtime"><span class="pr-step__pane pr-step__pane--app">node</span><code>node run.mjs rate-limit-realtime</code><em>a shared limit, an update reaching the other instance</em></button></li>
+        </ol>
+      </div>
+      <div class="pr-phase">
+        <p class="pr-phase__name"><code>streams</code> an order pipeline</p>
+        <ol class="pr-steps">
+        <li><button type="button" class="pr-step" data-pane="app" data-cmd="node run.mjs order-pipeline"><span class="pr-step__pane pr-step__pane--app">node</span><code>node run.mjs order-pipeline</code><em>a worker dies, XAUTOCLAIM recovers its orders, SQL reports revenue</em></button></li>
+        </ol>
+      </div>
+      </div>
+
+      <div class="pr-panel" role="tabpanel" id="pr-rail-recipes" aria-labelledby="pr-tab-recipes" hidden>
+      <div class="pr-phase">
+        <p class="pr-phase__name"><code>cache</code> keys that expire and evict</p>
+        <ol class="pr-steps">
+        <li><button type="button" class="pr-step" data-pane="redis" data-cmd="CONFIG SET maxmemory 16mb maxmemory-policy allkeys-lru"><span class="pr-step__pane">redis</span><code>CONFIG SET … allkeys-lru</code><em>past the limit, the least recently used go</em></button></li>
+        <li><button type="button" class="pr-step" data-pane="redis" data-cmd='SET page:/pricing "&lt;html&gt;…&lt;/html&gt;" EX 300'><span class="pr-step__pane">redis</span><code>SET page:/pricing … EX 300</code><em>cached for five minutes</em></button></li>
+        </ol>
+      </div>
+      <div class="pr-phase">
+        <p class="pr-phase__name"><code>logged</code> the rest on database 8, as rows</p>
+        <ol class="pr-steps">
+        <li><button type="button" class="pr-step" data-pane="redis" data-cmd="SELECT 8"><span class="pr-step__pane">redis</span><code>SELECT 8</code><em>the logged database</em></button></li>
+        <li><button type="button" class="pr-step" data-pane="redis" data-cmd="EVAL &quot;local n = redis.call('INCR', KEYS[1]) if n == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end return n&quot; 1 rate:203.0.113.7 60"><span class="pr-step__pane">redis</span><code>EVAL "… INCR … EXPIRE …"</code><em>a rate limit, counted atomically</em></button></li>
+        <li><button type="button" class="pr-step" data-pane="redis" data-cmd="ZADD scores 1200 ada 950 grace 1100 linus"><span class="pr-step__pane">redis</span><code>ZADD scores 1200 ada …</code><em>a leaderboard</em></button></li>
+        <li><button type="button" class="pr-step" data-pane="sql" data-cmd="SELECT convert_from(member, 'UTF8') AS player, score, rank() OVER (ORDER BY score DESC) AS place FROM redis.zset_8 WHERE key = 'scores';"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>SELECT … rank() OVER …</code><em>ranked with a window function</em></button></li>
+        <li><button type="button" class="pr-step" data-pane="sql" data-cmd="SELECT redis.create_pubsub_table('public', 'order_events'); SELECT redis.route_publish('orders.created', 'public', 'order_events');"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>SELECT redis.route_publish(…);</code><em>a channel, copied into a table</em></button></li>
+        <li><button type="button" class="pr-step" data-pane="redis" data-cmd="PUBLISH orders.created '{&quot;order_id&quot;:1001,&quot;total&quot;:42.5}'"><span class="pr-step__pane">redis</span><code>PUBLISH orders.created …</code><em>publish an event</em></button></li>
+        <li><button type="button" class="pr-step" data-pane="sql" data-cmd="SELECT convert_from(payload, 'UTF8')::jsonb AS payload FROM public.order_events;"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>SELECT … FROM public.order_events;</code><em>stored, ready to query</em></button></li>
+        </ol>
+      </div>
+      </div>
     </div>
 
-    <div class="pr-demo__stage" tabindex="0" aria-label="Live terminal: redis-cli and psql">
+    <div class="pr-demo__stage" tabindex="0" aria-label="Live terminal: redis-cli, psql and a shell">
       <div class="pr-term__bar">
         <span></span><span></span><span></span>
         <em class="pr-demo__status" role="status">not started</em>
@@ -122,8 +180,9 @@
     </div>
   </div>
   <p class="pr-proof">
-    Click a step to type it, or type into either pane yourself. <kbd>alt</kbd>+<kbd>1</kbd> and
-    <kbd>alt</kbd>+<kbd>2</kbd> switch panes. Built with <a href="https://github.com/filipecabaco/snowglobe">snowglobe</a>.
+    Click a step to type it, or type into the panes yourself. <kbd>alt</kbd>+<kbd>1</kbd> and
+    <kbd>alt</kbd>+<kbd>2</kbd> switch between redis-cli and psql, <kbd>alt</kbd>+<kbd>3</kbd> to the
+    shell the apps run in. Built with <a href="https://github.com/filipecabaco/snowglobe">snowglobe</a>.
   </p>
 </section>
 
@@ -254,6 +313,7 @@ maxmemory_policy:allkeys-random</span></code></pre>
     CI, on both storage halves, and a test that passes is not allowed to stop passing. The
     deviations that remain are <a href="#differences">listed below</a>.
     <a href="{{ 'command-coverage/' | url }}">See every command</a>
+    or <a href="{{ 'examples/' | url }}">examples: caches, sessions joined with SQL, queues, streams, pub/sub into tables</a>.
   </p>
 </section>
 

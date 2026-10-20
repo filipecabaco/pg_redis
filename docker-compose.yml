@@ -46,6 +46,21 @@ services:
     network_mode: "service:postgres"
     profiles: ["e2e"]
 
+  # Production-style apps on Redis libraries (BullMQ, connect-redis,
+  # rate-limit-redis, the Socket.IO Redis adapter, streams), unchanged.
+  showcases:
+    build: ./examples
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      REDIS_HOST: localhost
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${PG_REDIS_PASSWORD-testpass}
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+    network_mode: "service:postgres"
+    profiles: ["showcases"]
+
   parity:
     build: ./docker/e2e
     depends_on:

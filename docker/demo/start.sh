@@ -14,4 +14,6 @@ exec tmux new-session -s demo -n demo \
   select-pane -T " redis-cli :6379 " \; \
   split-window -v "psql -h /run/postgresql -U postgres; sh" \; \
   select-pane -T " psql :5432 " \; \
-  select-pane -t 0
+  select-pane -t 0 \; \
+  new-window -d -n app -c /examples "sh" \; \
+  select-pane -t app -T " node /examples "

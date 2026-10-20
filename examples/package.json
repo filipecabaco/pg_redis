@@ -1,0 +1,22 @@
+{
+  "name": "pg-redis-showcases",
+  "private": true,
+  "type": "module",
+  "description": "Production-style apps built on Redis libraries, run unchanged against pg_redis",
+  "scripts": {
+    "all": "node run.mjs"
+  },
+  "dependencies": {
+    "@socket.io/redis-adapter": "^8.3.0",
+    "bullmq": "^5.12.0",
+    "connect-redis": "^7.1.1",
+    "express": "^4.21.0",
+    "express-rate-limit": "^7.4.0",
+    "express-session": "^1.18.0",
+    "ioredis": "^5.4.1",
+    "pg": "^8.12.0",
+    "rate-limit-redis": "^4.2.0",
+    "socket.io": "^4.8.0",
+    "socket.io-client": "^4.8.0"
+  }
+}

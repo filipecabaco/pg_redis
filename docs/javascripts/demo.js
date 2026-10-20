@@ -1,11 +1,14 @@
-// The live demo on the home page: PostgreSQL with pg_redis, booted in this tab.
+// The live demo, on the home page and the examples page: PostgreSQL with pg_redis, booted in
+// this tab.
 //
 // The machine is a snowglobe build of docker/demo (`mise run demo` writes it to docs/demo/):
 // an arm64 Linux snapshot restored by armless, a CPU emulator compiled to WebAssembly. This
 // file uses only the build's assets (snapshot, filesystem blobs, armless and xterm) and boots
 // the machine straight into the page, so the terminal is ours to style and to type into.
 //
-// Inside, tmux holds redis-cli (top pane) and psql (bottom); alt-1 and alt-2 switch between them.
+// Inside, tmux holds redis-cli (top pane) and psql (bottom), and a second window a shell in
+// /examples, where the showcases run; alt-1, alt-2 and alt-3 switch between them. On the
+// examples page every redis, sql and console code block gets a Run button that types it in.
 (() => {
   const root = document.querySelector("[data-demo]");
   if (!root) return;
@@ -17,7 +20,7 @@
   const boot = root.querySelector(".pr-demo__boot");
   const status = root.querySelector(".pr-demo__status");
   const steps = [...root.querySelectorAll(".pr-step")];
-  const PANE = { redis: "\x1b1", sql: "\x1b2" };
+  const PANE = { redis: "\x1b1", sql: "\x1b2", app: "\x1b3" };
 
   let emulator = null;
   let started = false;
@@ -122,7 +125,12 @@
       root.classList.add("is-running");
       setStatus("ready", "running in this tab");
       term.focus();
-      preloadWarmPack().catch(() => {});
+      // The files the first commands read, then the page's own (the examples page names one
+      // holding Node and the showcases: docker/demo/warm.exs records it)
+      preloadWarmPack("system/warm.pack")
+        .then(() => root.dataset.warm && preloadWarmPack(root.dataset.warm))
+        .then(() => warmPanel(root.querySelector(".pr-panel:not([hidden])")))
+        .catch(() => {});
 
       root._term = term;
     } catch (error) {
@@ -131,9 +139,19 @@
     }
   }
 
-  // The files the first commands read, in one background download instead of one request each
-  async function preloadWarmPack() {
-    const response = await fetch(at("system/warm.pack"));
+  // A panel that names a pack (the home page's Apps, which run Node) preloads it once, the
+  // first time it is open while the machine runs: most visitors never open it
+  const warmed = new Set();
+  function warmPanel(panel) {
+    const path = panel?.dataset.warm;
+    if (!path || warmed.has(path) || !emulator || root.dataset.state !== "ready") return;
+    warmed.add(path);
+    preloadWarmPack(path).catch(() => warmed.delete(path));
+  }
+
+  // A pack of files the guest will read, in one background download instead of one request each
+  async function preloadWarmPack(path) {
+    const response = await fetch(at(path));
     if (!response.ok) return;
     const pack = new Uint8Array(await response.arrayBuffer());
     const indexSize = new DataView(pack.buffer).getUint32(0, true);
@@ -147,14 +165,14 @@
     }
   }
 
-  function send(step) {
-    if (!emulator || root.dataset.state !== "ready") return;
-    const pane = PANE[step.dataset.pane];
-    // Switch pane, clear whatever is half-typed there (ctrl-u), then type the command
-    emulator.console_input(`${pane}\x15${step.dataset.cmd}\r`);
-    step.classList.add("is-done");
-    const next = steps[steps.indexOf(step) + 1];
-    steps.forEach((s) => s.classList.toggle("is-next", s === next));
+  // Switch pane, clear whatever is half-typed there (ctrl-u), then type the lines
+  function type(pane, lines) {
+    if (!emulator || root.dataset.state !== "ready") return false;
+    emulator.console_input(`${PANE[pane]}\x15${lines.join("\r")}\r`);
+    return true;
+  }
+
+  function reveal() {
     // Stacked on a phone, the terminal is above the steps: bring it back into
     // view so the step's output is seen
     if (matchMedia("(max-width: 52em)").matches) {
@@ -162,6 +180,84 @@
       stage.scrollIntoView({ block: "start", behavior: smooth ? "smooth" : "auto" });
     }
     root._term?.focus();
+  }
+
+  function send(step) {
+    if (!type(step.dataset.pane, [step.dataset.cmd])) return;
+    step.classList.add("is-done");
+    // The next step is the next one in the same tab
+    const own = [...(step.closest(".pr-panel") ?? root).querySelectorAll(".pr-step")];
+    const next = own[own.indexOf(step) + 1];
+    own.forEach((s) => s.classList.toggle("is-next", s === next));
+    reveal();
+  }
+
+  // The rail's tabs: Tour, Apps, Recipes
+  const tabs = [...root.querySelectorAll(".pr-tab")];
+  function select(tab) {
+    for (const t of tabs) {
+      const on = t === tab;
+      t.setAttribute("aria-selected", String(on));
+      t.tabIndex = on ? 0 : -1;
+      const panel = document.getElementById(t.getAttribute("aria-controls"));
+      if (panel) panel.hidden = !on;
+      if (on) warmPanel(panel);
+    }
+  }
+  for (const [i, tab] of tabs.entries()) {
+    tab.addEventListener("click", () => select(tab));
+    tab.addEventListener("keydown", (e) => {
+      const to = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: tabs.length - 1 }[e.key];
+      if (to === undefined) return;
+      e.preventDefault();
+      const t = tabs[(to + tabs.length) % tabs.length];
+      select(t);
+      t.focus();
+    });
+  }
+  for (const panel of root.querySelectorAll(".pr-panel")) {
+    panel.querySelector(".pr-step")?.classList.add("is-next");
+  }
+
+  // What a code block types: a redis-cli transcript's commands (found by their prompts, which
+  // name the database, so it starts with a SELECT; Pygments has no Redis lexer, so these are
+  // text blocks), a SQL block whole, a console block's `$` lines. Anything else is not run.
+  const PROMPT = /^127\.0\.0\.1:6379(?:\[(\d+)\])?> (.*)$/;
+  function runnable(block) {
+    const text = block.querySelector("code")?.textContent ?? "";
+    const lines = text.replace(/\n$/, "").split("\n");
+    if (block.classList.contains("language-redis") || block.classList.contains("language-text")) {
+      const cmds = lines.map((l) => l.match(PROMPT)).filter(Boolean);
+      if (!cmds.length) return null;
+      return { pane: "redis", lines: [`SELECT ${cmds[0][1] ?? 0}`, ...cmds.map((m) => m[2])] };
+    }
+    if (block.classList.contains("language-sql")) return { pane: "sql", lines };
+    if (block.classList.contains("language-console")) {
+      const cmds = lines.filter((l) => l.startsWith("$ ")).map((l) => l.slice(2));
+      return cmds.length ? { pane: "app", lines: cmds } : null;
+    }
+    return null;
+  }
+
+  if ("runnable" in root.dataset) {
+    const blocks = ".language-redis, .language-text, .language-sql, .language-console";
+    for (const block of root.querySelectorAll(blocks)) {
+      const run = runnable(block);
+      if (!run) continue;
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "pr-run";
+      button.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11l9-5.5z"/></svg>Run';
+      button.title = { redis: "Type into redis-cli", sql: "Type into psql", app: "Run in the shell" }[run.pane];
+      button.addEventListener("click", async () => {
+        if (!started) await start();
+        if (!type(run.pane, run.lines)) return;
+        button.classList.add("is-done");
+        reveal();
+      });
+      block.classList.add("pr-runnable");
+      block.prepend(button);
+    }
   }
 
   boot.addEventListener("click", start);

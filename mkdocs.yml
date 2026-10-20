@@ -50,6 +50,8 @@ markdown_extensions:
   - admonition
   - pymdownx.highlight:
       anchor_linenums: true
+      # The examples page finds its runnable blocks by language (demo.js)
+      pygments_lang_class: true
   - pymdownx.superfences
   - pymdownx.tabbed:
       alternate_style: true
@@ -59,6 +61,7 @@ nav:
   - Getting started:
       - Installation: installation.md
       - Configuration: configuration.md
+      - Examples: examples.md
       - Operating in production: operations.md
       - Storage policies: STORAGE.md
   - Reference:

@@ -260,8 +260,10 @@ run = """
 set -e
 SNOWGLOBE="${SNOWGLOBE:-snowglobe}"
 docker build --platform linux/arm64 -t pg_redis:alpine-arm64 .
+docker build --platform linux/arm64 -t pg_redis:examples-arm64 examples
 rm -rf docs/demo
 "$SNOWGLOBE" build docker/demo --out docs/demo
+SNOWGLOBE="$SNOWGLOBE" elixir docker/demo/warm.exs
 """
 
 [tasks.bench-suite]

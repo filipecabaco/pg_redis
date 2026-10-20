@@ -230,6 +230,13 @@ struct Sub {
 }
 
 impl Sub {
+    /// What is queued, and the part of it Redis would hold in the client's
+    /// static reply buffer (`pubheap::note_reply_buffer`).
+    fn set_queued(&mut self, bytes: usize) {
+        crate::pubheap::note_reply_buffer(self.queued.min(REPLY_CHUNK), bytes.min(REPLY_CHUNK));
+        self.queued = bytes;
+    }
+
     fn new() -> Sub {
         Sub {
             channels: HVec::new_in(PubHeap),
@@ -275,7 +282,7 @@ impl Sub {
         if queued.is_none() {
             return self.overflow();
         }
-        self.queued += bytes;
+        self.set_queued(self.queued + bytes);
         if self.over_limit(limits, now_ms) {
             return self.overflow();
         }
@@ -305,14 +312,15 @@ impl Sub {
         self.overflowed = true;
         self.queue = HVec::new_in(PubHeap);
         self.head = 0;
-        self.queued = 0;
+        self.set_queued(0);
         self.wake();
     }
 
     fn pop(&mut self) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
         let q = self.queue.get(self.head)?;
         let out = (q.channel.to_vec(), q.pattern.to_vec(), q.payload.to_vec());
-        self.queued -= q.bytes;
+        let bytes = q.bytes;
+        self.set_queued(self.queued - bytes);
         self.head += 1;
         if self.head == self.queue.len() {
             self.queue.clear();
@@ -322,6 +330,12 @@ impl Sub {
             self.head = 0;
         }
         Some(out)
+    }
+}
+
+impl Drop for Sub {
+    fn drop(&mut self) {
+        self.set_queued(0);
     }
 }
 

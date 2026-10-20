@@ -1,4 +1,4 @@
-//! The shared heap pub/sub, client tracking and the ACL users live in.
+//! Te shared heap pub/sub, client tracking and the ACL users live in.
 //!
 //! Redis keeps a subscriber's subscriptions and its undelivered messages in
 //! ordinary heap memory, so neither has a fixed size: a channel name, a
@@ -51,6 +51,10 @@ struct Header {
     /// Bytes handed out by the allocator, and the most it has reached.
     used: AtomicUsize,
     peak: AtomicUsize,
+    /// Of `used`, what clients' first `REPLY_CHUNK` bytes of queued replies
+    /// take: Redis holds those in each client's static buffer, which
+    /// `used_memory` does not see grow.
+    in_reply_buffers: AtomicUsize,
     lock: AtomicU8,
     talc: UnsafeCell<Talc<Manual, DefaultBinning>>,
     /// The root built at startup, or null before then.
@@ -128,6 +132,7 @@ pub fn startup() {
                 cap: heap_bytes(),
                 used: AtomicUsize::new(0),
                 peak: AtomicUsize::new(0),
+                in_reply_buffers: AtomicUsize::new(0),
                 lock: AtomicU8::new(0),
                 talc: UnsafeCell::new(talc),
                 root: AtomicPtr::new(std::ptr::null_mut()),
@@ -291,9 +296,26 @@ unsafe impl Allocator for PubHeap {
     }
 }
 
-/// Bytes handed out from the heap now.
-pub fn used() -> usize {
-    header().map_or(0, |h| h.used.load(Ordering::Relaxed))
+/// What the heap adds to `used_memory`: what it holds, less what Redis
+/// would hold in clients' static reply buffers.
+pub fn counted() -> usize {
+    header().map_or(0, |h| {
+        h.used
+            .load(Ordering::Relaxed)
+            .saturating_sub(h.in_reply_buffers.load(Ordering::Relaxed))
+    })
+}
+
+/// A client's queued replies within its static buffer went from `old`
+/// bytes to `new`.
+pub fn note_reply_buffer(old: usize, new: usize) {
+    if let Some(h) = header() {
+        if new > old {
+            h.in_reply_buffers.fetch_add(new - old, Ordering::Relaxed);
+        } else {
+            h.in_reply_buffers.fetch_sub(old - new, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Run `f`, turning a full heap into `None` instead of a panic.
@@ -331,6 +353,7 @@ pub fn for_tests() {
                 cap: bytes,
                 used: AtomicUsize::new(0),
                 peak: AtomicUsize::new(0),
+                in_reply_buffers: AtomicUsize::new(0),
                 lock: AtomicU8::new(0),
                 talc: UnsafeCell::new(talc),
                 root: AtomicPtr::new(std::ptr::null_mut()),

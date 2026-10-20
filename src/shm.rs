@@ -211,7 +211,7 @@ pub fn usage() -> Option<Usage> {
 /// and ACL users (`pubheap.rs`). Redis counts its clients' output buffers
 /// against `maxmemory` too.
 fn used_bytes(a: &Arena) -> usize {
-    a.used.load(Ordering::Relaxed) + crate::pubheap::used()
+    a.used.load(Ordering::Relaxed) + crate::pubheap::counted()
 }
 
 /// `CONFIG SET maxmemory`: a new limit, no higher than the arena was sized

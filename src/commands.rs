@@ -2834,16 +2834,13 @@ impl Command {
         let guarded = self.collection_read_guarded();
         if !writes && !guarded && self.reads_a_collection() {
             self.sql_reap_expired(client, db);
-        } else if !writes {
+        } else if !writes && !self.reaps_on_miss() {
             // Redis deletes a key it finds past its deadline on a read,
             // counts it in expired_keys, invalidates it and raises
             // `expired`, and DBSIZE no longer counts it: reap first. In the
             // ordinary case, nothing expired, that is one indexed lookup on
             // the keys that carry a deadline.
-            let mut keys: Vec<&[u8]> = self.typed_keys().iter().map(|(k, _)| *k).collect();
-            if let Command::MGet { keys: named } = self {
-                keys.extend(named.iter().map(Vec::as_slice));
-            }
+            let keys: Vec<&[u8]> = self.typed_keys().iter().map(|(k, _)| *k).collect();
             Self::reap_keys(client, db, &keys);
         }
         // The probe reaped these already, in the same statement.
@@ -2852,6 +2849,23 @@ impl Command {
             Self::reap_keys(client, db, &stale);
         }
         let response = self.execute_inner(client, db);
+        // GET and MGET filter expired keys out in their own statement, so a
+        // key they return is live and only a miss can have met an expired
+        // one: reaping then, rather than before every read, keeps the hot
+        // reads to one statement. The reply is the same either way.
+        match (self, &response) {
+            (Command::Get { key }, Response::Null) => Self::reap_keys(client, db, &[key]),
+            (Command::MGet { keys }, Response::Array(values)) => {
+                let missed: Vec<&[u8]> = keys
+                    .iter()
+                    .zip(values)
+                    .filter(|(_, v)| v.is_none())
+                    .map(|(k, _)| k.as_slice())
+                    .collect();
+                Self::reap_keys(client, db, &missed);
+            }
+            _ => {}
+        }
         if !writes && response.found_nothing() {
             // A guarded read that found nothing may have refused an expired
             // key whose rows are still in the tables. They have to go before
@@ -2867,6 +2881,11 @@ impl Command {
             }
         }
         response
+    }
+
+    /// The reads that reap the keys they missed after running, not before.
+    fn reaps_on_miss(&self) -> bool {
+        matches!(self, Command::Get { .. } | Command::MGet { .. })
     }
 
     /// Reads whose reply is not empty even when a key holds the wrong type, so

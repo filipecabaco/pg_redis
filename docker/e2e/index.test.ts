@@ -5419,10 +5419,11 @@ describe("Atomicity across workers", () => {
 			await script.send("DEL", "atomic:busy");
 			for (const c of db1) await c.send("SELECT", "1");
 			for (const c of db0) await c.send("SELECT", "0");
+			// Time stands still inside a script, as in Redis, so the script
+			// holds its database by sleeping rather than watching TIME.
+			await script.send("DEBUG", "SET-DISABLE-DENY-SCRIPTS", "1");
 			const busy =
-				"local s = redis.call('TIME') local t0 = s[1] * 1000000 + s[2] " +
-				"repeat local n = redis.call('TIME') " +
-				"until n[1] * 1000000 + n[2] - t0 > tonumber(ARGV[1]) * 1000 " +
+				"redis.call('DEBUG', 'SLEEP', tonumber(ARGV[1]) / 1000) " +
 				"redis.call('SET', KEYS[1], 'done') return 1";
 			const started = performance.now();
 			const running = script.send("EVAL", busy, "1", "atomic:busy", String(LONG_MS));
@@ -5454,6 +5455,7 @@ describe("Atomicity across workers", () => {
 			await script.send("DEL", "atomic:busy");
 			for (const [i, c] of db1.entries()) await c.send("DEL", `atomic:free:${i}`);
 		} finally {
+			await script.send("DEBUG", "SET-DISABLE-DENY-SCRIPTS", "0");
 			script.close();
 			closeAll(db1);
 			closeAll(db0);

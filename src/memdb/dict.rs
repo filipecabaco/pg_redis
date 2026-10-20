@@ -56,11 +56,12 @@ impl<V, A: Allocator + Clone> Dict<V, A> {
     }
 
     /// Before adding an entry: when the entries are at capacity and doubling
-    /// them would take more than `room` bytes, grow by what fits in the room
+    /// them would take more than `room` bytes, grow by a quarter of the room
     /// instead, at least 16 entries and at most an eighth. Redis likewise
     /// declines to grow a dictionary past `maxmemory` (`dictExpandAllowed`):
     /// a doubling that eviction cannot take back would leave the arena over
-    /// the limit with nothing left to evict.
+    /// the limit with nothing left to evict, and growth that filled the room
+    /// would make the next write evict where Redis's would not.
     pub fn grow_within(&mut self, room: Option<usize>) {
         let cap = self.slots.capacity();
         if self.slots.len() < cap || cap == 0 {
@@ -69,7 +70,7 @@ impl<V, A: Allocator + Clone> Dict<V, A> {
         let per = std::mem::size_of::<Slot<V, A>>() + std::mem::size_of::<u32>();
         if let Some(room) = room.filter(|&r| cap * per > r) {
             self.slots
-                .reserve_exact((room / per).clamp(16, (cap / 8).max(16)));
+                .reserve_exact((room / per / 4).clamp(16, (cap / 8).max(16)));
         }
     }
 

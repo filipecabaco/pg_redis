@@ -158,7 +158,10 @@ async function unitPath(unit: string): Promise<string> {
 		// A tag of its own (`"external:skip"`) or one inside a quoted list
 		// (`"pubsubshard external:skip"`), whose closing quote stays.
 		.replaceAll(/\s*"external:skip"/g, "")
-		.replaceAll(/\s+external:skip/g, "");
+		.replaceAll(/\s+external:skip/g, "")
+		// Each block is a fresh server to Redis, its statistics at zero
+		// (`evicted_keys`, `expired_keys` ...); here it is the same server.
+		.replaceAll(/^(start_server .*\{)[ \t]*$/gm, "$1\n    r config resetstat");
 	const name = `unit/pg_redis/${unit.replace(/^unit\//, "")}`;
 	await Bun.write(`tests/${name}.tcl`, kept);
 	return name;

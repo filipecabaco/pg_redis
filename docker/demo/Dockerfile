@@ -55,10 +55,12 @@ COPY start.sh /usr/local/bin/start-demo
 
 ENV LANG=C.UTF-8 HOME=/root TERM=xterm-256color
 # Where the showcases find pg_redis and Postgres here, and how much slower than native the
-# emulated CPU is: their waits and locks stretch by it.
+# emulated CPU is: their waits and locks stretch by it, and the job queue runs its lighter
+# pass. The queue is on database 0: in memory, its many small writes commit nothing.
 ENV REDIS_HOST=127.0.0.1 \
     DATABASE_URL="postgresql://postgres@localhost/postgres?host=/run/postgresql" \
-    SHOWCASE_SLOW=5
+    SHOWCASE_SLOW=5 \
+    JOB_QUEUE_DB=0
 WORKDIR /root
 CMD ["/usr/local/bin/start-demo"]
 

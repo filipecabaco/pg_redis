@@ -43,9 +43,8 @@
 
 <span class="c"># the same data, from SQL</span>
 <span class="p">$</span> psql
-<span class="p">=#</span> SELECT convert_from(field, 'UTF8') AS field,
-          convert_from(value, 'UTF8') AS value
-     FROM redis.hash_8 WHERE key = 'user:42';
+<span class="p">=#</span> SELECT field, value FROM redis.hashes
+     WHERE db = 8 AND key = 'user:42';
 <span class="o"> field | value
 -------+-------
  name  | Ada
@@ -88,6 +87,7 @@
         <ol class="pr-steps">
         <li><button type="button" class="pr-step is-next" data-pane="redis" data-cmd='SET greeting "hello from postgres"'><span class="pr-step__pane">redis</span><code>SET greeting "hello from postgres"</code><em>db 0, in shared memory</em></button></li>
         <li><button type="button" class="pr-step" data-pane="sql" data-cmd="SELECT * FROM redis.policies() WHERE db IN (0, 8);"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>SELECT * FROM redis.policies() …;</code><em>db 0 is memory, db 8 is logged</em></button></li>
+        <li><button type="button" class="pr-step" data-pane="sql" data-cmd="SELECT key, type, value FROM redis.memory_keys(0);"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>SELECT … FROM redis.memory_keys(0);</code><em>memory, read from SQL</em></button></li>
         </ol>
       </div>
       <div class="pr-phase">
@@ -95,7 +95,7 @@
         <ol class="pr-steps">
         <li><button type="button" class="pr-step" data-pane="sql" data-cmd="SELECT redis.set_policy(0, 'memory+snapshot');"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>SELECT redis.set_policy(0, 'memory+snapshot');</code><em>still memory, now snapshotted</em></button></li>
         <li><button type="button" class="pr-step" data-pane="redis" data-cmd="SAVE"><span class="pr-step__pane">redis</span><code>SAVE</code><em>take the snapshot now</em></button></li>
-        <li><button type="button" class="pr-step" data-pane="sql" data-cmd="SELECT s.db, convert_from(s.key, 'UTF8') AS key, t.taken_at FROM redis.snapshot s JOIN redis.snapshot_taken t USING (db);"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>SELECT … FROM redis.snapshot …;</code><em>the snapshot is a logged row</em></button></li>
+        <li><button type="button" class="pr-step" data-pane="sql" data-cmd="SELECT s.db, redis.text(s.key) AS key, t.taken_at FROM redis.snapshot s JOIN redis.snapshot_taken t USING (db);"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>SELECT … FROM redis.snapshot …;</code><em>the snapshot is a logged row</em></button></li>
         </ol>
       </div>
       <div class="pr-phase">
@@ -103,8 +103,8 @@
         <ol class="pr-steps">
         <li><button type="button" class="pr-step" data-pane="sql" data-cmd="SELECT redis.set_policy(0, 'logged');"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>SELECT redis.set_policy(0, 'logged');</code><em>move db 0 into tables, live</em></button></li>
         <li><button type="button" class="pr-step" data-pane="redis" data-cmd="GET greeting"><span class="pr-step__pane">redis</span><code>GET greeting</code><em>still there, moved into a table</em></button></li>
-        <li><button type="button" class="pr-step" data-pane="sql" data-cmd="SELECT convert_from(key, 'UTF8') AS key, convert_from(value, 'UTF8') AS value FROM redis.kv_0 WHERE key = 'greeting';"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>SELECT … FROM redis.kv_0 WHERE key = 'greeting';</code><em>now it is a row</em></button></li>
-        <li><button type="button" class="pr-step" data-pane="sql" data-cmd="UPDATE redis.kv_0 SET value = convert_to('hello from SQL', 'UTF8') WHERE key = 'greeting';"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>UPDATE redis.kv_0 SET value = …</code><em>change it from SQL</em></button></li>
+        <li><button type="button" class="pr-step" data-pane="sql" data-cmd="SELECT key, value FROM redis.strings WHERE db = 0 AND key = 'greeting';"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>SELECT … FROM redis.strings WHERE db = 0 …;</code><em>now it is a row</em></button></li>
+        <li><button type="button" class="pr-step" data-pane="sql" data-cmd="UPDATE redis.kv_0 SET value = 'hello from SQL' WHERE key = 'greeting';"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>UPDATE redis.kv_0 SET value = …</code><em>change it from SQL</em></button></li>
         <li><button type="button" class="pr-step" data-pane="redis" data-cmd="GET greeting"><span class="pr-step__pane">redis</span><code>GET greeting</code><em>Redis sees the update</em></button></li>
         </ol>
       </div>
@@ -152,10 +152,10 @@
         <li><button type="button" class="pr-step" data-pane="redis" data-cmd="SELECT 8"><span class="pr-step__pane">redis</span><code>SELECT 8</code><em>the logged database</em></button></li>
         <li><button type="button" class="pr-step" data-pane="redis" data-cmd="EVAL &quot;local n = redis.call('INCR', KEYS[1]) if n == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end return n&quot; 1 rate:203.0.113.7 60"><span class="pr-step__pane">redis</span><code>EVAL "… INCR … EXPIRE …"</code><em>a rate limit, counted atomically</em></button></li>
         <li><button type="button" class="pr-step" data-pane="redis" data-cmd="ZADD scores 1200 ada 950 grace 1100 linus"><span class="pr-step__pane">redis</span><code>ZADD scores 1200 ada …</code><em>a leaderboard</em></button></li>
-        <li><button type="button" class="pr-step" data-pane="sql" data-cmd="SELECT convert_from(member, 'UTF8') AS player, score, rank() OVER (ORDER BY score DESC) AS place FROM redis.zset_8 WHERE key = 'scores';"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>SELECT … rank() OVER …</code><em>ranked with a window function</em></button></li>
+        <li><button type="button" class="pr-step" data-pane="sql" data-cmd="SELECT member AS player, score, rank() OVER (ORDER BY score DESC) AS place FROM redis.zsets WHERE db = 8 AND key = 'scores';"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>SELECT … rank() OVER …</code><em>ranked with a window function</em></button></li>
         <li><button type="button" class="pr-step" data-pane="sql" data-cmd="SELECT redis.create_pubsub_table('public', 'order_events'); SELECT redis.route_publish('orders.created', 'public', 'order_events');"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>SELECT redis.route_publish(…);</code><em>a channel, copied into a table</em></button></li>
         <li><button type="button" class="pr-step" data-pane="redis" data-cmd="PUBLISH orders.created '{&quot;order_id&quot;:1001,&quot;total&quot;:42.5}'"><span class="pr-step__pane">redis</span><code>PUBLISH orders.created …</code><em>publish an event</em></button></li>
-        <li><button type="button" class="pr-step" data-pane="sql" data-cmd="SELECT convert_from(payload, 'UTF8')::jsonb AS payload FROM public.order_events;"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>SELECT … FROM public.order_events;</code><em>stored, ready to query</em></button></li>
+        <li><button type="button" class="pr-step" data-pane="sql" data-cmd="SELECT payload_text::jsonb AS payload FROM public.order_events;"><span class="pr-step__pane pr-step__pane--sql">sql</span><code>SELECT … FROM public.order_events;</code><em>stored, ready to query</em></button></li>
         </ol>
       </div>
       </div>

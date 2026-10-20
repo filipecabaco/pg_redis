@@ -28,9 +28,11 @@ DATABASE_URL=postgres://postgres@db.internal/postgres \
 node run.mjs                 # all four, or: node run.mjs job-queue
 ```
 
-They use databases `0` (memory) and `8` (logged) and the SQL tables in the `redis` schema.
-`SHOWCASE_SLOW` stretches their waits and lock times for a slow machine; the in-browser demo
-on the site sets it, since it runs them on an emulated CPU.
+They use databases `0` (memory) and `8` (logged), and read them from SQL with the views in the
+`redis` schema. `SHOWCASE_SLOW` stretches their waits and lock times for a slow machine and
+makes the job queue's pass lighter; `JOB_QUEUE_DB` moves the queue off database 8. The
+in-browser demo on the site sets both, since it runs them on an emulated CPU. Connections are
+expected to start on database 0, Redis's default: ioredis sends no `SELECT 0`.
 
 ## In the browser
 

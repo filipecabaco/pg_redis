@@ -99,11 +99,65 @@ table rows. The snapshot of a `memory+snapshot` database is the exception.
 
 ## Querying from SQL
 
-Every database has its own set of tables, with the database number as the suffix. They hold
-data only while that database's policy is `logged`. Keys, fields, members and values are
-`bytea`.
+### Views
+
+The views read every database's tables at once, with the database as the `db` column. Keys,
+fields, members and values are text, `NULL` where the bytes are not UTF-8, and the `*_bytes`
+columns hold them exactly. Only live keys are listed: one past its expiry is gone, as it is for
+Redis, even before the sweep deletes its rows.
+
+| View | Columns |
+|------|---------|
+| `redis.strings` | `db`, `key`, `value`, `key_bytes`, `value_bytes`, `expires_at` |
+| `redis.hashes` | `db`, `key`, `field`, `value`, `field_bytes`, `value_bytes`, `seq`, `key_bytes`, `expires_at` |
+| `redis.lists` | `db`, `key`, `position`, `value`, `value_bytes`, `key_bytes`, `expires_at` |
+| `redis.sets` | `db`, `key`, `member`, `member_bytes`, `seq`, `key_bytes`, `expires_at` |
+| `redis.zsets` | `db`, `key`, `member`, `score`, `member_bytes`, `key_bytes`, `expires_at` |
+| `redis.streams` | `db`, `key`, `key_bytes`, `expires_at` |
+| `redis.keys` | `db`, `key`, `type`, `value`, `key_bytes`, `expires_at` |
+
+```sql
+-- Strings in database 8
+SELECT key, value, expires_at FROM redis.strings WHERE db = 8;
+
+-- A hash's fields, in the order HGETALL returns them
+SELECT field, value FROM redis.hashes WHERE db = 8 AND key = 'user:1' ORDER BY seq;
+
+-- A list, LRANGE 0 -1
+SELECT value FROM redis.lists WHERE db = 8 AND key = 'jobs' ORDER BY position;
+```
+
+`redis.keys` has every key once, with its type and its whole value as `jsonb`: a string is a
+JSON string, a hash an object, a list an array, a set an array in insertion order, and a sorted
+set an array of `[member, score]` pairs by score. Bytes that are not UTF-8 are
+`{"base64": "..."}`. A stream's value is `NULL`; `XRANGE` reads it.
+
+```sql
+SELECT key, type, value FROM redis.keys WHERE db = 8 AND key LIKE 'user:%';
+```
+
+A filter on `db` reads only that database's tables. A filter on `key` decodes every key of the
+type to compare it; `key_bytes` uses the index, so for one key in a large database write
+`key_bytes = 'user:1'`.
+
+`memory` and `memory+snapshot` databases have no rows in tables. `redis.memory_keys(db)` reads
+one from shared memory, in the shape of `redis.keys`, without changing it: an expired key is
+skipped and not deleted, and no key's idle time or access frequency is touched. It walks the
+whole database, so it is for inspection, not for a hot path.
+
+```sql
+SELECT key, type, value, expires_at FROM redis.memory_keys(0);
+```
+
+### Tables
+
+The views are not writable. Writes go to the tables they read: every database has its own set,
+with the database number as the suffix, holding data only while that database's policy is
+`logged`. Their columns are `bytea`, as Redis's keys and values are bytes; a string literal is
+taken as its bytes, so `WHERE key = 'user:1'` and `SET value = 'on'` work as written.
 
 | Table | Columns | Holds |
+
 |-------|---------|-------|
 | `redis.kv_N` | `key`, `value`, `expires_at` | Strings, with their expiry |
 | `redis.hash_N` | `key`, `field`, `value`, `seq` | Hashes, one row per field |
@@ -116,23 +170,7 @@ data only while that database's policy is `logged`. Keys, fields, members and va
 
 A string's expiry is the `expires_at` column of `redis.kv_N`, `NULL` when it has none. The
 other types keep theirs in `redis.expiry_N`, and a key with no expiry has no row there. A key
-past its expiry can still be in the tables until the next sweep removes it, so filter on the
-expiry when you read:
-
-```sql
--- Strings in database 8
-SELECT convert_from(key, 'UTF8') AS key, convert_from(value, 'UTF8') AS value
-FROM redis.kv_8
-WHERE expires_at IS NULL OR expires_at > now();
-
--- Hash fields in database 8
-SELECT convert_from(h.key, 'UTF8') AS key,
-       convert_from(h.field, 'UTF8') AS field,
-       convert_from(h.value, 'UTF8') AS value
-FROM redis.hash_8 h
-LEFT JOIN redis.expiry_8 e ON e.key = h.key
-WHERE e.expires_at IS NULL OR e.expires_at > now();
-```
+past its expiry can still be in the tables until the next sweep removes it.
 
 A hash's fields and a set's members come back in the order Redis would give
 them, and `seq` records it: it is set when a field or member is added and kept
@@ -147,15 +185,13 @@ setting by hand: a row written from SQL takes the next `seq`, and a key with
 no encoding row is in the encoding its contents imply.
 
 ```sql
--- A hash's fields in database 8, in the order HGETALL returns them
-SELECT convert_from(field, 'UTF8') AS field, convert_from(value, 'UTF8') AS value
-FROM redis.hash_8
-WHERE key = convert_to('user:1', 'UTF8')
-ORDER BY seq;
+-- A flag every application reads with GET
+INSERT INTO redis.kv_8 (key, value) VALUES ('feature:checkout-v2', 'on')
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, expires_at = NULL;
 ```
 
-`memory` and `memory+snapshot` databases have no rows in these tables. A `memory+snapshot`
-database's snapshot is in `redis.snapshot`, as one serialised `DUMP` payload per key.
+A `memory+snapshot` database's snapshot is in `redis.snapshot`, as one serialised `DUMP`
+payload per key.
 
 ## Security
 

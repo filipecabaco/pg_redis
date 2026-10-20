@@ -318,6 +318,8 @@ CREATE TABLE IF NOT EXISTS redis.pubsub_routes (
 
 -- Helper to create a target table for pub/sub routing.
 -- The table must have `channel BYTEA` and `payload BYTEA` columns to receive routed messages.
+-- This one also has both as text (NULL where the bytes are not UTF-8), so a JSON payload is
+-- `payload_text::jsonb`.
 CREATE OR REPLACE FUNCTION redis.create_pubsub_table(p_schema text, p_tbl text)
 RETURNS void
 LANGUAGE plpgsql
@@ -328,7 +330,9 @@ BEGIN
             id          BIGSERIAL PRIMARY KEY,
             channel     BYTEA NOT NULL,
             payload     BYTEA NOT NULL,
-            inserted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            inserted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            channel_text TEXT GENERATED ALWAYS AS (redis.text(channel)) STORED,
+            payload_text TEXT GENERATED ALWAYS AS (redis.text(payload)) STORED
         )',
         p_schema, p_tbl
     );

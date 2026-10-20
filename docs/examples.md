@@ -12,8 +12,10 @@ output shown under each block is what it printed.
 
 Database `0` uses the `memory` policy and database `8` the `logged` one, as they do by
 default ([Storage policies](./STORAGE.md)). On a logged database every key is a row you can
-read, join and change from SQL, in `redis.kv_8`, `redis.hash_8`, `redis.list_8`,
-`redis.set_8`, `redis.zset_8` and `redis.stream_8`.
+read, join and change from SQL. The views `redis.strings`, `redis.hashes`, `redis.lists`,
+`redis.sets`, `redis.zsets` and `redis.streams` show them as text, `redis.keys` gives each key
+with its whole value as JSON, and writes go to the tables underneath, `redis.kv_8`,
+`redis.hash_8` and the rest ([Querying from SQL](./operations.md#querying-from-sql)).
 
 ## Production showcases
 
@@ -26,11 +28,15 @@ them a few times slower than on a server.
 
 ### A job queue with BullMQ
 
-[BullMQ](https://docs.bullmq.io) is the most used Redis job queue for Node. Twelve signup
-emails go to two workers; a third of them fail on their first try and are retried with
-exponential backoff; a reminder waits out its delay; and a worker dies holding an invoice job,
-which another worker takes over once its lock lapses. The queue lives on database 8, so it
-survives a restart, and its state is ordinary rows.
+[BullMQ](https://docs.bullmq.io) is the most used Redis job queue for Node. Signup emails go
+to two workers; a third of them fail on their first try and are retried with exponential
+backoff; a reminder waits out its delay; and a worker dies holding an invoice job, which
+another worker takes over once its lock lapses. Its last check counts the queue's keys from
+SQL.
+
+Here it runs a lighter pass, six signups, on database 0, in memory; `redis.memory_keys(0)` is
+what reads it. Run natively, as CI does, it sends twelve on database 8, where the queue
+survives a restart and its keys are rows in `redis.keys` (`JOB_QUEUE_DB` picks the database).
 
 ```js
 const queue = new Queue("emails", { connection });
@@ -49,11 +55,11 @@ $ node run.mjs job-queue
 
 ```text
 ▶ job-queue
-  ✓ every job completed  ({"completed":13,"failed":0,"delayed":0,"waiting":0,"active":0,"paused":0})
-  ✓ the transient failures were retried, with backoff  (4 retried)
-  ✓ the delayed job waited for its delay  (1506 ms)
+  ✓ every job completed  ({"completed":7,"failed":0,"delayed":0,"waiting":0,"active":0,"paused":0})
+  ✓ the transient failures were retried, with backoff  (2 retried)
+  ✓ the delayed job waited for its delay  (1502 ms)
   ✓ a crashed worker's job was taken over and finished  (invoiced 1001)
-  ✓ the queue's state is in the logged tables  (18 keys)
+  ✓ the queue's state is in database 0, in memory, read from SQL  (12 keys, 0 lists)
 ```
 
 ### Sessions and a cache for a web app
@@ -91,10 +97,10 @@ The query behind that check. The showcase signs Ada out at the end, so run after
 nobody signed in.
 
 ```sql
-SELECT u.email, k.expires_at > now() AS live
-FROM redis.kv_8 k
-JOIN app_users u ON u.id = (convert_from(k.value, 'UTF8')::jsonb ->> 'userId')::int
-WHERE k.key LIKE 'sess:%';
+SELECT u.email, s.expires_at
+FROM redis.strings s
+JOIN app_users u ON u.id = (s.value::jsonb ->> 'userId')::int
+WHERE s.db = 8 AND s.key LIKE 'sess:%';
 ```
 
 ### Rate limiting and live updates across instances
@@ -240,24 +246,31 @@ INSERT INTO app_users VALUES (42, 'ada@example.com') ON CONFLICT DO NOTHING;
 ```
 
 ```sql
-SELECT convert_from(s.key, 'UTF8') AS session,
-       u.email,
-       e.expires_at > now() AS live
-FROM redis.hash_8 s
-JOIN app_users u ON u.id = convert_from(s.value, 'UTF8')::int
-LEFT JOIN redis.expiry_8 e ON e.key = s.key
-WHERE s.field = 'user_id';
+SELECT s.key AS session, u.email
+FROM redis.hashes s
+JOIN app_users u ON u.id = s.value::int
+WHERE s.db = 8 AND s.field = 'user_id';
 ```
 
 ```text
-   session    |      email      | live
---------------+-----------------+------
- session:9f2c | ada@example.com | t
+   session    |      email
+--------------+-----------------
+ session:9f2c | ada@example.com
 ```
 
-Keys, fields and values are `bytea`, as Redis's are bytes: `convert_from(..., 'UTF8')` reads
-them as text. A string's deadline is the `expires_at` column of `redis.kv_8`; a collection's
-is in `redis.expiry_8`.
+The views list only keys that are live, so a session past its expiry is not there, as it is
+not for Redis. The whole session, as one JSON value:
+
+```sql
+SELECT type, value, expires_at > now() + interval '23 hours' AS for_a_day
+FROM redis.keys WHERE db = 8 AND key = 'session:9f2c';
+```
+
+```text
+ type |                             value                              | for_a_day
+------+----------------------------------------------------------------+-----------
+ hash | {"ip": "203.0.113.7", "agent": "Firefox/131", "user_id": "42"} | t
+```
 
 ### Rate limiting with a script
 
@@ -353,9 +366,9 @@ events stuck for a minute move.
 The same scores, ranked with a window function for a report:
 
 ```sql
-SELECT convert_from(member, 'UTF8') AS player, score,
+SELECT member AS player, score,
        rank() OVER (ORDER BY score DESC) AS place
-FROM redis.zset_8 WHERE key = 'scores';
+FROM redis.zsets WHERE db = 8 AND key = 'scores';
 ```
 
 ```text
@@ -382,8 +395,7 @@ SELECT redis.route_publish('orders.created', 'public', 'order_events');
 ```
 
 ```sql
-SELECT id, convert_from(channel, 'UTF8') AS channel,
-       convert_from(payload, 'UTF8')::jsonb AS payload
+SELECT id, channel_text AS channel, payload_text::jsonb AS payload
 FROM public.order_events;
 ```
 

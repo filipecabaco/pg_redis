@@ -40,7 +40,7 @@ OK
 ```
 
 ```sql
-SELECT key, value, expires_at FROM redis.kv_8;
+SELECT key, value, expires_at FROM redis.strings WHERE db = 8;
 ```
 
 ## How it works

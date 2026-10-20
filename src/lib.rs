@@ -51,6 +51,9 @@ use pgrx::prelude::*;
 ::pgrx::pg_module_magic!(name, version);
 
 ::pgrx::extension_sql_file!("../sql/schema.sql", bootstrap);
+// The views over every database's tables, and redis.memory_keys, once the
+// functions they call exist.
+::pgrx::extension_sql_file!("../sql/views.sql", finalize);
 
 #[pg_schema]
 mod redis {}
@@ -485,6 +488,89 @@ fn policies() -> TableIterator<
     }))
 }
 
+/// Bytes as text when they are UTF-8, NULL otherwise: keys and values are
+/// bytes, as Redis's are, and most are text. The views in sql/views.sql show
+/// them with it.
+#[pg_extern(schema = "redis", immutable, parallel_safe, strict)]
+fn text(bytes: &[u8]) -> Option<String> {
+    std::str::from_utf8(bytes).ok().map(str::to_string)
+}
+
+/// A key or value as SQL's `bytea`.
+type Bytea = Vec<u8>;
+
+/// Every live key of a memory database, one row per element, in Redis's
+/// order (a key's rows come out together, in order: number them `WITH
+/// ORDINALITY`): what `redis.memory_keys(db)` builds its rows from. Read in
+/// pages under the database's lock, so it is not one atomic snapshot, as
+/// SCAN is not. Empty for a database that is not in memory. `field` is what
+/// goes with an element: a hash's field, a sorted set member's score as
+/// Redis prints it, empty for other types. The deadlines are
+/// `redis.memory_deadlines(db)`'s.
+#[pg_extern(schema = "redis")]
+fn memory_entries(
+    db: i32,
+) -> TableIterator<
+    'static,
+    (
+        name!(key, Bytea),
+        name!(kind, String),
+        name!(field, Bytea),
+        name!(value, Bytea),
+    ),
+> {
+    let mut rows = Vec::new();
+    for key in memory_walk(db, true) {
+        let kind = key.kind.name().to_string();
+        // A stream has no elements here, and still one row.
+        if key.elements.is_empty() {
+            rows.push((key.key.clone(), kind.clone(), Vec::new(), Vec::new()));
+        }
+        for e in key.elements {
+            let field = match e.score {
+                Some(s) => commands::format_score(s).into_bytes(),
+                None => e.field.unwrap_or_default(),
+            };
+            rows.push((key.key.clone(), kind.clone(), field, e.value));
+        }
+    }
+    TableIterator::new(rows)
+}
+
+/// The deadline of every live key of a memory database that has one, in
+/// microseconds since the epoch, read as `redis.memory_entries` reads.
+#[pg_extern(schema = "redis")]
+fn memory_deadlines(
+    db: i32,
+) -> TableIterator<'static, (name!(key, Bytea), name!(expires_at_us, i64))> {
+    TableIterator::new(
+        memory_walk(db, false)
+            .into_iter()
+            .filter(|k| k.deadline != 0)
+            .map(|k| (k.key, k.deadline)),
+    )
+}
+
+/// Every live key of memory database `db`, a page at a time under its lock,
+/// with its elements if asked; none when `db` is not in memory.
+fn memory_walk(db: i32, elements: bool) -> Vec<memdb::Copied> {
+    let mut keys = Vec::new();
+    let slot = u8::try_from(db)
+        .ok()
+        .filter(|d| (*d as usize) < commands::NUM_DBS)
+        .and_then(storage::slot);
+    let mut cursor = slot.map(|s| (s, 0));
+    while let Some((slot, at)) = cursor {
+        let (next, page) =
+            shm::with_db(slot, |m| m.copy_page(at, 256, elements)).unwrap_or_else(|f| {
+                pgrx::error!("pg_redis: could not read database {db} from shared memory: {f:?}")
+            });
+        keys.extend(page);
+        cursor = (next != 0).then_some((slot, next));
+    }
+    keys
+}
+
 #[pg_extern(schema = "redis")]
 fn worker_count() -> i64 {
     Spi::get_one::<i64>(
@@ -585,6 +671,98 @@ mod tests {
         for tbl in ["kv", "hash"] {
             Spi::run(&format!("DELETE FROM redis.{tbl}_{db}")).unwrap();
         }
+    }
+
+    // ─────────────────────────── Views over the data ─────────────────────────
+
+    /// The views read every database's tables as text, live keys only, and
+    /// `redis.keys` gives each key's whole value as jsonb.
+    #[pg_test]
+    fn views_show_the_tables_data_as_text_and_json() {
+        Spi::run(
+            "INSERT INTO redis.kv_14 (key, value, expires_at) VALUES \
+               ('v:str', 'hello', NULL), ('v:bin', '\\xff00', NULL), \
+               ('v:gone', 'x', now() - interval '1 second')",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO redis.hash_14 (key, field, value) VALUES \
+               ('v:hash', 'name', 'Ada'), ('v:hash', 'plan', 'pro')",
+        )
+        .unwrap();
+        Spi::run("INSERT INTO redis.zset_14 (key, member, score) VALUES ('v:z', 'b', 2), ('v:z', 'a', 1)")
+            .unwrap();
+        let text = |q: &str| Spi::get_one::<String>(q).unwrap();
+        assert_eq!(
+            text("SELECT value FROM redis.strings WHERE db = 14 AND key = 'v:str'").as_deref(),
+            Some("hello")
+        );
+        // Bytes that are not UTF-8: NULL as text, exact as bytes, base64 in json.
+        assert_eq!(
+            text(
+                "SELECT coalesce(value, 'null') FROM redis.strings WHERE db = 14 AND key = 'v:bin'"
+            )
+            .as_deref(),
+            Some("null")
+        );
+        assert_eq!(
+            text("SELECT value::text FROM redis.keys WHERE db = 14 AND key = 'v:bin'").as_deref(),
+            Some(r#"{"base64": "/wA="}"#)
+        );
+        // An expired key is gone, as it is for Redis.
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM redis.keys WHERE db = 14 AND key = 'v:gone'")
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            text("SELECT value::text FROM redis.keys WHERE db = 14 AND key = 'v:hash'").as_deref(),
+            Some(r#"{"name": "Ada", "plan": "pro"}"#)
+        );
+        assert_eq!(
+            text("SELECT value::text FROM redis.keys WHERE db = 14 AND key = 'v:z'").as_deref(),
+            Some(r#"[["a", 1], ["b", 2]]"#)
+        );
+        for tbl in ["kv", "hash", "zset"] {
+            Spi::run(&format!("DELETE FROM redis.{tbl}_14 WHERE key LIKE 'v:%'")).unwrap();
+        }
+    }
+
+    /// A memory database is read from shared memory, in the same shape.
+    #[pg_test]
+    fn memory_keys_read_a_memory_database() {
+        use crate::commands::Command;
+        let run = |args: &[&str]| {
+            let parts: Vec<Vec<u8>> = args.iter().map(|a| a.as_bytes().to_vec()).collect();
+            Command::parse(parts).unwrap().execute_mem(6)
+        };
+        run(&["DEL", "m:list", "m:str", "m:set"]);
+        run(&["RPUSH", "m:list", "a", "b", "c"]);
+        run(&["SET", "m:str", "v", "EX", "100"]);
+        run(&["SADD", "m:set", "x"]);
+        let text = |q: &str| Spi::get_one::<String>(q).unwrap();
+        assert_eq!(
+            text("SELECT value::text FROM redis.memory_keys(6) WHERE key = 'm:list'").as_deref(),
+            Some(r#"["a", "b", "c"]"#)
+        );
+        assert_eq!(
+            text("SELECT type || ' ' || value::text FROM redis.memory_keys(6) WHERE key = 'm:str'")
+                .as_deref(),
+            Some(r#"string "v""#)
+        );
+        assert_eq!(
+            Spi::get_one::<bool>(
+                "SELECT expires_at > now() FROM redis.memory_keys(6) WHERE key = 'm:str'"
+            )
+            .unwrap(),
+            Some(true)
+        );
+        // A logged database has no memory to read.
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM redis.memory_keys(8)").unwrap(),
+            Some(0)
+        );
+        run(&["DEL", "m:list", "m:str", "m:set"]);
     }
 
     // ─────────────────────────── Schema contract ────────────────────────────
@@ -1062,6 +1240,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(count, Some(1));
+        // The payload is readable as text, and as JSON from there.
+        let text = Spi::get_one::<String>(
+            "SELECT channel_text || ' ' || payload_text FROM public.pg_redis_route_tbl",
+        )
+        .unwrap();
+        assert_eq!(text.as_deref(), Some("mychan hello"));
 
         Spi::run("DROP TABLE IF EXISTS public.pg_redis_route_tbl").unwrap();
     }

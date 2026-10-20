@@ -63,6 +63,23 @@ impl<A: Allocator + Clone> Value<A> {
     }
 }
 
+/// A key copied out of shared memory: its type, its deadline (microseconds
+/// since the epoch, 0 for none) and its elements in Redis's order.
+pub struct Copied {
+    pub key: Vec<u8>,
+    pub kind: KeyKind,
+    pub deadline: i64,
+    pub elements: Vec<Element>,
+}
+
+/// One element: a string's value, a list's or set's member, a hash's field
+/// and value, a sorted set's member and score.
+pub struct Element {
+    pub field: Option<Vec<u8>>,
+    pub value: Vec<u8>,
+    pub score: Option<f64>,
+}
+
 fn held_deadline<A: Allocator + Clone>(e: &Entry<A>) -> Option<i64> {
     (e.deadline() != 0).then_some(e.deadline())
 }
@@ -370,6 +387,43 @@ impl<A: Allocator + Clone> Db<A> {
             Value::Hash(_, e) | Value::Set(_, e) | Value::Zset(_, e) => Some(*e),
             _ => None,
         }
+    }
+
+    /// A page of the live keys, copied out with their elements, for SQL to
+    /// read a memory database (`redis.memory_entries`). Read-only, as
+    /// `OBJECT` reads: a key past its deadline is skipped, not removed, and
+    /// no access field moves. The cursor is `scan`'s; without `elements`
+    /// only keys, types and deadlines are copied.
+    pub fn copy_page(&self, cursor: u64, count: usize, elements: bool) -> (u64, Vec<Copied>) {
+        let now = now();
+        let mut out = Vec::new();
+        let next = self.keys.scan(cursor, count, |k, e| {
+            if e.expired(now) {
+                return;
+            }
+            let one = |field: Option<&[u8]>, value: &[u8], score: Option<f64>| Element {
+                field: field.map(<[u8]>::to_vec),
+                value: value.to_vec(),
+                score,
+            };
+            let elements = match &e.value {
+                _ if !elements => Vec::new(),
+                Value::Str(v) => vec![one(None, v, None)],
+                Value::List(l) => l.iter().map(|v| one(None, v, None)).collect(),
+                Value::Hash(h, _) => h.iter().map(|(f, v)| one(Some(f), v, None)).collect(),
+                Value::Set(s, _) => s.keys().map(|m| one(None, m, None)).collect(),
+                Value::Zset(z, _) => z.iter().map(|(m, s)| one(None, m, Some(s))).collect(),
+                // A stream's value is its serialised form, not elements.
+                Value::Stream(_) => Vec::new(),
+            };
+            out.push(Copied {
+                key: k.to_vec(),
+                kind: e.value.kind(),
+                deadline: e.deadline(),
+                elements,
+            });
+        });
+        (next, out)
     }
 
     /// Up to `limit` keys, live or past their deadline.

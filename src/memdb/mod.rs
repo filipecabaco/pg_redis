@@ -20,7 +20,7 @@ pub mod keyspace;
 pub mod lru;
 pub mod zset;
 
-pub use db::{Db, Score, pause_expiry, take_reaped};
+pub use db::{Copied, Db, Score, pause_expiry, take_reaped};
 
 use allocator_api2::alloc::Allocator;
 use allocator_api2::vec::Vec;

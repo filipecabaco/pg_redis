@@ -95,9 +95,8 @@ export async function run() {
 	const db = sql();
 	await db.connect();
 	const { rows } = await db.query(
-		`SELECT convert_from(field, 'UTF8') AS region,
-		        convert_from(value, 'UTF8')::numeric AS revenue
-		 FROM redis.hash_8 WHERE key = $1::bytea ORDER BY revenue DESC`,
+		`SELECT field AS region, value::numeric AS revenue
+		 FROM redis.hashes WHERE db = 8 AND key = $1 ORDER BY revenue DESC`,
 		[`${stream}:revenue`],
 	);
 	await db.end();

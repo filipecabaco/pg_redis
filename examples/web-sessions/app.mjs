@@ -112,22 +112,22 @@ export async function run() {
 
 	// Who is signed in, from SQL: connect-redis stores each session as JSON.
 	const { rows } = await db.query(`
-		SELECT u.email, k.expires_at > now() AS live
-		FROM redis.kv_8 k
-		JOIN app_users u ON u.id = (convert_from(k.value, 'UTF8')::jsonb ->> 'userId')::int
-		WHERE k.key LIKE 'sess:%'`);
+		SELECT u.email, s.expires_at
+		FROM redis.strings s
+		JOIN app_users u ON u.id = (s.value::jsonb ->> 'userId')::int
+		WHERE s.db = 8 AND s.key LIKE 'sess:%'`);
 	check(
 		"SQL lists the signed-in users, joined with app_users",
-		rows.some((r) => r.email === "ada@example.com" && r.live),
+		rows.some((r) => r.email === "ada@example.com" && r.expires_at > new Date()),
 		rows.map((r) => r.email).join(", "),
 	);
 
 	await post("/logout", {}, cookie);
 	const after = await fetch(url + "/me", { headers: { cookie } });
 	const { rows: left } = await db.query(`
-		SELECT count(*)::int AS n FROM redis.kv_8 k
-		WHERE k.key LIKE 'sess:%'
-		  AND (convert_from(k.value, 'UTF8')::jsonb ->> 'userId')::int = 1`);
+		SELECT count(*)::int AS n FROM redis.strings s
+		WHERE s.db = 8 AND s.key LIKE 'sess:%'
+		  AND (s.value::jsonb ->> 'userId')::int = 1`);
 	check("signing out deletes the session", after.status === 401 && left[0].n === 0);
 
 	s.close();

@@ -59,6 +59,7 @@ nav:
   - Getting started:
       - Installation: installation.md
       - Configuration: configuration.md
+      - Examples: examples.md
       - Operating in production: operations.md
       - Storage policies: STORAGE.md
   - Reference:

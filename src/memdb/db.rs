@@ -736,12 +736,19 @@ impl<A: Allocator + Clone> Store for Db<A> {
     /// move another key, and the sweep or the next access removes it anyway.
     fn scan_keys(&mut self, cursor: u64, count: usize) -> Out<(u64, Vec<Vec<u8>>)> {
         let now = now();
-        let mut out = Vec::new();
+        let (mut out, mut expired) = (Vec::new(), Vec::new());
         let next = self.keys.scan(cursor, count, |k, e| {
-            if !e.expired(now) {
+            if e.expired(now) {
+                expired.push(k.to_vec());
+            } else {
                 out.push(k.to_vec());
             }
         });
+        // `scanCallback` looks each key up, so one past its deadline is
+        // reaped, not just skipped. The dictionary's cursor holds across it.
+        for k in &expired {
+            self.lookup(k);
+        }
         Ok((next, out))
     }
 

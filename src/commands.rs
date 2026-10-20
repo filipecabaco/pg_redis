@@ -4158,7 +4158,7 @@ impl Command {
     /// are deleted, and reported as Redis reports an expiry it notices on
     /// access — the `expired` event, INFO's expired_keys, and an
     /// invalidation for whoever tracks them.
-    fn reap_keys(client: &mut SpiClient<'_>, db: u8, keys: &[&[u8]]) {
+    pub(crate) fn reap_keys(client: &mut SpiClient<'_>, db: u8, keys: &[&[u8]]) {
         // CLIENT PAUSE pauses expiry too: the rows stay until it ends.
         if keys.is_empty() || crate::server::paused() {
             return;

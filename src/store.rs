@@ -1683,7 +1683,8 @@ impl Store for SqlStore<'_, '_> {
     /// the first `count` of their union are the page. A key in a table that
     /// is not among them would sort after all of them, so the page has no
     /// gap. The cursor follows the page's last key, live or not; a key past
-    /// its deadline is dropped from the reply afterwards.
+    /// its deadline is dropped from the reply and reaped, as Redis's
+    /// `scanCallback` expires each key it looks up.
     fn scan_keys(&mut self, cursor: u64, count: usize) -> Out<(u64, Vec<Vec<u8>>)> {
         let db = self.db;
         let scope = crate::cursor::scope(db, 0, b"");
@@ -1712,13 +1713,10 @@ impl Store for SqlStore<'_, '_> {
                     .collect())
             },
         )?;
-        Ok((
-            next,
-            rows.into_iter()
-                .filter(|(_, live)| *live)
-                .map(|(k, _)| k)
-                .collect(),
-        ))
+        let (live, expired): (Vec<_>, Vec<_>) = rows.into_iter().partition(|(_, live)| *live);
+        let expired: Vec<&[u8]> = expired.iter().map(|(k, _)| k.as_slice()).collect();
+        Command::reap_keys(self.client, db, &expired);
+        Ok((next, live.into_iter().map(|(k, _)| k).collect()))
     }
 
     fn dbsize(&mut self) -> Out<i64> {

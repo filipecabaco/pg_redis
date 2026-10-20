@@ -1097,7 +1097,13 @@ impl WaiterHandle {
     /// waiter's). The oldest client blocked on a key is served first, as in
     /// Redis — but one the write cannot serve, a BLPOP on a key that became a
     /// stream, is passed over rather than holding the clients behind it.
-    pub fn my_turn(&self, current: &[u64]) -> bool {
+    ///
+    /// `polling`: the waiter is trying because time passed, not because a
+    /// counter moved (a write the counters missed). Then any older waiter on
+    /// a shared key goes first, tried or not: a write's rows are visible from
+    /// its commit, a moment before its counters move, and a poll in between
+    /// would otherwise serve a younger client ahead of an older one.
+    pub fn my_turn(&self, current: &[u64], polling: bool) -> bool {
         let Some(ctl) = ctl() else { return true };
         !ctl.waiters.iter().any(|w| {
             let t = w.ticket.load(Ordering::Acquire);
@@ -1115,7 +1121,7 @@ impl WaiterHandle {
                 self.keys
                     .iter()
                     .zip(current)
-                    .any(|(k, v)| *k == id && w.seen[i].load(Ordering::Acquire) < *v)
+                    .any(|(k, v)| *k == id && (polling || w.seen[i].load(Ordering::Acquire) < *v))
             })
         })
     }

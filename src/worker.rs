@@ -3496,6 +3496,7 @@ fn wait_blocked(
     let waiter = crate::server::WaiterHandle::register(&ids, &seen, nokey);
     client.set_flag(crate::server::flag::BLOCKED, true);
     let mut pending = false;
+    let mut polling = false;
     let mut last_try = std::time::Instant::now();
     let outcome = loop {
         if client.killed() || parser.peer_closed() {
@@ -3515,12 +3516,14 @@ fn wait_blocked(
         if now_v != seen {
             seen = now_v;
             pending = true;
+            polling = false;
         }
         // A write that bypassed the counters is caught by trying now and then.
-        if last_try.elapsed() >= Duration::from_millis(50) {
+        if !pending && last_try.elapsed() >= Duration::from_millis(50) {
             pending = true;
+            polling = true;
         }
-        if pending && waiter.my_turn(&seen) {
+        if pending && waiter.my_turn(&seen, polling) {
             pending = false;
             last_try = std::time::Instant::now();
             let tried_at = versions();

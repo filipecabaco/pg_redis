@@ -5567,7 +5567,7 @@ describe("Eviction and access tracking", () => {
 	};
 	const reset = async () => {
 		await raw.send("CONFIG", "SET", "maxmemory", "0", "maxmemory-policy", "noeviction");
-		await raw.send("CONFIG", "SET", "notify-keyspace-events", "");
+		await raw.send("CONFIG", "SET", "notify-keyspace-events", "", "lfu-decay-time", "1");
 	};
 	const within = <T>(p: Promise<T>, ms: number) =>
 		Promise.race([p, Bun.sleep(ms).then(() => null)]);
@@ -5683,7 +5683,10 @@ describe("Eviction and access tracking", () => {
 	test("allkeys-lfu keeps the keys used often", async () => {
 		await raw.send("FLUSHDB");
 		try {
-			await raw.send("CONFIG", "SET", "maxmemory-policy", "allkeys-lfu");
+			// The counter decays a step for each minute boundary its clock
+			// crosses, as Redis's does, which took k:999 to 4 whenever one
+			// fell during the test. Without decay the counts are only the reads.
+			await raw.send("CONFIG", "SET", "maxmemory-policy", "allkeys-lfu", "lfu-decay-time", "0");
 			const empty = await usedMemory();
 			for (let i = 0; i < 1000; i++) await raw.send("SET", `k:${i}`, value);
 			const full = await usedMemory();

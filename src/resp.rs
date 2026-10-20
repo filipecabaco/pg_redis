@@ -4,7 +4,11 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 const MAX_BULK_LEN: usize = 512 * 1024 * 1024; // 512 MiB — matches Redis default
-const MAX_ARRAY_LEN: usize = 65_536;
+/// Redis's limit on a command's argument count: `INT_MAX`.
+const MAX_ARRAY_LEN: usize = i32::MAX as usize;
+/// What a client may send before it authenticates, as Redis limits it.
+const UNAUTH_ARRAY_LEN: usize = 10;
+const UNAUTH_BULK_LEN: usize = 16384;
 /// Redis's `PROTO_INLINE_MAX_SIZE`: the longest line accepted, inline command
 /// or RESP header alike.
 const MAX_INLINE_LEN: usize = 64 * 1024;
@@ -18,6 +22,9 @@ const BULK_CHUNK: usize = 64 * 1024;
 pub struct RespParser<R = TcpStream> {
     reader: BufReader<R>,
     line_buf: Vec<u8>,
+    /// Whether the connection has authenticated, or needs no password:
+    /// before then Redis takes only small commands.
+    authenticated: bool,
 }
 
 impl<R: Read> RespParser<R> {
@@ -25,7 +32,13 @@ impl<R: Read> RespParser<R> {
         Self {
             reader: BufReader::new(source),
             line_buf: Vec::with_capacity(256),
+            authenticated: true,
         }
+    }
+
+    /// Whether the connection has authenticated (or needs no password).
+    pub fn set_authenticated(&mut self, yes: bool) {
+        self.authenticated = yes;
     }
 
     /// Whether a command is already waiting in the read buffer — a pipeline
@@ -108,8 +121,13 @@ impl<R: Read> RespParser<R> {
             if count as u64 > MAX_ARRAY_LEN as u64 {
                 return Err(protocol_error("invalid multibulk length"));
             }
+            if !self.authenticated && count as usize > UNAUTH_ARRAY_LEN {
+                return Err(protocol_error("unauthenticated multibulk length"));
+            }
             let count = count as usize;
-            let mut parts = Vec::with_capacity(count);
+            // Reserved as the arguments arrive, as Redis grows argv: a
+            // declared count costs nothing until its arguments are sent.
+            let mut parts = Vec::with_capacity(count.min(1024));
             for _ in 0..count {
                 parts.push(self.read_bulk_string()?);
             }
@@ -134,6 +152,9 @@ impl<R: Read> RespParser<R> {
             .ok_or_else(|| protocol_error("invalid bulk length"))?;
         if len < 0 || len as u64 > MAX_BULK_LEN as u64 {
             return Err(protocol_error("invalid bulk length"));
+        }
+        if !self.authenticated && len as usize > UNAUTH_BULK_LEN {
+            return Err(protocol_error("unauthenticated bulk length"));
         }
         let len = len as usize;
         // Grow as the bytes actually arrive. Trusting the announced length would

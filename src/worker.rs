@@ -1132,6 +1132,7 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<DispatchMsg>, default_d
                 }
             }
         }
+        parser.set_authenticated(!crate::acl::current().auth_required(&session));
         let parts = match parser.read_command() {
             Ok(p) if p.is_empty() => continue,
             Ok(p) => p,

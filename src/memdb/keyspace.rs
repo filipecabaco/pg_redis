@@ -250,7 +250,7 @@ impl<A: Allocator + Clone> Keyspace<A> {
 
     pub fn clear(&mut self) {
         self.dict.clear();
-        self.volatile.clear();
+        self.volatile = Vec::new_in(self.dict.alloc());
     }
 
     /// Every position the index holds points back at itself, and every

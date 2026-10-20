@@ -151,7 +151,22 @@ impl<V, A: Allocator + Clone> Dict<V, A> {
             }
         }
         let s = self.slots.swap_remove(i);
+        self.shrink_if_sparse();
         (s.key, s.value)
+    }
+
+    /// Redis's `htNeedsResize`: a table less than a tenth full gives back
+    /// what it does not use, as `tryResizeHashTables` shrinks it. Entries
+    /// keep their positions, so a `SCAN` cursor holds across it.
+    fn shrink_if_sparse(&mut self) {
+        const MIN: usize = 64;
+        let cap = self.slots.capacity();
+        if cap > MIN && self.slots.len() * 10 < cap {
+            let want = (self.slots.len() * 2).max(MIN);
+            self.slots.shrink_to(want);
+            let slots = &self.slots;
+            self.index.shrink_to(want, |&j| slots[j as usize].hash);
+        }
     }
 
     /// Remove `key` keeping the order of the rest, as a listpack deletes:
@@ -175,6 +190,7 @@ impl<V, A: Allocator + Clone> Dict<V, A> {
             }
         }
         let s = self.slots.remove(i);
+        self.shrink_if_sparse();
         (s.key, s.value)
     }
 
@@ -212,9 +228,11 @@ impl<V, A: Allocator + Clone> Dict<V, A> {
         self.slots.iter().map(|s| &s.value)
     }
 
+    /// Empty, giving the memory back, as Redis's `emptyDb` frees its tables.
     pub fn clear(&mut self) {
-        self.index.clear();
-        self.slots.clear();
+        let alloc = self.alloc();
+        self.index = HashTable::new_in(alloc.clone());
+        self.slots = Vec::new_in(alloc);
     }
 
     /// One step of a `SCAN`-style cursor: visit up to `count` entries and

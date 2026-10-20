@@ -290,19 +290,20 @@ thread_local! {
 
 /// The refusals Redis's `processCommand` answers before calling a command:
 /// an unknown command or subcommand, the wrong arity, ACL, `OOM`, a busy
-/// script.
+/// script. A message may come without the `ERR` that `write_error` adds.
 pub(crate) fn is_rejection(msg: &str) -> bool {
+    let bare = msg.strip_prefix("ERR ").unwrap_or(msg);
     [
-        "ERR unknown command",
-        "ERR unknown subcommand",
-        "ERR wrong number of arguments",
+        "unknown command",
+        "unknown subcommand",
+        "wrong number of arguments",
         "NOPERM",
         "OOM command not allowed",
         "BUSY ",
         "NOREPLICAS",
     ]
     .iter()
-    .any(|p| msg.starts_with(p))
+    .any(|p| bare.starts_with(p))
 }
 
 /// The code an error reply is counted under in `INFO errorstats`: its first

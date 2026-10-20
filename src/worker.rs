@@ -290,6 +290,9 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
     std::thread::spawn(move || accept_loop(port, cmd_tx, listen_addr));
 
     let mut last_expiry_scan = Instant::now();
+    // When the event loop's next cron tick is due: on a fixed schedule, as
+    // Redis's timer fires, however long each round's own work took.
+    let mut next_cron = Instant::now() + crate::eventloop::CRON;
 
     loop {
         if BackgroundWorker::sigterm_received() {
@@ -308,7 +311,7 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
         // rate (`eventloop.rs`); the others only for work and the sweep.
         let owner = crate::eventloop::claim();
         let idle = if owner {
-            crate::eventloop::CRON
+            next_cron.saturating_duration_since(Instant::now())
         } else {
             Duration::from_millis(250)
         };
@@ -499,6 +502,14 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
             );
         }
         crate::eventloop::cycle(owner, served, cmd_usec, cron.elapsed().as_micros() as u64);
+        let now = Instant::now();
+        if now >= next_cron {
+            next_cron += crate::eventloop::CRON;
+            // Far behind, after a long command: the next tick is a period on.
+            if next_cron <= now {
+                next_cron = now + crate::eventloop::CRON;
+            }
+        }
     }
     // Left on SIGTERM: shutdown or `redis.remove_workers`.
     crate::eventloop::release();

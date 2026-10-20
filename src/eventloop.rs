@@ -129,7 +129,6 @@ fn sample(c: &EventLoopCtl, now: u64) {
 pub fn reset() {
     let Some(c) = ctl() else { return };
     for a in [
-        &c.cycles,
         &c.duration_sum,
         &c.cmd_sum,
         &c.cron_sum,
@@ -138,6 +137,8 @@ pub fn reset() {
     ] {
         a.store(0, Relaxed);
     }
+    // The cycle RESETSTAT runs in, which Redis counts once it ends.
+    c.cycles.store(1, Relaxed);
     c.held.store(0, Relaxed);
 }
 

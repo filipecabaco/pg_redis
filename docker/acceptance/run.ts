@@ -345,7 +345,8 @@ async function runUnit(half: Half, unit: string): Promise<UnitResult> {
 		m = line.match(/^\[err\]: (.*?)(?: in tests\/\S+)?$/);
 		if (m) {
 			tests.set(m[1], "err");
-			if (process.env.VERBOSE) console.log(`    ${line}\n      ${lines[i + 1]}`);
+			// What failed and why: two lines, and all a CI log has to go on.
+			console.log(`    ${line}\n      ${lines[i + 1]}`);
 			continue;
 		}
 		m = line.match(/^\[(?:skip|ignore)\]: (.*)$/);

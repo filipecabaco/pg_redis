@@ -437,8 +437,10 @@ pub fn set(args: &[Vec<u8>]) -> Result<(), String> {
             && port != 0
             && i64::from(port) != get_i64("port")
         {
+            // A plain bind, without the reuse flags the listeners take: it
+            // fails while anything listens on the port, on any address.
             let at = live_gucs().bind.unwrap_or_else(|| "0.0.0.0".into());
-            crate::worker::bind_listener(&at, port)
+            std::net::TcpListener::bind((at.as_str(), port))
                 .map_err(|e| failed(&arg, &format!("Unable to listen on this port: {e}")))?;
         }
         staged.push((spec.name, value));

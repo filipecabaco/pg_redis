@@ -169,9 +169,10 @@ keep the port on a trusted network.
 To give applications less than that, create ACL users with the commands, keys and channels
 they need ([Users](./configuration.md#users)) and save them with `ACL SAVE`. Refused commands
 and failed logins are listed by `ACL LOG` and counted in `INFO stats`
-(`acl_access_denied_*`). Saved users are in `redis.acl_users`, with passwords stored only as
-SHA-256 hashes; restrict who can read it as you would any table holding credentials. `ACL
-SETUSER`'s arguments are hidden from `SLOWLOG`, as in Redis.
+(`acl_access_denied_*`). Saved users are in the ACL file `redis.aclfile` names, with passwords
+stored only as SHA-256 hashes; keep it readable by the PostgreSQL server's user alone, as you
+would any file holding credentials. `ACL SETUSER`'s arguments are hidden from `SLOWLOG`, as in
+Redis.
 
 `redis.password` set with `ALTER SYSTEM` is stored in plain text in `postgresql.auto.conf`, and
 a reload that changes it writes the new value to the server log

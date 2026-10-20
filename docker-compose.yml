@@ -20,6 +20,7 @@ services:
         -c redis.workers=${PG_REDIS_WORKERS:-4}
         -c redis.batch_size=${PG_REDIS_BATCH_SIZE:-64}
         -c redis.password=${PG_REDIS_PASSWORD-testpass}
+        -c redis.aclfile=${PG_REDIS_ACLFILE-}
     # Healthy means both listeners are up: PostgreSQL accepting connections
     # is not the same as the pg_redis workers having bound their port, and a
     # suite that connects in between fails with ECONNREFUSED before any test.

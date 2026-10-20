@@ -1362,8 +1362,8 @@ pub struct AclCtl {
     log: Region<LOG>,
     next_serial: AtomicU64,
     log_next_id: AtomicU64,
-    /// 0 before the users are loaded from `redis.acl_users`, 1 while one
-    /// worker loads them, 2 after.
+    /// 0 before the users are loaded from `aclfile`, 1 while one worker
+    /// loads them, 2 after.
     init: AtomicU32,
     /// The `redis.password` last applied to the default user: 0 unset, 1 set
     /// to the password whose hash follows. Under the users' lock.
@@ -2146,52 +2146,68 @@ pub fn sync_password(guc: Option<&[u8]>) {
     set_default_password(guc);
 }
 
-/// Worker start: the first worker loads `redis.acl_users` (`rows`, from the
-/// table, `None` when it is not there) and applies `redis.password`; the
-/// rest wait for it.
-pub fn startup(rows: impl FnOnce() -> Option<Vec<(Vec<u8>, Vec<u8>)>>, guc: Option<&[u8]>) {
+/// Worker start, `ACLLoadUsersAtStartup`: one worker loads `aclfile`, when
+/// one is configured, and applies `redis.password`; the rest wait for it. An
+/// ACL file that cannot be loaded stops the worker, as Redis refuses to
+/// start: serving with users other than the file's would be a security hole.
+/// The next worker to start tries again.
+pub fn startup(guc: Option<&[u8]>) {
     let ctl = ctl();
     let guc = guc.filter(|p| !p.is_empty());
-    if ctl
-        .init
-        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-    {
-        let rows = rows().unwrap_or_default();
-        let has_default = rows.iter().any(|(n, _)| n == b"default");
-        if !rows.is_empty() {
-            match parse_rows(&rows) {
-                Ok(users) => {
-                    let _ = mutate(|u| {
-                        *u = users;
-                        Ok(())
-                    });
-                }
-                Err(e) => eprintln!("pg_redis: WARNING redis.acl_users was not loaded: {e}"),
+    loop {
+        match ctl
+            .init
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => break,
+            Err(2) => return sync_password(guc),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    }
+    let mut has_default = false;
+    if let Some(file) = acl_file() {
+        match load_file(&file) {
+            Ok((users, named_default)) => {
+                has_default = named_default;
+                let _ = mutate(|u| {
+                    *u = users;
+                    Ok(())
+                });
+            }
+            Err(e) => {
+                ctl.init.store(0, Ordering::Release);
+                pgrx::error!("pg_redis: aborting startup because of ACL errors: {e}");
             }
         }
-        if !has_default && guc.is_some() {
-            set_default_password(guc);
-        }
-        set_pass_marker(ctl, guc);
-        ctl.init.store(2, Ordering::Release);
-        return;
     }
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while ctl.init.load(Ordering::Acquire) != 2 && std::time::Instant::now() < until {
-        std::thread::sleep(std::time::Duration::from_millis(10));
+    if !has_default && guc.is_some() {
+        set_default_password(guc);
     }
-    sync_password(guc);
+    set_pass_marker(ctl, guc);
+    ctl.init.store(2, Ordering::Release);
 }
 
-/// `ACLLoadFromFile`, over the table's rows: every row checked, nothing
-/// applied if one is wrong.
-fn parse_rows(rows: &[(Vec<u8>, Vec<u8>)]) -> Result<BTreeMap<Vec<u8>, User>, String> {
-    let file = "redis.acl_users";
+/// `ACLLoadFromFile`, over the text of `file`: every line checked, nothing
+/// applied if one is wrong. The users, and whether the file named `default`.
+fn parse_file(file: &str, text: &[u8]) -> Result<(BTreeMap<Vec<u8>, User>, bool), String> {
     let mut errors = String::new();
     let mut users: BTreeMap<Vec<u8>, User> = BTreeMap::new();
-    for (i, (name, rules)) in rows.iter().enumerate() {
+    for (i, raw) in text.split(|&c| c == b'\n').enumerate() {
         let line = i + 1;
+        let trimmed = raw.trim_ascii_start();
+        let trimmed = trimmed.trim_ascii_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let argv: Vec<&[u8]> = trimmed.split(|&c| c == b' ').collect();
+        if argv[0] != b"user" || argv.len() < 2 {
+            errors.push_str(&format!(
+                "{file}:{line} should start with user keyword followed by the username. "
+            ));
+            continue;
+        }
+        let name = argv[1].to_vec();
+        let name = &name;
         let shown = String::from_utf8_lossy(name);
         if has_spaces(name) {
             errors.push_str(&format!(
@@ -2211,13 +2227,7 @@ fn parse_rows(rows: &[(Vec<u8>, Vec<u8>)]) -> Result<BTreeMap<Vec<u8>, User>, St
             new_serial()
         };
         let mut u = User::new(name, serial);
-        let trimmed = String::from_utf8_lossy(rules);
-        let args: Vec<Vec<u8>> = trimmed
-            .trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'))
-            .as_bytes()
-            .split(|&c| c == b' ')
-            .map(<[u8]>::to_vec)
-            .collect();
+        let args: Vec<Vec<u8>> = argv[2..].iter().map(|a| a.to_vec()).collect();
         let Ok(merged) = merge_selector_args(&args) else {
             errors.push_str(&format!(
                 "{file}:{line}: Unmatched parenthesis in selector definition."
@@ -2251,21 +2261,80 @@ fn parse_rows(rows: &[(Vec<u8>, Vec<u8>)]) -> Result<BTreeMap<Vec<u8>, User>, St
         );
         return Err(errors);
     }
+    let has_default = users.contains_key(b"default".as_slice());
     users
         .entry(b"default".to_vec())
         .or_insert_with(User::default_user);
-    Ok(users)
+    Ok((users, has_default))
+}
+
+/// `aclfile`, or `None` when no ACL file is configured.
+fn acl_file() -> Option<String> {
+    Some(crate::config::get_str("aclfile")).filter(|f| !f.is_empty())
+}
+
+/// `ACLLoadFromFile`: the users `file` describes.
+fn load_file(file: &str) -> Result<(BTreeMap<Vec<u8>, User>, bool), String> {
+    let text = std::fs::read(file).map_err(|e| {
+        format!(
+            "Error loading ACLs, opening file '{file}': {}",
+            strerror(&e)
+        )
+    })?;
+    parse_file(file, &text)
+}
+
+/// `strerror(errno)`: the system's text for an error, without the
+/// `(os error N)` Rust adds to it.
+fn strerror(e: &std::io::Error) -> String {
+    let s = e.to_string();
+    match s.rfind(" (os error ") {
+        Some(i) => s[..i].to_string(),
+        None => s,
+    }
+}
+
+/// `ACLSaveToFile`: every user as a `user` line, written to a temporary file
+/// beside `file` and renamed over it, each step synced to disk.
+fn save_file(file: &str, users: &BTreeMap<Vec<u8>, User>) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut text = Vec::new();
+    for u in users.values() {
+        text.extend_from_slice(b"user ");
+        text.extend_from_slice(&u.name);
+        text.push(b' ');
+        text.extend_from_slice(&u.describe());
+        text.push(b'\n');
+    }
+    let tmp = format!(
+        "{file}.tmp-{}-{}",
+        std::process::id(),
+        crate::server::now_ms()
+    );
+    let written = (|| {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(&text)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, file)?;
+        // `fsyncFileDir`: the rename is only durable once the directory is.
+        let dir = std::path::Path::new(file)
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        std::fs::File::open(dir)?.sync_all()
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 // ───────────────────────────── the ACL command ──────────────────────────────
-
-/// `ACL SAVE` and `ACL LOAD` read and write `redis.acl_users`, which only
-/// the dispatcher can reach: this is what it is sent.
-#[derive(Debug, Clone)]
-pub enum TableOp {
-    Save(Vec<(Vec<u8>, Vec<u8>)>),
-    Load,
-}
 
 /// Where an `ACL` command runs and who runs it.
 pub struct Caller {
@@ -2275,6 +2344,12 @@ pub struct Caller {
     /// closes. Not on the dispatcher.
     pub may_wait: bool,
 }
+
+/// `ACL LOAD` and `ACL SAVE` with no `aclfile`.
+const NO_ACL_FILE: &str = "ERR This Redis instance is not configured to use an ACL file. \
+     You may want to specify users via the ACL SETUSER command and then issue a CONFIG \
+     REWRITE (assuming you have a Redis configuration file set) in order to store users \
+     in the Redis configuration.";
 
 fn err(m: impl Into<String>) -> Response {
     Response::Error(m.into())
@@ -2340,7 +2415,7 @@ fn random_hex(chars: usize) -> String {
 }
 
 /// `ACL <subcommand> ...`. `args` starts at the subcommand.
-pub fn command(args: &[Vec<u8>], caller: &Caller, data: &mut crate::admin::Data) -> Response {
+pub fn command(args: &[Vec<u8>], caller: &Caller) -> Response {
     let Some(sub_raw) = args.first() else {
         return err("ERR wrong number of arguments for 'acl' command");
     };
@@ -2420,39 +2495,28 @@ pub fn command(args: &[Vec<u8>], caller: &Caller, data: &mut crate::admin::Data)
             Some(u) => Response::BulkString(u.name.clone()),
             None => Response::Null,
         },
+        "load" | "save" if argc == 2 && acl_file().is_none() => err(NO_ACL_FILE),
         "save" if argc == 2 => {
-            let rows: Vec<(Vec<u8>, Vec<u8>)> = current()
-                .users
-                .values()
-                .map(|u| (u.name.clone(), u.describe()))
-                .collect();
-            match data(crate::commands::Command::AclTable(TableOp::Save(rows)), 0) {
-                Response::Error(_) => err(
-                    "ERR There was an error trying to save the ACLs. Please check the server logs for more information",
-                ),
-                _ => Response::Ok,
+            let file = acl_file().unwrap_or_default();
+            match save_file(&file, &current().users) {
+                Ok(()) => Response::Ok,
+                Err(e) => {
+                    eprintln!(
+                        "pg_redis: WARNING writing ACL file for ACL SAVE: {}",
+                        strerror(&e)
+                    );
+                    err(
+                        "ERR There was an error trying to save the ACLs. Please check the server logs for more information",
+                    )
+                }
             }
         }
         "load" if argc == 2 => {
-            let rows = match data(crate::commands::Command::AclTable(TableOp::Load), 0) {
-                Response::Value(Value::Array(rows)) => rows
-                    .into_iter()
-                    .filter_map(|r| match r {
-                        Value::Array(mut p) if p.len() == 2 => match (p.remove(0), p.remove(0)) {
-                            (Value::Bulk(n), Value::Bulk(r)) => Some((n, r)),
-                            _ => None,
-                        },
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>(),
-                Response::Error(e) => return err(e),
-                _ => return err("ERR Error loading ACLs from redis.acl_users"),
-            };
-            let users = match parse_rows(&rows) {
+            let file = acl_file().unwrap_or_default();
+            let (users, has_default) = match load_file(&file) {
                 Ok(u) => u,
                 Err(e) => return err(format!("ERR {e}")),
             };
-            let has_default = rows.iter().any(|(n, _)| n == b"default");
             match mutate(|u| {
                 *u = users;
                 Ok(())
@@ -2976,22 +3040,53 @@ mod tests {
     }
 
     #[test]
-    fn rows_load_like_an_acl_file() {
-        let rows = vec![
-            (b"alice".to_vec(), b"on >alice ~* &* +@all".to_vec()),
-            (
-                b"bob".to_vec(),
-                b"on -@all +@set +acl ~set* &* >bob".to_vec(),
-            ),
-        ];
-        let users = parse_rows(&rows).unwrap();
+    fn an_acl_file_loads_as_redis_loads_it() {
+        let text =
+            b"user alice on >alice ~* &* +@all\n\n  user bob on -@all +@set +acl ~set* &* >bob\r\n";
+        let (users, named_default) = parse_file("users.acl", text).unwrap();
         assert!(users["alice".as_bytes()].accepts(b"alice"));
+        assert!(users["bob".as_bytes()].accepts(b"bob"));
         assert!(users.contains_key(b"default".as_slice()));
-        let bad = vec![(b"x".to_vec(), b"on +nosuch".to_vec())];
-        assert!(parse_rows(&bad).unwrap_err().contains(
-            "redis.acl_users:1: Error in applying operation '+nosuch': Unknown command or category name in ACL. WARNING: ACL errors detected"
-        ));
+        assert!(!named_default);
+        // Every line is checked, and nothing applies if one is wrong.
+        let bad = b"user x on +nosuch\nnotuser y\nuser x on\n";
+        assert_eq!(
+            parse_file("users.acl", bad).unwrap_err(),
+            "users.acl:1: Error in applying operation '+nosuch': Unknown command or category \
+             name in ACL. users.acl:2 should start with user keyword followed by the username. \
+             WARNING: Duplicate user 'x' found on line 3. WARNING: ACL errors detected, no \
+             change to the previously active ACL rules was performed"
+        );
         let _ = id("get");
+    }
+
+    #[test]
+    fn acl_save_writes_what_acl_load_reads() {
+        let dir = std::env::temp_dir().join(format!("pg_redis-acl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("users.acl").to_string_lossy().into_owned();
+        let (users, _) = parse_file(
+            "users.acl",
+            b"user default on nopass ~* &* +@all\nuser amy off -@all\n",
+        )
+        .unwrap();
+        save_file(&file, &users).unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.starts_with("user amy off "), "{text}");
+        assert!(text.contains("\nuser default on nopass "), "{text}");
+        let (again, named_default) = load_file(&file).unwrap();
+        assert!(named_default);
+        assert_eq!(
+            again.keys().collect::<Vec<_>>(),
+            users.keys().collect::<Vec<_>>()
+        );
+        // Nothing left behind: the temporary file was renamed into place.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            load_file(&file).unwrap_err(),
+            format!("Error loading ACLs, opening file '{file}': No such file or directory")
+        );
     }
 
     #[test]

@@ -199,14 +199,11 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
 
     crate::shm::attach();
     crate::pubheap::attach();
-    // The users saved with ACL SAVE, and redis.password, before anyone is
-    // served. One worker loads them; the others wait for it.
+    // The users in `aclfile`, and redis.password, before anyone is served.
+    // One worker loads them; the others wait for it.
     crate::config::snapshot_gucs();
     let guc_password = crate::config::live_gucs().password();
-    crate::acl::startup(
-        || BackgroundWorker::transaction(|| Spi::connect(load_acl_rows)),
-        guc_password.as_deref(),
-    );
+    crate::acl::startup(guc_password.as_deref());
     // memory+snapshot databases filled back in before anyone is served.
     crate::storage::restore_snapshots();
     crate::storage::worker_started();
@@ -506,41 +503,6 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
     // Left on SIGTERM: shutdown or `redis.remove_workers`.
     crate::eventloop::release();
     crate::storage::worker_exiting();
-}
-
-/// The rows of `redis.acl_users`, or `None` where the table does not exist
-/// (the extension is not installed in `redis.database`, or not yet).
-fn load_acl_rows(client: &pgrx::spi::SpiClient<'_>) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
-    let present = client
-        .select(
-            "SELECT to_regclass('redis.acl_users') IS NOT NULL",
-            None,
-            &[],
-        )
-        .ok()?
-        .first()
-        .get::<bool>(1)
-        .ok()
-        .flatten()?;
-    if !present {
-        return None;
-    }
-    let rows = client
-        .select(
-            "SELECT name, rules FROM redis.acl_users ORDER BY name",
-            None,
-            &[],
-        )
-        .ok()?;
-    Some(
-        rows.filter_map(|r| {
-            Some((
-                r.get::<Vec<u8>>(1).ok().flatten()?,
-                r.get::<Vec<u8>>(2).ok().flatten()?,
-            ))
-        })
-        .collect(),
-    )
 }
 
 /// Whether this database has the `redis.kv_*` tables the SQL expiry sweep needs.

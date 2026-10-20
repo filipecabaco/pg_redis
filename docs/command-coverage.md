@@ -35,7 +35,7 @@ The limits that apply only to databases in memory are described once, in
 |---------|-------|
 | `SLOWLOG` | `GET`, `LEN`, `RESET`, honouring `slowlog-log-slower-than` and `slowlog-max-len` |
 | `LATENCY` | `HISTOGRAM` from per-command latencies; no spike sampling, so `LATEST` and `HISTORY` are empty |
-| `ACL` | Redis 7.2's users, rules, selectors and checks on every command, script call and `EXEC`; `SETUSER`, `GETUSER`, `DELUSER`, `LIST`, `USERS`, `WHOAMI`, `CAT`, `GENPASS`, `LOG`, `DRYRUN`, `HELP`; `SAVE` and `LOAD` write and read `redis.acl_users` in place of an ACL file |
+| `ACL` | Redis 7.2's users, rules, selectors and checks on every command, script call and `EXEC`; `SETUSER`, `GETUSER`, `DELUSER`, `LIST`, `USERS`, `WHOAMI`, `CAT`, `GENPASS`, `LOG`, `DRYRUN`, `HELP`; `SAVE` and `LOAD` write and read the ACL file `redis.aclfile` names, as Redis's `aclfile` |
 | `DEBUG` | `OBJECT`, `POPULATE`, `SLEEP`, `SET-ACTIVE-EXPIRE`, `PROTOCOL` with every RESP3 type (big numbers, attributes, pushes); `RELOAD`, `LOADAOF` and the tuning subcommands are accepted |
 | `LASTSAVE` | Unix time, in seconds, of the last snapshot of a `memory+snapshot` database, or of the last `SAVE` or `BGSAVE` that found none to take. Before either, the server's start |
 | `SAVE` | Snapshots every `memory+snapshot` database before replying. With none, there is nothing to save, since `logged` databases are already in PostgreSQL and `memory` ones keep no disk image |

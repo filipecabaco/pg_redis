@@ -7,6 +7,7 @@
 | `redis.port` | `6379` | postmaster | TCP port the Redis listener binds to (1024–65535) |
 | `redis.listen_address` | `127.0.0.1` | postmaster | IP address to bind on. See [Exposing the listener](#exposing-the-listener) before widening this. |
 | `redis.password` | _(none)_ | superuser | The `default` user's password, Redis's `requirepass`. When set, clients must `AUTH` before any command. Only superusers (and members of `pg_read_all_settings`) can read it, and `SHOW ALL` leaves it out. See [Users](#users). |
+| `redis.aclfile` | _(none)_ | postmaster | Redis's `aclfile`: the ACL users loaded at start and by `ACL LOAD`, and written by `ACL SAVE`. Relative to the data directory. Unset, `ACL LOAD` and `ACL SAVE` refuse, as in Redis. See [Users](#users). |
 | `redis.database` | `postgres` | postmaster | The database the workers connect to. Run `CREATE EXTENSION pg_redis` in this database. |
 | `redis.default_db` | `0` | superuser | Database new connections start on (0–15). `0` uses the `memory` policy by default, matching Redis's own default database; `8` uses `logged` by default. |
 | `redis.workers` | `4` | postmaster | Number of background worker processes (1–64). Each counts against `max_worker_processes`. |
@@ -20,7 +21,7 @@
 ## When a change takes effect
 
 `postmaster` settings change only at server start: `redis.port`, `redis.listen_address`,
-`redis.database`, `redis.workers` and `redis.maxmemory`. The shared memory and the worker
+`redis.aclfile`, `redis.database`, `redis.workers` and `redis.maxmemory`. The shared memory and the worker
 pool are sized when the server starts. As in Redis, `CONFIG SET port` moves the listener
 while the server runs, after checking the new port is free (`port 0` stops listening), and
 `CONFIG SET maxmemory` lowers or raises the limit up to `redis.maxmemory`. Neither outlives
@@ -101,22 +102,32 @@ The `default` user is the one a connection starts as. Its password is `redis.pas
 none set, `default` is `on nopass`, and connections need no `AUTH`, as in Redis. `CONFIG SET
 requirepass` changes it at runtime.
 
-Users are saved to the table `redis.acl_users`, one row per user: the name, and the rules as
-`ACL LIST` prints them after it, with each password as its SHA-256 (`#<hash>`). `ACL SAVE`
-writes the table and `ACL LOAD` reads it back; the first worker to start loads it. As in Redis,
-`ACL SETUSER` alone changes only the running server, and is lost at a restart unless saved. A
-row written by hand may use `>password`, which is hashed when it is loaded:
+Users are kept as Redis keeps them: in an ACL file, named by `redis.aclfile` (Redis's
+`aclfile`). Without one, `ACL SETUSER` changes only the running server, and `ACL SAVE` and
+`ACL LOAD` refuse with Redis's error. With one, the server loads it at start, `ACL SAVE`
+writes every user to it and `ACL LOAD` reads it back. A relative path is relative to the
+PostgreSQL data directory, as Redis's is to its `dir`:
 
-```sql
-INSERT INTO redis.acl_users (name, rules)
-VALUES ('ops'::bytea, convert_to('on >ops-secret ~* +@all', 'UTF8'));
-SELECT convert_from(name, 'UTF8') AS name, convert_from(rules, 'UTF8') AS rules
-FROM redis.acl_users;
+```
+redis.aclfile = 'users.acl'
 ```
 
-When the table has a row for `default`, that row is the default user, its password included;
-otherwise `redis.password` is. A reload that changes `redis.password` sets it again. The table
-is included in `pg_dump`. Changing it with SQL takes effect at the next `ACL LOAD` or restart.
+The file is Redis's format, one user per line, so a file from Redis works as it is:
+
+```
+user default on #<sha256 of the password> ~* &* +@all
+user app on >app-secret ~app:* &app:* +@all -@dangerous
+```
+
+`ACL SAVE` writes each password as its SHA-256 (`#<hash>`); a line written by hand may use
+`>password`, which is hashed when it is loaded. `ACL LOAD` checks every line first and changes
+nothing if one is wrong, with Redis's messages. A file that cannot be loaded at start (missing,
+or with an error) stops the server from serving, as Redis will not start: the log says why,
+and the workers try again as they restart. An empty file is a valid one.
+
+When the file has a line for `default`, that line is the default user, its password included;
+otherwise `redis.password` is. A reload that changes `redis.password` sets it again. The file is
+not part of `pg_dump`: back it up with the data directory.
 
 Users and the ACL LOG live in the shared heap `redis.pubsub_memory` sizes. As in Redis, there
 is no limit on users or rules, and the log keeps `acllog-max-len` entries.

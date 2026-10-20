@@ -2308,6 +2308,7 @@ fn reach_error(db: u8) -> String {
 
 /// Run one scripting command on the dispatcher.
 pub fn execute(cmd: &ScriptCmd, db: u8, host: &mut dyn Host) -> Response {
+    let _frozen = crate::server::freeze_time();
     ENGINE.with(|e| {
         let mut engine = e.borrow_mut();
         engine.execute(cmd, db, host).unwrap_or_else(|r| r)

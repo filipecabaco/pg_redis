@@ -329,11 +329,41 @@ pub fn server_ctl_size() -> usize {
     std::mem::size_of::<ServerCtl>()
 }
 
-pub fn now_ms() -> i64 {
+thread_local! {
+    /// The time a running script sees, fixed when it started.
+    static FROZEN_US: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+fn clock_us() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
+        .map(|d| d.as_micros() as i64)
         .unwrap_or(0)
+}
+
+/// Unix microseconds: Redis's `commandTimeSnapshot`, which a script's
+/// commands all read as the moment the script started.
+pub fn now_us() -> i64 {
+    FROZEN_US.get().unwrap_or_else(clock_us)
+}
+
+pub fn now_ms() -> i64 {
+    now_us() / 1000
+}
+
+/// Holds the time still on this thread until dropped: a script's commands
+/// set and test deadlines, and TIME answers, as of its start, as Redis's do.
+pub struct FrozenTime(Option<i64>);
+
+pub fn freeze_time() -> FrozenTime {
+    let at = FROZEN_US.get().unwrap_or_else(clock_us);
+    FrozenTime(FROZEN_US.replace(Some(at)))
+}
+
+impl Drop for FrozenTime {
+    fn drop(&mut self) {
+        FROZEN_US.set(self.0);
+    }
 }
 
 /// The shared block, once the postmaster has set it up.

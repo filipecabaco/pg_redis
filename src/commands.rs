@@ -2834,11 +2834,12 @@ impl Command {
         let guarded = self.collection_read_guarded();
         if !writes && !guarded && self.reads_a_collection() {
             self.sql_reap_expired(client, db);
-        } else if !writes && someone_hears_expiry() {
-            // A read finds an expired string missing without deleting it,
-            // which spares every GET a write. Redis deletes it on that read,
-            // invalidates it and raises `expired`: when a tracking client or
-            // a keyspace subscriber would hear that, reap first.
+        } else if !writes {
+            // Redis deletes a key it finds past its deadline on a read,
+            // counts it in expired_keys, invalidates it and raises
+            // `expired`, and DBSIZE no longer counts it: reap first. In the
+            // ordinary case, nothing expired, that is one indexed lookup on
+            // the keys that carry a deadline.
             let mut keys: Vec<&[u8]> = self.typed_keys().iter().map(|(k, _)| *k).collect();
             if let Command::MGet { keys: named } = self {
                 keys.extend(named.iter().map(Vec::as_slice));
@@ -4328,6 +4329,16 @@ impl Command {
     /// Whether the command can need more memory: Redis's `denyoom`, a write
     /// that is not purely a removal. Refused past `redis.maxmemory`.
     pub(crate) fn may_grow(&self) -> bool {
+        // FUNCTION LOAD and RESTORE are `denyoom` in Redis: a library is memory.
+        if matches!(
+            self,
+            Command::Script(
+                crate::scripting::ScriptCmd::FunctionLoad { .. }
+                    | crate::scripting::ScriptCmd::FunctionRestore { .. }
+            )
+        ) {
+            return true;
+        }
         !self.write_keys().is_empty()
             && !matches!(
                 self,
@@ -4456,10 +4467,7 @@ pub(crate) fn time_reply() -> Response {
 }
 
 fn now_micros() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as i64
+    crate::server::now_us()
 }
 
 /// Fetch an argument that carries Redis data. Redis keys, values, fields and
@@ -5728,12 +5736,6 @@ pub(crate) fn zadd_sql(db: u8, flags: &ZAddFlags) -> String {
                      FROM ups u LEFT JOIN existing e ON e.member = u.member) AS changed"
         )
     }
-}
-
-/// Whether an expiry noticed on a read would be heard: a client tracks keys,
-/// or `notify-keyspace-events` asks for `expired`.
-fn someone_hears_expiry() -> bool {
-    crate::server::tracking_active() || crate::notify::flags() & crate::notify::EXPIRED != 0
 }
 
 #[cfg(test)]

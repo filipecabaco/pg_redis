@@ -134,7 +134,6 @@ pub fn execute(a: &Admin, conn: &mut Conn, data: &mut Data) -> Response {
                 client_id: conn.client.id,
                 may_wait: conn.may_wait,
             },
-            data,
         ),
         "DEBUG" => debug(a, conn, data),
         "MEMORY" => memory(a),

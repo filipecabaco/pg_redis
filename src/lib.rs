@@ -67,6 +67,10 @@ pub(crate) static LISTEN_ADDRESS: GucSetting<Option<std::ffi::CString>> =
 pub(crate) static MAX_CONNECTIONS: GucSetting<i32> = GucSetting::<i32>::new(128);
 pub(crate) static PASSWORD: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
+/// Redis's `aclfile`: the ACL file loaded at start and by `ACL LOAD`, and
+/// written by `ACL SAVE`. Unset, as in Redis, there is none.
+pub(crate) static ACLFILE: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(None);
 pub(crate) static BATCH_SIZE: GucSetting<i32> = GucSetting::<i32>::new(64);
 /// Seconds between snapshots of a `memory+snapshot` database.
 pub(crate) static SNAPSHOT_INTERVAL: GucSetting<i32> = GucSetting::<i32>::new(60);
@@ -239,6 +243,17 @@ pub extern "C-unwind" fn _PG_init() {
           go through PostgreSQL authentication, so widening this exposes every redis.* \
           table to anything that can reach the port. Set redis.password as well.",
         &LISTEN_ADDRESS,
+        restart_only(),
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"redis.aclfile",
+        c"ACL file, as Redis's aclfile",
+        c"The users loaded at start and by ACL LOAD, and written by ACL SAVE, in Redis's \
+          ACL file format. A relative path is relative to the data directory. Unset, \
+          ACL LOAD and ACL SAVE refuse and users last until the server stops, as in Redis.",
+        &ACLFILE,
         restart_only(),
         GucFlags::default(),
     );
@@ -1082,40 +1097,6 @@ mod tests {
             odd.replace('"', "\"\"")
         ))
         .unwrap();
-    }
-
-    // ───────────────────────────── ACL table ─────────────────────────────────
-
-    /// `ACL SAVE` replaces the rows of `redis.acl_users`; `ACL LOAD` reads
-    /// them back, in name order, as the dispatcher runs both.
-    #[pg_test]
-    fn acl_save_replaces_the_table_and_load_reads_it() {
-        use crate::acl::TableOp;
-        use crate::commands::{Command, Response, Value};
-        let run = |op| Spi::connect_mut(|c| Command::AclTable(op).execute(c, 0));
-        Spi::run("INSERT INTO redis.acl_users VALUES ('stale', 'off')").unwrap();
-        let rows = vec![
-            (b"zed".to_vec(), b"on nopass ~* +@all".to_vec()),
-            (b"amy".to_vec(), b"off -@all".to_vec()),
-        ];
-        assert!(matches!(run(TableOp::Save(rows)), Response::Ok));
-        match run(TableOp::Load) {
-            Response::Value(Value::Array(got)) => {
-                let names: Vec<Vec<u8>> = got
-                    .into_iter()
-                    .map(|r| match r {
-                        Value::Array(mut p) => match p.remove(0) {
-                            Value::Bulk(n) => n,
-                            _ => panic!("a name"),
-                        },
-                        _ => panic!("a row"),
-                    })
-                    .collect();
-                assert_eq!(names, vec![b"amy".to_vec(), b"zed".to_vec()]);
-            }
-            other => panic!("ACL LOAD read {other:?}"),
-        }
-        Spi::run("DELETE FROM redis.acl_users").unwrap();
     }
 
     // ──────────────────────────── SCAN cursors ───────────────────────────────

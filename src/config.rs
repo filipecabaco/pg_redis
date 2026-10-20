@@ -33,6 +33,7 @@ pub struct LiveGucs {
     pub maxclients: i32,
     pub maxmemory_policy: Option<String>,
     pub default_db: u8,
+    pub aclfile: Option<String>,
 }
 
 impl LiveGucs {
@@ -61,6 +62,7 @@ pub fn snapshot_gucs() {
         maxclients: crate::MAX_CONNECTIONS.get(),
         maxmemory_policy: Some(crate::MAXMEMORY_POLICY.get().name().to_string()),
         default_db: crate::DEFAULT_DB.get().clamp(0, 15) as u8,
+        aclfile: s(&crate::ACLFILE),
     };
     // A poisoned lock only means a reader panicked holding it; the value is
     // a plain copy and still whole.
@@ -92,6 +94,7 @@ fn live(name: &str) -> Option<String> {
         "databases" => Some(crate::commands::NUM_DBS.to_string()),
         "bind" => g.bind,
         "requirepass" => g.requirepass,
+        "aclfile" => g.aclfile,
         "maxclients" => Some(g.maxclients.to_string()),
         "maxmemory-policy" => g.maxmemory_policy,
         "maxmemory" => crate::shm::usage().map(|u| u.limit.to_string()),

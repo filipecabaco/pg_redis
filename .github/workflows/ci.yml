@@ -324,7 +324,11 @@ jobs:
       - name: Build e2e image
         run: docker compose --profile e2e build e2e
 
+      # With an ACL file, so ACL SAVE and ACL LOAD are tested against one;
+      # the acceptance suite runs without, as Redis's tests expect.
       - name: Run e2e tests
+        env:
+          PG_REDIS_ACLFILE: users.acl
         run: |
           docker compose --profile e2e up \
             --no-build \

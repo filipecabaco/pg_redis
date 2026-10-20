@@ -592,9 +592,6 @@ pub enum Command {
         auth: Option<(Vec<u8>, Vec<u8>)>,
         setname: Option<Vec<u8>>,
     },
-    /// `ACL SAVE` / `ACL LOAD`: `redis.acl_users`, read or written on the
-    /// dispatcher (`acl.rs`).
-    AclTable(crate::acl::TableOp),
     Reset,
     Quit,
     /// A server-administration command — see `admin.rs`.
@@ -3495,7 +3492,6 @@ impl Command {
         matches!(
             self,
             Command::TablePublish { .. }
-                | Command::AclTable(_)
                 | Command::FlushAll { .. }
                 | Command::Copy { .. }
                 | Command::Dump { .. }
@@ -3701,7 +3697,6 @@ impl Command {
             }
             Command::Time => time_reply(),
             Command::Hello { .. } => Response::Ok,
-            Command::AclTable(op) => acl_table(client, op),
             Command::Reset => Response::Ok,
             Command::Quit => Response::Ok,
             // Answered on the connection's thread, never dispatched.
@@ -4821,60 +4816,6 @@ pub(crate) fn count_bits(value: &[u8], range: Option<(i64, i64, bool)>) -> i64 {
 
 /// The reply for an SPI call that failed. Logged through PostgreSQL rather than
 /// stderr, where an operator will find it.
-/// `ACL SAVE` and `ACL LOAD` against `redis.acl_users`.
-fn acl_table(client: &mut SpiClient<'_>, op: &crate::acl::TableOp) -> Response {
-    let present = client
-        .select(
-            "SELECT to_regclass('redis.acl_users') IS NOT NULL",
-            None,
-            &[],
-        )
-        .ok()
-        .and_then(|t| t.first().get::<bool>(1).ok().flatten())
-        .unwrap_or(false);
-    if !present {
-        pgrx::warning!("pg_redis: ACL SAVE/LOAD: redis.acl_users does not exist in this database");
-        return Response::Error(
-            "ERR redis.acl_users does not exist: run CREATE EXTENSION pg_redis in redis.database"
-                .into(),
-        );
-    }
-    match op {
-        crate::acl::TableOp::Save(rows) => {
-            if let Err(e) = client.update("DELETE FROM redis.acl_users", None, &[]) {
-                return spi_failed("ACL SAVE", e);
-            }
-            for (name, rules) in rows {
-                if let Err(e) = client.update(
-                    "INSERT INTO redis.acl_users (name, rules) VALUES ($1, $2)",
-                    None,
-                    &[name.as_slice().into(), rules.as_slice().into()],
-                ) {
-                    return spi_failed("ACL SAVE", e);
-                }
-            }
-            Response::Ok
-        }
-        crate::acl::TableOp::Load => {
-            match client.select(
-                "SELECT name, rules FROM redis.acl_users ORDER BY name",
-                None,
-                &[],
-            ) {
-                Ok(t) => Response::Value(Value::Array(
-                    t.filter_map(|r| {
-                        let n = r.get::<Vec<u8>>(1).ok().flatten()?;
-                        let rl = r.get::<Vec<u8>>(2).ok().flatten()?;
-                        Some(Value::Array(vec![Value::Bulk(n), Value::Bulk(rl)]))
-                    })
-                    .collect(),
-                )),
-                Err(e) => spi_failed("ACL LOAD", e),
-            }
-        }
-    }
-}
-
 pub(crate) fn spi_failed(cmd: &str, e: impl std::fmt::Display) -> Response {
     pgrx::warning!("pg_redis: {cmd} failed: {e}");
     Response::Error("ERR internal error executing the command".to_string())

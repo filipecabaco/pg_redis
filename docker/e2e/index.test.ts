@@ -5864,17 +5864,22 @@ describe("ACL", () => {
 		return c;
 	};
 	let admin: RawRedis;
-	const users = ["acl-app", "acl-ro", "acl-ps", "acl-gone", "acl-saved", "acl-multi", "acl-blk", "acl-sql"];
+	const users = ["acl-app", "acl-ro", "acl-ps", "acl-gone", "acl-saved", "acl-multi", "acl-blk", "acl-file", "acl-bad"];
+	/** `aclfile`, relative to the data directory; empty when none is set. */
+	let aclfile = "";
+	let dataDir = "";
 
 	beforeAll(async () => {
 		admin = await new RawRedis().connect();
 		await admin.send("ACL", "DELUSER", ...users);
 		await admin.send("ACL", "LOG", "RESET");
+		aclfile = ((await cmd(admin, "CONFIG", "GET", "aclfile")) as string[])[1] ?? "";
+		dataDir = (await sql`SHOW data_directory`)[0].data_directory as string;
 	});
 
 	afterAll(async () => {
 		await admin.send("ACL", "DELUSER", ...users);
-		await sql`DELETE FROM redis.acl_users`;
+		if (aclfile) await cmd(admin, "ACL", "SAVE");
 		admin.close();
 	});
 
@@ -6066,13 +6071,28 @@ describe("ACL", () => {
 		await admin.send("DEL", "acl:list");
 	});
 
-	test("ACL SAVE writes redis.acl_users and ACL LOAD reads it back", async () => {
+	// As in Redis: without an ACL file there is nothing to save to or load from.
+	test("ACL SAVE and ACL LOAD refuse without an aclfile", async () => {
+		if (aclfile) return;
+		const refusal = {
+			error:
+				"ERR This Redis instance is not configured to use an ACL file. You may want to specify " +
+				"users via the ACL SETUSER command and then issue a CONFIG REWRITE (assuming you have a " +
+				"Redis configuration file set) in order to store users in the Redis configuration.",
+		};
+		expect(await cmd(admin, "ACL", "SAVE")).toEqual(refusal);
+		expect(await cmd(admin, "ACL", "LOAD")).toEqual(refusal);
+	});
+
+	test("ACL SAVE writes the aclfile and ACL LOAD reads it back", async () => {
+		if (!aclfile) return;
+		const read = async () =>
+			(await sql`SELECT pg_read_file(${aclfile}) AS text`)[0].text as string;
 		await cmd(admin, "ACL", "SETUSER", "acl-saved", "on", ">pw", "~s:*", "+get");
 		const c = await as("acl-saved", "pw");
 		expect(await cmd(admin, "ACL", "SAVE")).toBe("OK");
-		const rows =
-			await sql`SELECT convert_from(rules, 'UTF8') AS rules FROM redis.acl_users WHERE name = 'acl-saved'::bytea`;
-		expect(rows[0].rules).toContain("#30c952fab122c3f9759f02a6d95c3758b246b4fee239957b2d4fee46e26170c4 ~s:*");
+		const line = (await read()).split("\n").find((l) => l.startsWith("user acl-saved "));
+		expect(line).toContain("#30c952fab122c3f9759f02a6d95c3758b246b4fee239957b2d4fee46e26170c4 ~s:*");
 		expect(await cmd(admin, "ACL", "DELUSER", "acl-saved")).toBe(1);
 		expect(await cmd(admin, "ACL", "GETUSER", "acl-saved")).toBeNull();
 		expect(await cmd(admin, "ACL", "LOAD")).toBe("OK");
@@ -6083,12 +6103,30 @@ describe("ACL", () => {
 		expect(await cmd(admin, "ACL", "LOAD")).toBe("OK");
 		expect((await again.send("PING")).length).toBe(0);
 		c.close();
-		// An operator's own row, with a cleartext password, loads too.
-		await sql`INSERT INTO redis.acl_users (name, rules) VALUES ('acl-sql'::bytea, convert_to('on >sqlpw ~* +ping', 'UTF8'))`;
+		// A line an operator wrote, with a cleartext password, loads too.
+		// The file, as the server sees it: one line per row, which COPY writes
+		// as they are while no line holds a tab or a backslash.
+		const write = (text: string) =>
+			sql.unsafe(
+				`COPY (SELECT unnest(string_to_array(convert_from(decode('${Buffer.from(text).toString("hex")}', 'hex'), 'UTF8'), E'\\n'))) TO '${dataDir}/${aclfile}'`,
+			);
+		await write(`${await read()}user acl-file on >filepw ~* +ping`);
 		expect(await cmd(admin, "ACL", "LOAD")).toBe("OK");
-		const viaSql = await as("acl-sql", "sqlpw");
-		expect(await cmd(viaSql, "PING")).toBe("PONG");
-		viaSql.close();
+		const viaFile = await as("acl-file", "filepw");
+		expect(await cmd(viaFile, "PING")).toBe("PONG");
+		viaFile.close();
+		// A wrong line loads nothing, and says where it is.
+		const before = await cmd(admin, "ACL", "USERS");
+		await write(`${await read()}user acl-bad on +nosuch`);
+		const bad = await cmd(admin, "ACL", "LOAD");
+		expect(JSON.stringify(bad)).toContain(
+			`${aclfile}:`,
+		);
+		expect(JSON.stringify(bad)).toContain(
+			"Error in applying operation '+nosuch': Unknown command or category name in ACL. WARNING: ACL errors detected, no change to the previously active ACL rules was performed",
+		);
+		expect(await cmd(admin, "ACL", "USERS")).toEqual(before);
+		expect(await cmd(admin, "ACL", "SAVE")).toBe("OK");
 		expect(await cmd(admin, "ACL", "WHOAMI")).toBe("default");
 		expect(await cmd(admin, "PING")).toBe("PONG");
 	});

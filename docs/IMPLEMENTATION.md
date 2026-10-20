@@ -718,15 +718,9 @@ client get `BUSY`, on every worker, until it ends or `SCRIPT KILL` /
   `REPLICAOF` and `CLUSTER` answer as a stand-alone server would, and
   `MODULE` answers as a server with no modules loaded. Replication is
   PostgreSQL's.
-- **ACL users are saved to a table.** Users, rules,
-  selectors, the permission checks and their error texts follow Redis 7.2's
-  `acl.c`; see [Users and permissions](#users-and-permissions). Where Redis
-  reads and writes an ACL file, `ACL LOAD` and `ACL SAVE` read and write
-  `redis.acl_users`, so they work on every server, and the acceptance test
-  that expects them to fail without an ACL file does not pass. A
-  blocked command is checked again each time it is retried (every 50 ms, and
-  on each write to its keys), where Redis checks it again only when a write
-  serves it.
+- **A blocked command's ACL check repeats.** A blocked command is checked
+  again each time it is retried (every 50 ms, and on each write to its keys),
+  where Redis checks it again only when a write serves it.
 - **Logged keys' access fields are approximate.** `OBJECT IDLETIME` and
   `OBJECT FREQ` on a `logged` database read a lossy table in shared memory
   ([The access clock](#the-access-clock)): two keys can share a slot, and the
@@ -1560,12 +1554,17 @@ allowed. `off` and `resetpass` close nothing, as in Redis. A connection
 thread waits up to a second for the clients it closed to go before it
 replies; inside `EXEC` the dispatcher does not wait.
 
-**Persistence.** `ACL SAVE` replaces the rows of `redis.acl_users` with one
-row per user (name, and the description after it); `ACL LOAD` reads them
-back, checking every row first and changing nothing if one is wrong, with
-`ACLLoadFromFile`'s messages (the row number stands for the line). The first
-worker to start loads the table before anyone is served. `ACL SETUSER`
-changes only the live users, as it does in Redis without `ACL SAVE`.
-`redis.password` is the default user's password: applied at start unless the
-table has a row for `default`, again on a reload that changes it, and
-`CONFIG SET requirepass` sets it at runtime, as `updateRequirePass` does.
+**Persistence.** As in Redis, users persist only through an ACL file,
+`redis.aclfile` (`aclfile`). Without one, `ACL LOAD` and `ACL SAVE` refuse
+with Redis's error, and `ACL SETUSER` changes only the live users. With one,
+`ACL SAVE` is `ACLSaveToFile`: every user as a `user` line, written to a
+temporary file beside it, synced, renamed over it, and the directory synced.
+`ACL LOAD` is `ACLLoadFromFile`: every line checked first, nothing changed if
+one is wrong, with its messages. The connection thread reads and writes the
+file itself. At start, `ACLLoadUsersAtStartup`: one worker loads the file
+before anyone is served, and a file that cannot be loaded stops it with the
+error, as Redis refuses to start; the others wait, and whichever starts next
+tries again. `redis.password` is the default user's password: applied at
+start unless the file has a line for `default`, again on a reload that
+changes it, and `CONFIG SET requirepass` sets it at runtime, as
+`updateRequirePass` does.

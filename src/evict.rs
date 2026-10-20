@@ -118,8 +118,15 @@ fn evict_until_under(s: crate::access::Settings) -> Evict {
     let started = std::time::Instant::now();
     let limit = s.time_limit_us();
     let volatile = s.policy.volatile();
-    let mut freed = 0u64;
-    while shm::over_limit() {
+    let used = || shm::usage().map_or(0, |u| u.used);
+    // `performEvictions`: what to free is decided once, and each key counts
+    // what its deletion gave back, measured before its invalidation and
+    // events go out. Those queue messages of their own, which counted here
+    // would make every eviction call for another.
+    let to_free = shm::usage().map_or(0, |u| u.used.saturating_sub(u.limit));
+    let (mut freed, mut keys) = (0usize, 0u64);
+    while freed < to_free {
+        let before = used();
         let pick = match s.policy {
             Policy::AllKeysRandom | Policy::VolatileRandom => pick_random(volatile),
             Policy::VolatileTtl => pick_pooled(volatile, s.samples, Score::Deadline),
@@ -128,10 +135,17 @@ fn evict_until_under(s: crate::access::Settings) -> Evict {
         let Some((slot, key)) = pick else {
             return Evict::Fail;
         };
+        freed += before.saturating_sub(used());
         report(slot, &key);
-        freed += 1;
-        if freed.is_multiple_of(16) && started.elapsed().as_micros() as u64 > limit {
-            return Evict::Running;
+        keys += 1;
+        if keys.is_multiple_of(16) {
+            // Under the limit already, as Redis checks every 16 keys.
+            if !shm::over_limit() {
+                break;
+            }
+            if started.elapsed().as_micros() as u64 > limit {
+                return Evict::Running;
+            }
         }
     }
     Evict::Ok

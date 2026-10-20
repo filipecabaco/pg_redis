@@ -503,7 +503,7 @@ describe("Server", () => {
 	// to the parser in both directions. A change here means a command was
 	// added or removed: update the page and this number together.
 	test("COMMAND COUNT reports the number of accepted commands", async () => {
-		expect(await client.send("COMMAND", ["COUNT"])).toBe(235);
+		expect(await client.send("COMMAND", ["COUNT"])).toBe(237);
 	});
 });
 

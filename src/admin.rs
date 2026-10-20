@@ -581,6 +581,8 @@ pub fn info(args: &[Vec<u8>], conn: &Conn, data: &mut Data) -> Response {
                 DEFAULT_SECTIONS.iter().for_each(|s| add(s, &mut sections));
                 ALL_EXTRA.iter().for_each(|s| add(s, &mut sections));
             }
+            // Shown only when named, never by `all` or `everything`.
+            "debug" => add("debug", &mut sections),
             other => {
                 for s in DEFAULT_SECTIONS.iter().chain(ALL_EXTRA) {
                     if *s == other {
@@ -605,6 +607,7 @@ pub fn info(args: &[Vec<u8>], conn: &Conn, data: &mut Data) -> Response {
         "latencystats",
         "cluster",
         "keyspace",
+        "debug",
     ]
     .into_iter()
     .filter(|s| sections.contains(s))
@@ -642,6 +645,7 @@ fn info_section(section: &str, conn: &Conn, data: &mut Data) -> String {
         "errorstats" => "Errorstats",
         "latencystats" => "Latencystats",
         "cluster" => "Cluster",
+        "debug" => "Debug",
         _ => "Keyspace",
     };
     match section {
@@ -775,9 +779,14 @@ fn info_section(section: &str, conn: &Conn, data: &mut Data) -> String {
                     stat(|c| &c.total_connections)
                 ),
                 format!("total_commands_processed:{}", stat(|c| &c.total_commands)),
-                "instantaneous_ops_per_sec:0".into(),
+                crate::eventloop::ops_line(),
                 format!("total_net_input_bytes:{}", stat(|c| &c.net_input)),
                 format!("total_net_output_bytes:{}", stat(|c| &c.net_output)),
+                "total_net_repl_input_bytes:0".into(),
+                "total_net_repl_output_bytes:0".into(),
+            ]);
+            lines.extend(crate::eventloop::kbps_lines());
+            lines.extend([
                 format!("rejected_connections:{}", stat(|c| &c.rejected_connections)),
                 format!("expired_keys:{}", stat(|c| &c.expired_keys)),
                 format!("evicted_keys:{}", stat(|c| &c.evicted_keys)),
@@ -809,6 +818,18 @@ fn info_section(section: &str, conn: &Conn, data: &mut Data) -> String {
                 "dump_payload_sanitizations:0".into(),
                 format!("total_reads_processed:{}", stat(|c| &c.total_commands)),
                 format!("total_writes_processed:{}", stat(|c| &c.total_commands)),
+                "io_threaded_reads_processed:0".into(),
+                "io_threaded_writes_processed:0".into(),
+                "client_query_buffer_limit_disconnections:0".into(),
+                format!(
+                    "client_output_buffer_limit_disconnections:{}",
+                    stat(|c| &c.output_limit_disconnections)
+                ),
+                "reply_buffer_shrinks:0".into(),
+                "reply_buffer_expands:0".into(),
+            ]);
+            lines.extend(crate::eventloop::stats_lines());
+            lines.extend([
                 format!("acl_access_denied_auth:{}", denied[0]),
                 format!("acl_access_denied_cmd:{}", denied[1]),
                 format!("acl_access_denied_key:{}", denied[2]),
@@ -867,6 +888,7 @@ fn info_section(section: &str, conn: &Conn, data: &mut Data) -> String {
                 lines.push(format!("errorstat_{code}:count={n}"));
             }
         }
+        "debug" => lines.extend(crate::eventloop::debug_lines()),
         "latencystats" => {
             let percentiles: Vec<f64> = crate::config::get_str("latency-tracking-info-percentiles")
                 .split_whitespace()

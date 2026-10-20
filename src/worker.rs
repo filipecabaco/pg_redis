@@ -307,7 +307,23 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
             crate::acl::sync_password(crate::config::live_gucs().password().as_deref());
             batch_size = crate::BATCH_SIZE.get().max(1) as usize;
         }
-        match cmd_rx.recv_timeout(Duration::from_millis(250)) {
+        // The loop that stands for Redis's event loop wakes at its cron's
+        // rate (`eventloop.rs`); the others only for work and the sweep.
+        let owner = crate::eventloop::claim();
+        let idle = if owner {
+            crate::eventloop::CRON
+        } else {
+            Duration::from_millis(250)
+        };
+        let received = cmd_rx.recv_timeout(idle);
+        let woke = Instant::now();
+        let mut served = match &received {
+            Ok(DispatchMsg::Cmd(..)) => 1,
+            Ok(DispatchMsg::Batch(cmds, ..)) => cmds.len() as u64,
+            Ok(DispatchMsg::FireAndForget(..)) => 1,
+            _ => 0,
+        };
+        match received {
             Ok(first) => match first {
                 DispatchMsg::Move(keys, drains, tx) => {
                     run_move(&keys, &drains);
@@ -365,6 +381,7 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                         }
                     }
 
+                    served = (cmds.len() + faf_cmds.len()) as u64;
                     let responses = run_held(&cmds, &origins, true);
                     for (tx, resp) in txs.into_iter().zip(responses) {
                         tx.send(resp).ok();
@@ -387,6 +404,8 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                 break;
             }
         }
+        let cmd_usec = woke.elapsed().as_micros() as u64;
+        let cron = Instant::now();
 
         // Redis keeps the tracking table to `tracking-table-max-keys` from
         // its cron as well as before each command, invalidating keys at
@@ -482,8 +501,10 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                 cycle.elapsed().as_millis() as u64,
             );
         }
+        crate::eventloop::cycle(owner, served, cmd_usec, cron.elapsed().as_micros() as u64);
     }
     // Left on SIGTERM: shutdown or `redis.remove_workers`.
+    crate::eventloop::release();
     crate::storage::worker_exiting();
 }
 
@@ -3363,6 +3384,7 @@ impl Write for ConnWriter {
             if listed >= hard {
                 self.held = Vec::new();
                 self.broken = true;
+                crate::server::count_output_limit_disconnection();
             }
             return Ok(buf.len());
         }
@@ -3829,6 +3851,7 @@ fn queued_db(queue: &Queue, db: u8) -> u8 {
 
 fn finish(job: InFlight, client: &crate::server::ClientHandle) {
     let usec = job.started.elapsed().as_micros() as u64;
+    crate::eventloop::command(usec);
     // A logged database's keys are touched here, after the command, from
     // the keys its arguments name (`access::after_command`).
     if !job.queued && !job.rejected {

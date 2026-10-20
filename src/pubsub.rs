@@ -299,6 +299,9 @@ impl Sub {
     }
 
     fn overflow(&mut self) {
+        if !self.overflowed {
+            crate::server::count_output_limit_disconnection();
+        }
         self.overflowed = true;
         self.queue = HVec::new_in(PubHeap);
         self.head = 0;

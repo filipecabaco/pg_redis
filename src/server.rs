@@ -228,6 +228,8 @@ pub struct ServerCtl {
     pub expired_keys: AtomicU64,
     /// INFO's `lazyfreed_objects` (`lazyfree.rs`).
     pub lazyfreed_objects: AtomicU64,
+    /// INFO's `client_output_buffer_limit_disconnections`.
+    pub output_limit_disconnections: AtomicU64,
     /// INFO's `evicted_keys`.
     pub evicted_keys: AtomicU64,
     /// When the arena went over the limit and stayed there (unix ms, 0 when
@@ -299,6 +301,8 @@ pub struct ServerCtl {
     pub storage: crate::storage::PolicyTable,
     /// The latency monitor's samples (`latency.rs`).
     pub latency: crate::latency::LatencyCtl,
+    /// The event loop metrics (`eventloop.rs`).
+    pub eventloop: crate::eventloop::EventLoopCtl,
 }
 
 /// Keys one blocked client is recorded under; past this its later keys still
@@ -835,6 +839,7 @@ pub fn reset_stats() {
         &ctl.keyspace_misses,
         &ctl.expired_keys,
         &ctl.lazyfreed_objects,
+        &ctl.output_limit_disconnections,
         &ctl.evicted_keys,
         &ctl.eviction_exceeded_total,
         &ctl.net_input,
@@ -853,6 +858,7 @@ pub fn reset_stats() {
     for e in &ctl.errstats {
         e.count.store(0, Ordering::Relaxed);
     }
+    crate::eventloop::reset();
     ctl.stat_reset_ms.store(now_ms(), Ordering::Relaxed);
 }
 
@@ -1423,6 +1429,14 @@ pub fn count_expired(n: u64) {
         && let Some(ctl) = ctl()
     {
         ctl.expired_keys.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// A client closed past its output buffer limit.
+pub fn count_output_limit_disconnection() {
+    if let Some(ctl) = ctl() {
+        ctl.output_limit_disconnections
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 

@@ -13,6 +13,7 @@ pub(crate) mod config;
 pub(crate) mod cursor;
 pub(crate) mod dblock;
 pub(crate) mod dirty;
+pub(crate) mod eventloop;
 pub(crate) mod evict;
 #[cfg(test)]
 mod fuzz;

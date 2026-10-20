@@ -350,7 +350,32 @@ pub fn run(cmd: &Command, store: &mut dyn Store) -> Option<Response> {
         Command::ObjectEncoding { key } => object_encoding(store, key),
         Command::ZsetToSkiplist { key } => store.zset_to_skiplist(key).map(|()| Response::Ok),
         Command::ObjectAccess { key, field } => object_access(store, key, *field),
-        Command::ObjectOther => Ok(Response::Null),
+        Command::ObjectOther(sub) if sub == "HELP" => Ok(Response::Value(crate::commands::Value::Array(
+            [
+                "OBJECT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                "ENCODING <key>",
+                "    Return the kind of internal representation used in order to store the value",
+                "    associated with a <key>.",
+                "FREQ <key>",
+                "    Return the access frequency index of the <key>. The returned integer is",
+                "    proportional to the logarithm of the recent access frequency of the key.",
+                "IDLETIME <key>",
+                "    Return the idle time of the <key>, that is the approximated number of",
+                "    seconds elapsed since the last access to the key.",
+                "REFCOUNT <key>",
+                "    Return the number of references of the value associated with the specified",
+                "    <key>.",
+                "HELP",
+                "    Print this help.",
+            ]
+            .into_iter()
+            .map(|l| crate::commands::Value::Simple(l.to_string()))
+            .collect(),
+        ))),
+        Command::ObjectOther(sub) => Ok(Response::Error(format!(
+            "ERR unknown subcommand '{}'. Try OBJECT HELP.",
+            sub.to_ascii_lowercase()
+        ))),
 
         Command::Get { key } => store.get(key).map(bulk_or_nil),
         Command::Set {

@@ -2102,7 +2102,7 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<DispatchMsg>, default_d
                     write_array_header(w, 4)?;
                     write_bulk_string(
                         w,
-                        b"PUBSUB <subcommand> [<arg> [value] [opt] ...]. subcommands are:",
+                        b"PUBSUB <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
                     )?;
                     write_bulk_string(w, b"CHANNELS [<pattern>] -- Return the currently active channels matching a pattern (default: all).")?;
                     write_bulk_string(w, b"NUMSUB [<channel> ...] -- Return the number of subscribers for the specified channels.")?;

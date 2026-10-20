@@ -152,7 +152,7 @@ pub fn mode(cmd: &crate::commands::Command, origin: u64) -> Access {
             | C::ObjectEncoding { .. }
             | C::ZsetToSkiplist { .. }
             | C::ObjectAccess { .. }
-            | C::ObjectOther
+            | C::ObjectOther(_)
             | C::MemoryUsage { .. }
             | C::Keys { .. }
             | C::Scan { .. }

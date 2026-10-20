@@ -832,7 +832,7 @@ pub enum Command {
         field: ObjectField,
     },
     /// Any other `OBJECT` subcommand, which is answered rather than refused.
-    ObjectOther,
+    ObjectOther(String),
     SetBit {
         key: Vec<u8>,
         offset: i64,
@@ -2026,7 +2026,7 @@ impl Command {
                         _ => ObjectField::Freq,
                     },
                 }),
-                _ => Ok(Command::ObjectOther),
+                other => Ok(Command::ObjectOther(other.to_string())),
             },
             "SETBIT" => {
                 let key = bytes_arg(args, 0, "SETBIT")?;
@@ -3625,7 +3625,7 @@ impl Command {
             | Command::ObjectEncoding { .. }
             | Command::ZsetToSkiplist { .. }
             | Command::ObjectAccess { .. }
-            | Command::ObjectOther => {
+            | Command::ObjectOther(_) => {
                 Response::Error("ERR internal error: command not routed to store".to_string())
             }
             // Each sub-command goes to the backend that serves its database.

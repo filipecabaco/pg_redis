@@ -74,6 +74,16 @@
   display: flex;
   flex-wrap: wrap;
   gap: 0.6rem;
+  container-type: inline-size;
+}
+
+/* Too narrow for the three on one line: each grows to fill its row, so the
+   one that wraps is a full-width button rather than a stray. */
+@container (max-width: 24.5rem) {
+  .pr-hero__actions .pr-btn {
+    flex: 1 1 auto;
+    justify-content: center;
+  }
 }
 
 .pr-hero__note {
@@ -196,9 +206,11 @@
 
 /* Stats strip */
 
+/* One row for the five figures, so none is left alone on a second. */
 .pr-stats {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  column-gap: 1.2rem;
   margin: 2.6rem 0 0;
   border-top: 1px solid #2e2e2e;
 }
@@ -594,6 +606,11 @@
 
   .pr-stats {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  /* An odd one out takes the whole row rather than half of it. */
+  .pr-stats > div:last-child:nth-child(odd) {
+    grid-column: 1 / -1;
   }
 }
 

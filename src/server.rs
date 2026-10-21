@@ -282,6 +282,9 @@ pub struct ServerCtl {
     /// Bumped by `FLUSHDB` / `FLUSHALL`, per database: a WATCH on a key that
     /// existed is broken by a flush, one on a missing key is not.
     flush_epochs: [AtomicU64; 16],
+    /// Bumped by a `SWAPDB` that swapped two databases' tables, per database:
+    /// a WATCH on a key missing then breaks if the swap brought the key in.
+    swap_epochs: [AtomicU64; 16],
     /// `notify-keyspace-events`, parsed: read before every command.
     notify_flags: AtomicU32,
     /// The `*-max-listpack-*` and `set-max-intset-entries` thresholds, read
@@ -1423,6 +1426,21 @@ pub fn bump_flush_epoch(db: u8) {
 pub fn flush_epoch(db: u8) -> u64 {
     ctl()
         .and_then(|c| c.flush_epochs.get(db as usize))
+        .map_or(0, |e| e.load(Ordering::Acquire))
+}
+
+/// A database's tables were swapped with another's.
+pub fn bump_swap_epoch(db: u8) {
+    if let Some(ctl) = ctl()
+        && let Some(e) = ctl.swap_epochs.get(db as usize)
+    {
+        e.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+pub fn swap_epoch(db: u8) -> u64 {
+    ctl()
+        .and_then(|c| c.swap_epochs.get(db as usize))
         .map_or(0, |e| e.load(Ordering::Acquire))
 }
 

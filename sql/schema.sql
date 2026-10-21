@@ -51,6 +51,8 @@ CREATE INDEX IF NOT EXISTS kv_15_expires_idx ON redis.kv_15 (expires_at) WHERE e
 -- one is the order its fields or members were added (docs/STORAGE.md). `seq`
 -- records that order: it is set when a row is inserted, from one sequence
 -- for every table, and left alone when a field's value is updated.
+-- The primary keys lead with `key`, so they serve a whole hash or set as well as
+-- one field or member: a second index on `key` alone would only be written.
 CREATE SEQUENCE IF NOT EXISTS redis.seq;
 
 CREATE         TABLE IF NOT EXISTS redis.hash_0  (key BYTEA NOT NULL, field BYTEA NOT NULL, value BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, field));
@@ -110,40 +112,6 @@ CREATE         TABLE IF NOT EXISTS redis.set_12 (key BYTEA NOT NULL, member BYTE
 CREATE         TABLE IF NOT EXISTS redis.set_13 (key BYTEA NOT NULL, member BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, member));
 CREATE         TABLE IF NOT EXISTS redis.set_14 (key BYTEA NOT NULL, member BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, member));
 CREATE         TABLE IF NOT EXISTS redis.set_15 (key BYTEA NOT NULL, member BYTEA NOT NULL, seq BIGINT NOT NULL DEFAULT nextval('redis.seq'), PRIMARY KEY (key, member));
-
-CREATE INDEX IF NOT EXISTS hash_0_key_pattern_idx  ON redis.hash_0  (key);
-CREATE INDEX IF NOT EXISTS hash_1_key_pattern_idx  ON redis.hash_1  (key);
-CREATE INDEX IF NOT EXISTS hash_2_key_pattern_idx  ON redis.hash_2  (key);
-CREATE INDEX IF NOT EXISTS hash_3_key_pattern_idx  ON redis.hash_3  (key);
-CREATE INDEX IF NOT EXISTS hash_4_key_pattern_idx  ON redis.hash_4  (key);
-CREATE INDEX IF NOT EXISTS hash_5_key_pattern_idx  ON redis.hash_5  (key);
-CREATE INDEX IF NOT EXISTS hash_6_key_pattern_idx  ON redis.hash_6  (key);
-CREATE INDEX IF NOT EXISTS hash_7_key_pattern_idx  ON redis.hash_7  (key);
-CREATE INDEX IF NOT EXISTS hash_8_key_pattern_idx  ON redis.hash_8  (key);
-CREATE INDEX IF NOT EXISTS hash_9_key_pattern_idx  ON redis.hash_9  (key);
-CREATE INDEX IF NOT EXISTS hash_10_key_pattern_idx ON redis.hash_10 (key);
-CREATE INDEX IF NOT EXISTS hash_11_key_pattern_idx ON redis.hash_11 (key);
-CREATE INDEX IF NOT EXISTS hash_12_key_pattern_idx ON redis.hash_12 (key);
-CREATE INDEX IF NOT EXISTS hash_13_key_pattern_idx ON redis.hash_13 (key);
-CREATE INDEX IF NOT EXISTS hash_14_key_pattern_idx ON redis.hash_14 (key);
-CREATE INDEX IF NOT EXISTS hash_15_key_pattern_idx ON redis.hash_15 (key);
-
-CREATE INDEX IF NOT EXISTS set_0_key_pattern_idx   ON redis.set_0   (key);
-CREATE INDEX IF NOT EXISTS set_1_key_pattern_idx   ON redis.set_1   (key);
-CREATE INDEX IF NOT EXISTS set_2_key_pattern_idx   ON redis.set_2   (key);
-CREATE INDEX IF NOT EXISTS set_3_key_pattern_idx   ON redis.set_3   (key);
-CREATE INDEX IF NOT EXISTS set_4_key_pattern_idx   ON redis.set_4   (key);
-CREATE INDEX IF NOT EXISTS set_5_key_pattern_idx   ON redis.set_5   (key);
-CREATE INDEX IF NOT EXISTS set_6_key_pattern_idx   ON redis.set_6   (key);
-CREATE INDEX IF NOT EXISTS set_7_key_pattern_idx   ON redis.set_7   (key);
-CREATE INDEX IF NOT EXISTS set_8_key_pattern_idx   ON redis.set_8   (key);
-CREATE INDEX IF NOT EXISTS set_9_key_pattern_idx   ON redis.set_9   (key);
-CREATE INDEX IF NOT EXISTS set_10_key_pattern_idx  ON redis.set_10  (key);
-CREATE INDEX IF NOT EXISTS set_11_key_pattern_idx  ON redis.set_11  (key);
-CREATE INDEX IF NOT EXISTS set_12_key_pattern_idx  ON redis.set_12  (key);
-CREATE INDEX IF NOT EXISTS set_13_key_pattern_idx  ON redis.set_13  (key);
-CREATE INDEX IF NOT EXISTS set_14_key_pattern_idx  ON redis.set_14  (key);
-CREATE INDEX IF NOT EXISTS set_15_key_pattern_idx  ON redis.set_15  (key);
 
 -- Sorted sets. Scores are DOUBLE PRECISION to match Redis float64 semantics
 -- (native +Infinity/-Infinity handling). The composite index on

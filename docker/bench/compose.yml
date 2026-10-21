@@ -8,14 +8,18 @@
 #   redis       Redis 7.2 with persistence off: the reference for memory
 #   redis-aof   Redis 7.2 with appendfsync everysec: the reference for the durable policies
 #   load        redis-benchmark and memtier_benchmark
+#
+# BENCH_SERVER_CPUS and BENCH_LOAD_CPUS move the pins, for a machine with fewer CPUs: CI's
+# runner has four, two for the server and two for the load.
 x-server: &server
-  cpuset: "0-3"
+  cpuset: "${BENCH_SERVER_CPUS:-0-3}"
   mem_limit: 4g
 
 services:
   pg_redis:
     <<: *server
-    image: pg_redis:latest
+    # BENCH_IMAGE measures another build, main's say, on the same rig.
+    image: ${BENCH_IMAGE:-pg_redis:latest}
     shm_size: 2g
     environment:
       POSTGRES_PASSWORD: postgres
@@ -60,10 +64,10 @@ services:
 
   load:
     image: redis:7.2-alpine
-    cpuset: "8-13"
+    cpuset: "${BENCH_LOAD_CPUS:-8-13}"
     entrypoint: ["sleep", "infinity"]
 
   memtier:
     image: redislabs/memtier_benchmark:2.2.1
-    cpuset: "8-13"
+    cpuset: "${BENCH_LOAD_CPUS:-8-13}"
     entrypoint: ["sleep", "infinity"]

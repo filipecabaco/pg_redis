@@ -34,6 +34,10 @@ theme:
     - content.code.copy
     - content.action.edit
 
+# The throughput figures, from the last benchmark report (hooks/bench.py)
+hooks:
+  - hooks/bench.py
+
 extra_css:
   - stylesheets/supabase.css
   - stylesheets/home.css

@@ -103,7 +103,8 @@ in shared memory (`src/dblock.rs`). Only the dispatchers take them.
     `ZINTERCARD`, `MOVE`, `SORT`, `SORT_RO`, `SWAPDB`, `PFADD`, `PFCOUNT`,
     `PFMERGE`, `PFDEBUG`, `GEODIST`, `GEOHASH`, `GEOPOS`, `GEORADIUS`,
     `GEORADIUSBYMEMBER`, `GEOSEARCH`, `GEOSEARCHSTORE` and the `_RO` forms;
-  - `COPY`, `RESTORE` and `FLUSHALL`;
+  - `COPY`, `RESTORE` and `FLUSHALL`, and `FLUSHDB` on a database in tables,
+    which truncates them;
   - each try of `BLPOP`, `BRPOP`, `BLMOVE`, `BRPOPLPUSH`, `BLMPOP`, `BZPOPMIN`,
     `BZPOPMAX` and `BZMPOP`, which checks the key's type and then pops;
   - a stream write on a table-backed database, which reads the stream and
@@ -767,26 +768,15 @@ disk, and by PostgreSQL's ~1 GB per-field TOAST limit.
 ## 8. Performance
 
 Requests per second, higher is better. `redis-benchmark`, 50 clients, 64-byte
-values over 100,000 random keys, median of 5 runs. Each server runs alone on the
-same 4 pinned CPUs with the load generator on 6 others, Docker on an Apple M5 Pro,
-PostgreSQL 17 with `redis.workers=4`. `mise run bench-suite` reproduces it and
-writes the full report, value sizes, client counts, pipelining and a memtier mix
-included, to `docker/bench/results/`.
+values over 100,000 random keys. Each server runs alone on the same pinned CPUs,
+with the load generator on others, PostgreSQL with `redis.workers=4`. The
+figures are not typed in: `mise run bench-site` runs `docker/bench/suite.exs`
+and writes its report to `docs/bench.json`, which the site is built from.
+`mise run bench-suite` runs the same suite and writes the full report, value
+sizes, client counts, pipelining and a memtier mix included, to
+`docker/bench/results/`.
 
-| Command | Redis 7.2 | Redis 7.2, AOF everysec | memory | memory+snapshot | logged |
-|---------|----------:|------------------------:|-------:|----------------:|-------:|
-| SET     | 225,734 | 219,539 | 182,315 | 184,843 |   6,374 |
-| GET     | 229,885 | 227,273 | 187,970 | 188,501 | 121,065 |
-| INCR    | 228,311 | 223,714 | 187,617 | 188,324 |   4,609 |
-| LPUSH   | 217,865 | 211,640 | 186,916 | 187,793 |   3,004 |
-| LPOP    | 208,117 | 215,750 | 187,793 | 189,394 |   1,323 |
-| SADD    | 226,501 | 226,244 | 182,482 | 186,741 |   8,486 |
-| SPOP    | 228,311 | 227,790 | 192,123 | 190,840 |  18,018 |
-| HSET    | 225,989 | 221,484 | 179,211 | 178,094 |   5,890 |
-| ZADD    | 226,757 | 216,920 | 175,593 | 175,439 |   6,368 |
-| ZPOPMIN | 227,015 | 229,095 | 192,493 | 191,571 |   3,308 |
-| MSET    | 196,657 | 146,199 | 100,959 | 103,520 |   3,391 |
-| memtier 1:10, 256 B | 360,804 | 347,290 | 245,948 | 241,851 | 14,581 |
+<!-- bench:commands -->
 
 `logged` writes commit to the WAL, so they measure the disk more than this
 code. On Docker Desktop the same `SET` measured 6,374 and 15,309 per second in
@@ -853,8 +843,8 @@ needs its own design, and lock sharding only becomes interesting afterwards.
   phase 6, `-n 20000` was past what a list table held at the default, so the
   run ended in the OOM the server is supposed to give and reported nothing.
   The arena has no per-type limit, but a list that grows with every test still
-  skews the ones after it, so `docker/bench/report.sh` clears the key and uses
-  4,000 requests for those.
+  skews the ones after it, so `docker/bench/pr.exs` clears the key before each
+  of those tests and uses 4,000 requests for them.
 - **The noise band is ±6%, which is wider than most changes worth measuring.**
   Three rounds is not enough. One attempt at measuring the KV key change read as
   "SET and GET are 10% slower" while `PING`, which the change cannot touch, read
@@ -866,13 +856,16 @@ needs its own design, and lock sharding only becomes interesting afterwards.
   reading every key out of every entry is what it does. Time it directly
   over a populated database.
 
-CI runs `docker/bench/report.sh` on every pull request against memory mode and a
-Redis 7 container on the same runner, and posts the result as one comment. The
-comment is keyed on an HTML marker, so a push edits it in place and duplicates
-are deleted. The same report goes to the job summary, which is all a fork's
-token can write. It is a smoke signal and nothing gates on it. It catches a
-collapse from tens of thousands per second to hundreds. The ratio against the
-Redis beside it compares across runs better than the absolute numbers do. `mise run bench-report` runs it locally.
+CI runs `docker/bench/pr.exs` on every pull request: pg_redis built from the
+pull request and from main, and Redis 7.2, on the same runner, on a memory and a
+logged database. Each measurement runs on all three in turn, starting with a
+different one each round, and the median of the rounds is reported with the
+change from main; changes of 10% or more are marked. `PING`, which no change to
+the data path reaches, is the calibration row. The result is posted as one
+comment, keyed on an HTML marker, so a push edits it in place and duplicates are
+deleted. The same report goes to the job summary, which is all a fork's token
+can write. Nothing gates on it. `mise run bench-report` runs it locally against
+the local `main`.
 
 ---
 

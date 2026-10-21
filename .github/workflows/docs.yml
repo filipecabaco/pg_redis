@@ -19,6 +19,7 @@ on:
       - "Dockerfile"
       - "src/**"
       - "sql/**"
+      - "hooks/**"
       - ".github/workflows/docs.yml"
   workflow_dispatch:
 

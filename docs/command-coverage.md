@@ -116,7 +116,7 @@ The limits that apply only to databases in memory are described once, in
 | `MIGRATE` | To another Redis or pg_redis, with `COPY`, `REPLACE`, `AUTH`, `AUTH2` and `KEYS`; each key is dumped and restored there, then deleted here |
 | `SORT` | `BY` (with `->field`), `LIMIT`, `GET`, `ASC`/`DESC`, `ALPHA`, `STORE` |
 | `SORT_RO` | `SORT` without `STORE` |
-| `SWAPDB` | Any two databases, across the storage halves too; a key the target half cannot hold puts both back and fails |
+| `SWAPDB` | Any two databases, across the storage halves too; a key the target half cannot hold puts both back and fails. Two databases in tables swap their tables, moving no row |
 
 ## Expiry
 

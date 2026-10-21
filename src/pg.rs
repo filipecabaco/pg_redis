@@ -219,3 +219,20 @@ pub fn before_exit(f: fn()) {
     // once, on the main thread, while shared memory is still attached.
     unsafe { pg_sys::before_shmem_exit(Some(run), pg_sys::Datum::from(0usize)) };
 }
+
+/// Send the table counts this process's commits have gathered — the rows
+/// each wrote, updated and deleted — to the statistics PostgreSQL keeps, at
+/// most once a second; the rest wait for the next call. A backend does this
+/// as it goes idle. A background worker has to, or `pg_stat_user_tables`
+/// never hears of its writes and autovacuum, which goes by them, never
+/// vacuums or analyzes its tables.
+pub fn report_table_stats() {
+    assert!(
+        !in_transaction(),
+        "table stats are reported between transactions"
+    );
+    // SAFETY: no transaction is open (asserted), as PostgresMain calls it.
+    unsafe {
+        pg_sys::pgstat_report_stat(false);
+    }
+}

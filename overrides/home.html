@@ -257,35 +257,29 @@ maxmemory:16777216
 maxmemory_policy:allkeys-random</span></code></pre>
 </section>
 
-<section class="pr-section">
+<section class="pr-section" id="throughput">
   <h2 class="pr-h2">Throughput</h2>
+  {% set bench = config.extra.bench %}
   <p class="pr-sub">
-    Requests per second, higher is better: <strong>230k/s</strong> is 230,000 commands answered
+    Requests per second, higher is better: <strong>100k/s</strong> is 100,000 commands answered
     every second. <code>redis-benchmark</code>, 50 clients, 64-byte values over 100,000 random
-    keys, median of 5 runs. Each server pinned to the same 4 CPUs, Docker on Apple Silicon.
-    Each client sends one command at a time, with no pipelining.
-    <code>memory+snapshot</code> runs within 2% of <code>memory</code>. <code>logged</code> writes
-    commit to PostgreSQL's write-ahead log and wait for it to reach disk, so the disk sets their
-    rate; reads stay fast.
+    keys, each client sending one command at a time.
+    {% if bench %}Measured on {{ bench.date }} (<code>{{ bench.commit }}</code>),
+    median of {{ bench.reps }} runs, every server alone on the same pinned CPUs of a
+    {{ bench.host }}.{% endif %}
+    <code>logged</code> writes commit to PostgreSQL's write-ahead log and wait for it to reach
+    disk, so the disk sets their rate; reads stay fast.
     <a href="{{ 'IMPLEMENTATION/#8-performance' | url }}">Full table and tuning</a>
   </p>
+  {% if bench %}
   <div class="pr-bench" role="table" aria-label="Requests per second by command, in thousands">
     <div class="pr-bench__legend" aria-hidden="true">
       <span class="k k--redis">Redis 7.2</span>
       <span class="k k--mem">pg_redis memory</span>
       <span class="k k--wal">pg_redis logged</span>
     </div>
-    {% set top = 230 %}
-    {% set rows = [
-      ("SET",   226, 182, 6.4),
-      ("GET",   230, 188, 121),
-      ("INCR",  228, 188, 4.6),
-      ("LPUSH", 218, 187, 3.0),
-      ("SADD",  227, 182, 8.5),
-      ("HSET",  226, 179, 5.9),
-      ("ZADD",  227, 176, 6.4),
-    ] %}
-    {% for name, r, m, w in rows %}
+    {% set top = bench.top %}
+    {% for name, r, m, w in bench.rows %}
     <div class="pr-bench__row" role="row">
       <span class="pr-bench__cmd" role="rowheader">{{ name }}</span>
       <div class="pr-bench__bars" role="cell">
@@ -296,6 +290,9 @@ maxmemory_policy:allkeys-random</span></code></pre>
     </div>
     {% endfor %}
   </div>
+  {% else %}
+  <p class="pr-sub">Not measured yet: the figures come from <code>mise run bench-site</code>.</p>
+  {% endif %}
 </section>
 
 <section class="pr-section">

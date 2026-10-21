@@ -11,3 +11,9 @@ tests/pg_regress/regression.out
 
 # The in-browser demo, built by `mise run demo` (a snowglobe site, ~100 MB of blobs)
 docs/demo/
+
+# MkDocs hooks' bytecode (hooks/bench.py)
+__pycache__/
+
+# `mise run bench-site` writes its report here before copying it to docs/bench.json
+docker/bench/results/site.*

@@ -34,7 +34,7 @@ theme:
     - content.code.copy
     - content.action.edit
 
-# The throughput figures, from the report CI measured (hooks/bench.py)
+# The throughput figures, from the last benchmark report (hooks/bench.py)
 hooks:
   - hooks/bench.py
 

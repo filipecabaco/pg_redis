@@ -1,11 +1,11 @@
-"""Throughput figures for the site, from the report CI measured.
+"""Throughput figures for the site, from the report of the last benchmark run.
 
-The docs workflow downloads the newest report main's benchmark runs uploaded
-(.github/workflows/bench.yml, written by docker/bench/suite.exs) to
-docs/bench.json. This puts it in front of the pages: the home page's bars read
-`config.extra.bench`, and a `<!-- bench:... -->` marker in a page becomes a
-table. Without a report, the pages say there is none rather than showing
-figures nobody measured.
+`mise run bench-site` runs docker/bench/suite.exs on the benchmark rig, every
+server pinned to the same CPUs, and writes its report to docs/bench.json,
+which is committed. This puts it in front of the pages: the home page's bars
+read `config.extra.bench`, and a `<!-- bench:... -->` marker in a page becomes
+a table, so no figure on the site is typed in. Without a report, the pages say
+there is none rather than showing figures nobody measured.
 """
 
 import json
@@ -24,8 +24,8 @@ ORDER = ["set", "get", "incr", "lpush", "lpop", "rpush", "rpop", "sadd", "spop",
 
 NONE = (
     '!!! note "Not measured yet"\n'
-    "    These figures come from the benchmark workflow on main, which has not\n"
-    "    produced a report this build could read.\n"
+    "    These figures come from `mise run bench-site`, which writes\n"
+    "    docs/bench.json; this build found none.\n"
 )
 
 
@@ -105,7 +105,7 @@ def _commands(data):
                     lines.append(f"| {name} | " + " | ".join(cells) + " |")
     m = _meta(report)
     note = (
-        f"Measured by CI on {m['date']}: pg_redis `{m['commit']}` on PostgreSQL {m['postgres']}, "
+        f"Measured on {m['date']}: pg_redis `{m['commit']}` on PostgreSQL {m['postgres']}, "
         f"{m['host']}, the server under test {m['server_cpus']}, the load generator "
         f"{m['load_cpus']}; median of {m['reps']} run{'' if m['reps'] == 1 else 's'}. "
         f"The whole report is [bench.json](bench.json)."

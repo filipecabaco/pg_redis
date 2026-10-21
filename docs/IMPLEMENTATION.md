@@ -769,11 +769,11 @@ disk, and by PostgreSQL's ~1 GB per-field TOAST limit.
 Requests per second, higher is better. `redis-benchmark`, 50 clients, 64-byte
 values over 100,000 random keys. Each server runs alone on the same pinned CPUs,
 with the load generator on others, PostgreSQL with `redis.workers=4`. The
-figures are not typed in: every change to main that can move them runs
-`docker/bench/suite.exs` in CI (`.github/workflows/bench.yml`), and the site is
-built from its latest report. `mise run bench-suite` runs the same suite
-locally and writes the full report, value sizes, client counts, pipelining and
-a memtier mix included, to `docker/bench/results/`.
+figures are not typed in: `mise run bench-site` runs `docker/bench/suite.exs`
+and writes its report to `docs/bench.json`, which the site is built from.
+`mise run bench-suite` runs the same suite and writes the full report, value
+sizes, client counts, pipelining and a memtier mix included, to
+`docker/bench/results/`.
 
 <!-- bench:commands -->
 

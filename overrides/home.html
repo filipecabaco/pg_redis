@@ -264,7 +264,7 @@ maxmemory_policy:allkeys-random</span></code></pre>
     Requests per second, higher is better: <strong>100k/s</strong> is 100,000 commands answered
     every second. <code>redis-benchmark</code>, 50 clients, 64-byte values over 100,000 random
     keys, each client sending one command at a time.
-    {% if bench %}Measured by CI on {{ bench.date }} (<code>{{ bench.commit }}</code>),
+    {% if bench %}Measured on {{ bench.date }} (<code>{{ bench.commit }}</code>),
     median of {{ bench.reps }} runs, every server alone on the same pinned CPUs of a
     {{ bench.host }}.{% endif %}
     <code>logged</code> writes commit to PostgreSQL's write-ahead log and wait for it to reach
@@ -291,7 +291,7 @@ maxmemory_policy:allkeys-random</span></code></pre>
     {% endfor %}
   </div>
   {% else %}
-  <p class="pr-sub">Not measured yet: the figures come from the benchmark workflow on main.</p>
+  <p class="pr-sub">Not measured yet: the figures come from <code>mise run bench-site</code>.</p>
   {% endif %}
 </section>
 

@@ -53,6 +53,33 @@ pub mod sql {
 
     pub static REAP_EXPIRED: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| arr(reap_expired_keys));
 
+    /// What the key `key` (an SQL expression) holds: `string`, `list`,
+    /// `set`, `hash`, `zset` or `stream`; `expired` for a collection past its
+    /// deadline, and for a string too when `expired_strings`; NULL for none.
+    pub fn kind_case(db: usize, key: &str, expired_strings: bool) -> String {
+        let expired_string = if expired_strings {
+            format!(
+                "WHEN EXISTS (SELECT 1 FROM redis.kv_{db} t WHERE t.key = {key}) THEN 'expired' "
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "CASE \
+               WHEN EXISTS (SELECT 1 FROM redis.kv_{db} t WHERE t.key = {key} \
+                              AND (t.expires_at IS NULL OR t.expires_at > now())) THEN 'string' \
+               {expired_string}\
+               WHEN EXISTS (SELECT 1 FROM redis.expiry_{db} e WHERE e.key = {key} \
+                              AND e.expires_at <= now()) THEN 'expired' \
+               WHEN EXISTS (SELECT 1 FROM redis.list_{db} t WHERE t.key = {key}) THEN 'list' \
+               WHEN EXISTS (SELECT 1 FROM redis.set_{db}  t WHERE t.key = {key}) THEN 'set' \
+               WHEN EXISTS (SELECT 1 FROM redis.hash_{db} t WHERE t.key = {key}) THEN 'hash' \
+               WHEN EXISTS (SELECT 1 FROM redis.zset_{db} t WHERE t.key = {key}) THEN 'zset' \
+               WHEN EXISTS (SELECT 1 FROM redis.stream_{db} t WHERE t.key = {key}) THEN 'stream' \
+             END"
+        )
+    }
+
     pub static MGET: LazyLock<[String; NUM_DBS]> = LazyLock::new(|| {
         arr(|db| {
             format!(
@@ -2849,19 +2876,37 @@ impl Command {
         // GET and MGET filter expired keys out in their own statement, so a
         // key they return is live and only a miss can have met an expired
         // one: reaping then, rather than before every read, keeps the hot
-        // reads to one statement. The reply is the same either way.
-        match (self, &response) {
-            (Command::Get { key }, Response::Null) => Self::reap_keys(client, db, &[key]),
-            (Command::MGet { keys }, Response::Array(values)) => {
-                let missed: Vec<&[u8]> = keys
-                    .iter()
-                    .zip(values)
-                    .filter(|(_, v)| v.is_none())
-                    .map(|(k, _)| k.as_slice())
-                    .collect();
-                Self::reap_keys(client, db, &missed);
+        // reads to one statement. A miss asks what each missed key holds, in
+        // one statement that only reads, and reaps only the keys it found
+        // past their deadline. The reap deletes across every table, and run
+        // on every miss it cost one six times what a hit did, for the rare
+        // miss that had anything to delete.
+        let missed: Vec<&[u8]> = match (self, &response) {
+            (Command::Get { key }, Response::Null) => vec![key.as_slice()],
+            (Command::MGet { keys }, Response::Array(values)) => keys
+                .iter()
+                .zip(values)
+                .filter(|(_, v)| v.is_none())
+                .map(|(k, _)| k.as_slice())
+                .collect(),
+            _ => Vec::new(),
+        };
+        if !missed.is_empty() {
+            let kinds = Self::sql_missed_kinds(client, db, &missed);
+            let expired: Vec<&[u8]> = kinds
+                .iter()
+                .filter(|(_, kind)| kind.is_none())
+                .map(|(k, _)| k.as_slice())
+                .collect();
+            Self::reap_keys(client, db, &expired);
+            // MGET answers nil for a key of another type; GET refuses it.
+            let other_type = kinds
+                .iter()
+                .any(|(_, kind)| kind.is_some_and(|k| k != crate::memdb::KeyKind::String));
+            if matches!(self, Command::Get { .. }) && other_type {
+                return wrong_type();
             }
-            _ => {}
+            return response;
         }
         if !writes && response.found_nothing() {
             // A guarded read that found nothing may have refused an expired
@@ -3214,21 +3259,29 @@ impl Command {
         db: u8,
         keys: &[&[u8]],
     ) -> Vec<(Vec<u8>, Option<crate::memdb::KeyKind>)> {
-        use crate::memdb::KeyKind;
+        Self::key_kinds(client, db, keys, false)
+    }
+
+    /// `sql_key_kinds`, with a string past its deadline reported as `None`
+    /// too rather than left out: what a read that missed needs to know, to
+    /// reap only the keys that are there to reap.
+    fn sql_missed_kinds(
+        client: &mut SpiClient<'_>,
+        db: u8,
+        keys: &[&[u8]],
+    ) -> Vec<(Vec<u8>, Option<crate::memdb::KeyKind>)> {
+        Self::key_kinds(client, db, keys, true)
+    }
+
+    fn key_kinds(
+        client: &mut SpiClient<'_>,
+        db: u8,
+        keys: &[&[u8]],
+        expired_strings: bool,
+    ) -> Vec<(Vec<u8>, Option<crate::memdb::KeyKind>)> {
         let sql = format!(
-            "SELECT a.key, \
-                    CASE \
-                      WHEN EXISTS (SELECT 1 FROM redis.kv_{db} t WHERE t.key = a.key \
-                                     AND (t.expires_at IS NULL OR t.expires_at > now())) THEN 'string' \
-                      WHEN EXISTS (SELECT 1 FROM redis.expiry_{db} e WHERE e.key = a.key \
-                                     AND e.expires_at <= now()) THEN 'expired' \
-                      WHEN EXISTS (SELECT 1 FROM redis.list_{db} t WHERE t.key = a.key) THEN 'list' \
-                      WHEN EXISTS (SELECT 1 FROM redis.set_{db}  t WHERE t.key = a.key) THEN 'set' \
-                      WHEN EXISTS (SELECT 1 FROM redis.hash_{db} t WHERE t.key = a.key) THEN 'hash' \
-                      WHEN EXISTS (SELECT 1 FROM redis.zset_{db} t WHERE t.key = a.key) THEN 'zset' \
-                      WHEN EXISTS (SELECT 1 FROM redis.stream_{db} t WHERE t.key = a.key) THEN 'stream' \
-                    END AS kind \
-             FROM unnest($1::bytea[]) AS a(key)"
+            "SELECT a.key, {} AS kind FROM unnest($1::bytea[]) AS a(key)",
+            sql::kind_case(db as usize, "a.key", expired_strings)
         );
         let args: Vec<Option<Vec<u8>>> = keys.iter().map(|k| Some(k.to_vec())).collect();
         let Ok(tbl) = client.select_kept(&sql, &[args.into()]) else {
@@ -3240,19 +3293,28 @@ impl Command {
             else {
                 continue;
             };
-            let kind = match kind.as_str() {
-                "string" => Some(KeyKind::String),
-                "list" => Some(KeyKind::List),
-                "set" => Some(KeyKind::Set),
-                "hash" => Some(KeyKind::Hash),
-                "zset" => Some(KeyKind::Zset),
-                "stream" => Some(KeyKind::Stream),
-                "expired" => None,
-                _ => continue,
+            let Some(kind) = Self::parse_kind(&kind) else {
+                continue;
             };
             out.push((key, kind));
         }
         out
+    }
+
+    /// A `sql::kind_case` answer: `Some(None)` for `expired`, `None` for
+    /// anything it does not name.
+    fn parse_kind(kind: &str) -> Option<Option<crate::memdb::KeyKind>> {
+        use crate::memdb::KeyKind;
+        Some(match kind {
+            "string" => Some(KeyKind::String),
+            "list" => Some(KeyKind::List),
+            "set" => Some(KeyKind::Set),
+            "hash" => Some(KeyKind::Hash),
+            "zset" => Some(KeyKind::Zset),
+            "stream" => Some(KeyKind::Stream),
+            "expired" => None,
+            _ => return None,
+        })
     }
 
     /// Delete a key's data from every table but `expiry_N` — for a RENAME, which

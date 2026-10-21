@@ -270,6 +270,16 @@ rm -rf docs/demo
 SNOWGLOBE="$SNOWGLOBE" elixir docker/demo/warm.exs
 """
 
+[tasks.bench-site]
+description = "Benchmark the storage policies against Redis on pinned CPUs and write the report the site shows (docs/bench.json)"
+run = """
+set -e
+docker build -q -t pg_redis:latest . > /dev/null
+BENCH_REPS=${BENCH_REPS:-5} BENCH_OUT=docker/bench/results/site elixir docker/bench/suite.exs
+cp docker/bench/results/site.json docs/bench.json
+echo "wrote docs/bench.json: commit it with the change it measures"
+"""
+
 [tasks.bench-suite]
 description = "Benchmark the four storage policies against Redis on pinned CPUs (docker/bench/suite.exs)"
 run = "elixir docker/bench/suite.exs"

@@ -34,8 +34,8 @@ allows. See
 ## Performance
 
 `memory` runs close to Redis; `memory+snapshot` keeps pace with it. `logged` reads stay fast,
-and its writes wait for the WAL to reach disk. The figures are measured by CI on every change
-to main and shown on the site:
+and its writes wait for the WAL to reach disk. The figures come from `mise run bench-site`, on
+pinned CPUs, and are shown on the site:
 [Throughput](https://filipecabaco.github.io/pg_redis/#throughput) and the full table under
 [Performance](https://filipecabaco.github.io/pg_redis/IMPLEMENTATION/#8-performance).
 

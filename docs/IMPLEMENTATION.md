@@ -186,7 +186,7 @@ first, `logged` the second ([Storage policies](STORAGE.md)).
 | Transaction | None | `BEGIN`/`COMMIT` per batch |
 | SPI overhead | None | Yes |
 | WAL | No (`memory+snapshot`: the snapshot) | Yes |
-| Survives crash | No (`memory+snapshot`: to the last snapshot) | Yes |
+| Survives crash | No (`memory+snapshot`: to the last snapshot) | Yes (`appendfsync everysec` or `no`: all but the last ~600 ms of writes) |
 | Replication | No | Yes |
 | SQL-visible | No (`SELECT * FROM redis.kv_0` returns nothing) | Yes |
 | Max data | `redis.maxmemory` (256 MB), backed as it fills | Disk |

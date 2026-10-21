@@ -25,7 +25,7 @@ The limits that apply only to databases in memory are described once, in
 | `QUIT` |  |
 | `CLIENT` | `ID`, `INFO`, `LIST`, `KILL`, `GETNAME`/`SETNAME`, `SETINFO`, `REPLY`, `PAUSE`/`UNPAUSE`, `UNBLOCK`, `NO-EVICT`, `NO-TOUCH`, across every worker; `LIST` and `INFO` show each client's `user=`, `KILL USER` closes a user's clients; `TRACKING` (standard, `BCAST`, `OPTIN`/`OPTOUT`, `NOLOOP`, `REDIRECT`), `CACHING`, `GETREDIR`, `TRACKINGINFO` |
 | `COMMAND` | With no subcommand, Redis 7.2's command-table entry for every command on this page. `INFO`, `DOCS`, `LIST`, `GETKEYS` and `GETKEYSANDFLAGS` answer from the same table, for the same commands; `COUNT` reports the number of rows on this page |
-| `CONFIG` | `GET`/`SET` over Redis 7.2's parameter table, validated as Redis validates; most parameters describe Redis internals and change nothing here. `RESETSTAT`; `REWRITE` reports no config file |
+| `CONFIG` | `GET`/`SET` over Redis 7.2's parameter table, validated as Redis validates; most parameters describe Redis internals and change nothing here, but `maxmemory`, `maxmemory-policy` and its tuning, `appendfsync` (when a write to a logged database is acknowledged) and the client and pub/sub limits act as in Redis. `RESETSTAT`; `REWRITE` reports no config file |
 | `INFO` | Every section; `commandstats`, `errorstats` and `latencystats` are counted across workers |
 | `TIME` | Seconds and microseconds, from one clock reading |
 

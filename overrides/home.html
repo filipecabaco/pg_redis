@@ -206,7 +206,7 @@
     </article>
     <article class="pr-policy pr-policy--accent">
       <header><code>logged</code><span class="pr-tag">default 8–15</span></header>
-      <p>WAL-logged tables. Every write is a row, streamed to your replicas and included in your backups.</p>
+      <p>WAL-logged tables. Every write is a row, streamed to your replicas and included in your backups. Acknowledged once on disk, or with <code>appendfsync everysec</code> before, as in Redis.</p>
       <dl><div><dt>Survives a crash</dt><dd class="yes">yes</dd></div><div><dt>Replicated</dt><dd class="yes">yes</dd></div><div><dt>Visible to SQL</dt><dd class="yes">yes</dd></div></dl>
     </article>
   </div>
@@ -267,8 +267,9 @@ maxmemory_policy:allkeys-random</span></code></pre>
     {% if bench %}Measured on {{ bench.date }} (<code>{{ bench.commit }}</code>),
     median of {{ bench.reps }} runs, every server alone on the same pinned CPUs of a
     {{ bench.host }}.{% endif %}
-    <code>logged</code> writes commit to PostgreSQL's write-ahead log and wait for it to reach
-    disk, so the disk sets their rate; reads stay fast.
+    <code>logged</code> writes commit to PostgreSQL's write-ahead log and, by default, wait for it
+    to reach disk, so the disk sets their rate; <code>appendfsync everysec</code> stops waiting, as in
+    Redis, for several times the write rate. Reads stay fast.
     <a href="{{ 'IMPLEMENTATION/#8-performance' | url }}">Full table and tuning</a>
   </p>
   {% if bench %}

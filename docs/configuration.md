@@ -16,6 +16,7 @@
 | `redis.maxmemory` | `256MB` | postmaster | The memory engine's equivalent of Redis's `maxmemory`. Past it, a write that could grow memory is refused with `OOM` unless `redis.maxmemory_policy` evicts enough first. Reserved at startup (plus a quarter, at least 32 MB, of headroom) but backed by RAM only as data fills it. `CONFIG SET maxmemory` changes the limit at runtime, never past this. |
 | `redis.pubsub_memory` | `128MB` | postmaster | The shared heap for pub/sub subscriptions and undelivered messages, the client tracking table, and the ACL users and log. Nothing in it has a size limit of its own, as in Redis; a command that needs more than is left gets `OOM`. Reserved at startup but backed by RAM only as it fills. A slow subscriber is disconnected by `client-output-buffer-limit pubsub` long before that, as in Redis. |
 | `redis.maxmemory_policy` | `noeviction` | superuser | What memory mode does past `redis.maxmemory`, with Redis's eight values: `noeviction` (refuse the write, as in Redis), `allkeys-lru`, `allkeys-lfu`, `allkeys-random`, `volatile-lru`, `volatile-lfu`, `volatile-random` or `volatile-ttl`. Any other value is refused. `CONFIG SET maxmemory-policy` changes it at runtime, and `CONFIG SET maxmemory-samples`, `lfu-log-factor`, `lfu-decay-time` and `maxmemory-eviction-tenacity` tune it as in Redis. See [the limit and eviction](./IMPLEMENTATION.md#the-limit-and-eviction). |
+| `redis.appendfsync` | `always` | superuser | Redis's `appendfsync`, for the `logged` databases: when a write is acknowledged. `always`: once its WAL is on disk, so an acknowledged write survives a crash. `everysec` or `no`: before, as with `synchronous_commit = off`, for several times the write throughput; PostgreSQL flushes the WAL within three times `wal_writer_delay` (600 ms by default), so a crash can lose the writes acknowledged in that window, and never leaves one half done. Redis's default is `everysec`; this one is `always`, so a logged database keeps its guarantee unless you choose otherwise. `CONFIG SET appendfsync` changes it at runtime. See [the cost of logged databases](./operations.md#the-cost-of-logged-databases). |
 | `redis.snapshot_interval` | `60` | sighup | Seconds between snapshots of a `memory+snapshot` database (1–86400). See [Storage policies](./STORAGE.md). |
 
 ## When a change takes effect
@@ -31,9 +32,10 @@ Every other setting takes effect on a reload. Each worker reads the configuratio
 `pg_reload_conf()` (or `SIGHUP`), as a backend does. A new `redis.password` becomes the
 `default` user's password, as `CONFIG SET requirepass` does in Redis: it applies to the next
 `AUTH` and to new connections, and connections that already authenticated stay authenticated. A new `redis.default_db` and `redis.max_connections` apply to new
-connections. A new `redis.batch_size`, `redis.snapshot_interval` or `redis.maxmemory_policy`
-applies from the worker's next round. A value set with `CONFIG SET maxmemory-policy` keeps
-precedence over the setting until the server restarts.
+connections. A new `redis.batch_size`, `redis.snapshot_interval`, `redis.maxmemory_policy` or
+`redis.appendfsync` applies from the worker's next round. A value set with `CONFIG SET
+maxmemory-policy` or `CONFIG SET appendfsync` keeps precedence over the setting until the server
+restarts.
 
 A setting given on the `postgres` command line (`-c redis.password=…`) outranks
 `postgresql.auto.conf`, so `ALTER SYSTEM` cannot change it; that is PostgreSQL's order of

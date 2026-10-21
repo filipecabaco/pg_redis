@@ -337,6 +337,8 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
     std::thread::spawn(move || accept_loop(port, cmd_tx, listen_addr));
 
     let mut last_expiry_scan = Instant::now();
+    // What this worker last applied of `appendfsync`: nothing yet.
+    let mut applied_fsync: Option<bool> = None;
     // When the event loop's next cron tick is due: on a fixed schedule, as
     // Redis's timer fires, however long each round's own work took.
     let mut next_cron = Instant::now() + crate::eventloop::CRON;
@@ -456,6 +458,14 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
 
         // What this worker's commits wrote, for autovacuum to go by.
         crate::pg::report_table_stats();
+
+        // `appendfsync`, from `redis.appendfsync` or a CONFIG SET: whether the
+        // next round's commits wait for their WAL to reach disk.
+        let fsync_always = crate::config::get_str("appendfsync") == "always";
+        if applied_fsync != Some(fsync_always) {
+            crate::pg::set_synchronous_commit(fsync_always);
+            applied_fsync = Some(fsync_always);
+        }
 
         // Redis keeps the tracking table to `tracking-table-max-keys` from
         // its cron as well as before each command, invalidating keys at

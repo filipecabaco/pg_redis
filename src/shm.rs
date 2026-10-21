@@ -330,6 +330,29 @@ unsafe impl Allocator for Shm {
     }
 }
 
+/// `appendfsync`, and the `redis.appendfsync` GUC: whether a write to a logged
+/// database is acknowledged after its WAL reaches disk (`always`) or before
+/// (`everysec`, `no`). Here for the same reason as `Policy` below.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, pgrx::PostgresGucEnum)]
+pub enum Fsync {
+    #[name = c"always"]
+    Always,
+    #[name = c"everysec"]
+    Everysec,
+    #[name = c"no"]
+    No,
+}
+
+impl Fsync {
+    pub fn name(self) -> &'static str {
+        match self {
+            Fsync::Always => "always",
+            Fsync::Everysec => "everysec",
+            Fsync::No => "no",
+        }
+    }
+}
+
 /// `maxmemory-policy`, and the `redis.maxmemory_policy` GUC. Here rather
 /// than in `access.rs` because the GUC derive implements an `unsafe` trait,
 /// and this module is the one in the engine allowed `unsafe`.

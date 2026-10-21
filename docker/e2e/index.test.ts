@@ -141,6 +141,41 @@ describe("Table statistics", () => {
 	});
 });
 
+// `appendfsync` decides whether a logged write's reply waits for its WAL to
+// reach disk. The default keeps the guarantee; the others trade the last
+// fraction of a second for throughput, and every write still lands.
+describe("appendfsync", () => {
+	afterAll(async () => {
+		await raw.send("CONFIG", "SET", "appendfsync", "always");
+	});
+
+	test("defaults to always, takes Redis's values and refuses others", async () => {
+		expect((await raw.send("CONFIG", "GET", "appendfsync")).toString()).toBe(
+			"*2\r\n$11\r\nappendfsync\r\n$6\r\nalways\r\n",
+		);
+		for (const mode of ["everysec", "no", "always"]) {
+			expect((await raw.send("CONFIG", "SET", "appendfsync", mode)).toString()).toBe("+OK\r\n");
+		}
+		expect((await raw.send("CONFIG", "SET", "appendfsync", "sometimes")).toString()).toStartWith("-ERR");
+	});
+
+	test("logged writes land in their table whatever it is set to", async () => {
+		const conn = await new RawRedis().connect();
+		await conn.send("SELECT", "15");
+		for (const mode of ["everysec", "no", "always"]) {
+			await raw.send("CONFIG", "SET", "appendfsync", mode);
+			// The workers apply it from their next round.
+			await Bun.sleep(300);
+			for (let i = 0; i < 20; i++) await conn.send("SET", `fsync:${mode}:${i}`, "v");
+			const [{ n }] =
+				await sql`SELECT count(*)::int AS n FROM redis.strings WHERE db = 15 AND key LIKE ${`fsync:${mode}:%`}`;
+			expect(n).toBe(20);
+		}
+		await conn.send("FLUSHDB");
+		conn.close();
+	});
+});
+
 // Two logged databases swap their tables, and a logged FLUSHDB truncates
 // them: no key is moved or deleted row by row.
 describe("SWAPDB and FLUSHDB on logged databases", () => {

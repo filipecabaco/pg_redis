@@ -32,6 +32,7 @@ pub struct LiveGucs {
     pub requirepass: Option<String>,
     pub maxclients: i32,
     pub maxmemory_policy: Option<String>,
+    pub appendfsync: Option<String>,
     pub default_db: u8,
     pub aclfile: Option<String>,
 }
@@ -61,6 +62,7 @@ pub fn snapshot_gucs() {
         requirepass: s(&crate::PASSWORD),
         maxclients: crate::MAX_CONNECTIONS.get(),
         maxmemory_policy: Some(crate::MAXMEMORY_POLICY.get().name().to_string()),
+        appendfsync: Some(crate::APPENDFSYNC.get().name().to_string()),
         default_db: crate::DEFAULT_DB.get().clamp(0, 15) as u8,
         aclfile: s(&crate::ACLFILE),
     };
@@ -97,6 +99,7 @@ fn live(name: &str) -> Option<String> {
         "aclfile" => g.aclfile,
         "maxclients" => Some(g.maxclients.to_string()),
         "maxmemory-policy" => g.maxmemory_policy,
+        "appendfsync" => g.appendfsync,
         "maxmemory" => crate::shm::usage().map(|u| u.limit.to_string()),
         _ => None,
     }

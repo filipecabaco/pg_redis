@@ -119,8 +119,14 @@ A `logged` database stores its data in WAL-logged tables, and every command runs
 - Each worker runs an expiry sweep about once a second, deleting expired keys from every
   `logged` database in one statement per database.
 - Each worker groups the commands its clients send into one transaction, up to
-  `redis.batch_size` commands (64 by default). A client gets its reply after that transaction
-  commits, so with `synchronous_commit = on` an acknowledged write is on disk.
+  `redis.batch_size` commands (64 by default). With `redis.appendfsync = always`, the default, a
+  client gets its reply after that transaction's WAL is on disk, so an acknowledged write
+  survives a crash, and the disk sets the write rate. With `everysec` or `no` the reply does not
+  wait for the disk (`synchronous_commit = off`): on the benchmark rig a single client's logged
+  `SET`s went from 623 to 7,614 a second, and fifty clients' from 13,268 to 87,977. PostgreSQL
+  writes the WAL out within three times `wal_writer_delay` (600 ms by default), so a crash can
+  lose the writes acknowledged in that window, as Redis's `appendfsync everysec` can lose a
+  second. It never leaves a write half done, and replicas and backups stay consistent.
 
 Commands on `memory` and `memory+snapshot` databases are served from shared memory and write no
 table rows. The snapshot of a `memory+snapshot` database is the exception.

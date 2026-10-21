@@ -461,6 +461,9 @@ pub fn needs_exclusive(cmd: &Command, db: u8) -> bool {
         Command::Copy { .. } | Command::Restore { .. } => true,
         // Sixteen databases, one after another.
         Command::FlushAll { .. } => true,
+        // A TRUNCATE of the database's tables (`sql::truncate_dbs`), which no
+        // other worker may hold a lock on.
+        Command::FlushDb { .. } => crate::storage::slot(db).is_none(),
         _ => false,
     }
 }

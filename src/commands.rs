@@ -207,6 +207,70 @@ pub mod sql {
         format!("{}, ", ctes.join(", "))
     }
 
+    /// Every table a database has, in the order a statement that locks
+    /// several of them takes them: `expiry_N` first, as the sweep does.
+    pub const DB_TABLES: [&str; 8] = [
+        "expiry", "kv", "hash", "list", "set", "zset", "stream", "encoding",
+    ];
+
+    /// Every table of `dbs`, in ascending database order and `DB_TABLES`
+    /// order within each.
+    fn tables_of(dbs: &[usize]) -> String {
+        let mut dbs = dbs.to_vec();
+        dbs.sort_unstable();
+        dbs.iter()
+            .flat_map(|db| DB_TABLES.iter().map(move |t| format!("redis.{t}_{db}")))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Empty every table of the named databases at once, leaving no dead
+    /// rows for vacuum. `TRUNCATE` takes each table's ACCESS EXCLUSIVE lock,
+    /// so whoever runs it must hold the databases exclusive (`dblock`): then
+    /// no worker holds a lock on their tables, and those it takes come in
+    /// `tables_of`'s order.
+    pub fn truncate_dbs(dbs: &[usize]) -> String {
+        format!("TRUNCATE {}", tables_of(dbs))
+    }
+
+    /// `SWAPDB` of two databases in tables: their tables trade names, and
+    /// each index takes its table's, in one transaction that moves no row.
+    /// The views are bound to tables, not names, so they are made again.
+    pub fn swap_tables(a: usize, b: usize) -> String {
+        let tables = DB_TABLES.map(|t| format!("'{t}'")).join(", ");
+        format!(
+            "LOCK TABLE {locked} IN ACCESS EXCLUSIVE MODE; \
+             DO $swap$ \
+             DECLARE t text; r record; \
+             BEGIN \
+               FOREACH t IN ARRAY ARRAY[{tables}] LOOP \
+                 EXECUTE format('ALTER TABLE redis.%I RENAME TO %I', t || '_{a}', t || '_swapping'); \
+                 EXECUTE format('ALTER TABLE redis.%I RENAME TO %I', t || '_{b}', t || '_{a}'); \
+                 EXECUTE format('ALTER TABLE redis.%I RENAME TO %I', t || '_swapping', t || '_{b}'); \
+               END LOOP; \
+               FOR r IN SELECT i.oid, i.relname AS idx, \
+                               substring(i.relname FROM '^[a-z]+_[0-9]+(_.+)$') AS rest \
+                          FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid \
+                          JOIN pg_class c ON c.oid = x.indrelid \
+                          JOIN pg_namespace n ON n.oid = c.relnamespace \
+                         WHERE n.nspname = 'redis' AND c.relname ~ '^[a-z]+_({a}|{b})$' LOOP \
+                 EXECUTE format('ALTER INDEX redis.%I RENAME TO %I', r.idx, 'swapping_' || r.oid || r.rest); \
+               END LOOP; \
+               FOR r IN SELECT i.relname AS idx, c.relname AS tbl, \
+                               substring(i.relname FROM '^swapping_[0-9]+(_.+)$') AS rest \
+                          FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid \
+                          JOIN pg_class c ON c.oid = x.indrelid \
+                          JOIN pg_namespace n ON n.oid = c.relnamespace \
+                         WHERE n.nspname = 'redis' AND i.relname LIKE 'swapping\\_%' LOOP \
+                 EXECUTE format('ALTER INDEX redis.%I RENAME TO %I', r.idx, r.tbl || r.rest); \
+               END LOOP; \
+             END $swap$; \
+             {views}",
+            locked = tables_of(&[a, b]),
+            views = include_str!("../sql/views.sql"),
+        )
+    }
+
     /// Empty every table of the named databases, in one statement.
     ///
     /// `DELETE`, not `TRUNCATE`. `TRUNCATE` takes each table's ACCESS
@@ -3717,6 +3781,29 @@ impl Command {
             | Command::ObjectOther(_) => {
                 Response::Error("ERR internal error: command not routed to store".to_string())
             }
+            // Two databases in tables swap their tables rather than their
+            // keys: Redis's SWAPDB moves no key either.
+            Command::Composite(op @ crate::composite::Op::SwapDb { a, b })
+                if *a != *b
+                    && [*a, *b].iter().all(|&d| {
+                        crate::storage::slot(d).is_none() && !crate::storage::migrating(d)
+                    }) =>
+            {
+                match client.update(&sql::swap_tables(*a as usize, *b as usize), None, &[]) {
+                    Ok(_) => {
+                        // A WATCH on a key either database held is broken, as by
+                        // a flush; one on a missing key only if the swap brought
+                        // it in (`watch_broken`).
+                        for d in [*a, *b] {
+                            crate::server::bump_flush_epoch(d);
+                            crate::server::bump_swap_epoch(d);
+                        }
+                        crate::dirty::force(crate::dirty::of_op(op, &Response::Ok));
+                        Response::Ok
+                    }
+                    Err(e) => spi_failed("SWAPDB", e),
+                }
+            }
             // Each sub-command goes to the backend that serves its database.
             Command::Composite(op) => {
                 op.run(db, &mut |d, cmd: Command| Self::route(client, d, cmd))
@@ -3920,9 +4007,26 @@ impl Command {
                     })
                     .sum();
                 crate::storage::flush_memory();
-                let all: Vec<usize> = (0..NUM_DBS).collect();
-                match client.update_kept(&sql::flush_dbs(&all), &[]) {
-                    Ok(_) => {
+                // The databases in tables are truncated, which leaves no dead
+                // rows; the tables of one in memory are empty, and a DELETE
+                // of nothing costs less than a TRUNCATE's new files.
+                let (tables, memory): (Vec<usize>, Vec<usize>) = (0..NUM_DBS).partition(|&d| {
+                    crate::storage::slot(d as u8).is_none() || crate::storage::migrating(d as u8)
+                });
+                let truncated = if tables.is_empty() {
+                    Ok(())
+                } else {
+                    client
+                        .update_kept(&sql::truncate_dbs(&tables), &[])
+                        .map(|_| ())
+                };
+                let flushed = truncated.and_then(|()| {
+                    client
+                        .update_kept(&sql::flush_dbs(&memory), &[])
+                        .map(|_| ())
+                });
+                match flushed {
+                    Ok(()) => {
                         crate::dirty::add(removed as u64);
                         if !crate::config::get_str("save").trim().is_empty() {
                             crate::server::mark_saved();

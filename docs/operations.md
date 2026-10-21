@@ -83,8 +83,12 @@ A `logged` database stores its data in WAL-logged tables, and every command runs
 
 - Every write is a row insert, update or delete, with the WAL record that goes with it. It is
   replicated and archived like any other table change.
-- `FLUSHDB` and `FLUSHALL` run `DELETE` on the database's tables. The rows become dead tuples
-  that autovacuum has to clean up, and the tables keep their size until it does.
+- `FLUSHDB` and `FLUSHALL` truncate the database's tables: they are empty at once, with no dead
+  rows left for vacuum. `TRUNCATE` waits for any SQL session reading those tables to finish,
+  and fires a table's `TRUNCATE` triggers rather than its row `DELETE` triggers.
+- `SWAPDB` of two logged databases swaps their tables, renaming them in one transaction, so it
+  moves no row whatever the databases hold. A trigger, a view of your own or a foreign key on
+  one of those tables follows the table, and so the data, to its new database number.
 - `LINSERT` moves every element after the insertion point, updating each of those rows twice.
   An `LREM` that removes anything renumbers the whole list, updating every row in it twice.
   Long lists that see these commands produce a lot of WAL and dead tuples.

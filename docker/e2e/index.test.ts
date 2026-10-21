@@ -141,6 +141,137 @@ describe("Table statistics", () => {
 	});
 });
 
+// Two logged databases swap their tables, and a logged FLUSHDB truncates
+// them: no key is moved or deleted row by row.
+describe("SWAPDB and FLUSHDB on logged databases", () => {
+	const A = 13;
+	const B = 14;
+	let conn: RawRedis;
+
+	beforeAll(async () => {
+		conn = await new RawRedis().connect();
+		for (const db of [A, B]) {
+			await conn.send("SELECT", String(db));
+			await conn.send("FLUSHDB");
+		}
+	});
+
+	afterAll(async () => {
+		for (const db of [A, B]) {
+			await conn.send("SELECT", String(db));
+			await conn.send("FLUSHDB");
+		}
+		conn.close();
+	});
+
+	test("SWAPDB moves every type, TTLs included, and the views follow", async () => {
+		await conn.send("SELECT", String(A));
+		await conn.send("SET", "swap:s", "in-a", "EX", "1000");
+		await conn.send("RPUSH", "swap:l", "1", "2");
+		await conn.send("HSET", "swap:h", "f", "v");
+		await conn.send("SELECT", String(B));
+		await conn.send("SADD", "swap:set", "m");
+
+		expect((await conn.send("SWAPDB", String(A), String(B))).toString()).toBe("+OK\r\n");
+
+		// The connection is still on B, which now holds what A did.
+		expect((await conn.bulk("GET", "swap:s"))?.toString()).toBe("in-a");
+		expect(integerReply(await conn.send("TTL", "swap:s"))).toBeGreaterThan(900);
+		expect(integerReply(await conn.send("LLEN", "swap:l"))).toBe(2);
+		expect((await conn.bulk("HGET", "swap:h", "f"))?.toString()).toBe("v");
+		expect(integerReply(await conn.send("EXISTS", "swap:set"))).toBe(0);
+		await conn.send("SELECT", String(A));
+		expect(integerReply(await conn.send("SISMEMBER", "swap:set", "m"))).toBe(1);
+		expect(integerReply(await conn.send("DBSIZE"))).toBe(1);
+
+		const rows = await sql`SELECT db, key FROM redis.keys WHERE db IN (${A}, ${B}) ORDER BY db, key`;
+		expect(rows.map((r: { db: number; key: string }) => `${r.db}:${r.key}`)).toEqual([
+			`${A}:swap:set`,
+			`${B}:swap:h`,
+			`${B}:swap:l`,
+			`${B}:swap:s`,
+		]);
+		// Every index is named after the table it is on.
+		const misnamed = await sql`
+			SELECT indexname FROM pg_indexes
+			WHERE schemaname = 'redis' AND tablename ~ ${`_(${A}|${B})$`}
+			  AND indexname NOT LIKE tablename || '\\_%'`;
+		expect(misnamed.length).toBe(0);
+	});
+
+	test("SWAPDB breaks a WATCH on a key either database held, and no other", async () => {
+		const watcher = await new RawRedis().connect();
+		const run = async (key: string) => {
+			await watcher.send("SELECT", String(A));
+			await watcher.send("WATCH", key);
+			await conn.send("SWAPDB", String(A), String(B));
+			await watcher.send("MULTI");
+			await watcher.send("PING");
+			return (await watcher.send("EXEC")).toString();
+		};
+		await conn.send("SELECT", String(A));
+		await conn.send("FLUSHDB");
+		await conn.send("SELECT", String(B));
+		await conn.send("FLUSHDB");
+
+		await conn.send("SELECT", String(A));
+		await conn.send("SET", "w:here", "1");
+		expect(await run("w:here")).toBe("*-1\r\n"); // held by A, now in B
+
+		await conn.send("SELECT", String(A));
+		await conn.send("SET", "w:there", "1"); // A holds it; the swap moves it to B
+		await conn.send("SWAPDB", String(A), String(B));
+		// Now B holds w:there and A does not: watching it on A, missing, the
+		// swap brings it in.
+		expect(await run("w:there")).toBe("*-1\r\n");
+
+		expect(await run("w:nowhere")).toBe("*1\r\n+PONG\r\n");
+		watcher.close();
+	});
+
+	test("FLUSHDB empties its database's tables and leaves the other's", async () => {
+		await conn.send("SELECT", String(A));
+		await conn.send("FLUSHDB");
+		await conn.send("SELECT", String(B));
+		await conn.send("FLUSHDB");
+		await conn.send("SET", "keep", "1");
+		await conn.send("SELECT", String(A));
+		for (let i = 0; i < 50; i++) await conn.send("HSET", `f:${i}`, "a", "b");
+		await conn.send("FLUSHDB");
+		expect(integerReply(await conn.send("DBSIZE"))).toBe(0);
+		const [{ n }] = await sql`SELECT count(*)::int AS n FROM redis.hashes WHERE db = ${A}`;
+		expect(n).toBe(0);
+		await conn.send("SELECT", String(B));
+		expect((await conn.bulk("GET", "keep"))?.toString()).toBe("1");
+	});
+
+	test("writers on both databases keep going through FLUSHDB and SWAPDB", async () => {
+		const writers = Array.from({ length: 8 }, (_, i) => new Bun.RedisClient(`${redisUrl}/${i % 2 ? A : B}`));
+		let stop = false;
+		const failures: string[] = [];
+		const write = async (c: Bun.RedisClient, i: number) => {
+			for (let n = 0; !stop; n++) {
+				try {
+					await c.set(`load:${i}:${n % 20}`, "v");
+					await c.send("HSET", [`load:h:${i}`, `f${n % 20}`, "v"]);
+				} catch (e) {
+					failures.push(String(e));
+				}
+			}
+		};
+		const load = writers.map(write);
+		for (let round = 0; round < 20; round++) {
+			await conn.send("SELECT", String(round % 2 ? A : B));
+			const r = (await conn.send(round % 3 ? "SWAPDB" : "FLUSHDB", ...(round % 3 ? [String(A), String(B)] : []))).toString();
+			expect(r).toBe("+OK\r\n");
+		}
+		stop = true;
+		await Promise.all(load);
+		for (const c of writers) c.close();
+		expect(failures).toEqual([]);
+	});
+});
+
 describe("Connection", () => {
 	test("PING", async () => {
 		expect(await client.ping()).toBe("PONG");

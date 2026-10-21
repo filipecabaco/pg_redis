@@ -103,7 +103,8 @@ in shared memory (`src/dblock.rs`). Only the dispatchers take them.
     `ZINTERCARD`, `MOVE`, `SORT`, `SORT_RO`, `SWAPDB`, `PFADD`, `PFCOUNT`,
     `PFMERGE`, `PFDEBUG`, `GEODIST`, `GEOHASH`, `GEOPOS`, `GEORADIUS`,
     `GEORADIUSBYMEMBER`, `GEOSEARCH`, `GEOSEARCHSTORE` and the `_RO` forms;
-  - `COPY`, `RESTORE` and `FLUSHALL`;
+  - `COPY`, `RESTORE` and `FLUSHALL`, and `FLUSHDB` on a database in tables,
+    which truncates them;
   - each try of `BLPOP`, `BRPOP`, `BLMOVE`, `BRPOPLPUSH`, `BLMPOP`, `BZPOPMIN`,
     `BZPOPMAX` and `BZMPOP`, which checks the key's type and then pops;
   - a stream write on a table-backed database, which reads the stream and

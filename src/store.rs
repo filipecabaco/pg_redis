@@ -1775,7 +1775,10 @@ impl Store for SqlStore<'_, '_> {
 
     fn flushdb(&mut self) -> Out<()> {
         self.client
-            .update_kept(&crate::commands::sql::flush_dbs(&[self.db as usize]), &[])
+            .update_kept(
+                &crate::commands::sql::truncate_dbs(&[self.db as usize]),
+                &[],
+            )
             .map_err(|e| failed("FLUSHDB", e))?;
         Ok(())
     }

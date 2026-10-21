@@ -130,7 +130,18 @@ fn run_batch_msg(cmds: Vec<(Command, u8)>, origin: u64, kind: BatchKind) -> Opti
                 crate::dblock::plan_exec(&cmds).union(crate::dblock::Plan::exclusive(watched_dbs));
             crate::evict::before_run(|| {
                 let _held = crate::dblock::hold(plan);
-                if watch_broken(&watched) {
+                let broken = match watch_check(&watched) {
+                    WatchCheck::Clean => false,
+                    WatchCheck::Broken => true,
+                    // Keys a SWAPDB may have brought in: looked at here, on the
+                    // dispatcher, holding the databases.
+                    WatchCheck::Lookup(missing) => {
+                        run_dispatch_batch(&missing, &vec![0; missing.len()], false)
+                            .iter()
+                            .any(|r| matches!(r, Response::Integer(n) if *n > 0))
+                    }
+                };
+                if broken {
                     return None;
                 }
                 let responses = run_dispatch_batch(&cmds, &origins, false);
@@ -141,16 +152,52 @@ fn run_batch_msg(cmds: Vec<(Command, u8)>, origin: u64, kind: BatchKind) -> Opti
     }
 }
 
-/// Whether any watched key was written, flushed or expired since its WATCH.
+/// What the counters say of a transaction's WATCHes.
+enum WatchCheck {
+    Clean,
+    /// A key was written, flushed, expired or swapped away since its WATCH.
+    Broken,
+    /// Only these `EXISTS` can tell: keys missing when watched, in a database
+    /// a SWAPDB has swapped since.
+    Lookup(Vec<(Command, u8)>),
+}
+
+/// Whether a watched key has been touched, from the counters alone: what a
+/// connection thread, which cannot run a command itself, can check before it
+/// hands an EXEC over. The dispatcher checks again, with the lookups.
 fn watch_broken(watched: &[((u8, Vec<u8>), Watched)]) -> bool {
+    matches!(watch_check(watched), WatchCheck::Broken)
+}
+
+fn watch_check(watched: &[((u8, Vec<u8>), Watched)]) -> WatchCheck {
     // Without shared memory WATCH refused, so nothing is watched.
     let Some(ctl) = crate::watch_state() else {
-        return false;
+        return WatchCheck::Clean;
     };
-    watched.iter().any(|((db, key), w)| {
+    // `touchAllWatchedKeysInDb`: a SWAPDB touches a watched key that was in
+    // either database. One that was there when watched was in this one; one
+    // that was not is touched only if the swap brought it in, which only a
+    // look at the key now can tell. A swap of tables names no keys, so this
+    // costs a lookup per such key, after a swap only.
+    let mut missing = Vec::new();
+    for ((db, key), w) in watched {
         let now = crate::watch::version(ctl, *db, key);
-        w.broken(now, crate::server::flush_epoch(*db))
-    })
+        if w.broken(now, crate::server::flush_epoch(*db)) {
+            return WatchCheck::Broken;
+        }
+        if crate::server::swap_epoch(*db) != w.swap_epoch {
+            if w.existed {
+                return WatchCheck::Broken;
+            }
+            let keys = vec![key.clone()];
+            missing.push((Command::Exists { keys }, *db));
+        }
+    }
+    if missing.is_empty() {
+        WatchCheck::Clean
+    } else {
+        WatchCheck::Lookup(missing)
+    }
 }
 
 thread_local! {
@@ -1840,12 +1887,13 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<DispatchMsg>, default_d
                 Some(ctl) => {
                     // The counters first, then what the keys hold: a write in
                     // between moves a counter, which breaks the WATCH anyway.
-                    let marks: Vec<(u64, u64)> = keys
+                    let marks: Vec<(u64, u64, u64)> = keys
                         .iter()
                         .map(|k| {
                             (
                                 crate::watch::version(ctl, db, k),
                                 crate::server::flush_epoch(db),
+                                crate::server::swap_epoch(db),
                             )
                         })
                         .collect();
@@ -1867,7 +1915,7 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<DispatchMsg>, default_d
                     };
                     let now = crate::server::now_ms();
                     for (i, key) in keys.iter().enumerate() {
-                        let (version, flush_epoch) = marks[i];
+                        let (version, flush_epoch, swap_epoch) = marks[i];
                         let (existed, deadline_ms) = match ttls.get(i) {
                             Some(Response::Integer(-2)) => (false, None),
                             Some(Response::Integer(ms)) if *ms >= 0 => (true, Some(now + ms)),
@@ -1878,6 +1926,7 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<DispatchMsg>, default_d
                             Watched {
                                 version,
                                 flush_epoch,
+                                swap_epoch,
                                 existed,
                                 deadline_ms,
                             },
@@ -3417,6 +3466,7 @@ impl ConnWriter {
 struct Watched {
     version: u64,
     flush_epoch: u64,
+    swap_epoch: u64,
     existed: bool,
     deadline_ms: Option<i64>,
 }

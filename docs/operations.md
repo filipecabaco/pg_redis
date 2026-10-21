@@ -60,22 +60,46 @@ as of its last snapshot; run `SAVE` first to take one.
 
 ## Memory
 
-`redis.maxmemory` (256 MB by default) is reserved in PostgreSQL's main shared memory segment at
-server start, plus headroom of a quarter of it or 32 MB, whichever is larger. The reservation
-counts toward `shared_memory_size`. With the defaults that is about 320 MB on top of
-`shared_buffers` and PostgreSQL's own structures. Check the total after changing it:
+There is no single setting for all the memory pg_redis uses. Two settings bound its own shared
+memory, and the logged databases use PostgreSQL's:
+
+| What | Bounded by | Default |
+|------|------------|---------|
+| Keys in `memory` and `memory+snapshot` databases | `redis.maxmemory`, plus headroom of a quarter of it or 32 MB, whichever is larger | 256 MB + 64 MB |
+| Pub/sub subscriptions and undelivered messages, the client tracking table, ACL users and log | `redis.pubsub_memory` | 128 MB |
+| Keys in `logged` databases | Nothing of pg_redis's: they are table rows, cached in `shared_buffers` like any table's and on disk past it | |
+
+Both pg_redis regions are reserved in PostgreSQL's main shared memory segment when the server
+starts, and both count toward `shared_memory_size`: with the defaults, about 448 MB on top of
+`shared_buffers` and PostgreSQL's own structures. A few small fixed tables (the `WATCH`
+counters, the `SCAN` cursors of logged databases, their keys' access times) add a little more.
+Check the total after changing anything:
 
 ```sql
 SHOW shared_memory_size;
 ```
 
-Without huge pages, the operating system backs a page of the region only once it is written,
-so resident memory grows with the data. With `huge_pages` in use, the whole segment, the
-pg_redis region included, is reserved from the huge page pool when the server starts. Size
-`vm.nr_hugepages` from `SHOW shared_memory_size_in_huge_pages`.
+Without huge pages, the operating system backs a page of either region only once it is written,
+so resident memory grows with the data, not with the reservation. With `huge_pages` in use, the
+whole segment, both pg_redis regions included, is reserved from the huge page pool when the
+server starts. Size `vm.nr_hugepages` from `SHOW shared_memory_size_in_huge_pages`.
 
-`redis.maxmemory` needs a restart to change. `CONFIG SET maxmemory` can lower the limit at
-runtime, and raise it again up to `redis.maxmemory`.
+Past `redis.maxmemory`, a write that could grow memory is refused with `OOM`, or keys are
+evicted first if `redis.maxmemory_policy` allows it. Past `redis.pubsub_memory`, the command
+that needs more gets `OOM`; a slow subscriber is disconnected by `client-output-buffer-limit
+pubsub` long before that. Each worker also has the memory of an ordinary backend, `work_mem`
+included, and a thread per connection; `redis.workers` and `redis.max_connections` bound those.
+
+To give pg_redis 1 GB of keys in memory and 256 MB for pub/sub:
+
+```sql
+ALTER SYSTEM SET redis.maxmemory = '1GB';
+ALTER SYSTEM SET redis.pubsub_memory = '256MB';
+-- restart, then: SHOW shared_memory_size;  -- about 1.5 GB on top of shared_buffers
+```
+
+`redis.maxmemory` and `redis.pubsub_memory` need a restart to change. `CONFIG SET maxmemory` can
+lower the limit at runtime, and raise it again up to `redis.maxmemory`.
 
 ## The cost of logged databases
 

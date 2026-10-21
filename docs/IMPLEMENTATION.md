@@ -767,26 +767,15 @@ disk, and by PostgreSQL's ~1 GB per-field TOAST limit.
 ## 8. Performance
 
 Requests per second, higher is better. `redis-benchmark`, 50 clients, 64-byte
-values over 100,000 random keys, median of 5 runs. Each server runs alone on the
-same 4 pinned CPUs with the load generator on 6 others, Docker on an Apple M5 Pro,
-PostgreSQL 17 with `redis.workers=4`. `mise run bench-suite` reproduces it and
-writes the full report, value sizes, client counts, pipelining and a memtier mix
-included, to `docker/bench/results/`.
+values over 100,000 random keys. Each server runs alone on the same pinned CPUs,
+with the load generator on others, PostgreSQL with `redis.workers=4`. The
+figures are not typed in: every change to main that can move them runs
+`docker/bench/suite.exs` in CI (`.github/workflows/bench.yml`), and the site is
+built from its latest report. `mise run bench-suite` runs the same suite
+locally and writes the full report, value sizes, client counts, pipelining and
+a memtier mix included, to `docker/bench/results/`.
 
-| Command | Redis 7.2 | Redis 7.2, AOF everysec | memory | memory+snapshot | logged |
-|---------|----------:|------------------------:|-------:|----------------:|-------:|
-| SET     | 225,734 | 219,539 | 182,315 | 184,843 |   6,374 |
-| GET     | 229,885 | 227,273 | 187,970 | 188,501 | 121,065 |
-| INCR    | 228,311 | 223,714 | 187,617 | 188,324 |   4,609 |
-| LPUSH   | 217,865 | 211,640 | 186,916 | 187,793 |   3,004 |
-| LPOP    | 208,117 | 215,750 | 187,793 | 189,394 |   1,323 |
-| SADD    | 226,501 | 226,244 | 182,482 | 186,741 |   8,486 |
-| SPOP    | 228,311 | 227,790 | 192,123 | 190,840 |  18,018 |
-| HSET    | 225,989 | 221,484 | 179,211 | 178,094 |   5,890 |
-| ZADD    | 226,757 | 216,920 | 175,593 | 175,439 |   6,368 |
-| ZPOPMIN | 227,015 | 229,095 | 192,493 | 191,571 |   3,308 |
-| MSET    | 196,657 | 146,199 | 100,959 | 103,520 |   3,391 |
-| memtier 1:10, 256 B | 360,804 | 347,290 | 245,948 | 241,851 | 14,581 |
+<!-- bench:commands -->
 
 `logged` writes commit to the WAL, so they measure the disk more than this
 code. On Docker Desktop the same `SET` measured 6,374 and 15,309 per second in

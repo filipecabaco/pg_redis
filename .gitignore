@@ -11,3 +11,6 @@ tests/pg_regress/regression.out
 
 # The in-browser demo, built by `mise run demo` (a snowglobe site, ~100 MB of blobs)
 docs/demo/
+
+# The benchmark report the docs build downloads (.github/workflows/docs.yml)
+docs/bench.json

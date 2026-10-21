@@ -20,10 +20,18 @@ on:
       - "src/**"
       - "sql/**"
       - ".github/workflows/docs.yml"
+      - "hooks/**"
+  # New figures from the benchmark workflow (bench.yml) rebuild the site with them.
+  workflow_run:
+    workflows: ["Site benchmarks"]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
+  # To download the benchmark workflow's artifact
+  actions: read
 
 concurrency:
   group: pages
@@ -34,6 +42,8 @@ env:
 
 jobs:
   build:
+    # A benchmark run that failed has no figures to bring.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     # snowglobe guests are arm64; an arm64 runner builds the extension natively instead of
     # under QEMU, which for a pgrx build is the difference between minutes and an hour
     runs-on: ubuntu-24.04-arm
@@ -78,6 +88,21 @@ jobs:
       # that the home page's warm pack does not hold, for the examples page to preload
       - name: Warm the examples page
         run: elixir docker/demo/warm.exs
+
+      # The figures the site shows: the newest report main's benchmark runs uploaded
+      # (bench.yml), rendered by hooks/bench.py. Without one the pages say so.
+      - name: Fetch the latest benchmark
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run=$(gh run list -R "$GITHUB_REPOSITORY" --workflow bench.yml --branch main \
+                  --status success --limit 1 --json databaseId -q '.[0].databaseId')
+          if [ -n "$run" ]; then
+            gh run download "$run" -R "$GITHUB_REPOSITORY" -n bench -D /tmp/bench
+            cp /tmp/bench/bench.json docs/bench.json
+          else
+            echo "No benchmark run on main yet"
+          fi
 
       - name: Build the site
         run: mkdocs build --strict

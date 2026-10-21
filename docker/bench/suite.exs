@@ -16,6 +16,10 @@
 #   BENCH_KEEP    leave the rig running afterwards when set
 #   BENCH_TARGETS comma-separated target ids to run (default all): redis, redis-aof, memory,
 #                 memory+snapshot, logged
+#   BENCH_OUT     where to write the report, without extension (default
+#                 docker/bench/results/<timestamp>); CI writes the one the site reads
+#   BENCH_HOST    what to call the machine in the report (default: its CPU)
+#   BENCH_SERVER_CPUS, BENCH_LOAD_CPUS  the CPU pins (docker/bench/compose.yml)
 
 defmodule Rig do
   @compose ["compose", "-f", "docker/bench/compose.yml", "-p", "pgrbench"]
@@ -173,7 +177,12 @@ log.("pg_redis policies: #{policy_table}")
 
 meta = %{
   started_at: DateTime.utc_now() |> DateTime.to_iso8601(),
-  host_cpu: System.cmd("sysctl", ["-n", "machdep.cpu.brand_string"], stderr_to_stdout: true) |> elem(0) |> String.trim(),
+  host_cpu:
+    System.get_env("BENCH_HOST") ||
+      case :os.type() do
+        {:unix, :darwin} -> System.cmd("sysctl", ["-n", "machdep.cpu.brand_string"]) |> elem(0) |> String.trim()
+        _ -> File.read!("/proc/cpuinfo") |> then(&Regex.run(~r/model name\s*:\s*(.+)/, &1)) |> Enum.at(1)
+      end,
   docker_cpus: System.cmd("docker", ["info", "--format", "{{.NCPU}}"]) |> elem(0) |> String.trim(),
   pg_redis_commit: System.cmd("git", ["rev-parse", "--short", "HEAD"]) |> elem(0) |> String.trim(),
   pg_redis_dirty: System.cmd("git", ["status", "--porcelain"]) |> elem(0) |> String.trim() != "",
@@ -181,8 +190,8 @@ meta = %{
   redis: Rig.exec("redis", ["redis-server", "--version"]) |> String.trim(),
   policies: policy_table,
   reps: Bench.reps(),
-  server_cpus: "4 pinned (cpuset 0-3), 4 GB",
-  load_cpus: "6 pinned (cpuset 8-13)",
+  server_cpus: "pinned to cpuset #{System.get_env("BENCH_SERVER_CPUS", "0-3")}, 4 GB",
+  load_cpus: "pinned to cpuset #{System.get_env("BENCH_LOAD_CPUS", "8-13")}",
   pg_settings: "redis.workers=4, redis.maxmemory=1024MB, shared_buffers=1GB, redis.snapshot_interval=60"
 }
 
@@ -283,7 +292,8 @@ table = fn group, title ->
 end
 
 stamp = DateTime.utc_now() |> Calendar.strftime("%Y%m%d-%H%M%S")
-File.mkdir_p!("docker/bench/results")
+out = System.get_env("BENCH_OUT", "docker/bench/results/#{stamp}")
+File.mkdir_p!(Path.dirname(out))
 
 md = """
 # pg_redis benchmark #{meta.started_at}
@@ -304,9 +314,9 @@ keys random over 100,000 unless the row says otherwise; 50 clients.
 #{if by["mixed"], do: "## Mixed workload (memtier_benchmark, 1 write : 10 reads, 256 B, 4 threads × 25 clients)\n\n" <> table.("mixed", "workload") <> "\n", else: ""}
 """
 
-File.write!("docker/bench/results/#{stamp}.json", JSON.encode!(%{meta: meta, results: Enum.map(results, fn {t, g, r} -> %{target: t, group: g, rows: r} end)}))
-File.write!("docker/bench/results/#{stamp}.md", md)
-log.("wrote docker/bench/results/#{stamp}.{json,md}")
+File.write!("#{out}.json", JSON.encode!(%{meta: meta, targets: Enum.map(targets, &Map.take(&1, [:id, :label])), results: Enum.map(results, fn {t, g, r} -> %{target: t, group: g, rows: r} end)}))
+File.write!("#{out}.md", md)
+log.("wrote #{out}.{json,md}")
 IO.puts(md)
 
 unless System.get_env("BENCH_KEEP"), do: Rig.down()

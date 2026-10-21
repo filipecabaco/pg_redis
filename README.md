@@ -33,23 +33,11 @@ allows. See
 
 ## Performance
 
-Requests per second, higher is better. `redis-benchmark`, 50 clients, 64-byte values over
-100,000 random keys, median of 5 runs; each server pinned to the same 4 CPUs, Docker on an
-Apple M5 Pro (`mise run bench-suite`).
-
-| Command | Redis 7.2 | pg_redis `memory` | pg_redis `logged` |
-|---------|----------:|------------------:|------------------:|
-| SET     | 225,734   | **182,315**       | 6,374             |
-| GET     | 229,885   | **187,970**       | 121,065           |
-| INCR    | 228,311   | **187,617**       | 4,609             |
-| LPUSH   | 217,865   | **186,916**       | 3,004             |
-| SADD    | 226,501   | **182,482**       | 8,486             |
-| HSET    | 225,989   | **179,211**       | 5,890             |
-| ZADD    | 226,757   | **175,593**       | 6,368             |
-
-`memory` runs at about 80% of Redis; `memory+snapshot` is within 2% of it. `logged` reads
-stay fast, and its writes wait for the WAL to reach disk. See
-[Performance](./docs/IMPLEMENTATION.md#8-performance) for the full table and tuning options.
+`memory` runs close to Redis; `memory+snapshot` keeps pace with it. `logged` reads stay fast,
+and its writes wait for the WAL to reach disk. The figures are measured by CI on every change
+to main and shown on the site:
+[Throughput](https://filipecabaco.github.io/pg_redis/#throughput) and the full table under
+[Performance](https://filipecabaco.github.io/pg_redis/IMPLEMENTATION/#8-performance).
 
 ## Quick start
 

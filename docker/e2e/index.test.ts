@@ -115,6 +115,32 @@ describe("BGW SPI sanity", () => {
 	});
 });
 
+// Autovacuum decides what to vacuum and analyze from pg_stat_user_tables. A
+// worker that never reported its writes there left every logged table
+// unvacuumed however much it churned.
+describe("Table statistics", () => {
+	test("the workers' writes reach pg_stat_user_tables", async () => {
+		const db15 = new Bun.RedisClient(`${redisUrl}/15`);
+		const counted = async () =>
+			(
+				await sql`SELECT (n_tup_ins + n_tup_upd + n_tup_del)::int AS n
+				          FROM pg_stat_user_tables WHERE relid = 'redis.kv_15'::regclass`
+			)[0].n;
+		const before = await counted();
+		for (let i = 0; i < 20; i++) await db15.set(`stats:${i}`, "v");
+		await db15.send("DEL", Array.from({ length: 20 }, (_, i) => `stats:${i}`));
+		db15.close();
+		// Sent at most once a second, and read back from a snapshot that a
+		// new transaction refreshes.
+		let after = before;
+		for (let t = 0; t < 30 && after < before + 40; t++) {
+			await Bun.sleep(200);
+			after = await counted();
+		}
+		expect(after).toBeGreaterThanOrEqual(before + 40);
+	});
+});
+
 describe("Connection", () => {
 	test("PING", async () => {
 		expect(await client.ping()).toBe("PONG");

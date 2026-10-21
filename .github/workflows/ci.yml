@@ -428,13 +428,13 @@ jobs:
         if: failure()
         run: docker compose --profile parity logs
 
-  # Benchmarks, published on the pull request rather than buried in a log.
+  # Benchmarks: the pull request against main, published on the pull request
+  # rather than buried in a log, in one comment that each run updates.
   #
   # Not a gate. GitHub-hosted runners are shared, so absolute numbers move
-  # between runs on their own; what this catches is a collapse — a change that
-  # takes a command from tens of thousands per second to hundreds. The
-  # reference Redis runs on the same runner for exactly that reason: the ratio
-  # survives a noisy neighbour where the raw figure does not.
+  # between runs on their own. Main is built and measured on the same runner,
+  # in turns with the pull request, which is what makes the change between
+  # them worth reading; Redis 7.2 runs alongside as the reference.
   bench:
     name: Benchmarks
     needs: [image]
@@ -468,11 +468,35 @@ jobs:
           tags: pg_redis:latest
           cache-from: type=local,src=/tmp/.buildx-cache
 
-      - name: Start pg_redis and the reference Redis
-        run: docker compose --profile bench up -d --no-build --wait
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: main
+
+      # From the same layer cache: the dependencies are built already, and
+      # only what differs is compiled.
+      - name: Build main's image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: main
+          load: true
+          tags: pg_redis:main
+          cache-from: type=local,src=/tmp/.buildx-cache
+
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        with:
+          otp-version: "28"
+          elixir-version: "1.18"
+
+      - name: Start both servers and the reference Redis
+        run: docker compose -f docker-compose.yml -f docker-compose.noports.yml --profile bench --profile bench-main up -d --no-build --wait
 
       - name: Run benchmarks
-        run: bash docker/bench/report.sh | tee bench.md
+        env:
+          MAIN_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_SHA: ${{ github.event.pull_request.head.sha }}
+        run: elixir docker/bench/pr.exs | tee bench.md
 
       # Always visible, including on pull requests from forks, where the token
       # this job is handed cannot write a comment.
@@ -527,4 +551,4 @@ jobs:
 
       - name: Print logs on failure
         if: failure()
-        run: docker compose --profile bench logs
+        run: docker compose --profile bench --profile bench-main logs

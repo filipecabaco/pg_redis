@@ -6,3 +6,5 @@ services:
     ports: !reset []
   redis:
     ports: !reset []
+  postgres-main:
+    ports: !reset []

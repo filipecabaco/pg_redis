@@ -33,6 +33,14 @@ services:
       timeout: 5s
       retries: 15
 
+  # The same server built from main, for docker/bench/pr.exs to measure a
+  # pull request against: CI tags that build pg_redis:main and starts both.
+  postgres-main:
+    extends: postgres
+    image: pg_redis:main
+    pull_policy: never
+    profiles: ["bench-main"]
+
   e2e:
     build: ./docker/e2e
     depends_on:

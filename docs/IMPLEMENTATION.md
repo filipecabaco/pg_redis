@@ -853,8 +853,8 @@ needs its own design, and lock sharding only becomes interesting afterwards.
   phase 6, `-n 20000` was past what a list table held at the default, so the
   run ended in the OOM the server is supposed to give and reported nothing.
   The arena has no per-type limit, but a list that grows with every test still
-  skews the ones after it, so `docker/bench/report.sh` clears the key and uses
-  4,000 requests for those.
+  skews the ones after it, so `docker/bench/pr.exs` clears the key before each
+  of those tests and uses 4,000 requests for them.
 - **The noise band is ±6%, which is wider than most changes worth measuring.**
   Three rounds is not enough. One attempt at measuring the KV key change read as
   "SET and GET are 10% slower" while `PING`, which the change cannot touch, read
@@ -866,13 +866,16 @@ needs its own design, and lock sharding only becomes interesting afterwards.
   reading every key out of every entry is what it does. Time it directly
   over a populated database.
 
-CI runs `docker/bench/report.sh` on every pull request against memory mode and a
-Redis 7 container on the same runner, and posts the result as one comment. The
-comment is keyed on an HTML marker, so a push edits it in place and duplicates
-are deleted. The same report goes to the job summary, which is all a fork's
-token can write. It is a smoke signal and nothing gates on it. It catches a
-collapse from tens of thousands per second to hundreds. The ratio against the
-Redis beside it compares across runs better than the absolute numbers do. `mise run bench-report` runs it locally.
+CI runs `docker/bench/pr.exs` on every pull request: pg_redis built from the
+pull request and from main, and Redis 7.2, on the same runner, on a memory and a
+logged database. Each measurement runs on all three in turn, starting with a
+different one each round, and the median of the rounds is reported with the
+change from main; changes of 10% or more are marked. `PING`, which no change to
+the data path reaches, is the calibration row. The result is posted as one
+comment, keyed on an HTML marker, so a push edits it in place and duplicates are
+deleted. The same report goes to the job summary, which is all a fork's token
+can write. Nothing gates on it. `mise run bench-report` runs it locally against
+the local `main`.
 
 ---
 

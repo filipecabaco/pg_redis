@@ -149,13 +149,17 @@ run_suite 'pg_redis' postgres
 """
 
 [tasks.bench-report]
-description = "Benchmark memory mode against Redis and print the markdown CI posts on a PR"
+description = "Benchmark this checkout against main and Redis, and print the markdown CI posts on a PR"
 run = """
 set -e
+# main from the local branch; the checkout as it stands. `up` builds neither:
+# postgres-main inherits postgres's build, which would overwrite main's image.
+git archive main | docker build -q -t pg_redis:main - > /dev/null
+docker compose build -q postgres
 PG_REDIS_DEFAULT_DB=0 \
-  docker compose -f docker-compose.yml -f docker-compose.noports.yml --profile bench up -d --build --wait
-trap 'docker compose --profile bench down' EXIT INT TERM
-bash docker/bench/report.sh
+  docker compose -f docker-compose.yml -f docker-compose.noports.yml --profile bench --profile bench-main up -d --no-build --wait
+trap 'docker compose --profile bench --profile bench-main down' EXIT INT TERM
+MAIN_SHA=$(git rev-parse main) PR_SHA=$(git rev-parse HEAD) elixir docker/bench/pr.exs
 """
 
 [tasks.bench-value-sizes]

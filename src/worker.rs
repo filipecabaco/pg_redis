@@ -407,6 +407,9 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
         let cmd_usec = woke.elapsed().as_micros() as u64;
         let cron = Instant::now();
 
+        // What this worker's commits wrote, for autovacuum to go by.
+        crate::pg::report_table_stats();
+
         // Redis keeps the tracking table to `tracking-table-max-keys` from
         // its cron as well as before each command, invalidating keys at
         // random to get back under it.

@@ -852,6 +852,14 @@ needs its own design, and lock sharding only becomes interesting afterwards.
   builds, run nine rounds each at 50,000 requests, take medians, and include a
   command the change cannot reach as a calibration. At that sample size `PING` came back at +0.5% and
   everything else sat inside ±5% straddling zero.
+- **Logged writes measure the disk, and the disk moves.** On OrbStack the same
+  image gave a logged `SET` of 1 KB 11,202 and 18,219 per second in two runs, and
+  fresh containers differ from each other by as much again: a suite run against
+  main showed `SPOP` at half and `MSET` at 0.7× that neither reproduced. To
+  compare two builds' code paths on a logged database, take the disk out
+  (`ALTER SYSTEM SET synchronous_commit = off`), measure both in the same
+  container where the change allows it, and alternate them. Read logged writes
+  across separate runs by their order of magnitude only.
 - **`KEYS` needs its own measurement.** It is not a `redis-benchmark` test, and
   reading every key out of every entry is what it does. Time it directly
   over a populated database.

@@ -20,6 +20,8 @@
 #                 docker/bench/results/<timestamp>); CI writes the one the site reads
 #   BENCH_HOST    what to call the machine in the report (default: its CPU)
 #   BENCH_SERVER_CPUS, BENCH_LOAD_CPUS  the CPU pins (docker/bench/compose.yml)
+#   BENCH_IMAGE   the pg_redis image to measure (default pg_redis:latest)
+#   BENCH_COMMIT  the commit that image was built from, for the report (default HEAD)
 
 defmodule Rig do
   @compose ["compose", "-f", "docker/bench/compose.yml", "-p", "pgrbench"]
@@ -184,8 +186,12 @@ meta = %{
         _ -> File.read!("/proc/cpuinfo") |> then(&Regex.run(~r/model name\s*:\s*(.+)/, &1)) |> Enum.at(1)
       end,
   docker_cpus: System.cmd("docker", ["info", "--format", "{{.NCPU}}"]) |> elem(0) |> String.trim(),
-  pg_redis_commit: System.cmd("git", ["rev-parse", "--short", "HEAD"]) |> elem(0) |> String.trim(),
-  pg_redis_dirty: System.cmd("git", ["status", "--porcelain"]) |> elem(0) |> String.trim() != "",
+  pg_redis_commit:
+    System.get_env("BENCH_COMMIT") ||
+      System.cmd("git", ["rev-parse", "--short", "HEAD"]) |> elem(0) |> String.trim(),
+  pg_redis_dirty:
+    !System.get_env("BENCH_COMMIT") and
+      System.cmd("git", ["status", "--porcelain"]) |> elem(0) |> String.trim() != "",
   postgres: Rig.psql("SHOW server_version"),
   redis: Rig.exec("redis", ["redis-server", "--version"]) |> String.trim(),
   policies: policy_table,

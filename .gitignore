@@ -14,3 +14,6 @@ docs/demo/
 
 # MkDocs hooks' bytecode (hooks/bench.py)
 __pycache__/
+
+# `mise run bench-site` writes its report here before copying it to docs/bench.json
+docker/bench/results/site.*

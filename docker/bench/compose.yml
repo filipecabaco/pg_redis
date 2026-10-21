@@ -18,7 +18,8 @@ x-server: &server
 services:
   pg_redis:
     <<: *server
-    image: pg_redis:latest
+    # BENCH_IMAGE measures another build, main's say, on the same rig.
+    image: ${BENCH_IMAGE:-pg_redis:latest}
     shm_size: 2g
     environment:
       POSTGRES_PASSWORD: postgres

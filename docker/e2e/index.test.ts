@@ -220,6 +220,10 @@ for (const half of ["cache", "durable"] as const) {
 			expect(await counted([["SET", "n", "1"], ["RPUSH", "l", "a"]], [["INCR", "n"], ["LPOP", "l"], ["LPOP", "nope"], ["DEL", "n", "nope"]])).toEqual([0, 0]);
 		});
 
+		test("SCAN TYPE counts every key its step found, whatever its type", async () => {
+			expect(await counted([["SET", "a", "1"], ["SET", "b", "2"], ["HSET", "h", "f", "v"]], [["SCAN", "0", "TYPE", "hash", "COUNT", "100"], ["SCAN", "0", "MATCH", "a*", "TYPE", "string", "COUNT", "100"], ["SCAN", "0", "COUNT", "100"]])).toEqual([4, 0]);
+		});
+
 		test("a script's commands count as they would outside it", async () => {
 			expect(await counted([["SET", "s", "v"]], [["EVAL", "return {redis.call('GET', KEYS[1]), redis.call('GET', KEYS[2])}", "2", "s", "nope"]])).toEqual([1, 1]);
 		});

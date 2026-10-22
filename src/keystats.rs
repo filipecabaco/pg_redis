@@ -23,6 +23,15 @@ pub struct Lookups {
 /// The read lookups `argv` makes, or `None` for a command that makes none.
 pub fn lookups(argv: &[Vec<u8>]) -> Option<Lookups> {
     let name = String::from_utf8_lossy(argv.first()?).to_ascii_uppercase();
+    // `SCAN ... TYPE` names no key: the keys its step finds are counted as
+    // the store looks them up (`scanned_types`).
+    if name == "SCAN" {
+        let typed = argv.iter().skip(2).any(|a| a.eq_ignore_ascii_case(b"TYPE"));
+        return typed.then(|| Lookups {
+            name,
+            keys: Vec::new(),
+        });
+    }
     // A read-only script's keys are looked up by the commands it runs.
     if matches!(name.as_str(), "EVAL_RO" | "EVALSHA_RO" | "FCALL_RO") {
         return None;
@@ -72,6 +81,20 @@ const ALWAYS_LOOK: &[&str] = &[
     "BITPOS",
 ];
 
+thread_local! {
+    /// What the `SCAN ... TYPE` that just ran looked up: keys that were
+    /// there, keys past their deadline.
+    static SCANNED: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// `SCAN ... TYPE` reads every key its step found, after MATCH, to compare
+/// its type, and Redis counts each lookup: a hit for one that is there
+/// whatever its type, a miss for one past its deadline, never a `keymiss`
+/// (`LOOKUP_NONOTIFY`). Called by the scan, read by its tally.
+pub fn scanned_types(hits: u64, misses: u64) {
+    SCANNED.set((hits, misses));
+}
+
 /// Answer nil, nothing or 0 only without the key: `GET` meets another type
 /// with WRONGTYPE, and Redis keeps no empty collection.
 const EMPTY_IS_ABSENT: &[&str] = &[
@@ -98,6 +121,15 @@ pub type ExistsMany<'a> = dyn FnMut(u8, &[Vec<u8>]) -> Vec<bool> + 'a;
 /// keys all in one go: a multi-key read of keys that are not there (an `MGET`
 /// of a thousand) must not cost a statement each.
 pub fn tally(db: u8, l: &Lookups, reply: &Response, exists: &mut ExistsMany<'_>) -> Tally {
+    if l.name == "SCAN" {
+        let (hits, misses) = SCANNED.take();
+        return Tally {
+            db,
+            hits,
+            missed: vec![Vec::new(); misses as usize],
+            notify: false,
+        };
+    }
     let mut t = Tally {
         db,
         notify: l.name != "OBJECT",

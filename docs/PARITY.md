@@ -313,10 +313,10 @@ every read lookup, never a write one, and a key that is there is a hit
 whatever the command finds in it. `src/keystats.rs` takes the keys a command
 reads from its key specs (`RO`) plus the `GET` family, and counts them from
 the reply when the reply can only come with or without the key, looking at
-the key otherwise. Thirteen scenarios, run on Redis 7.2 and on a memory and a
-logged database, give the same counts on all three; the e2e suite holds them.
-`SCAN ... TYPE`, which Redis counts as a lookup per key scanned, does not count
-here.
+the key otherwise. `SCAN ... TYPE` counts a lookup for every key its step
+finds after `MATCH`, whatever its type, as Redis's type filter does. Fourteen
+scenarios, run on Redis 7.2 and on a memory and a logged database, give the
+same counts on all three; the e2e suite holds them.
 
 
 ## The two architectural blockers

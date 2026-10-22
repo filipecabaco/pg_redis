@@ -81,6 +81,17 @@ executed through SPI per command, which for a plain `SET` cost more than the
 `SET` itself. It mirrors the save/restore sequence PL/pgSQL performs around its
 `EXCEPTION` blocks.
 
+A backend caches the xids of 64 of a transaction's subtransactions
+(`PGPROC_MAX_CACHED_SUBXIDS`); one more and the cache overflows, and every
+other backend's snapshot checks visibility through `pg_subtrans` until the
+transaction ends. A batch of independent commands from different connections
+therefore commits in groups of at most 64 when it takes this careful path,
+whatever `redis.batch_size` is. An `EXEC` stays one transaction, as Redis runs
+it: one with more than 64 writes that takes this path (a script or an admin
+command in it, keyspace events on, or a command that errors) overflows the
+cache for as long as it runs. One of plain table commands runs flat, with no
+subtransactions.
+
 ### Atomicity across workers
 
 Redis runs every command on one thread, so nothing changes under a script, an

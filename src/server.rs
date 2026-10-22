@@ -1477,6 +1477,15 @@ pub fn notify_flags() -> u32 {
     ctl().map_or(0, |c| c.notify_flags.load(Ordering::Relaxed))
 }
 
+/// Read lookups that found their key and that did not, for INFO's
+/// `keyspace_hits` and `keyspace_misses` (`keystats.rs`).
+pub fn count_lookups(hits: u64, misses: u64) {
+    if let Some(ctl) = ctl() {
+        ctl.keyspace_hits.fetch_add(hits, Ordering::Relaxed);
+        ctl.keyspace_misses.fetch_add(misses, Ordering::Relaxed);
+    }
+}
+
 /// Keys the expiry sweep removed, for INFO's `expired_keys`.
 pub fn count_expired(n: u64) {
     if n > 0

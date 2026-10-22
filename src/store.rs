@@ -985,6 +985,8 @@ fn scan(
         && !keys.is_empty()
     {
         let kinds = store.kinds(&keys)?;
+        let there = kinds.iter().filter(|k| k.is_some()).count() as u64;
+        crate::keystats::scanned_types(there, kinds.len() as u64 - there);
         keys = keys
             .into_iter()
             .zip(kinds)

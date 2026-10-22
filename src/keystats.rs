@@ -91,14 +91,13 @@ fn proves_key(reply: &Response) -> bool {
     }
 }
 
-/// Count `l`'s lookups of `db`, run with reply `reply`. `exists` looks at a
-/// key without touching it.
-pub fn tally(
-    db: u8,
-    l: &Lookups,
-    reply: &Response,
-    exists: &mut dyn FnMut(u8, &[u8]) -> bool,
-) -> Tally {
+/// Whether each of a database's keys is there, looked at without touching.
+pub type ExistsMany<'a> = dyn FnMut(u8, &[Vec<u8>]) -> Vec<bool> + 'a;
+
+/// Count `l`'s lookups of `db`, run with reply `reply`. `exists` looks at
+/// keys all in one go: a multi-key read of keys that are not there (an `MGET`
+/// of a thousand) must not cost a statement each.
+pub fn tally(db: u8, l: &Lookups, reply: &Response, exists: &mut ExistsMany<'_>) -> Tally {
     let mut t = Tally {
         db,
         notify: l.name != "OBJECT",
@@ -128,12 +127,28 @@ pub fn tally(
         }
         _ => None,
     };
-    match by_reply {
-        Some(there) if single => found(&l.keys[0], there),
-        _ => {
-            for key in &l.keys {
-                found(key, exists(db, key));
+    // `MGET` names its keys in order: a value is a string that is there, and
+    // only a nil (no key, or another type) needs a look.
+    let unknown: Vec<Vec<u8>> = match (l.name.as_str(), reply, by_reply) {
+        (_, _, Some(there)) if single => {
+            found(&l.keys[0], there);
+            Vec::new()
+        }
+        ("MGET", Response::Array(items), _) if items.len() == l.keys.len() => {
+            let mut unknown = Vec::new();
+            for (key, item) in l.keys.iter().zip(items) {
+                match item {
+                    Some(_) => found(key, true),
+                    None => unknown.push(key.clone()),
+                }
             }
+            unknown
+        }
+        _ => l.keys.clone(),
+    };
+    if !unknown.is_empty() {
+        for (key, there) in unknown.iter().zip(exists(db, &unknown)) {
+            found(key, there);
         }
     }
     t

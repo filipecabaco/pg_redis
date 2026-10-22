@@ -795,6 +795,21 @@ fn run_dispatch_batch(
         );
         matches!(r, Response::Integer(n) if n > 0)
     };
+    // Whether each of `keys` is there, in one go: one statement for a
+    // database in tables, however many keys a read named.
+    let exists_many =
+        |client: Option<&mut pgrx::spi::SpiClient<'_>>, d: u8, keys: &[Vec<u8>]| -> Vec<bool> {
+            match client {
+                Some(client) if crate::storage::slot(d).is_none() => {
+                    let named: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+                    let kinds = Command::sql_key_kinds(client, d, &named);
+                    keys.iter()
+                        .map(|k| kinds.iter().any(|(held, kind)| held == k && kind.is_some()))
+                        .collect()
+                }
+                _ => keys.iter().map(|k| exists(None, d, k)).collect(),
+            }
+        };
     // With each reply, the keys the command named as written and left as
     // they were: no WATCH is broken on them and no tracking client told.
     // `guarded`: in a subtransaction of its own (`in_subtransaction`), or
@@ -807,35 +822,36 @@ fn run_dispatch_batch(
             t.resize_with(cmds.len(), || None);
         }
     });
-    let run_as =
-        |client: &mut pgrx::spi::SpiClient<'_>, i: usize, cmd: &Command, db: u8, guarded: bool| {
-            let started = Instant::now();
-            let lazy =
-                crate::lazyfree::before(cmd, db, &mut |d, c| probe(Some(&mut *client), d, c));
-            let before =
-                crate::notify::before(cmd, db, &mut |d, k| exists(Some(&mut *client), d, k));
-            let r = if on_mem(cmd, db) {
-                cmd.execute_mem(db)
-            } else if guarded {
-                in_subtransaction(|| cmd.execute(client, db))
-            } else {
-                crate::pg::statement(|| cmd.execute(client, db))
-            };
-            crate::notify::after(before, cmd, db, &r, &mut |d, k| {
-                exists(Some(&mut *client), d, k)
-            });
-            crate::lazyfree::after(lazy, &r);
-            if let Some(l) = looks.get(i).and_then(Option::as_ref) {
-                let t = keystats::tally(db, l, &r, &mut |d, k| exists(Some(&mut *client), d, k));
-                TALLIES.with_borrow_mut(|v| {
-                    if let Some(slot) = v.get_mut(i) {
-                        *slot = Some(t);
-                    }
-                });
-            }
-            STEP_USEC.with_borrow_mut(|t| t.push(started.elapsed().as_micros() as i64));
-            (r, crate::notify::take_untouched())
+    let run_as = |client: &mut pgrx::spi::SpiClient<'_>,
+                  i: usize,
+                  cmd: &Command,
+                  db: u8,
+                  guarded: bool| {
+        let started = Instant::now();
+        let lazy = crate::lazyfree::before(cmd, db, &mut |d, c| probe(Some(&mut *client), d, c));
+        let before = crate::notify::before(cmd, db, &mut |d, k| exists(Some(&mut *client), d, k));
+        let r = if on_mem(cmd, db) {
+            cmd.execute_mem(db)
+        } else if guarded {
+            in_subtransaction(|| cmd.execute(client, db))
+        } else {
+            crate::pg::statement(|| cmd.execute(client, db))
         };
+        crate::notify::after(before, cmd, db, &r, &mut |d, k| {
+            exists(Some(&mut *client), d, k)
+        });
+        crate::lazyfree::after(lazy, &r);
+        if let Some(l) = looks.get(i).and_then(Option::as_ref) {
+            let t = keystats::tally(db, l, &r, &mut |d, k| exists_many(Some(&mut *client), d, k));
+            TALLIES.with_borrow_mut(|v| {
+                if let Some(slot) = v.get_mut(i) {
+                    *slot = Some(t);
+                }
+            });
+        }
+        STEP_USEC.with_borrow_mut(|t| t.push(started.elapsed().as_micros() as i64));
+        (r, crate::notify::take_untouched())
+    };
     let run = |client: &mut pgrx::spi::SpiClient<'_>, i: usize, cmd: &Command, db: u8| {
         run_as(client, i, cmd, db, true)
     };
@@ -872,7 +888,7 @@ fn run_dispatch_batch(
                 crate::notify::after(before, cmd, *db, &r, &mut |d, k| exists(None, d, k));
                 crate::lazyfree::after(lazy, &r);
                 if let Some(l) = looks.get(i).and_then(Option::as_ref) {
-                    let t = keystats::tally(*db, l, &r, &mut |d, k| exists(None, d, k));
+                    let t = keystats::tally(*db, l, &r, &mut |d, k| exists_many(None, d, k));
                     TALLIES.with_borrow_mut(|v| {
                         if let Some(slot) = v.get_mut(i) {
                             *slot = Some(t);

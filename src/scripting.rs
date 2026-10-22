@@ -1705,11 +1705,15 @@ fn run_from_script(argv: &[Vec<u8>], ctx: &mut CallCtx<'_>) -> Result<Response, 
             crate::lazyfree::after(lazy, &r);
             // The command's read lookups count as they do outside a script.
             if let Some(l) = crate::keystats::lookups(argv) {
-                let mut exists = |d: u8, k: &[u8]| {
-                    matches!(
-                        host.exec(d, Command::Exists { keys: vec![k.to_vec()] }),
-                        Response::Integer(n) if n > 0
-                    )
+                let mut exists = |d: u8, keys: &[Vec<u8>]| -> Vec<bool> {
+                    keys.iter()
+                        .map(|k| {
+                            matches!(
+                                host.exec(d, Command::Exists { keys: vec![k.clone()] }),
+                                Response::Integer(n) if n > 0
+                            )
+                        })
+                        .collect()
                 };
                 crate::keystats::tally(db, &l, &r, &mut exists).apply();
             }

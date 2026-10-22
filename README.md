@@ -34,7 +34,8 @@ allows. See
 ## Performance
 
 `memory` runs close to Redis; `memory+snapshot` keeps pace with it. `logged` reads stay fast,
-and its writes wait for the WAL to reach disk. The figures come from `mise run bench-site`, on
+and by default its writes wait for the WAL to reach disk; `CONFIG SET appendfsync everysec`
+trades the last fraction of a second of writes for several times the write rate. The figures come from `mise run bench-site`, on
 pinned CPUs, and are shown on the site:
 [Throughput](https://filipecabaco.github.io/pg_redis/#throughput) and the full table under
 [Performance](https://filipecabaco.github.io/pg_redis/IMPLEMENTATION/#8-performance).

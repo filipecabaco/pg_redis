@@ -17,8 +17,8 @@ it was slower than memory and not durable, so it was never the best choice.
 |---|---|---|
 | Cache, memoised query results | `memory` | Losing it on a restart costs only recomputation. Set `redis.maxmemory_policy` to `allkeys-lru` (or another evicting policy) so a full cache evicts keys; the default, `noeviction`, refuses writes past `redis.maxmemory` with `OOM`. |
 | Rate limits | `memory` | Short-lived counters with a TTL. Losing them on a restart only resets the limits. |
-| Sessions | `memory+snapshot`, or `logged` if losing any is unacceptable | Served from memory and copied to a logged table every `redis.snapshot_interval` seconds (60 by default), so a crash loses at most that interval of changes. `logged` loses none. |
-| Job queues, anything you cannot lose | `logged` | Survives a crash, is replicated and can be queried in SQL. Every write commits to the WAL, so writes are much slower than in memory; see [Performance](IMPLEMENTATION.md#8-performance). |
+| Sessions | `memory+snapshot`, or `logged` if losing any is unacceptable | Served from memory and copied to a logged table every `redis.snapshot_interval` seconds (60 by default), so a crash loses at most that interval of changes. `logged` loses none under the default `appendfsync always`. |
+| Job queues, anything you cannot lose | `logged` | Survives a crash, is replicated and can be queried in SQL. Every write commits to the WAL and, under the default `appendfsync always`, waits for it to reach disk, so writes are much slower than in memory; `appendfsync everysec` stops waiting, as in Redis, at the cost of up to ~600 ms of acknowledged writes on a crash ([the cost of logged databases](operations.md#the-cost-of-logged-databases)). |
 | Pub/sub | any | Pub/sub does not depend on storage policies. Messages pass through ring buffers in shared memory and are not stored, unless `redis.route_publish` routes a channel into a table ([§4](IMPLEMENTATION.md#4-pubsub)). |
 
 ## Policies
@@ -31,7 +31,7 @@ database with no row there keeps its default.
 |---|---|---|---|---|
 | `memory` | a shared-memory slot | no | no | no |
 | `memory+snapshot` | a shared-memory slot, copied to a logged table on an interval | up to the last snapshot | the snapshot | the snapshot |
-| `logged` | WAL-logged tables | yes | yes | yes |
+| `logged` | WAL-logged tables | yes; with `appendfsync everysec` or `no`, all but the writes of the last ~600 ms | yes | yes |
 
 The defaults reproduce the old layout, so nothing changes for a server that
 never sets a policy: 0–7 `memory` and 8–15 `logged`. Every database has

@@ -85,6 +85,12 @@ pub(crate) static DATABASE: GucSetting<Option<std::ffi::CString>> =
 pub(crate) static MAXMEMORY_POLICY: GucSetting<shm::Policy> =
     GucSetting::<shm::Policy>::new(shm::Policy::NoEviction);
 
+/// Redis's `appendfsync`, for the logged databases: `always` (the default
+/// here, where Redis's is `everysec`) acknowledges a write once its WAL is on
+/// disk; `everysec` and `no` acknowledge it before (`synchronous_commit = off`).
+pub(crate) static APPENDFSYNC: GucSetting<shm::Fsync> =
+    GucSetting::<shm::Fsync>::new(shm::Fsync::Always);
+
 /// Megabytes the memory engine may hold — Redis's `maxmemory`. The arena is
 /// reserved at this size (plus headroom) but backed only as it fills.
 pub(crate) static MAXMEMORY: GucSetting<i32> = GucSetting::<i32>::new(256);
@@ -314,6 +320,19 @@ pub extern "C-unwind" fn _PG_init() {
           'volatile-lru', 'volatile-lfu', 'volatile-random', 'volatile-ttl': evict \
           only keys that carry an expiry, the last by soonest expiry.",
         &MAXMEMORY_POLICY,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_enum_guc(
+        c"redis.appendfsync",
+        c"When a write to a logged database is acknowledged",
+        c"Redis's appendfsync, for the logged databases. 'always' (default): once its \
+          WAL is on disk, so an acknowledged write survives a crash. 'everysec' or 'no': \
+          before, as with synchronous_commit = off; PostgreSQL flushes the WAL within \
+          three times wal_writer_delay (600 ms by default), so a crash can lose the \
+          writes acknowledged in that window, and never leaves a write half done.",
+        &APPENDFSYNC,
         GucContext::Suset,
         GucFlags::default(),
     );

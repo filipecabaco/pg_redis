@@ -2739,9 +2739,14 @@ impl Store for SqlStore<'_, '_> {
         }
         let db = self.db;
         let l = Limits::current();
+        // The size decides two things only: whether the pop takes the whole
+        // set, and Redis's choice for popping most of it (`remaining * 5 <=
+        // n`). Neither needs more than 6n + 1 members counted, and counting
+        // the rest cost a third of a pop from a large set.
         let sql = format!(
             "WITH pre AS (SELECT (SELECT encoding FROM redis.encoding_{db} WHERE key = $1) AS enc, \
-                                 (SELECT count(*) FROM redis.set_{db} WHERE key = $1) AS n), \
+                                 (SELECT count(*) FROM (SELECT 1 FROM redis.set_{db} \
+                                                         WHERE key = $1 LIMIT $3) c) AS n), \
                   picked AS (SELECT ctid FROM redis.set_{db} WHERE key = $1 ORDER BY random() LIMIT $2), \
                   d AS (DELETE FROM redis.set_{db} t USING picked WHERE t.ctid = picked.ctid \
                         RETURNING t.member, t.seq) \
@@ -2749,7 +2754,14 @@ impl Store for SqlStore<'_, '_> {
         );
         let tbl = self
             .client
-            .update_kept(&sql, &[key.into(), n.into()])
+            .update_kept(
+                &sql,
+                &[
+                    key.into(),
+                    n.into(),
+                    n.saturating_mul(6).saturating_add(1).into(),
+                ],
+            )
             .map_err(|e| failed("SPOP", e))?;
         let mut popped = Vec::new();
         let (mut row, mut size) = (None, 0usize);

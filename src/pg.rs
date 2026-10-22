@@ -220,6 +220,31 @@ pub fn before_exit(f: fn()) {
     unsafe { pg_sys::before_shmem_exit(Some(run), pg_sys::Datum::from(0usize)) };
 }
 
+/// Whether this process's commits wait for their WAL to reach disk:
+/// `appendfsync always` keeps the server's own `synchronous_commit`, which may
+/// also wait for a synchronous standby; otherwise `off`. Set for the session,
+/// so every transaction after it has it.
+pub fn set_synchronous_commit(wait: bool) {
+    assert!(!in_transaction(), "set between transactions");
+    let name = c"synchronous_commit";
+    // SAFETY: no transaction is open (asserted). The name is a NUL-terminated
+    // static, and the reset string PostgreSQL returns stays valid until the
+    // next change of the setting, which is the call that reads it.
+    unsafe {
+        let value = if wait {
+            pg_sys::GetConfigOptionResetString(name.as_ptr())
+        } else {
+            c"off".as_ptr()
+        };
+        pg_sys::SetConfigOption(
+            name.as_ptr(),
+            value,
+            pg_sys::GucContext::PGC_SUSET,
+            pg_sys::GucSource::PGC_S_SESSION,
+        );
+    }
+}
+
 /// Send the table counts this process's commits have gathered — the rows
 /// each wrote, updated and deleted — to the statistics PostgreSQL keeps, at
 /// most once a second; the rest wait for the next call. A backend does this

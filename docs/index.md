@@ -54,7 +54,7 @@ its own storage policy, which can be changed at runtime while clients keep using
 |--------|-------------------|------------------|-------------|
 | `memory` | Shared memory, bounded by `redis.maxmemory` | No | 0–7 (`SELECT cache`) |
 | `memory+snapshot` | Shared memory, snapshotted to a logged table | Up to the last snapshot | |
-| `logged` | WAL-logged PostgreSQL tables | Yes | 8–15 (`SELECT durable`) |
+| `logged` | WAL-logged PostgreSQL tables | Yes (all of it under the default `appendfsync always`) | 8–15 (`SELECT durable`) |
 
 ```sql
 SELECT * FROM redis.policies();

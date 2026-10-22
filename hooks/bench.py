@@ -76,9 +76,11 @@ def on_config(config):
     rows = []
     for cmd in HOME:
         values = [rps.get(("commands", cmd, t)) for t in ("redis", "memory", "logged")]
+        # A report from before the everysec target has none: its bar is left out.
+        everysec = rps.get(("commands", cmd, "logged-everysec"))
         if None not in values:
-            rows.append((cmd.upper(), *(_k(v) for v in values)))
-    top = max((max(r[1:]) for r in rows), default=1)
+            rows.append((cmd.upper(), *(_k(v) for v in values), everysec and _k(everysec)))
+    top = max((v for r in rows for v in r[1:] if v is not None), default=1)
     config.extra["bench"] = {"rows": rows, "top": top, **_meta(data["report"])}
     config.extra["bench_data"] = data
     return config

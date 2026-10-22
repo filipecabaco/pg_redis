@@ -278,15 +278,17 @@ maxmemory_policy:allkeys-random</span></code></pre>
       <span class="k k--redis">Redis 7.2</span>
       <span class="k k--mem">pg_redis memory</span>
       <span class="k k--wal">pg_redis logged</span>
+      {% if bench.rows and bench.rows[0][4] %}<span class="k k--fsync">pg_redis logged, <code>appendfsync everysec</code></span>{% endif %}
     </div>
     {% set top = bench.top %}
-    {% for name, r, m, w in bench.rows %}
+    {% for name, r, m, w, e in bench.rows %}
     <div class="pr-bench__row" role="row">
       <span class="pr-bench__cmd" role="rowheader">{{ name }}</span>
       <div class="pr-bench__bars" role="cell">
         <i class="b b--redis" style="--v: {{ r / top }}"><b>{{ r }}k/s</b></i>
         <i class="b b--mem" style="--v: {{ m / top }}"><b>{{ m }}k/s</b></i>
         <i class="b b--wal" style="--v: {{ w / top }}"><b>{{ w }}k/s</b></i>
+        {% if e %}<i class="b b--fsync" style="--v: {{ e / top }}"><b>{{ e }}k/s</b></i>{% endif %}
       </div>
     </div>
     {% endfor %}

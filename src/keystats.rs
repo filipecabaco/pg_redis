@@ -22,26 +22,32 @@ pub struct Lookups {
 
 /// The read lookups `argv` makes, or `None` for a command that makes none.
 pub fn lookups(argv: &[Vec<u8>]) -> Option<Lookups> {
-    let name = String::from_utf8_lossy(argv.first()?).to_ascii_uppercase();
+    let cmd = argv.first()?;
+    let is = |name: &str| cmd.eq_ignore_ascii_case(name.as_bytes());
     // `SCAN ... TYPE` names no key: the keys its step finds are counted as
     // the store looks them up (`scanned_types`).
-    if name == "SCAN" {
+    if is("SCAN") {
         let typed = argv.iter().skip(2).any(|a| a.eq_ignore_ascii_case(b"TYPE"));
         return typed.then(|| Lookups {
-            name,
+            name: "SCAN".to_string(),
             keys: Vec::new(),
         });
     }
     // A read-only script's keys are looked up by the commands it runs.
-    if matches!(name.as_str(), "EVAL_RO" | "EVALSHA_RO" | "FCALL_RO") {
+    if is("EVAL_RO") || is("EVALSHA_RO") || is("FCALL_RO") {
         return None;
     }
     // `getGenericCommand` and `GETEX` read the key with `lookupKeyRead`.
-    let get_family = match name.as_str() {
-        "GETDEL" | "GETEX" | "GETSET" => true,
-        "SET" => argv.iter().skip(3).any(|a| a.eq_ignore_ascii_case(b"GET")),
-        _ => false,
-    };
+    let get_family = is("GETDEL")
+        || is("GETEX")
+        || is("GETSET")
+        || (is("SET") && argv.iter().skip(3).any(|a| a.eq_ignore_ascii_case(b"GET")));
+    // Every other command, a write's whole work, is settled by its key specs
+    // alone, before any key is worked out or copied.
+    if !get_family && !crate::admin::reads_keys(argv) {
+        return None;
+    }
+    let name = String::from_utf8_lossy(cmd).to_ascii_uppercase();
     let keys: Vec<Vec<u8>> = if get_family {
         vec![argv.get(1)?.clone()]
     } else {

@@ -964,6 +964,29 @@ fn find_spec(name: &[u8]) -> Option<&'static CommandSpec> {
     BY_NAME.get(lower.as_str()).copied()
 }
 
+/// Whether the command line reads any key, by its key specs (a container's,
+/// `OBJECT ENCODING`'s, are its subcommand's): one with only written keys
+/// (`SET`, `MSET`, `LPUSH`) need not have its keys worked out to learn that it
+/// makes no read lookup.
+pub(crate) fn reads_keys(argv: &[Vec<u8>]) -> bool {
+    let Some(mut spec) = argv.first().and_then(|n| find_spec(n)) else {
+        return false;
+    };
+    if spec.key_specs.is_empty()
+        && let Some(sub) = argv.get(1)
+    {
+        let full = format!(
+            "{}|{}",
+            spec.name,
+            String::from_utf8_lossy(sub).to_ascii_lowercase()
+        );
+        if let Some(s) = BY_NAME.get(full.as_str()) {
+            spec = s;
+        }
+    }
+    spec.key_specs.iter().any(|k| k.flags.contains(&"RO"))
+}
+
 /// Redis's `populateCommandLegacyRangeSpec`: the single first/last/step
 /// range COMMAND INFO still reports, and whether keys are movable. Movability
 /// comes from the key specs alone — a native command with its own key

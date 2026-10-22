@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 use crate::commands::{Command, Response};
+use crate::keystats::{self, Lookups};
 use crate::resp::*;
 use pgrx::bgworkers::*;
 use pgrx::pg_sys;
@@ -27,7 +28,15 @@ const PUBSUB_FULL: &str = "OOM pub/sub memory is full; raise redis.pubsub_memory
 /// Each message names the client it came from (0 for the server itself), so
 /// a write's invalidations can skip a NOLOOP client's own.
 enum DispatchMsg {
-    Cmd(Command, u8, u64, mpsc::SyncSender<Response>),
+    /// A command, its database, its client, where to reply, and the keys
+    /// its line reads (`keystats`).
+    Cmd(
+        Command,
+        u8,
+        u64,
+        mpsc::SyncSender<Response>,
+        Option<Lookups>,
+    ),
     /// One connection's commands, run in order in one go.
     Batch(Vec<(Command, u8)>, u64, BatchReply, BatchKind),
     FireAndForget(Command, u8),
@@ -70,11 +79,16 @@ fn run_move(keys: &[(u8, Vec<u8>)], drains: &[u8]) {
 /// Run commands with the database locks they need held around the whole run,
 /// commit included (`src/dblock.rs`): what each command needs on its own.
 /// Released before the replies go out.
-fn run_held(cmds: &[(Command, u8)], origins: &[u64], retry_conflicts: bool) -> Vec<Response> {
+fn run_held(
+    cmds: &[(Command, u8)],
+    origins: &[u64],
+    looks: &[Option<Lookups>],
+    retry_conflicts: bool,
+) -> Vec<Response> {
     let plan = crate::dblock::plan_batch(cmds);
     let run = || {
         let _held = crate::dblock::hold(plan);
-        run_dispatch_batch(cmds, origins, retry_conflicts)
+        run_dispatch_batch(cmds, origins, looks, retry_conflicts)
     };
     // What holds a database exclusive runs as one command does in Redis:
     // evicted for once, before it starts.
@@ -88,6 +102,11 @@ fn run_held(cmds: &[(Command, u8)], origins: &[u64], retry_conflicts: bool) -> V
 thread_local! {
     /// How long each command of the batch now running took, in order.
     static STEP_USEC: std::cell::RefCell<Vec<i64>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// What each command of the batch now running found by its read lookups,
+    /// by its place in the batch: a command run again (the careful pass after a
+    /// flat one failed, a retry) replaces what its earlier run found, so each
+    /// counts once.
+    static TALLIES: std::cell::RefCell<Vec<Option<keystats::Tally>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// The slow log's entries for an `EXEC`: each command it ran that took
@@ -121,7 +140,7 @@ fn slowlog_exec_steps(lines: &[Vec<Vec<u8>>], origin: u64) {
 fn run_batch_msg(cmds: Vec<(Command, u8)>, origin: u64, kind: BatchKind) -> Option<Vec<Response>> {
     let origins = vec![origin; cmds.len()];
     match kind {
-        BatchKind::Probe => Some(run_held(&cmds, &origins, false)),
+        BatchKind::Probe => Some(run_held(&cmds, &origins, &vec![None; cmds.len()], false)),
         BatchKind::Exec(watched, lines) => {
             let watched_dbs = watched
                 .iter()
@@ -135,16 +154,22 @@ fn run_batch_msg(cmds: Vec<(Command, u8)>, origin: u64, kind: BatchKind) -> Opti
                     WatchCheck::Broken => true,
                     // Keys a SWAPDB may have brought in: looked at here, on the
                     // dispatcher, holding the databases.
-                    WatchCheck::Lookup(missing) => {
-                        run_dispatch_batch(&missing, &vec![0; missing.len()], false)
-                            .iter()
-                            .any(|r| matches!(r, Response::Integer(n) if *n > 0))
-                    }
+                    WatchCheck::Lookup(missing) => run_dispatch_batch(
+                        &missing,
+                        &vec![0; missing.len()],
+                        &vec![None; missing.len()],
+                        false,
+                    )
+                    .iter()
+                    .any(|r| matches!(r, Response::Integer(n) if *n > 0)),
                 };
                 if broken {
                     return None;
                 }
-                let responses = run_dispatch_batch(&cmds, &origins, false);
+                // The read lookups of each queued command, as it ran on its own.
+                let looks: Vec<Option<Lookups>> =
+                    lines.iter().map(|l| keystats::lookups(l)).collect();
+                let responses = run_dispatch_batch(&cmds, &origins, &looks, false);
                 slowlog_exec_steps(&lines, origin);
                 Some(responses)
             })
@@ -383,7 +408,7 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                     tx.send(()).ok();
                 }
                 DispatchMsg::FireAndForget(cmd, db) => {
-                    run_held(&[(cmd, db)], &[0], true);
+                    run_held(&[(cmd, db)], &[0], &[None], true);
                 }
                 DispatchMsg::Batch(cmds, origin, resp_tx, kind) => {
                     resp_tx.send(run_batch_msg(cmds, origin, kind)).ok();
@@ -392,21 +417,24 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                 // the batch then holds its databases exclusive (`plan_batch`).
                 // The commands run one after another on this thread, so each
                 // is still whole, and a table-backed batch shares one commit.
-                DispatchMsg::Cmd(first_cmd, first_db, first_origin, first_resp_tx) => {
+                DispatchMsg::Cmd(first_cmd, first_db, first_origin, first_resp_tx, first_look) => {
                     let mut cmds: Vec<(Command, u8)> = Vec::with_capacity(batch_size);
+                    let mut looks: Vec<Option<Lookups>> = Vec::with_capacity(batch_size);
                     let mut origins: Vec<u64> = Vec::with_capacity(batch_size);
                     let mut txs: Vec<mpsc::SyncSender<Response>> = Vec::with_capacity(batch_size);
                     let mut faf_cmds: Vec<(Command, u8)> = Vec::new();
                     let mut pending_batch: PendingBatch = None;
 
                     cmds.push((first_cmd, first_db));
+                    looks.push(first_look);
                     origins.push(first_origin);
                     txs.push(first_resp_tx);
 
                     while cmds.len() < batch_size {
                         match cmd_rx.try_recv() {
-                            Ok(DispatchMsg::Cmd(c, d, o, tx)) => {
+                            Ok(DispatchMsg::Cmd(c, d, o, tx, look)) => {
                                 cmds.push((c, d));
+                                looks.push(look);
                                 origins.push(o);
                                 txs.push(tx);
                             }
@@ -431,14 +459,14 @@ pub fn worker_main(db_oid_datum: pgrx::pg_sys::Datum) {
                     }
 
                     served = (cmds.len() + faf_cmds.len()) as u64;
-                    let responses = run_held(&cmds, &origins, true);
+                    let responses = run_held(&cmds, &origins, &looks, true);
                     for (tx, resp) in txs.into_iter().zip(responses) {
                         tx.send(resp).ok();
                     }
 
                     if !faf_cmds.is_empty() {
                         let zeros = vec![0; faf_cmds.len()];
-                        run_held(&faf_cmds, &zeros, true);
+                        run_held(&faf_cmds, &zeros, &vec![None; faf_cmds.len()], true);
                     }
 
                     if let Some((batch_cmds, batch_origin, batch_tx, kind)) = pending_batch {
@@ -602,6 +630,10 @@ pub(crate) fn kv_tables_present() -> bool {
 const LOCK_CONFLICT: &str = "ERR deadlock detected between concurrent writes, retry the command";
 const LOCK_CONFLICT_RETRIES: usize = 3;
 
+/// The subtransaction xids a backend caches for its transaction:
+/// PostgreSQL's `PGPROC_MAX_CACHED_SUBXIDS`.
+const CACHED_SUBXIDS: usize = 64;
+
 /// The reply for a PostgreSQL error raised while running a command, and the
 /// line to log for it. Overflow gets Redis's wording; anything else is a bug in
 /// a statement, so the client is told only that the command failed. Catching
@@ -695,7 +727,7 @@ fn run_flat<F>(
     mut run: F,
 ) -> Option<Vec<(Response, Vec<Vec<u8>>)>>
 where
-    F: FnMut(&mut pgrx::spi::SpiClient<'_>, &Command, u8) -> (Response, Vec<Vec<u8>>),
+    F: FnMut(&mut pgrx::spi::SpiClient<'_>, usize, &Command, u8) -> (Response, Vec<Vec<u8>>),
 {
     use crate::store::Store;
     crate::pg::transaction_or_abort(|| {
@@ -713,9 +745,9 @@ where
                 return Some(cmds.iter().map(|_| (Response::Ok, Vec::new())).collect());
             }
             let mut out = Vec::with_capacity(cmds.len());
-            for ((cmd, db), origin) in cmds.iter().zip(origins) {
+            for (i, ((cmd, db), origin)) in cmds.iter().zip(origins).enumerate() {
                 crate::tracking::set_origin(*origin);
-                let r = run(client, cmd, *db);
+                let r = run(client, i, cmd, *db);
                 if matches!(r.0, Response::Error(_)) {
                     return None;
                 }
@@ -732,6 +764,7 @@ where
 fn run_dispatch_batch(
     cmds: &[(Command, u8)],
     origins: &[u64],
+    looks: &[Option<Lookups>],
     retry_conflicts: bool,
 ) -> Vec<Response> {
     // Whether one command is served from shared memory. Decided per command:
@@ -767,26 +800,44 @@ fn run_dispatch_batch(
     // `guarded`: in a subtransaction of its own (`in_subtransaction`), or
     // as a plain statement of a batch that `run_flat` can roll back whole.
     STEP_USEC.with_borrow_mut(Vec::clear);
-    let run_as = |client: &mut pgrx::spi::SpiClient<'_>, cmd: &Command, db: u8, guarded: bool| {
-        let started = Instant::now();
-        let lazy = crate::lazyfree::before(cmd, db, &mut |d, c| probe(Some(&mut *client), d, c));
-        let before = crate::notify::before(cmd, db, &mut |d, k| exists(Some(&mut *client), d, k));
-        let r = if on_mem(cmd, db) {
-            cmd.execute_mem(db)
-        } else if guarded {
-            in_subtransaction(|| cmd.execute(client, db))
-        } else {
-            crate::pg::statement(|| cmd.execute(client, db))
+    // Only a batch with a read lookup in it keeps tallies.
+    TALLIES.with_borrow_mut(|t| {
+        t.clear();
+        if looks.iter().any(Option::is_some) {
+            t.resize_with(cmds.len(), || None);
+        }
+    });
+    let run_as =
+        |client: &mut pgrx::spi::SpiClient<'_>, i: usize, cmd: &Command, db: u8, guarded: bool| {
+            let started = Instant::now();
+            let lazy =
+                crate::lazyfree::before(cmd, db, &mut |d, c| probe(Some(&mut *client), d, c));
+            let before =
+                crate::notify::before(cmd, db, &mut |d, k| exists(Some(&mut *client), d, k));
+            let r = if on_mem(cmd, db) {
+                cmd.execute_mem(db)
+            } else if guarded {
+                in_subtransaction(|| cmd.execute(client, db))
+            } else {
+                crate::pg::statement(|| cmd.execute(client, db))
+            };
+            crate::notify::after(before, cmd, db, &r, &mut |d, k| {
+                exists(Some(&mut *client), d, k)
+            });
+            crate::lazyfree::after(lazy, &r);
+            if let Some(l) = looks.get(i).and_then(Option::as_ref) {
+                let t = keystats::tally(db, l, &r, &mut |d, k| exists(Some(&mut *client), d, k));
+                TALLIES.with_borrow_mut(|v| {
+                    if let Some(slot) = v.get_mut(i) {
+                        *slot = Some(t);
+                    }
+                });
+            }
+            STEP_USEC.with_borrow_mut(|t| t.push(started.elapsed().as_micros() as i64));
+            (r, crate::notify::take_untouched())
         };
-        crate::notify::after(before, cmd, db, &r, &mut |d, k| {
-            exists(Some(&mut *client), d, k)
-        });
-        crate::lazyfree::after(lazy, &r);
-        STEP_USEC.with_borrow_mut(|t| t.push(started.elapsed().as_micros() as i64));
-        (r, crate::notify::take_untouched())
-    };
-    let run = |client: &mut pgrx::spi::SpiClient<'_>, cmd: &Command, db: u8| {
-        run_as(client, cmd, db, true)
+    let run = |client: &mut pgrx::spi::SpiClient<'_>, i: usize, cmd: &Command, db: u8| {
+        run_as(client, i, cmd, db, true)
     };
     // The flat path's conditions: every command on tables, so a rollback
     // undoes all of it; none with an effect outside the database during the
@@ -798,8 +849,8 @@ fn run_dispatch_batch(
             .iter()
             .all(|(cmd, db)| !on_mem(cmd, *db) && !cmd.needs_sql());
     let flat = if flat_ok {
-        run_flat(cmds, origins, |client, cmd, db| {
-            run_as(client, cmd, db, false)
+        run_flat(cmds, origins, |client, i, cmd, db| {
+            run_as(client, i, cmd, db, false)
         })
     } else {
         None
@@ -810,7 +861,8 @@ fn run_dispatch_batch(
         crate::pg::use_top_memory_context();
         cmds.iter()
             .zip(origins)
-            .map(|((cmd, db), origin)| {
+            .enumerate()
+            .map(|(i, ((cmd, db), origin))| {
                 crate::tracking::set_origin(*origin);
                 let started = Instant::now();
                 let lazy = crate::lazyfree::before(cmd, *db, &mut |d, c| probe(None, d, c));
@@ -819,6 +871,14 @@ fn run_dispatch_batch(
                 STEP_USEC.with_borrow_mut(|t| t.push(started.elapsed().as_micros() as i64));
                 crate::notify::after(before, cmd, *db, &r, &mut |d, k| exists(None, d, k));
                 crate::lazyfree::after(lazy, &r);
+                if let Some(l) = looks.get(i).and_then(Option::as_ref) {
+                    let t = keystats::tally(*db, l, &r, &mut |d, k| exists(None, d, k));
+                    TALLIES.with_borrow_mut(|v| {
+                        if let Some(slot) = v.get_mut(i) {
+                            *slot = Some(t);
+                        }
+                    });
+                }
                 (r, crate::notify::take_untouched())
             })
             .collect()
@@ -830,20 +890,36 @@ fn run_dispatch_batch(
         let (cmd, db) = &cmds[0];
         crate::tracking::set_origin(origins[0]);
         vec![BackgroundWorker::transaction(|| {
-            Spi::connect_mut(|client| run(client, cmd, *db))
+            Spi::connect_mut(|client| run(client, 0, cmd, *db))
         })]
     } else {
-        BackgroundWorker::transaction(|| {
-            Spi::connect_mut(|client| {
-                cmds.iter()
-                    .zip(origins)
-                    .map(|((cmd, db), origin)| {
-                        crate::tracking::set_origin(*origin);
-                        run(client, cmd, *db)
+        // Each command's subtransaction takes an xid, and a backend caches 64
+        // of a transaction's (`PGPROC_MAX_CACHED_SUBXIDS`); one more and the
+        // cache overflows, and every other backend's snapshot then checks
+        // visibility through `pg_subtrans` until the transaction ends.
+        // Independent commands commit in groups that fit. An EXEC's are one
+        // transaction, as Redis runs them, whatever it costs.
+        let group = if retry_conflicts {
+            CACHED_SUBXIDS
+        } else {
+            cmds.len()
+        };
+        let at: Vec<usize> = (0..cmds.len()).collect();
+        at.chunks(group)
+            .flat_map(|at| {
+                BackgroundWorker::transaction(|| {
+                    Spi::connect_mut(|client| {
+                        at.iter()
+                            .map(|&i| {
+                                let (cmd, db) = &cmds[i];
+                                crate::tracking::set_origin(origins[i]);
+                                run(client, i, cmd, *db)
+                            })
+                            .collect::<Vec<_>>()
                     })
-                    .collect()
+                })
             })
-        })
+            .collect()
     };
     let (mut responses, mut untouched): (Vec<Response>, Vec<Vec<Vec<u8>>>) =
         ran.into_iter().unzip();
@@ -859,11 +935,13 @@ fn run_dispatch_batch(
                 attempts += 1;
                 crate::tracking::set_origin(origins[i]);
                 (responses[i], untouched[i]) = BackgroundWorker::transaction(|| {
-                    Spi::connect_mut(|client| run(client, cmd, *db))
+                    Spi::connect_mut(|client| run(client, i, cmd, *db))
                 });
             }
         }
     }
+    // Each command's lookups, from the run that stood.
+    keystats::apply_all(TALLIES.take().into_iter().flatten());
     // What each client wrote, for the tracking invalidations sent once the
     // batch is done: grouped by client, so a transaction's BCAST messages
     // carry all its keys, one message per prefix, as Redis sends them.
@@ -2299,7 +2377,13 @@ fn conn_loop(stream: TcpStream, cmd_tx: mpsc::SyncSender<DispatchMsg>, default_d
                     .flatten();
                 let (resp_tx, resp_rx) = mpsc::sync_channel(1);
                 if cmd_tx
-                    .send(DispatchMsg::Cmd(cmd, db, client.id, resp_tx))
+                    .send(DispatchMsg::Cmd(
+                        cmd,
+                        db,
+                        client.id,
+                        resp_tx,
+                        keystats::lookups(&parts),
+                    ))
                     .is_err()
                 {
                     break;
@@ -3781,7 +3865,7 @@ fn dispatch_one(cmd_tx: &mpsc::SyncSender<DispatchMsg>, cmd: Command, db: u8) ->
     let (resp_tx, resp_rx) = mpsc::sync_channel(1);
     let origin = CONN_CLIENT.with(|c| c.get());
     if cmd_tx
-        .send(DispatchMsg::Cmd(cmd, db, origin, resp_tx))
+        .send(DispatchMsg::Cmd(cmd, db, origin, resp_tx, None))
         .is_err()
     {
         return Response::Error("ERR server is shutting down".to_string());
@@ -4036,7 +4120,7 @@ mod tests {
         std::thread::spawn(move || {
             for msg in cmd_rx {
                 match msg {
-                    DispatchMsg::Cmd(_, db, _, resp_tx) => {
+                    DispatchMsg::Cmd(_, db, _, resp_tx, _) => {
                         db_tx.send(db).ok();
                         resp_tx.send(Response::Ok).ok();
                     }

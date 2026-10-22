@@ -1,0 +1,166 @@
+//! `keyspace_hits` and `keyspace_misses`, and the `keymiss` event: what
+//! Redis's `lookupKey` counts for every read lookup of a key (`db.c`). A
+//! lookup made to write (`lookupKeyWrite`) counts nothing, so the keys a
+//! command reads are the ones its key specs mark `RO`, plus the key of the
+//! `GET` family, which reads its key first whatever it then writes.
+//!
+//! A key counts as a hit when it is there, whatever the command finds in it:
+//! `HGET` of a missing field in a hash that exists is a hit. Most replies say
+//! so already, and only a reply that cannot tell (empty, zero, nil, or one
+//! that answers the same with or without the key) costs a look at the key.
+#![forbid(unsafe_code)]
+
+use crate::commands::Response;
+
+/// The keys one command line reads, and its name, worked out on the
+/// connection thread from the line itself and carried with the command.
+#[derive(Clone, Debug)]
+pub struct Lookups {
+    pub name: String,
+    pub keys: Vec<Vec<u8>>,
+}
+
+/// The read lookups `argv` makes, or `None` for a command that makes none.
+pub fn lookups(argv: &[Vec<u8>]) -> Option<Lookups> {
+    let name = String::from_utf8_lossy(argv.first()?).to_ascii_uppercase();
+    // A read-only script's keys are looked up by the commands it runs.
+    if matches!(name.as_str(), "EVAL_RO" | "EVALSHA_RO" | "FCALL_RO") {
+        return None;
+    }
+    // `getGenericCommand` and `GETEX` read the key with `lookupKeyRead`.
+    let get_family = match name.as_str() {
+        "GETDEL" | "GETEX" | "GETSET" => true,
+        "SET" => argv.iter().skip(3).any(|a| a.eq_ignore_ascii_case(b"GET")),
+        _ => false,
+    };
+    let keys: Vec<Vec<u8>> = if get_family {
+        vec![argv.get(1)?.clone()]
+    } else {
+        crate::admin::get_keys(argv)
+            .ok()?
+            .into_iter()
+            .filter(|(_, flags)| flags.contains(&"RO"))
+            .map(|(k, _)| k)
+            .collect()
+    };
+    (!keys.is_empty()).then_some(Lookups { name, keys })
+}
+
+/// What one command's lookups found: added to the counters only once the
+/// command's run is the one that stands (a batch rolled back and run again
+/// counts once).
+#[derive(Default, Debug)]
+pub struct Tally {
+    db: u8,
+    hits: u64,
+    /// The keys missed, for the `keymiss` event.
+    missed: Vec<Vec<u8>>,
+    notify: bool,
+}
+
+/// Replies the same with or without the key, or one too plain to say: these
+/// always look.
+const ALWAYS_LOOK: &[&str] = &[
+    "HMGET",
+    "SMISMEMBER",
+    "ZMSCORE",
+    "GEOPOS",
+    "GEOHASH",
+    "SSCAN",
+    "HSCAN",
+    "ZSCAN",
+    "BITPOS",
+];
+
+/// Answer nil, nothing or 0 only without the key: `GET` meets another type
+/// with WRONGTYPE, and Redis keeps no empty collection.
+const EMPTY_IS_ABSENT: &[&str] = &[
+    "GET", "SMEMBERS", "HGETALL", "HKEYS", "HVALS", "HLEN", "LLEN", "SCARD", "ZCARD", "DUMP",
+];
+
+/// Whether `reply` could only have come from a key that is there.
+fn proves_key(reply: &Response) -> bool {
+    match reply {
+        Response::BulkString(b) => !b.is_empty(),
+        Response::Integer(n) => *n != 0,
+        Response::Array(items) => !items.is_empty(),
+        Response::Null | Response::NullArray | Response::Error(_) => false,
+        // Anything richer (a map, a double, a nested array) is a value read
+        // from a key.
+        _ => true,
+    }
+}
+
+/// Count `l`'s lookups of `db`, run with reply `reply`. `exists` looks at a
+/// key without touching it.
+pub fn tally(
+    db: u8,
+    l: &Lookups,
+    reply: &Response,
+    exists: &mut dyn FnMut(u8, &[u8]) -> bool,
+) -> Tally {
+    let mut t = Tally {
+        db,
+        notify: l.name != "OBJECT",
+        ..Tally::default()
+    };
+    let mut found = |key: &[u8], there: bool| {
+        if there {
+            t.hits += 1;
+        } else {
+            t.missed.push(key.to_vec());
+        }
+    };
+    let single = l.keys.len() == 1;
+    let by_reply = match (l.name.as_str(), reply) {
+        // They write the key after reading it, so only the reply says what
+        // the read found: nil for no key, a value or WRONGTYPE for one.
+        ("GETDEL" | "GETEX" | "GETSET" | "SET", r) => Some(!matches!(r, Response::Null)),
+        ("TTL" | "PTTL" | "EXPIRETIME" | "PEXPIRETIME", Response::Integer(n)) => Some(*n != -2),
+        ("TYPE", Response::SimpleString(s)) => Some(s != "none"),
+        ("OBJECT", Response::Null) => Some(false),
+        ("EXISTS" | "TOUCH", Response::Integer(n)) if single => Some(*n > 0),
+        _ if single && !ALWAYS_LOOK.contains(&l.name.as_str()) && proves_key(reply) => Some(true),
+        (name, r)
+            if single && EMPTY_IS_ABSENT.contains(&name) && !matches!(r, Response::Error(_)) =>
+        {
+            Some(false)
+        }
+        _ => None,
+    };
+    match by_reply {
+        Some(there) if single => found(&l.keys[0], there),
+        _ => {
+            for key in &l.keys {
+                found(key, exists(db, key));
+            }
+        }
+    }
+    t
+}
+
+impl Tally {
+    /// Add it to INFO's counters, and raise `keymiss` for each key missed.
+    pub fn apply(self) {
+        apply_all(std::iter::once(self));
+    }
+}
+
+/// Add a batch's tallies to INFO's counters in one step, which every worker
+/// shares, and raise `keymiss` for each key missed.
+pub fn apply_all(tallies: impl IntoIterator<Item = Tally>) {
+    let flags = crate::notify::flags();
+    let (mut hits, mut misses) = (0, 0);
+    for t in tallies {
+        hits += t.hits;
+        misses += t.missed.len() as u64;
+        if t.notify && flags & crate::notify::KEY_MISS != 0 {
+            for key in &t.missed {
+                crate::notify::emit(flags, crate::notify::KEY_MISS, "keymiss", key, t.db);
+            }
+        }
+    }
+    if hits + misses > 0 {
+        crate::server::count_lookups(hits, misses);
+    }
+}

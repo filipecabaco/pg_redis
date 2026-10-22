@@ -176,6 +176,74 @@ describe("appendfsync", () => {
 	});
 });
 
+// INFO's keyspace_hits and keyspace_misses count every read lookup of a key,
+// as Redis's lookupKey does: a key that is there is a hit whatever the
+// command finds in it, and a lookup made to write counts nothing. The
+// expected counts are what Redis 7.2 reports for the same commands.
+for (const half of ["cache", "durable"] as const) {
+	describe(`Keyspace hits and misses (${half})`, () => {
+		let conn: RawRedis;
+		beforeAll(async () => {
+			conn = await new RawRedis().connect();
+			await conn.send("SELECT", half);
+		});
+		afterAll(async () => {
+			await conn.send("FLUSHDB");
+			await conn.send("CONFIG", "SET", "notify-keyspace-events", "");
+			conn.close();
+		});
+
+		const counted = async (setup: string[][], measured: string[][]) => {
+			await conn.send("FLUSHDB");
+			for (const c of setup) await conn.send(...c);
+			await conn.send("CONFIG", "RESETSTAT");
+			for (const c of measured) await conn.send(...c);
+			const info = (await conn.bulk("INFO", "stats"))?.toString() ?? "";
+			const field = (f: string) => Number(info.match(new RegExp(`${f}:(\\d+)`))?.[1]);
+			return [field("keyspace_hits"), field("keyspace_misses")];
+		};
+
+		test("a key that is there is a hit, whatever the command finds in it", async () => {
+			expect(await counted([["HSET", "h", "f", "v"]], [["HGET", "h", "f"], ["HGET", "h", "nope"], ["HGET", "nope", "f"]])).toEqual([2, 1]);
+			expect(await counted([["SET", "s", "v"], ["HSET", "h", "f", "v"]], [["MGET", "s", "h", "nope"]])).toEqual([2, 1]);
+			expect(await counted([["SADD", "set", "a"]], [["SISMEMBER", "set", "z"], ["SCARD", "nope"], ["STRLEN", "nope"]])).toEqual([1, 2]);
+			expect(await counted([["HSET", "h", "f", "v"]], [["HMGET", "h", "f", "g"], ["HMGET", "nope", "f"]])).toEqual([1, 1]);
+		});
+
+		test("multi-key reads count each key, STORE sources included", async () => {
+			expect(await counted([["SADD", "a", "1"], ["SADD", "b", "2"]], [["SUNION", "a", "b", "nope"], ["SINTERSTORE", "dst", "a", "nope"]])).toEqual([3, 2]);
+			expect(await counted([["SET", "s", "v"]], [["EXISTS", "s", "nope", "s"], ["TOUCH", "s", "nope"]])).toEqual([3, 2]);
+		});
+
+		test("the GET family counts its read; other writes count nothing", async () => {
+			expect(await counted([["SET", "s", "v"], ["SET", "t", "v"]], [["GETDEL", "s"], ["GETDEL", "nope"], ["GETEX", "t"], ["SET", "t", "w", "GET"], ["GETSET", "nope", "x"]])).toEqual([3, 2]);
+			expect(await counted([["SET", "n", "1"], ["RPUSH", "l", "a"]], [["INCR", "n"], ["LPOP", "l"], ["LPOP", "nope"], ["DEL", "n", "nope"]])).toEqual([0, 0]);
+		});
+
+		test("a script's commands count as they would outside it", async () => {
+			expect(await counted([["SET", "s", "v"]], [["EVAL", "return {redis.call('GET', KEYS[1]), redis.call('GET', KEYS[2])}", "2", "s", "nope"]])).toEqual([1, 1]);
+		});
+
+		test("a miss raises keymiss; a hit and OBJECT do not", async () => {
+			const db = half === "cache" ? 0 : 8;
+			await conn.send("FLUSHDB");
+			await conn.send("HSET", "h", "f", "v");
+			await conn.send("CONFIG", "SET", "notify-keyspace-events", "Em");
+			const sub = new Bun.RedisClient(redisUrl);
+			const heard: string[] = [];
+			await sub.subscribe(`__keyevent@${db}__:keymiss`, (key: string) => heard.push(key));
+			await conn.send("GET", "nope");
+			await conn.send("HGET", "h", "nope");
+			await conn.send("OBJECT", "ENCODING", "nope2");
+			await conn.send("GET", "nope3");
+			for (let t = 0; t < 20 && heard.length < 2; t++) await Bun.sleep(50);
+			await Bun.sleep(100);
+			sub.close();
+			expect(heard).toEqual(["nope", "nope3"]);
+		});
+	});
+}
+
 // Two logged databases swap their tables, and a logged FLUSHDB truncates
 // them: no key is moved or deleted row by row.
 describe("SWAPDB and FLUSHDB on logged databases", () => {

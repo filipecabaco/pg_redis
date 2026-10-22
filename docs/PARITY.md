@@ -282,6 +282,8 @@ Measured side by side against the reference:
 | `COMMAND COUNT` | ~~`100`~~ ~~**150**~~ ~~**235**~~ **237**, the rows of the coverage page. **Closed.** | `240` (7.0), `242` (7.2) |
 | `COMMAND DOCS` / `INFO` / `LIST` | ~~*(empty)*~~ populated from Redis 7.2's command table. **Closed.** | populated |
 | `CLIENT ID` | ~~`0`, always~~ unique per connection. **Closed.** | unique per connection |
+| `INFO stats` `keyspace_hits` / `keyspace_misses` | ~~`0`, always~~ every read lookup counted, as `lookupKey` counts it. **Closed.** | counted |
+| `keymiss` event (`notify-keyspace-events m`) | ~~never raised~~ raised on every counted miss but `OBJECT`'s. **Closed.** | raised |
 
 The three `OBJECT` rows are closed: each key carries Redis's 24-bit access
 field, and the parity case "OBJECT IDLETIME, FREQ and REFCOUNT" compares them
@@ -304,6 +306,17 @@ the reply would not be enough.
 **Status now: closed.** Every connection is registered with an id from a
 counter in shared memory, and `CLIENT ID`, `INFO`, `LIST`, `KILL`,
 `GETNAME`/`SETNAME` and `PAUSE`/`UNPAUSE` work across every worker.
+
+The keyspace counters were declared and reset but never incremented, and the
+`m` flag was parsed but `keymiss` never raised. Redis counts in `lookupKey`:
+every read lookup, never a write one, and a key that is there is a hit
+whatever the command finds in it. `src/keystats.rs` takes the keys a command
+reads from its key specs (`RO`) plus the `GET` family, and counts them from
+the reply when the reply can only come with or without the key, looking at
+the key otherwise. Thirteen scenarios, run on Redis 7.2 and on a memory and a
+logged database, give the same counts on all three; the e2e suite holds them.
+`SCAN ... TYPE`, which Redis counts as a lookup per key scanned, does not count
+here.
 
 
 ## The two architectural blockers

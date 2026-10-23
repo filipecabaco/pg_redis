@@ -168,6 +168,10 @@ groups =
 commands = ~w(set get incr lpush lpop rpush rpop sadd spop hset zadd zpopmin lrange_100 mset)
 follows = ~w(lpop rpop spop zpopmin get)
 
+# A pop's first repetition drains what its producer made, and every one after would pop from
+# nothing: each repetition is seeded afresh by the producer, untimed.
+producer = %{"lpop" => "lpush", "rpop" => "rpush", "spop" => "sadd", "zpopmin" => "zadd"}
+
 log = fn msg -> IO.puts(:stderr, "[#{Time.utc_now() |> Time.truncate(:second)}] #{msg}") end
 
 # ── Run ──────────────────────────────────────────────────────────────────────
@@ -230,7 +234,14 @@ results =
             for cmd <- commands do
               unless cmd in follows, do: flush.()
               log.("  #{t.id} #{cmd}")
-              {cmd, Bench.repeat(fn -> Bench.redis_benchmark(t, cmd, n: Bench.n(200_000 * big)) end)}
+              n = Bench.n(200_000 * big)
+              seed = fn ->
+                if p = producer[cmd] do
+                  flush.()
+                  Bench.redis_benchmark(t, p, n: n)
+                end
+              end
+              {cmd, Bench.repeat(fn -> seed.(); Bench.redis_benchmark(t, cmd, n: n) end)}
             end
 
           "sizes" ->

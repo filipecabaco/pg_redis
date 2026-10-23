@@ -145,7 +145,11 @@ targets = [
   %{id: "redis-aof", label: "Redis 7.2, AOF everysec", host: "redis-aof", db: 0, server: "redis-aof", fast: true},
   %{id: "memory", label: "pg_redis memory", host: "pg_redis", db: 0, server: "pg_redis", fast: true},
   %{id: "memory+snapshot", label: "pg_redis memory+snapshot", host: "pg_redis", db: 1, server: "pg_redis", fast: true},
-  %{id: "logged", label: "pg_redis logged", host: "pg_redis", db: 8, server: "pg_redis", fast: false}
+  %{id: "logged", label: "pg_redis logged", host: "pg_redis", db: 8, server: "pg_redis", fast: false},
+  # The same logged database with replies that do not wait for the WAL to reach disk:
+  # Redis's appendfsync everysec, which the Redis column beside it uses too.
+  %{id: "logged-everysec", label: "pg_redis logged, appendfsync everysec", host: "pg_redis", db: 9,
+    server: "pg_redis", fast: false, fsync: "everysec"}
 ]
 
 targets =
@@ -163,6 +167,10 @@ groups =
 # Pops follow their producers so they have something to pop; everything else starts empty
 commands = ~w(set get incr lpush lpop rpush rpop sadd spop hset zadd zpopmin lrange_100 mset)
 follows = ~w(lpop rpop spop zpopmin get)
+
+# A pop's first repetition drains what its producer made, and every one after would pop from
+# nothing: each repetition is seeded afresh by the producer, untimed.
+producer = %{"lpop" => "lpush", "rpop" => "rpush", "spop" => "sadd", "zpopmin" => "zadd"}
 
 log = fn msg -> IO.puts(:stderr, "[#{Time.utc_now() |> Time.truncate(:second)}] #{msg}") end
 
@@ -210,6 +218,13 @@ results =
     Rig.only(server)
 
     for t <- ts, group <- groups do
+      # Each target runs with its own appendfsync, always unless it names another; the
+      # workers apply a change from their next round.
+      if t.server == "pg_redis" do
+        Rig.cli(t, ["CONFIG", "SET", "appendfsync", Map.get(t, :fsync, "always")])
+        Process.sleep(500)
+      end
+
       flush = fn -> Rig.cli(t, ["FLUSHDB"]) end
       big = if t.fast, do: 1, else: 0.25
 
@@ -219,7 +234,14 @@ results =
             for cmd <- commands do
               unless cmd in follows, do: flush.()
               log.("  #{t.id} #{cmd}")
-              {cmd, Bench.repeat(fn -> Bench.redis_benchmark(t, cmd, n: Bench.n(200_000 * big)) end)}
+              n = Bench.n(200_000 * big)
+              seed = fn ->
+                if p = producer[cmd] do
+                  flush.()
+                  Bench.redis_benchmark(t, p, n: n)
+                end
+              end
+              {cmd, Bench.repeat(fn -> seed.(); Bench.redis_benchmark(t, cmd, n: n) end)}
             end
 
           "sizes" ->

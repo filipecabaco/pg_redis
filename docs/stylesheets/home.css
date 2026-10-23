@@ -410,10 +410,11 @@
   background: var(--c);
 }
 
-.pr-bench { --c-redis: #8a8f98; --c-mem: var(--pr-green); --c-wal: #1f7a52; }
+.pr-bench { --c-redis: #8a8f98; --c-mem: var(--pr-green); --c-wal: #1f7a52; --c-fsync: #2f9e8f; }
 .k--redis, .b--redis { --c: var(--c-redis); }
 .k--mem, .b--mem { --c: var(--c-mem); }
 .k--wal, .b--wal { --c: var(--c-wal); }
+.k--fsync, .b--fsync { --c: var(--c-fsync); }
 
 .pr-bench__row {
   display: grid;

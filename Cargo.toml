@@ -17,7 +17,7 @@ pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
 pg_test = []
 
 [dependencies]
-pgrx = "=0.18.0"
+pgrx = "=0.19.3"
 socket2 = { version = "0.5", features = ["all"] }
 libc = "0.2"
 # Safe wrappers for the system calls std does not have: poll, futexes (src/sys.rs).
@@ -37,7 +37,7 @@ siphasher = "1"
 mlua-sys = { version = "0.13.0", features = ["lua51", "vendored"] }
 
 [dev-dependencies]
-pgrx-tests = "=0.18.0"
+pgrx-tests = "=0.19.3"
 # Fuzz harnesses (src/fuzz.rs): run as tests on stable, under libFuzzer with cargo-bolero.
 # Held below bolero-generator-derive 0.13.5, which pins `indexmap = "=2.11.2"`
 # and so blocks any dependency needing a newer indexmap (pgrx 0.19 does, via
